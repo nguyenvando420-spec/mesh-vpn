@@ -13,7 +13,8 @@
 | 2026-11-12 | Gate 1 | agile-critic | gemini-4-carbon-high | Phản biện độc lập Gate 1 Vòng 1 | 0 | 0 (Phát hiện chính xác 3B/3H/4M thực chất) | Không (đã kiểm chứng từng dòng đối chiếu) | 627.6 s | Không | Chờ Gate 1 |
 | 2026-11-12 | Gate 1 | agile-researcher | gemini-4-argon-high | Vòng sửa 1: Cập nhật production-readiness-requirements.md v1.1 | 0 | 0 (Đã PASS Critic V2) | Không (đã kiểm chứng SEC-14, OPS-05/06/08, nhãn KN) | 166.4 s | Không | Chờ Gate 1 |
 | 2026-11-12 | Gate 1 | agile-po-ba | gemini-4-carbon-high | Vòng sửa 1: Cập nhật Product Backlog v1.1 & Charter v1.1 | 0 | 0 (Đã PASS Critic V2) | Không (đã kiểm chứng đủ 861 + 159 dòng, xử lý đủ BLK/HR/IMP) | 1035.8 s | Không | Chờ Gate 1 |
-| 2026-11-12 | Gate 1 | agile-critic | gemini-4-carbon-high | Tái thẩm định độc lập Gate 1 Vòng 2 | 0 | 0 (Xác nhận 10/10 mục đóng, `[APPROVED FOR GATE]`) | Không (đã đối chiếu chéo từng mã AC & yêu cầu) | 195.7 s | Không | Chờ Gate 1 |
+| 2026-11-12 | Gate 1 | agile-critic | gemini-4-carbon-high | Tái thẩm định độc lập Gate 1 Vòng 2 | 0 | 0 (Xác nhận 10/10 mục đóng, `[APPROVED FOR GATE]`) | Không (đã đối chiếu chéo từng mã AC & yêu cầu) | 195.7 s | Không | Duyệt Gate 1 |
+| 2026-11-12 | Gate 2 (Sync) | agile-researcher | claude-opus-5-5-high | Đồng bộ `production-readiness-requirements.md` v1.2 (macOS `PLAT-06`, IP Pinning, custom port, `SEC-15`) | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng 222 dòng, 8 nguồn mới `[T38..T45]`) | 451.3 s | Không | Theo yêu cầu người dùng tại Gate 1 |
 
 ## Chỉ số riêng cho vai trò AI (ghi thêm khi vai trò AI bàn giao)
 
@@ -24,8 +25,8 @@
 
 | Thời điểm | Vai trò | Từ model | Sang model | Lý do | Quota reset lúc | Đã quay lại model chính? |
 |---|---|---|---|---|---|---|
-| 2026-11-12 18:19 | agile-researcher | claude-opus-5-5-high | gemini-4-argon-high | Hết nhóm quota Claude (`RESOURCE_EXHAUSTED 429`, bao gồm cả dự phòng `claude-sonnet-5-5-high`) giữa Vòng sửa 1 | ~19:05+07:00 (sau 45m21s) | Chưa |
-| 2026-11-12 18:19 | agile-po-ba | claude-sonnet-5-5-high | gemini-4-carbon-high | Hết nhóm quota Claude (`RESOURCE_EXHAUSTED 429`) khi bắt đầu Vòng sửa 1; chuyển đúng model dự phòng trong `model-routing.md` | ~19:05+07:00 (sau 45m28s) | Chưa |
+| 2026-11-12 18:19 | agile-researcher | claude-opus-5-5-high | gemini-4-argon-high | Hết nhóm quota Claude (`RESOURCE_EXHAUSTED 429`, bao gồm cả dự phòng `claude-sonnet-5-5-high`) giữa Vòng sửa 1 | ~19:05+07:00 (sau 45m21s) | Có (quay lại `claude-opus-5-5-high` lúc 19:51) |
+| 2026-11-12 18:19 | agile-po-ba | claude-sonnet-5-5-high | gemini-4-carbon-high | Hết nhóm quota Claude (`RESOURCE_EXHAUSTED 429`) khi bắt đầu Vòng sửa 1; chuyển đúng model dự phòng trong `model-routing.md` | ~19:05+07:00 (sau 45m28s) | Có (quay lại `claude-sonnet-5-5-high` lúc 20:01) |
 
 ## Tổng hợp tại Gate 3
 
