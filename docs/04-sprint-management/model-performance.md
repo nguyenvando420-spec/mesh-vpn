@@ -46,6 +46,7 @@
 | 2026-11-12 18:19 | agile-po-ba | claude-sonnet-5-5-high | gemini-4-carbon-high | Hết nhóm quota Claude (`RESOURCE_EXHAUSTED 429`) khi bắt đầu Vòng sửa 1; chuyển đúng model dự phòng trong `model-routing.md` | ~19:05+07:00 (sau 45m28s) | Có (quay lại `claude-sonnet-5-5-high` lúc 20:01) |
 | 2026-11-12 21:11 | agile-tech-lead | claude-sonnet-5-5-high | gemini-4-argon-high | Chạm trần nhóm quota tuần của Claude (`RESOURCE_EXHAUSTED 429`, `Resets in 136h31m20s`) khi chạy Rust Stack; chuyển sang đúng model dự phòng trong `model-routing.md` | ~2026-11-18 13:43+07:00 | Chưa |
 | 2026-11-12 21:11 | agile-architect | claude-opus-5-5-high | gemini-4-argon-high | Nhóm quota tuần của Claude đã cạn (`Resets in 136h31m20s`); chuyển sang đúng model dự phòng trong `model-routing.md` (độc lập họ model ở Gate 2 vẫn được bảo toàn nhờ `agile-codex` họ OpenAI `gpt-6.1-sol`) | ~2026-11-18 13:43+07:00 | Chưa |
+| 2026-11-13 05:48 | agile-developer | claude-sonnet-5-5-high | gemini-4-hydrogen-xhigh | Nhóm quota tuần của Claude đang ở mức `0%` tới `~2026-11-18 13:41`; chuyển sang model dự phòng số 1 cho lõi khó theo `model-routing.md` v2.4.0 (khác biến thể với `agile-qa` `argon-high` & `agile-critic` `carbon-high`, kết hợp đối trọng `agile-codex`) | ~2026-11-18 13:41+07:00 | Chưa |
 
 ## Tổng hợp tại Gate 3
 
