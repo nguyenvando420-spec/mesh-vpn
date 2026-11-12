@@ -16,6 +16,7 @@
 | 2026-11-12 | Gate 1 | agile-critic | gemini-4-carbon-high | Tái thẩm định độc lập Gate 1 Vòng 2 | 0 | 0 (Xác nhận 10/10 mục đóng, `[APPROVED FOR GATE]`) | Không (đã đối chiếu chéo từng mã AC & yêu cầu) | 195.7 s | Không | Duyệt Gate 1 |
 | 2026-11-12 | Gate 2 (Sync) | agile-researcher | claude-opus-5-5-high | Đồng bộ `production-readiness-requirements.md` v1.2 (macOS `PLAT-06`, IP Pinning, custom port, `SEC-15`) | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng 222 dòng, 8 nguồn mới `[T38..T45]`) | 451.3 s | Không | Theo yêu cầu người dùng tại Gate 1 |
 | 2026-11-12 | Gate 2 (Sync) | agile-po-ba | claude-sonnet-5-5-high | Đồng bộ `product-backlog.md` v1.2 (997 dòng), `charter` v1.2, `vision` v1.1, `personas` v1.1 | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng khớp 100% số đếm 51 Must / 234 SP & ma trận truy vết) | 972.9 s | Không | Theo yêu cầu người dùng tại Gate 1 |
+| 2026-11-12 | Gate 2 | agile-tech-lead | claude-sonnet-5-5-high | Chốt Tech Stack (Go 1.27.4 `CGO_ENABLED=0`), 11 ADRs, Coding Standards, `.agents/rules/coding-standards.md`, `.golangci.yml`, `scripts/check.*` | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng đủ 12 file hoàn chỉnh 100%, không bị cắt dòng, frontmatter `always_on` < 10 KB; phiên CLI hết 1800s ngay sau khi ghi xong) | 1800.0 s | Không | Chờ Gate 2 |
 
 ## Chỉ số riêng cho vai trò AI (ghi thêm khi vai trò AI bàn giao)
 

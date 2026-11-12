@@ -7,7 +7,7 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `2 - Tech Stack, Coding Standards, System Design & Sprint Planning`
 - **Sprint hiện tại**: `Sprint 0 (Design)`
-- **Bước tiếp theo**: `Chờ Bước 2.1 (agile-tech-lead) hoàn tất, kiểm chứng & commit, sau đó chạy ngay Bước 2.2 (agile-architect)`
+- **Bước tiếp theo**: `Chạy Bước 2.2 (agile-architect thiết kế C4 System Architecture, Database Schema & Wire/API Contracts), sau đó lập sprint-backlog.md và phản biện song song (agile-critic + agile-codex)`
 
 ## Trạng thái Gate
 
@@ -24,8 +24,8 @@
 | agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Ghi nhận duyệt Gate 1 & điều phối Giai đoạn 2 | 🟢 Active |
 | agile-researcher | claude-opus-5-5-high | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
-| agile-tech-lead | claude-sonnet-5-5-high | | Đang chốt Tech Stack, ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md` & cấu hình Formatter/Linter | 🟡 Running |
-| agile-architect | claude-opus-5-5-high | | Chờ Tech Lead chốt Stack để thiết kế C4, DB, Wire/API Contracts | ⚪ Pending |
+| agile-tech-lead | claude-sonnet-5-5-high | (phiên CLI 1800s — đã ghi xong 100% file trước khi đóng) | Hoàn tất `tech-stack-decision.md` (Go 1.27.4 `CGO_ENABLED=0`), 11 ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md` (`always_on`), `.golangci.yml`, `.editorconfig`, `scripts/check.*` | ✅ Done |
+| agile-architect | claude-opus-5-5-high | | Đang thiết kế `system-architecture.md`, `database-design.md`, `api-design.md` | 🟡 Running |
 | agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Hoàn tất Gate 1 Vòng 2 (`[APPROVED FOR GATE]`); chờ phản biện Gate 2 | ⚪ Ready |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |

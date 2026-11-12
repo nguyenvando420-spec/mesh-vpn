@@ -1,0 +1,42 @@
+# EditorConfig — https://editorconfig.org
+# Chuẩn định dạng thống nhất cho toàn dự án mesh-vpn (xem docs/03-system-design/coding-standards.md §1).
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Go: gofmt/gofumpt bắt buộc dùng TAB; độ rộng hiển thị 4 (khớp lll.tab-width trong .golangci.yml).
+[*.go]
+indent_style = tab
+indent_size = 4
+max_line_length = 120
+
+[{go.mod,go.sum,go.work,go.work.sum}]
+indent_style = tab
+indent_size = 4
+
+[*.sql]
+indent_size = 4
+
+[*.{toml,yml,yaml,json,plist,service,xml}]
+indent_size = 2
+
+[*.md]
+# Markdown dùng 2 dấu cách cuối dòng để ngắt dòng cứng → không tự cắt khoảng trắng.
+trim_trailing_whitespace = false
+max_line_length = off
+
+# Script Windows giữ CRLF (khớp .gitattributes).
+[*.{ps1,bat,cmd}]
+end_of_line = crlf
+
+[*.sh]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
