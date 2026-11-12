@@ -7,7 +7,7 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `2 - Tech Stack, Coding Standards, System Design & Sprint Planning`
 - **Sprint hiện tại**: `Sprint 0 (Design)`
-- **Bước tiếp theo**: `Chạy Bước 2.2 (agile-architect) trên Rust 1.94.1 Stack đã khóa cứng, sau đó lập sprint-backlog.md và chạy phản biện song song (agile-critic + agile-codex)`
+- **Bước tiếp theo**: `Lập sprint-backlog.md (Bước 2.3), sau đó chạy phản biện song song Bước 2.4 (agile-critic + agile-codex review-design) và trình người dùng duyệt Gate 2`
 
 ## Trạng thái Gate
 
@@ -25,7 +25,7 @@
 | agile-researcher | claude-opus-5-5-high | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
 | agile-tech-lead | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | ffd94c65-24c6-4115-9801-012205be6731 | Hoàn tất Rust 1.94.1 Stack v2.0 (`tech-stack-decision.md`, 11 ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md`, `rustfmt/clippy/deny.toml`, `scripts/check.*`) | ✅ Done (Rust v2.0) |
-| agile-architect | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | | Đang thiết kế C4 System Architecture, `redb` Schema & Wire/API/IPC Contracts khớp 10 crates Rust | 🟡 Running |
+| agile-architect | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | 20cf96d9-f16b-4d37-894b-e466b1caecf6 | Hoàn tất thiết kế Rust v2.0 (`system-architecture.md` 808 dòng, `database-design.md` 511 dòng, `api-design.md` 647 dòng) | ✅ Done (Rust v2.0) |
 | agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Hoàn tất Gate 1 Vòng 2 (`[APPROVED FOR GATE]`); chờ phản biện Gate 2 | ⚪ Ready |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
