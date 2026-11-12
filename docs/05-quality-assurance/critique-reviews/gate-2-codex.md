@@ -1,24 +1,22 @@
-**Chưa đủ điều kiện qua Gate 2.** Đối chiếu tại HEAD `0061271537080319dc1a7d3376b30dd1e2ee745e`: các điểm vòng 1 **#1, #2, #3, #4, #7, #9, #11, #12, #13, #14** đã được xử lý ở mức tài liệu/script; **#5, #6, #8, #10** còn thiếu. Có thêm xung đột IPC khi VPS kiêm node.
+Đã xác nhận **`fd9cb0dbd990a301590cf09527938aee5a6583ff`**; 22 file tài liệu/script khớp Git object. **Còn 2 🟠 High Risk; chưa có 🔴 Blocker.**
 
-1. **🟠 High Risk — #5: version vẫn có thể lùi sau restart.**  
-   [database-design.md:429](D:/Project/Idea/mesh-vpn/docs/03-system-design/database-design.md:429), dòng 461 → presence chỉ tăng RAM, lúc boot lấy `max(db, slot, now_ms)` nên không bảo toàn version đã công bố nếu đồng hồ lùi. Tính toán chỉ-đọc xác nhận: đã phát `1700000060000`, sau restart có thể phát `1700000030001` → agent bỏ qua bản mới theo `US-009 AC3`, ảnh hưởng cả thu hồi. **Sửa:** đặc tả high-watermark bền vững cho version, kể cả cập nhật RAM; bổ sung test clock rollback → crash → restart và restore.
+| Mục R2 | Kết quả kiểm chứng |
+|---|---|
+| #1 — Version lùi khi clock rollback + crash | Ca gốc đã được xử lý bằng lease bền vững; còn nhánh hết lease dưới đây. |
+| #2 — Emergency persistence | Đã bổ sung `persisted`, ba tier, bảo vệ sức chứa và fail-closed boot; phục hồi `ram_only` chưa đầy đủ. |
+| #3 — Xung đột runtime IPC | **Đóng ở mức thiết kế**: đường dẫn/quyền đã tách và có yêu cầu test hai thứ tự khởi động. |
+| #4 — Lọc nhầm TCP/UDP | **Đóng ở mức thiết kế**: contract, kiến trúc và vector kiểm thử thống nhất. |
+| #5 — Bootstrap Msvc | **Đóng ở mức đọc mã**: dùng chung installer, kiểm tra exit code. Chưa chạy cài đặt. |
+| Improvement — Priority, slice pattern, tên file | **Đóng** tại các vị trí được chỉ định. |
 
-2. **🟠 High Risk — #6: nhánh phục hồi thu hồi chưa đầy đủ.**  
-   [database-design.md:383](D:/Project/Idea/mesh-vpn/docs/03-system-design/database-design.md:383), dòng 391–410 → khẳng định ghi slot “luôn thành công”, nhưng chưa quy định khi `pwrite`/`sync_data` lỗi, slot hết sức chứa hoặc cả hai slot hỏng. Pre-allocation không loại bỏ lỗi I/O → chưa bảo đảm chống hồi sinh sau restart trong các trường hợp này. **Sửa:** chỉ báo `persisted=true` sau ghi và sync thành công; khóa hành vi RAM-only, xử lý tràn/thu gọn journal và điều kiện boot fail-closed; bổ sung fault-injection. **Chưa chạy thử filesystem.**
+1. **🟠 High Risk — Compaction bỏ sót thu hồi `ram_only`.**  
+   [database-design.md:411](D:/Project/Idea/mesh-vpn/docs/03-system-design/database-design.md:411) và [dòng 415](D:/Project/Idea/mesh-vpn/docs/03-system-design/database-design.md:415) → thu hồi mới được giữ trong RAM khi ghi thất bại, nhưng compaction chỉ hợp nhất các mục nằm trong file emergency rồi xóa `disk_degraded`. Ví dụ: A đã lưu slot, B chỉ nằm trong RAM; đĩa phục hồi, compaction chỉ lưu A → `/readyz` có thể trở lại bình thường nhưng restart làm B sống lại. **Cách sửa:** theo dõi toàn bộ thu hồi chưa bền vững, gồm cả `ram_only`; hợp nhất chúng vào giao dịch phục hồi, chỉ bỏ trạng thái degraded khi không còn mục chưa lưu. Thêm test `ram_only → disk recovery → compaction → restart`.
 
-3. **🟠 High Risk — mới: hai dịch vụ tranh quyền thư mục IPC.**  
-   [api-design.md:480](D:/Project/Idea/mesh-vpn/docs/03-system-design/api-design.md:480) và [api-design.md:548](D:/Project/Idea/mesh-vpn/docs/03-system-design/api-design.md:548) → server yêu cầu `/run/mesh` là `0750 mesh:mesh-admin`, daemon yêu cầu cùng thư mục là `0755 root:root` (`/var/run` alias `/run`). Khi VPS kiêm node, một thư mục không đáp ứng đồng thời: server có thể không bind được socket hoặc user thường không truy cập được kênh đọc. **Sửa đề xuất:** tách thư mục runtime riêng cho hai dịch vụ, đồng bộ installer/systemd/CLI và kiểm thử cả hai thứ tự khởi động.
+2. **🟠 High Risk — Chưa khóa hành vi thu hồi khi hết lease và cả hai tầng lưu đều lỗi.**  
+   [database-design.md:454](D:/Project/Idea/mesh-vpn/docs/03-system-design/database-design.md:454), [dòng 458](D:/Project/Idea/mesh-vpn/docs/03-system-design/database-design.md:458) và [system-architecture.md:355](D:/Project/Idea/mesh-vpn/docs/03-system-design/system-architecture.md:355) → bất biến cấm phát `next > persisted_watermark`, nhưng nhánh lỗi chỉ quy định dừng presence; luồng revoke vẫn yêu cầu cấp version và phát Netmap trước khi ghi bền. Khi `current = watermark = W`, không thể cấp `W+1` đúng bất biến. Nếu vẫn phát, restart có thể phát lại `W+1`; nếu allocation thất bại, luồng chưa quy định việc tiếp tục cắt phiên. **Cách sửa:** đặc tả riêng nhánh này, bảo đảm chặn RAM/cancel phiên vẫn thực hiện khi không cấp được version; bổ sung test hết lease + lỗi cả hai tầng + restart.
 
-4. **🟠 High Risk — #8: bộ lọc vẫn nhầm TCP với UDP.**  
-   [api-design.md:37](D:/Project/Idea/mesh-vpn/docs/03-system-design/api-design.md:37) → loại candidate UDP nếu trùng `SocketAddr` của Control TCP. Cấu hình hợp lệ `Control TCP :51820`, `meshd UDP :51820`, `STUN UDP :3478` sẽ mất endpoint Direct của VPS dù hai transport không xung đột → trái yêu cầu cổng tùy ý. **Sửa:** phân biệt transport khi so endpoint; thêm vector TCP/UDP trùng số cổng.
+**Cần người dùng quyết định:** chính sách phân phối thu hồi tới peer trong nhánh suy giảm ở mục 2; và `OQ-15` về việc kéo 11 SP sang Milestone 1 vẫn giữ để trình Gate 2.
 
-5. **🟠 High Risk — #10: bootstrap MSVC chưa cài đủ công cụ.**  
-   [bootstrap-toolchain.ps1:236](D:/Project/Idea/mesh-vpn/scripts/bootstrap-toolchain.ps1:236) → nhánh thật chỉ gọi `winget` và thêm target; không tải cargo-deny/cargo-zigbuild/rcodesign như DryRun mô tả → máy sạch vẫn thất bại tại bước cargo-deny của `check.ps1`. **Sửa:** dùng chung bước cài prebuilt đã kiểm hash cho cả hai mode, kiểm tra exit code và executable cuối bước. **Chưa chạy installer.**
-
-**🟡 Improvement:** [ADR-007:293](D:/Project/Idea/mesh-vpn/docs/03-system-design/architecture-decision-record.md:293) dùng priority `5182/5181`, trong khi kiến trúc và ledger dùng `51820/51810` → worker có thể cài và dọn khác rule. **Sửa:** thống nhất giá trị và kiểm chứng cleanup theo ledger.
-
-**Cần người dùng quyết định:** cơ chế version bền vững, chính sách khi journal thu hồi không ghi được và phương án tách thư mục IPC. `OQ-15` tiếp tục trình riêng; giữ baseline **38 Must/174 SP** và **13 Must/60 SP**.
-
-Đã xác nhận `rustc 1.94.1`, rule **9.907 byte**, không BOM. Hash MinGW và cargo-deny khớp metadata phát hành chính thức ([MinGW](https://github.com/brechtsanders/winlibs_mingw/releases/expanded_assets/16.2.0posix-23.1.3-14.0.0-ucrt-r3), [cargo-deny](https://github.com/EmbarkStudios/cargo-deny/releases/expanded_assets/0.20.2)). Chưa có `Cargo.toml`, nên build/test/lint và footprint RAM **chưa kiểm chứng**. Không có AI/SLM; compute profile không áp dụng.
+Chưa có mã Rust nên chưa kiểm chứng runtime; các tình huống trên được đối chiếu bằng mô hình trong bộ nhớ. Không có AI/SLM nên giới hạn RTX 2060 không áp dụng; file compute-profile tại đường dẫn project được chỉ định không tồn tại.
 
 [REVISION REQUIRED]
