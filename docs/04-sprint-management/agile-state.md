@@ -7,7 +7,7 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `2 - Tech Stack, Coding Standards, System Design & Sprint Planning`
 - **Sprint hiện tại**: `Sprint 0 (Design)`
-- **Bước tiếp theo**: `Đang chạy song song Bước 2.4: agile-critic (gemini-4-carbon-high) + agile-codex (gpt-6.1-sol review-design) thẩm định toàn bộ thiết kế Gate 2`
+- **Bước tiếp theo**: `Vòng sửa 1 trước Gate 2: chạy song song agile-tech-lead + agile-architect + agile-scrum-master để đóng toàn bộ phát hiện [REVISION REQUIRED] của agile-critic & agile-codex`
 
 ## Trạng thái Gate
 
@@ -24,9 +24,9 @@
 | agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Ghi nhận duyệt Gate 1 & điều phối Giai đoạn 2 | 🟢 Active |
 | agile-researcher | claude-opus-5-5-high | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
-| agile-tech-lead | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | ffd94c65-24c6-4115-9801-012205be6731 | Hoàn tất Rust 1.94.1 Stack v2.0 (`tech-stack-decision.md`, 11 ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md`, `rustfmt/clippy/deny.toml`, `scripts/check.*`) | ✅ Done (Rust v2.0) |
-| agile-architect | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | 20cf96d9-f16b-4d37-894b-e466b1caecf6 | Hoàn tất thiết kế Rust v2.0 (`system-architecture.md` 808 dòng, `database-design.md` 511 dòng, `api-design.md` 647 dòng) | ✅ Done (Rust v2.0) |
-| agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Đang phản biện độc lập thiết kế Gate 2 (Rust Stack, C4, `redb`, API/Wire Contracts, `sprint-backlog.md`) | 🟡 Running |
+| agile-tech-lead | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | ffd94c65-24c6-4115-9801-012205be6731 | Đang thực hiện Vòng sửa 1 Gate 2 (`BLK-G2-01/04`, Codex `#3/#4/#13`, `HR-G2-01/02`, `IMP-G2-03`) | 🟡 Revising (R1) |
+| agile-architect | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | 20cf96d9-f16b-4d37-894b-e466b1caecf6 | Đang thực hiện Vòng sửa 1 Gate 2 (`BLK-G2-02/03`, Codex `#1/#2/#5-#9/#11`, `HR-G2-01/03/04`, `IMP-G2-01/02`) | 🟡 Revising (R1) |
+| agile-critic | gemini-4-carbon-high | 32d66da7-b094-4e7b-9120-b3be756e00c5 | Hoàn tất phản biện Gate 2 Vòng 1 (`gate-2-critique.md`: `[REVISION REQUIRED]`, 4B / 4H / 3M) | ✅ Done (G2 R1) |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-ai-engineer | — (Chưa kích hoạt) | | | ⚪ Inactive |
@@ -34,12 +34,13 @@
 | agile-qa | gemini-4-argon-high | | | ⚪ Pending |
 | agile-mlops-eval | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-devops | gemini-3.8-flash-high | | | ⚪ Pending |
-| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol | (gọi qua codex_task.py) | Đang phản biện thiết kế song song trước Gate 2 (`review-design` -> `gate-2-codex.md`) | 🟡 Running |
+| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol | (gọi qua codex_task.py) | Hoàn tất phản biện Gate 2 Vòng 1 (`gate-2-codex.md`: `[REVISION REQUIRED]`, 4B / 8H / 2M) | ✅ Done (G2 R1) |
 
 ## Kết luận Critic gần nhất
 
 - `Gate 1 Vòng 2 (2026-11-12): [APPROVED FOR GATE] — Người dùng đã duyệt Gate 1 lúc 19:48 ngày 2026-11-12 kèm điều chỉnh ưu tiên macOS + Windows trước và kết nối bằng IP + custom port.`
+- `Gate 2 Vòng 1 (2026-11-12): agile-critic [REVISION REQUIRED] (4B/4H/3M) + agile-codex [REVISION REQUIRED] (4B/8H/2M) — Đang thực thi Vòng sửa 1 song song.`
 
 ## Việc còn dở / Vấn đề mở
 
-- Thực thi liền mạch Giai đoạn 2 còn lại: `agile-architect` → `sprint-backlog.md` → `agile-critic` + `agile-codex` (`review-design` song song) → Trình Gate 2.
+- Hoàn tất Vòng sửa 1 (`agile-tech-lead` + `agile-architect` + `sprint-backlog.md`) → Tái thẩm định Vòng 2 song song (`agile-critic` + `agile-codex`) → Trình người dùng duyệt Gate 2.
