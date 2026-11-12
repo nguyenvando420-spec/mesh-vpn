@@ -7,7 +7,7 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `2 - Tech Stack, Coding Standards, System Design & Sprint Planning`
 - **Sprint hiện tại**: `Sprint 0 (Design)`
-- **Bước tiếp theo**: `Lập sprint-backlog.md (Bước 2.3), sau đó chạy phản biện song song Bước 2.4 (agile-critic + agile-codex review-design) và trình người dùng duyệt Gate 2`
+- **Bước tiếp theo**: `Đang chạy song song Bước 2.4: agile-critic (gemini-4-carbon-high) + agile-codex (gpt-6.1-sol review-design) thẩm định toàn bộ thiết kế Gate 2`
 
 ## Trạng thái Gate
 
@@ -26,7 +26,7 @@
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
 | agile-tech-lead | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | ffd94c65-24c6-4115-9801-012205be6731 | Hoàn tất Rust 1.94.1 Stack v2.0 (`tech-stack-decision.md`, 11 ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md`, `rustfmt/clippy/deny.toml`, `scripts/check.*`) | ✅ Done (Rust v2.0) |
 | agile-architect | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | 20cf96d9-f16b-4d37-894b-e466b1caecf6 | Hoàn tất thiết kế Rust v2.0 (`system-architecture.md` 808 dòng, `database-design.md` 511 dòng, `api-design.md` 647 dòng) | ✅ Done (Rust v2.0) |
-| agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Hoàn tất Gate 1 Vòng 2 (`[APPROVED FOR GATE]`); chờ phản biện Gate 2 | ⚪ Ready |
+| agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Đang phản biện độc lập thiết kế Gate 2 (Rust Stack, C4, `redb`, API/Wire Contracts, `sprint-backlog.md`) | 🟡 Running |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-ai-engineer | — (Chưa kích hoạt) | | | ⚪ Inactive |
@@ -34,7 +34,7 @@
 | agile-qa | gemini-4-argon-high | | | ⚪ Pending |
 | agile-mlops-eval | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-devops | gemini-3.8-flash-high | | | ⚪ Pending |
-| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol | (gọi qua codex_task.py) | Chờ phản biện thiết kế song song trước Gate 2 (`review-design`) | ⚪ Pending |
+| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol | (gọi qua codex_task.py) | Đang phản biện thiết kế song song trước Gate 2 (`review-design` -> `gate-2-codex.md`) | 🟡 Running |
 
 ## Kết luận Critic gần nhất
 
