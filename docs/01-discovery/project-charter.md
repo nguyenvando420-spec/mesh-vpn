@@ -4,8 +4,8 @@
 |---|---|
 | Tác giả | `agile-po-ba` |
 | Ngày | 2026-11-12 |
-| Phiên bản | 1.1 — Đã xử lý phản biện Gate 1 Vòng 1 |
-| Giai đoạn | 1 — Discovery (trình Gate 1) |
+| Phiên bản | **1.2** — Đồng bộ quyết định Gate 1 (người dùng duyệt 2026-11-12): macOS + Windows client, IP + Pin, cổng cấu hình được; OQ-01..14 đã chốt |
+| Giai đoạn | 1 — Discovery (Gate 1 ✅ đã duyệt 2026-11-12 → chuyển Gate 2) |
 | Chủ sở hữu sản phẩm | Người dùng (Product Owner kiêm Owner/Admin duy nhất) |
 | Liên kết | [vision-statement.md](./vision-statement.md) · [reference-systems-benchmark.md](./reference-systems-benchmark.md) · [production-readiness-requirements.md](./production-readiness-requirements.md) · [user-personas.md](../02-product-planning/user-personas.md) · [product-backlog.md](../02-product-planning/product-backlog.md) |
 | Thành phần AI/SLM | **Không có** — không áp dụng AI/Data Epic, Golden Test Set, guardrails AI |
@@ -16,38 +16,40 @@
 
 | # | Mục tiêu | Tiêu chí đo |
 |---|---|---|
-| G1 | Kết nối **3–20 thiết bị** (Windows + Linux) thành mạng overlay mã hóa đầu-cuối, tự host trên **1 VPS** | 20 node online đồng thời; mọi cặp ping được qua overlay |
+| G1 | Kết nối **3–20 thiết bị (macOS 13+ `arm64`/`amd64` + Windows 10/11 client; Ubuntu Linux VPS kiêm node)** thành mạng overlay mã hóa đầu-cuối, tự host trên **1 VPS** | 20 node online đồng thời; mọi cặp ping được qua overlay |
 | G2 | **Dùng thật 24/7** cá nhân (đủ Production-Readiness) | 100% mục Go-Live checklist (mục 6 của `production-readiness-requirements.md`) đạt ở Gate 3 |
 | G3 | **Học sâu bản chất** mesh VPN (control/data plane, NAT traversal, relay) | Tài liệu ADR + backlog bám nguồn nghiên cứu; không bê nguyên hộp đen |
 | G4 | **Không làm hỏng mạng máy thật** | 0 lần mất Internet do agent trong bộ test chaos (kill -9, sleep/wake, đổi mạng) |
 
 ## 2. Phạm vi
 
-### 2.1. IN-SCOPE — MVP (Must-have)
+### 2.1. IN-SCOPE — MVP (Must-have) — **51 story / 234 SP** (Milestone 1: 38 / 174 · Milestone 2: 13 / 60; chi tiết [product-backlog.md](../02-product-planning/product-backlog.md) v1.2 mục 15)
+
+> **Quyết định Gate 1 (2026-11-12):** (D1) client **macOS (13+, `arm64` + `amd64`) và Windows 10/11** trước; (D2) **VPS Ubuntu Linux** chạy Control + Relay + STUN kiêm 1 node mesh (Linux `/dev/net/tun` tối thiểu; gói Linux máy trạm `US-054` hạ `Should`); (D3) **kết nối trực tiếp bằng IP VPS + Pin `sha256:…`** là luồng chính thức ngay M1 (cấm TOFU, không cờ bỏ qua); (D4) **cổng TCP Control/Relay (mặc định 443) và UDP STUN (mặc định 3478) cấu hình được**, đổi về sau không mất danh tính node (`SEC-15`, `US-074`); CLI **`mesh`**, hậu tố **`.mesh.internal`**.
 
 | Nhóm | Hạng mục MVP | Epic |
 |---|---|---|
-| Onboarding | Khóa sinh tại client; pre-auth key one-time + TTL + hash (hỗ trợ truyền qua file/stdin/env); đăng ký idempotent; cấp IP overlay bền vững; kênh control TLS 443 (Standalone ACME không cần cổng 80, chạy sau Reverse Proxy sẵn có, hoặc pin chứng chỉ) + chứng minh khóa bằng nonce ngẫu nhiên từ server | EP-01 |
+| Onboarding | Khóa sinh tại client; pre-auth key one-time + TTL + hash (truyền qua file/stdin/env; lệnh tham gia in sẵn `IP:cổng` + pin + key); đăng ký idempotent; cấp IP overlay bền vững; kênh control TLS trên **cổng TCP cấu hình được (mặc định 443)** với **IP + Pin (mặc định, cấm TOFU)**, Standalone ACME không cần cổng 80 hoặc sau Reverse Proxy sẵn có; chứng minh khóa bằng nonce ngẫu nhiên từ server | EP-01 |
 | Coordination | Control server trên VPS; lưu trữ transactional; netmap snapshot có version qua stream (chỉ đẩy khi đổi cấu trúc/trạng thái, không bão `last_seen`); agent áp diff; audit log append-only (ưu tiên thu hồi trong RAM khi đầy đĩa); CLI quản trị tách biệt qua kênh cục bộ kiểm chứng đặc quyền OS (`SEC-14`) | EP-02 |
-| Data plane | WireGuard-based tunnel (userspace, chung socket với STUN/disco); Linux + Windows; MTU 1280; chống routing loop; chỉ route dải overlay | EP-03 |
+| Data plane | WireGuard-based tunnel (userspace, chung socket với STUN/disco); **macOS (`utun`) + Windows (adapter cố định) + Linux tối thiểu cho VPS-node/lab**; MTU 1280; chống routing loop (ràng socket vào interface vật lý); chỉ route dải overlay | EP-03 |
 | NAT traversal | STUN trên VPS (lưu bền cổng UDP cục bộ của agent); trao đổi endpoint (lọc interface ảo/bridge/overlay); disco Ping/Pong/CallMeMaybe-lite có xác thực mật mã + chống replay; phát hiện peer chết & chuyển direct↔relay (keepalive on-demand) | EP-04 |
 | Relay | Relay mù TLS 443 theo public key (gắn `src_pubkey` xác thực + hàng đợi giới hạn mỗi đích drop không chặn); chỉ node đã đăng ký; rate-limit băng thông/node + trần tổng; luôn là đường cuối | EP-05 |
 | Vòng đời | Thu hồi tức thì (cắt cả tunnel đang sống); node key expiry (đăng ký lại sinh khóa mới với key trói đích danh `--for`); control chết data vẫn sống (cache netmap phân quyền chặt); reconnect backoff+jitter (tự phục hồi sau lỗi TLS tạm thời/Captive Portal/lệch giờ) | EP-06 |
 | Chịu lỗi mạng | Đổi mạng, sleep/wake: rebind + STUN lại + republish endpoint + fallback relay | EP-07 |
 | Tên máy & Chẩn đoán | Khối hosts quản lý tự động (chặn tên hệ thống & domain Control/Relay/STUN chống vòng lặp DNS, kèm hậu tố miền nội bộ, giữ quyền đọc OS/container); CLI `status`, `ping` | EP-08 |
 | Vận hành & Bảo mật | Rate-limit/anti brute-force (kèm `trusted_proxies` tường minh); structured log (không secret); listener chỉ-đọc riêng cho `/healthz` `/readyz`; backup cục bộ nhất quán + diễn tập restore; hardening VPS an toàn với VPS dùng chung (firewall `opt-in` có dry-run & auto-rollback, giữ SSH/dịch vụ sẵn có); vòng đời TLS; cài đặt + supervisor | EP-09 |
-| Nền tảng | Windows Service + named pipe ACL + firewall profile/rule; Linux systemd; graceful shutdown + dọn dẹp lúc khởi động; VPS là một node mesh | EP-10 |
+| Nền tảng | **macOS: daemon `launchd` + IPC socket phân quyền `LOCAL_PEERCRED` + cài/gỡ sạch + luồng cài không phụ thuộc trình duyệt (SHA-256)**; Windows Service + named pipe ACL + firewall profile/rule; Linux `systemd` quyền tối thiểu cho VPS-node/lab; graceful shutdown + dọn dẹp lúc khởi động; VPS là một node mesh | EP-10 |
 | Chất lượng | Phòng lab mạng giả lập (NAT/UDP block/MTU thấp); bộ kiểm thử NFR/SLO tự động; runbook (kèm hướng dẫn đồng bộ backup mã hóa ra ngoài VPS) & Go-Live checklist | EP-11 |
 
 ### 2.2. "Should-have" — vẫn thuộc vòng đời MVP nhưng cắt được nếu trễ (P1 của nghiên cứu)
 
-`US-006` pre-auth key reusable/ephemeral · `US-011` agent validate netmap · `US-018` packet filter · `US-023` `netcheck` · `US-032` `rotate-key` thủ công · `US-037` cảnh báo xung đột dải IP/CGNAT · `US-041` `bugreport` · `US-048` metrics · `US-049` cảnh báo cá nhân · `US-050` versioning/tương thích giao thức.
+`US-006` pre-auth key reusable/ephemeral · `US-011` agent validate netmap · `US-018` packet filter · `US-023` `netcheck` · `US-032` `rotate-key` thủ công · `US-037` cảnh báo xung đột dải IP/CGNAT · `US-041` `bugreport` · `US-048` metrics · `US-049` cảnh báo cá nhân · `US-050` versioning/tương thích giao thức · **`US-054` gói dịch vụ Linux máy trạm (hạ từ Must theo Gate 1 D2; phần `systemd` VPS-node nằm ở `US-056`)** — **tổng 11 story / 35 SP**.
 
-### 2.3. OUT-OF-SCOPE — Phase 2+ (Could/Won't)
+### 2.3. OUT-OF-SCOPE — Phase 2+ (Could/Won't) — **12 story (`US-061..072`)**
 
 | Hạng mục | Story | Điều kiện kích hoạt (từ nghiên cứu) |
 |---|---|---|
-| macOS, Android, iOS | US-060, US-061 | Sau khi Windows/Linux ổn định |
+| Android, iOS (macOS đã **vào MVP** — `US-060`/`US-073`; bản macOS notarize/`.pkg`/GUI vẫn Phase 2+, `PLAT-07`) | US-061 | Khi có nhu cầu di động |
 | Tách machine key / node key, xoay node key tự động | US-062 | Khi cần xoay khóa không đăng ký lại |
 | Netmap delta | US-063 | > 50 node hoặc churn cao |
 | Đục lỗ hard-NAT ↔ hard-NAT (birthday paradox), UPnP/NAT-PMP/PCP | US-064 | Khi `status` cho thấy relay chiếm tỉ lệ cao |
@@ -73,7 +75,7 @@
 |---|---|
 | C1 | Hạ tầng duy nhất: **1 VPS** Linux (giả định 1–2 vCPU, 1–2 GB RAM, Public IPv4 cố định); không có HA |
 | C2 | Quy mô: 3–20 node; một chủ sở hữu; một tenant |
-| C3 | Client MVP: **Windows + Linux** |
+| C3 | Client MVP: **macOS 13+ (`arm64` + `amd64`) và Windows 10/11 x64**; Linux chỉ tối thiểu cho VPS-node/lab (máy trạm Linux = `Should`). Kiểm thử macOS cần phần cứng Apple (Mac thật/VM trên phần cứng Apple/runner macOS) |
 | C4 | Không khóa ngôn ngữ/framework/DB trong backlog — do `agile-tech-lead` (ADR) và `agile-architect` quyết định ở Gate 2 |
 | C5 | Giấy phép phụ thuộc: ưu tiên MIT/BSD; **loại AGPL**; Wintun binary phân phối đúng Prebuilt Binaries License [T35] |
 | C6 | Mọi SLO là **đề xuất chưa đo** — `agile-qa` đo thật; số liệu thực tế có thể điều chỉnh sau Gate 3 |
@@ -93,7 +95,7 @@
 | A-08 | Full-mesh mặc định: mọi thiết bị của chủ thấy mọi thiết bị khác; không ACL ở MVP | ACL ⇒ US-067 |
 | A-09 | **VPS là root of trust ở MVP** (đã hardening + TLS + audit); chưa có ký node key | Giảm tin cậy ⇒ US-069 |
 | A-10 | Hai máy cùng sau **hard NAT** sẽ **luôn đi relay** ở MVP (chấp nhận) | Nếu tỉ lệ relay quá cao ⇒ US-064 |
-| A-11 | Windows 10/11 x64 và Ubuntu LTS (x64) là nền tảng được hỗ trợ chính thức; ARM/distro khác là best-effort | Mở rộng ⇒ thêm story |
+| A-11 | **macOS 13+ (`arm64` + `amd64`), Windows 10/11 x64** (client) và Ubuntu LTS x64 (VPS-node/lab) là nền tảng được hỗ trợ chính thức; Windows ARM/distro khác/Linux desktop là best-effort/Phase 2 | Mở rộng ⇒ thêm story |
 | A-12 | Backup chỉ cần DB control (lưu cục bộ nhất quán + checksum; đồng bộ mã hóa ra ngoài VPS thực hiện qua công cụ chuẩn theo Runbook); **không** chứa private key client | — |
 | A-13 | Người dùng tự chịu trách nhiệm TLS theo 1 trong 3 mô hình: **(a)** Standalone có domain (ACME không cần cổng 80: `TLS-ALPN-01`/`DNS-01`), **(b)** Sau Reverse Proxy sẵn có trên VPS dùng chung, hoặc **(c)** Không có domain thì pin fingerprint chứng chỉ | Xem OQ-02 |
 | A-14 | Người dùng có quyền Administrator/root trên các máy cài agent | — |
@@ -117,27 +119,32 @@
 | R-13 | **SLO đề xuất chưa đo** có thể không khả thi (vd. P95 ≤ 5 s direct) | Trung bình | Trung bình | US-058 đo sớm; cho phép hiệu chỉnh có ghi chú tại Gate 3 | QA |
 | R-14 | **Xung đột dải overlay với CGNAT** | Trung bình | Trung bình | US-008, US-037 | Architect/Dev |
 | R-15 | **Giấy phép**: vô tình dùng mã AGPL | Thấp | Cao | Ràng buộc C5; kiểm tra license trong ADR | Tech Lead |
-| R-16 | **Năng lực đội/độ phức tạp** (8 điểm cho hole punching; 215 SP Must) lớn so với 1 cá nhân | Cao | Cao | Gợi ý lát cắt (Walking Skeleton relay-only trước, direct sau) trong backlog mục 15.2 | PO/SM |
+| R-16 | **Năng lực đội/độ phức tạp** (8 điểm cho hole punching; 234 SP Must) lớn so với 1 cá nhân | Cao | Cao | 2 Milestone (M1 38 story/174 SP; M2 13 story/60 SP) + gợi ý lát cắt trong backlog mục 15.2 | PO/SM |
 | R-17 | **Cài đặt/hardening làm sập dịch vụ sẵn có hoặc khóa mất SSH trên VPS đang dùng (`HR-01`)** | Cao | **Rất cao** | Hỗ trợ chạy sau Reverse Proxy + Standalone ACME không cần cổng 80; firewall mặc định deny là `opt-in` có dry-run, tự giữ SSH/dịch vụ sẵn có và tự rollback (US-024, US-046, US-047, US-051) | DevOps/Dev |
+| R-18 | **macOS: Gatekeeper/quarantine, daemon root nạp binary từ thư mục user ghi được, `utun` đụng VPN khác, Application Firewall chặn inbound im lặng; không giả lập được trong lab Linux** | Trung bình | Cao | US-073 (đường dẫn root-only, cài không phụ thuộc trình duyệt + SHA-256, firewall opt-in, `pf` anchor riêng), US-060 (chỉ đúng `utunN`), US-035; GNFR-12 (máy Mac thật/runner macOS) | Dev/QA/DevOps |
+| R-19 | **Kết nối bằng IP + Pin: MITM nếu pin sai/lộ; mất khóa định danh server buộc pin lại mọi máy; đổi cổng/IP làm client mồ côi** | Thấp | Cao | US-003/US-047 (cấm TOFU, không cờ bỏ qua pin, tập pin xoay khóa), US-045 (backup gồm khóa server), US-074 (đổi cổng/IP không mất danh tính, `mesh set` cho máy offline) | Dev/DevOps |
 
-## 6. Câu hỏi mở cần người dùng chốt tại Gate 1
+## 6. Câu hỏi mở — ✅ Đã chốt tại Gate 1 (người dùng duyệt 2026-11-12)
 
-| Mã | Câu hỏi | Đề xuất của PO | Ảnh hưởng nếu đổi |
-|---|---|---|---|
-| **OQ-01** | Tự định nghĩa giao thức (học bản chất) hay tương thích client Tailscale (viết lại Headscale)? | **Tự định nghĩa** | Toàn bộ EP-01/02/04/05 |
-| **OQ-02** | **Mô hình cổng 443 & TLS trên VPS của bạn**: (1) VPS đang chạy sẵn Reverse Proxy/web trên 443 (và/hoặc SSH cổng khác 22) hay dành riêng cổng 443 (Standalone)? (2) Có **domain** (dùng ACME `TLS-ALPN-01`/`DNS-01` không cần cổng 80, hoặc TLS tại Reverse Proxy sẵn có) hay không có domain (pin fingerprint chứng chỉ tự ký)? | Hỗ trợ **cả hai chế độ** (Standalone TLS 443 không cần cổng 80 **và** chạy sau Reverse Proxy sẵn có kèm `trusted_proxies`) + chế độ pin khi không có domain; firewall là `opt-in` | US-003, US-024, US-042, US-046, US-047, US-051 |
-| **OQ-03** | VPS có tham gia mesh như một **node** không? | **Có** | US-056, test REL-09 |
-| **OQ-04** | Dải IP overlay mặc định? (Phát hiện/tránh xung đột CGNAT thế nào?) | Cấu hình được; để Architect chọn mặc định | US-008, US-037 |
-| **OQ-05** | Chấp nhận hai máy sau hard NAT **luôn đi relay** ở MVP? | **Chấp nhận** | US-064 hoãn |
-| **OQ-06** | Pre-auth key **reusable/ephemeral** là Must hay Should? (nghiên cứu xếp là tùy chọn trong SEC-03 P0) | **Should** (one-time + TTL + revoke là Must) | US-006; ảnh hưởng onboarding máy ephemeral |
-| **OQ-07** | Kênh cảnh báo cá nhân ưu tiên: email / Telegram / webhook? | Webhook chung (1 kênh) | US-049 |
-| **OQ-08** | Hạn mức relay mặc định (đề xuất 20 Mbps/node + trần tổng) và quota băng thông tháng của VPS? | 20 Mbps/node; trần tổng = tuỳ quota VPS | US-027 |
-| **OQ-09** | Nền tảng hỗ trợ chính thức: Windows 10/11 x64 + Ubuntu LTS x64? Có sẵn chứng chỉ **code-signing** cho installer Windows không? | Như đề xuất; chưa ký ở MVP, chấp nhận SmartScreen | US-052 |
-| **OQ-10** | Chấp nhận **không có Web UI** và quản trị chỉ bằng CLI/SSH qua kênh cục bộ kiểm chứng quyền OS (`SEC-14`) ở MVP? | **Chấp nhận** | US-070 hoãn |
-| **OQ-11** | Giấy phép dự án (open-source/private)? Chốt chính sách tránh AGPL. | Private/MIT tùy chọn; tránh AGPL | Ràng buộc C5 |
-| **OQ-12** | Tên sản phẩm chính thức (ảnh hưởng tên adapter, tên service, tên CLI, hậu tố miền nội bộ `.mesh.internal`)? | Chưa chốt — dùng tên mã `Mesh` | US-038, US-052, US-054 |
-| **OQ-13** | Chấp nhận **VPS là root of trust** ở MVP (chưa ký node key)? | **Chấp nhận** | US-069 hoãn |
-| **OQ-14** | Ngân sách thời gian/đội: duyệt trọn gói **49 Must stories / 215 SP** hay giải ngân theo 2 cột mốc nội bộ (**Milestone 1**: Walking Skeleton + Direct P2P dùng hằng ngày → **Milestone 2**: Roaming/Key-Expiry/Chaos SLO)? | Theo lát cắt mục 15.2 backlog | Kế hoạch Sprint (Gate 2) |
+> Toàn bộ `OQ-01..OQ-14` đã được người dùng chốt: `OQ-01`, `OQ-03`, `OQ-12`, `OQ-14` theo quyết định trực tiếp; `OQ-05..OQ-11`, `OQ-13` giữ đúng đề xuất mặc định; `OQ-02`, `OQ-04`, `OQ-09` chốt kèm điều chỉnh theo D1–D4 (macOS + Windows, IP + Pin, cổng cấu hình được). `OQ-15` là gợi ý mới cho Gate 2.
+
+| Mã | Câu hỏi | Đề xuất của PO | Ảnh hưởng nếu đổi | **Quyết định Gate 1** |
+|---|---|---|---|---|
+| **OQ-01** | Tự định nghĩa giao thức (học bản chất) hay tương thích client Tailscale (viết lại Headscale)? | **Tự định nghĩa** | Toàn bộ EP-01/02/04/05 | ✅ **Tự định nghĩa giao thức tối giản** |
+| **OQ-02** | **Mô hình cổng 443 & TLS trên VPS của bạn**: (1) VPS đang chạy sẵn Reverse Proxy/web trên 443 (và/hoặc SSH cổng khác 22) hay dành riêng cổng 443 (Standalone)? (2) Có **domain** (dùng ACME `TLS-ALPN-01`/`DNS-01` không cần cổng 80, hoặc TLS tại Reverse Proxy sẵn có) hay không có domain (pin fingerprint chứng chỉ tự ký)? | Hỗ trợ **cả hai chế độ** (Standalone TLS 443 không cần cổng 80 **và** chạy sau Reverse Proxy sẵn có kèm `trusted_proxies`) + chế độ pin khi không có domain; firewall là `opt-in` | US-003, US-024, US-042, US-046, US-047, US-051 | ✅ **Hỗ trợ cả 3 chế độ; giai đoạn đầu kết nối bằng IP VPS + Pin (`SEC-04(c)`) là luồng chính thức mặc định**, chưa cần domain; cổng TCP/UDP cấu hình được (D3, D4) |
+| **OQ-03** | VPS có tham gia mesh như một **node** không? | **Có** | US-056, test REL-09 | ✅ **VPS tham gia mesh như 1 node (`vps.mesh.internal`)** |
+| **OQ-04** | Dải IP overlay mặc định? (Phát hiện/tránh xung đột CGNAT thế nào?) | Cấu hình được; để Architect chọn mặc định | US-008, US-037 | ✅ Giữ đề xuất (Architect chốt mặc định ở Gate 2) |
+| **OQ-05** | Chấp nhận hai máy sau hard NAT **luôn đi relay** ở MVP? | **Chấp nhận** | US-064 hoãn | ✅ Chấp nhận |
+| **OQ-06** | Pre-auth key **reusable/ephemeral** là Must hay Should? (nghiên cứu xếp là tùy chọn trong SEC-03 P0) | **Should** (one-time + TTL + revoke là Must) | US-006; ảnh hưởng onboarding máy ephemeral | ✅ Giữ đề xuất: **Should** |
+| **OQ-07** | Kênh cảnh báo cá nhân ưu tiên: email / Telegram / webhook? | Webhook chung (1 kênh) | US-049 | ✅ Giữ đề xuất |
+| **OQ-08** | Hạn mức relay mặc định (đề xuất 20 Mbps/node + trần tổng) và quota băng thông tháng của VPS? | 20 Mbps/node; trần tổng = tuỳ quota VPS | US-027 | ✅ Giữ đề xuất |
+| **OQ-09** | Nền tảng hỗ trợ chính thức: Windows 10/11 x64 + Ubuntu LTS x64? Có sẵn chứng chỉ **code-signing** cho installer Windows không? | Như đề xuất; chưa ký ở MVP, chấp nhận SmartScreen | US-052 | ✅ Giữ đề xuất, **cập nhật theo D1/D2**: nền tảng chính thức = macOS 13+ (`arm64`/`amd64`) + Windows 10/11 x64 (client) + Ubuntu LTS x64 (VPS); chưa ký/notarize ở MVP (Windows chấp nhận SmartScreen; macOS cài qua luồng không phụ thuộc trình duyệt + SHA-256, `US-073`) |
+| **OQ-10** | Chấp nhận **không có Web UI** và quản trị chỉ bằng CLI/SSH qua kênh cục bộ kiểm chứng quyền OS (`SEC-14`) ở MVP? | **Chấp nhận** | US-070 hoãn | ✅ Chấp nhận |
+| **OQ-11** | Giấy phép dự án (open-source/private)? Chốt chính sách tránh AGPL. | Private/MIT tùy chọn; tránh AGPL | Ràng buộc C5 | ✅ Giữ đề xuất |
+| **OQ-12** | Tên sản phẩm chính thức (ảnh hưởng tên adapter, tên service, tên CLI, hậu tố miền nội bộ `.mesh.internal`)? | Chưa chốt — dùng tên mã `Mesh` | US-038, US-052, US-054 | ✅ **CLI chính thức `mesh`; hậu tố miền nội bộ `.mesh.internal`** |
+| **OQ-13** | Chấp nhận **VPS là root of trust** ở MVP (chưa ký node key)? | **Chấp nhận** | US-069 hoãn | ✅ Chấp nhận |
+| **OQ-14** | Ngân sách thời gian/đội: duyệt trọn gói **49 Must stories / 215 SP** hay giải ngân theo 2 cột mốc nội bộ (**Milestone 1**: Walking Skeleton + Direct P2P dùng hằng ngày → **Milestone 2**: Roaming/Key-Expiry/Chaos SLO)? | Theo lát cắt mục 15.2 backlog | Kế hoạch Sprint (Gate 2) | ✅ **Chia 2 Milestone**: M1 Walking Skeleton + Direct P2P dùng hằng ngày macOS + Windows ↔ VPS (38 story / 174 SP) → M2 Roaming/Sleep-Wake, Key Expiry, Hardening, Rate-limit/Quota, NAT Chaos Lab & Packaging (13 story / 60 SP). Tổng Must **51 / 234 SP** |
+| **OQ-15** *(mới — gợi ý cho Gate 2)* | Trong **M1** chưa có thu hồi tức thì (`US-029/030`), reconnect backoff (`US-034`), rate-limit (`US-042`), hạn mức relay (`US-027`). Chấp nhận chỉ dùng M1 với thiết bị cá nhân tin cậy, hay kéo `US-029`, `US-030`, `US-034` (11 SP) từ M2 vào M1? | Kéo `US-029`, `US-030`, `US-034` vào M1 (M1 = 41 story / 185 SP; M2 = 10 / 49; tổng không đổi 51 / 234) | Kế hoạch Sprint (Gate 2), backlog mục 15.2 | ⏳ **Chờ Gate 2** (mặc định hiện tại: giữ nguyên OQ-14) |
 
 ## 7. Tiêu chí hoàn thành MVP (Definition of Done cấp sản phẩm)
 

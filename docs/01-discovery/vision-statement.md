@@ -4,7 +4,8 @@
 |---|---|
 | Tác giả | `agile-po-ba` |
 | Ngày | 2026-11-12 |
-| Giai đoạn | 1 — Discovery (trước Gate 1) |
+| Giai đoạn | 1 — Discovery (Gate 1 ✅ đã duyệt 2026-11-12) |
+| Phiên bản | **1.1** — Đồng bộ quyết định Gate 1: client macOS + Windows, VPS Ubuntu kiêm node, kết nối bằng IP + Pin, cổng cấu hình được, CLI `mesh` / `.mesh.internal` |
 | Đầu vào | [reference-systems-benchmark.md](./reference-systems-benchmark.md), [production-readiness-requirements.md](./production-readiness-requirements.md) |
 | Tên mã tạm | `Mesh` (chưa chốt tên sản phẩm — xem Câu hỏi mở trong [project-charter.md](./project-charter.md)) |
 | Thành phần AI/SLM | **Không có** |
@@ -70,8 +71,8 @@
 
 | Giai đoạn | Nội dung |
 |---|---|
-| **MVP** | 3–20 thiết bị **Windows + Linux**; 1 VPS; CLI + service; full-mesh; P2P + relay TLS 443; pre-auth key; thu hồi/hết hạn; backup/restore; observability tối thiểu |
-| **Phase 2** | macOS; tách machine/node key; netmap delta; hard-NAT↔hard-NAT; split DNS chuẩn; ACL nhóm; subnet router/exit node; relay UDP/QUIC/nhiều relay; metrics/alert hoàn chỉnh |
+| **MVP** | 3–20 thiết bị; **client macOS 13+ (Apple Silicon `arm64` + Intel `amd64`) và Windows 10/11**; **1 VPS Ubuntu Linux** chạy Control + Relay + STUN và đồng thời là 1 node mesh (`vps.mesh.internal`); CLI **`mesh`** + service nền (`launchd` / Windows Service / `systemd`); full-mesh; P2P + relay TLS; **kết nối trực tiếp bằng IP VPS + Pin khóa server `sha256:…` (cấm TOFU, chưa cần domain)**; **cổng TCP Control/Relay (mặc định 443) và UDP STUN (mặc định 3478) cấu hình được, đổi về sau không mất danh tính node**; pre-auth key; thu hồi/hết hạn; backup/restore; observability tối thiểu; hậu tố tên máy `.mesh.internal`. Giao 2 Milestone: **M1** Walking Skeleton + Direct P2P dùng hằng ngày macOS + Windows ↔ VPS → **M2** Roaming/Sleep-Wake, Key Expiry, Hardening, Rate-limit/Quota, NAT Chaos Lab & Packaging |
+| **Phase 2** | Gói Linux máy trạm desktop (`Should` trong backlog, sau macOS + Windows); bản macOS ký Developer ID/notarize/`.pkg`/GUI; tách machine/node key; netmap delta; hard-NAT↔hard-NAT; split DNS chuẩn; ACL nhóm; subnet router/exit node; relay UDP/QUIC/nhiều relay; metrics/alert hoàn chỉnh |
 | **Phase 3+** | Android/iOS; Web UI; OIDC/SSO; ký node key kiểu Tailnet Lock; HA control |
 
 ## 7. Nguyên tắc sản phẩm (Guiding Principles)
@@ -82,4 +83,5 @@
 4. **Không bao giờ làm hỏng mạng máy thật** — dọn dẹp khi dừng, tự sửa khi khởi động, không default route ở MVP (REL-08/09).
 5. **Control chết, data sống** (REL-01).
 6. **Mặc định an toàn, mặc định đơn giản** — full-mesh trong phạm vi một chủ sở hữu; mọi thứ khác là Phase 2+.
-7. **Tự định nghĩa giao thức** thay vì bám giao thức đóng của bên khác (đề xuất — chờ chốt tại Gate 1).
+7. **Tự định nghĩa giao thức** thay vì bám giao thức đóng của bên khác (✅ đã chốt Gate 1, OQ-01).
+8. **Không tin ngầm server**: kết nối bằng IP phải có pin; không TOFU, không cờ bỏ qua kiểm tra (SEC-04); đổi cổng/IP/pin không buộc cài lại danh tính node (SEC-15).

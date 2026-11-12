@@ -7,7 +7,7 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `2 - Tech Stack, Coding Standards, System Design & Sprint Planning`
 - **Sprint hiện tại**: `Sprint 0 (Design)`
-- **Bước tiếp theo**: `Chạy agile-po-ba đồng bộ v1.2 (Vision, Charter, Personas, Product Backlog) theo production-readiness-requirements.md v1.2, sau đó chạy ngay Bước 2.1 (agile-tech-lead)`
+- **Bước tiếp theo**: `Chờ Bước 2.1 (agile-tech-lead) hoàn tất, kiểm chứng & commit, sau đó chạy ngay Bước 2.2 (agile-architect)`
 
 ## Trạng thái Gate
 
@@ -23,8 +23,8 @@
 |---|---|---|---|---|
 | agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Ghi nhận duyệt Gate 1 & điều phối Giai đoạn 2 | 🟢 Active |
 | agile-researcher | claude-opus-5-5-high | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
-| agile-po-ba | claude-sonnet-5-5-high | | Đang đồng bộ v1.2 `vision`, `charter`, `personas`, `product-backlog.md` | 🟡 Running |
-| agile-tech-lead | claude-sonnet-5-5-high | | Chờ đồng bộ v1.2 để chốt Tech Stack, ADRs & Coding Standards | ⚪ Pending |
+| agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
+| agile-tech-lead | claude-sonnet-5-5-high | | Đang chốt Tech Stack, ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md` & cấu hình Formatter/Linter | 🟡 Running |
 | agile-architect | claude-opus-5-5-high | | Chờ Tech Lead chốt Stack để thiết kế C4, DB, Wire/API Contracts | ⚪ Pending |
 | agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Hoàn tất Gate 1 Vòng 2 (`[APPROVED FOR GATE]`); chờ phản biện Gate 2 | ⚪ Ready |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
