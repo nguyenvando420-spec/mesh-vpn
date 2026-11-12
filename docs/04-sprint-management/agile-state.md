@@ -7,14 +7,14 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `2 - Tech Stack, Coding Standards, System Design & Sprint Planning`
 - **Sprint hiện tại**: `Sprint 0 (Design)`
-- **Bước tiếp theo**: `Chạy Bước 2.2 (agile-architect thiết kế C4 System Architecture, Database Schema & Wire/API Contracts), sau đó lập sprint-backlog.md và phản biện song song (agile-critic + agile-codex)`
+- **Bước tiếp theo**: `Chạy Bước 2.2 (agile-architect) trên Rust 1.94.1 Stack đã khóa cứng, sau đó lập sprint-backlog.md và chạy phản biện song song (agile-critic + agile-codex)`
 
 ## Trạng thái Gate
 
 | Gate | Trạng thái | Ngày duyệt | Ghi chú của người dùng |
 |---|---|---|---|
 | Gate 1 — Nghiên cứu & Backlog | ✅ Đã duyệt | 2026-11-12 | (1) Ưu tiên làm Client cho **macOS và Windows trước** (Server chạy trên Ubuntu Linux VPS + hỗ trợ Linux TUN cho VPS làm node & phòng lab NAT); (2) Tạm thời **kết nối trực tiếp bằng IP VPS** (chế độ Pin chứng chỉ/khóa `SEC-04c`) và **hỗ trợ đổi port TCP/UDP tùy ý** (không khóa cứng 443/3478); (3) Giữ các mặc định: chia **2 đợt bàn giao** (Milestone 1 → Milestone 2), tự định nghĩa giao thức, tên CLI **`mesh`** (`.mesh.internal`), quản trị CLI/SSH cục bộ. |
-| Gate 2 — Stack/Model, Code Format, Thiết kế & Sprint | ⏳ Đang thực hiện | | |
+| Gate 2 — Stack/Model, Code Format, Thiết kế & Sprint | ⏳ Đang thực hiện | | Người dùng chốt sớm ngôn ngữ ngày 2026-11-12 21:01: **Chọn Rust (`rustc 1.94.1`)** thay vì Go/C++ để phần mềm siêu gọn nhẹ (~4–10 MB RAM, không GC, tốc độ sát phần cứng) và an toàn bộ nhớ. |
 | Gate 3 — Sprint Review, QA/AI Eval & Release | ⏳ Chưa trình | | |
 
 ## Các Vai trò trong Team (14 Vai trò: Scrum Master + 12 Subagents + Codex)
@@ -24,8 +24,8 @@
 | agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Ghi nhận duyệt Gate 1 & điều phối Giai đoạn 2 | 🟢 Active |
 | agile-researcher | claude-opus-5-5-high | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
-| agile-tech-lead | claude-sonnet-5-5-high | (phiên CLI 1800s — đã ghi xong 100% file trước khi đóng) | Hoàn tất `tech-stack-decision.md` (Go 1.27.4 `CGO_ENABLED=0`), 11 ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md` (`always_on`), `.golangci.yml`, `.editorconfig`, `scripts/check.*` | ✅ Done |
-| agile-architect | claude-opus-5-5-high | | Đang thiết kế `system-architecture.md`, `database-design.md`, `api-design.md` | 🟡 Running |
+| agile-tech-lead | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | ffd94c65-24c6-4115-9801-012205be6731 | Hoàn tất Rust 1.94.1 Stack v2.0 (`tech-stack-decision.md`, 11 ADRs, `coding-standards.md`, `.agents/rules/coding-standards.md`, `rustfmt/clippy/deny.toml`, `scripts/check.*`) | ✅ Done (Rust v2.0) |
+| agile-architect | gemini-4-argon-high (dự phòng — nhóm Claude chạm trần tuần, reset ~2026-11-18 13:43) | | Đang thiết kế C4 System Architecture, `redb` Schema & Wire/API/IPC Contracts khớp 10 crates Rust | 🟡 Running |
 | agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Hoàn tất Gate 1 Vòng 2 (`[APPROVED FOR GATE]`); chờ phản biện Gate 2 | ⚪ Ready |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
@@ -42,5 +42,4 @@
 
 ## Việc còn dở / Vấn đề mở
 
-- Đồng bộ v1.2 các tài liệu Giai đoạn 1 theo quyết định Gate 1 của người dùng (đưa macOS `US-060` + `PLAT-*` vào `Must` MVP cùng Windows; đưa bộ cài desktop Linux sang `Should`/thứ cấp trong khi vẫn giữ Linux VPS Server + Linux TUN cho VPS-node/NAT-lab; ghi rõ cổng TCP/UDP cấu hình được + IP Pinning mặc định).
-- Thực thi liền mạch Giai đoạn 2: `agile-tech-lead` → `agile-architect` → `sprint-backlog.md` → `agile-critic` + `agile-codex` (`review-design` song song) → Trình Gate 2.
+- Thực thi liền mạch Giai đoạn 2 còn lại: `agile-architect` → `sprint-backlog.md` → `agile-critic` + `agile-codex` (`review-design` song song) → Trình Gate 2.

@@ -1,416 +1,404 @@
-# Architecture Decision Records (ADR) — Mesh VPN
+# Architecture Decision Records (ADR) — Mesh VPN (Rust 1.94.1 Stack)
 
 | Thuộc tính | Giá trị |
 |---|---|
 | Tác giả | `agile-tech-lead` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **1.0** — trình Gate 2 |
-| Trạng thái chung | **Proposed → chờ Gate 2** (mọi ADR dưới đây là *Accepted-pending-Gate-2*; ADR bị người dùng bác ở Gate sẽ chuyển `Rejected` kèm lý do) |
-| Phạm vi | Quyết định **công nghệ**. Giao thức chi tiết (schema bản tin, DB schema, C4) thuộc `agile-architect`; các ADR này là **ràng buộc đầu vào** cho Architect |
-| Liên kết | [tech-stack-decision.md](./tech-stack-decision.md) · [coding-standards.md](./coding-standards.md) |
-| Đầu vào | `production-readiness-requirements.md` v1.2, `product-backlog.md` v1.2, `project-charter.md` v1.2, quyết định Gate 1 (D1–D4) |
+| Phiên bản | **2.0** — Cập nhật đồng bộ 100% sang **Rust `1.94.1` Stack** theo quyết định của Người dùng (2026-11-12 21:01), trình Gate 2 |
+| Trạng thái chung | **Accepted-by-User (ADR-001) / Proposed-for-Gate-2 (ADR-002..011)** |
+| Phạm vi | Quyết định công nghệ và ranh giới an toàn hệ thống. Giao thức chi tiết (schema bản tin, DB tables, C4) do `agile-architect` thiết kế dựa trên các ràng buộc bất biến trong tài liệu này |
+| Liên kết | [tech-stack-decision.md](./tech-stack-decision.md) · [coding-standards.md](./coding-standards.md) · [`.agents/rules/coding-standards.md`](../../.agents/rules/coding-standards.md) |
+| Đầu vào | `production-readiness-requirements.md` v1.2, `product-backlog.md` v1.2, `project-charter.md` v1.2, quyết định Gate 1 (D1–D4) & quyết định chọn Rust (2026-11-12 21:01) |
 
-**Định dạng ADR:** Bối cảnh (Context) → Phương án (Options) → Quyết định (Decision) → Hệ quả (Consequences, gồm rủi ro/chi phí). Mã `[V]` = đã **kiểm chứng thực nghiệm** trong phiên này (xem [tech-stack-decision.md §14](./tech-stack-decision.md)); `[N]` = dựa trên tài liệu/nguồn, chưa đo.
+---
 
 ## Mục lục
 
-| ADR | Tiêu đề | Yêu cầu chính |
+| ADR | Tiêu đề | Yêu cầu truy vết chính |
 |---|---|---|
-| [ADR-001](#adr-001) | Ngôn ngữ **Go 1.27** + chiến lược cross-compile `CGO_ENABLED=0` ra 4 đích | G1, G4, C5, GNFR-12 |
-| [ADR-002](#adr-002) | WireGuard userspace (`wireguard-go`) + `conn.Bind` tùy biến: **một UDP socket chung** cho STUN/Disco/WireGuard | REL-05/09/10, SEC-11, US-019/021 |
-| [ADR-003](#adr-003) | Giao thức Control & xác thực: TLS 1.3 + challenge–response NaCl box + Pre-Auth Key hash + Disco Auth | SEC-02/03/05, REL-02, US-003/021 |
-| [ADR-004](#adr-004) | Blind Relay trên WebSocket/TLS (một cổng TCP) & chống Head-of-Line blocking | SEC-07, REL-06, US-024/025 |
-| [ADR-005](#adr-005) | Lưu trữ nhúng SQLite thuần Go (`modernc.org/sqlite`, WAL) & backup nguyên tử | REL-11/12, US-007/045 |
-| [ADR-006](#adr-006) | Kênh Admin IPC cục bộ kiểm chứng đặc quyền OS (`SEC-14`) tách khỏi listener quan sát | SEC-14, OPS-05/06/08, PLAT-01/06 |
-| [ADR-007](#adr-007) | Tích hợp nền tảng: macOS `utun`+`launchd` (không cần Apple Developer $99), Windows `Wintun`+Service, Linux TUN+`systemd`; chống routing loop & dọn dẹp bằng sổ cái | REL-08/09, PLAT-01..06 |
-| [ADR-008](#adr-008) | Vòng đời TLS: IP-Pinning SPKI / Standalone ACME (`TLS-ALPN-01`, `DNS-01`) / Reverse Proxy | SEC-04, SEC-05, US-047 |
-| [ADR-009](#adr-009) | Cổng & địa chỉ cấu hình được; di chuyển cấu hình không mất danh tính (`SEC-15`) — lắng nghe song song, phân phối qua Netmap | GNFR-11, SEC-06/15, US-074 |
-| [ADR-010](#adr-010) | Quan sát & kiểu bí mật: `log/slog` + `Redacted Secret Types` + metrics `VictoriaMetrics/metrics` | SEC-01, OPS-01/06, GNFR-02 |
-| [ADR-011](#adr-011) | Phân phối & toàn vẹn bản phát hành (4 binary, `SHA256SUMS` có chữ ký, `wintun.dll` đúng giấy phép, không Gatekeeper-bypass) | PLAT-06(1), C5, R-11 |
+| [ADR-001](#adr-001) | Ngôn ngữ **Rust `1.94.1`** (`edition = "2024"`), chiến lược **Pure-Rust / Zero-C**, cô lập `unsafe` vào `mesh-sys` & Cross-Compile 4 đích | G1, G4, C5, PERF-01/09, GNFR-12 |
+| [ADR-002](#adr-002) | WireGuard Userspace Sans-I/O (`defguard_boringtun::noise::Tunn`) ghép trên **1 `tokio::net::UdpSocket` duy nhất** (`MagicSocket`) | SEC-02, REL-05/09/10, SEC-11, US-014/015/060/019/021 |
+| [ADR-003](#adr-003) | Giao thức Control & Xác thực Khóa: TLS 1.3 (`rustls`) + Challenge–Response NaCl Box (`crypto_box`) + Pre-Auth Key SHA-256 + Disco Auth | SEC-02/03/05, REL-02, US-003/004/021 |
+| [ADR-004](#adr-004) | Blind Relay trên WebSocket/TLS (`axum` + `tokio-tungstenite`) chung 1 cổng TCP & Hàng đợi `try_send` chống Head-of-Line Blocking | SEC-07, REL-06, PERF-11, US-024/025/027 |
+| [ADR-005](#adr-005) | Cơ sở dữ liệu nhúng ACID thuần Rust **`redb`** trên VPS, khẩn cấp thu hồi trong RAM khi đầy đĩa & Hot Atomic Snapshot Backup | REL-11/12, SEC-08/09, US-007/013/045 |
+| [ADR-006](#adr-006) | Kênh Admin IPC cục bộ kiểm chứng đặc quyền OS (`SEC-14`: Unix Socket `peer_cred` & Windows Named Pipe SDDL) tách rời Listener Quan sát | SEC-14, OPS-05/06/08, PLAT-01/06, US-012/044/046 |
+| [ADR-007](#adr-007) | Tích hợp Nền tảng: macOS (`utun` + `launchd`), Windows (`Wintun` + Service), Linux (`/dev/net/tun` + `systemd`); Chống Routing Loop & Sổ cái Tài nguyên | REL-08/09, PLAT-01..06, US-016/035/036/038/052/055/073 |
+| [ADR-008](#adr-008) | Vòng đời TLS (`rustls`): Chế độ IP + SPKI Pinning (`rcgen`, mặc định hạng nhất) · Standalone ACME (`instant-acme`) · Sau Reverse Proxy | SEC-04, SEC-05, US-003/034/042/047 |
+| [ADR-009](#adr-009) | Cổng & Địa chỉ cấu hình được (`GNFR-11`); Di chuyển cấu hình không mất danh tính (`SEC-15`) qua `ListenerSet` song song & `relay_map` | GNFR-11, SEC-06/15, US-009/019/024/074 |
+| [ADR-010](#adr-010) | Bảo vệ Bí mật trong RAM (`ZeroizeOnDrop` + Redacted `Secret<T>`) & Quan sát có cấu trúc (`tracing` JSON + Prometheus text) | SEC-01, OPS-01/06, GNFR-02, US-001/043/048 |
+| [ADR-011](#adr-011) | Đóng gói & Toàn vẹn Bản phát hành (4 đích, `SHA256SUMS` ký số, kiểm SHA-256 `wintun.dll` trước khi nạp, ký ad-hoc Mach-O `arm64`) | PLAT-01/06, C5, R-11/R-18, US-015/073 |
 
 ---
 
 <a id="adr-001"></a>
-## ADR-001 — Ngôn ngữ Go 1.27 và chiến lược cross-compile không CGO
+## ADR-001 — Ngôn ngữ Rust 1.94.1, Kiến trúc Pure-Rust / Zero-C & Cô lập `unsafe`
 
-**Trạng thái:** Accepted-pending-Gate-2 · **Ngày:** 2026-11-12 · **Người quyết:** `agile-tech-lead`
+- **Trạng thái**: **Accepted (Người dùng đã chốt ngày 2026-11-12 21:01)**
+- **Ngày**: 2026-11-12
 
 ### Context
-- Phải phát hành **4 đích**: `windows/amd64`, `darwin/arm64`, `darwin/amd64`, `linux/amd64`; **máy dev là Windows** (`rustc 1.94.1`/`cargo` có, `go` chưa cài) và CI GitHub Actions. Không được đòi Xcode/macOS SDK hay C toolchain phức tạp trên máy dev (kể cả SQLite nhúng).
-- Hệ thống cần: userspace WireGuard + TUN trên 3 OS (Wintun / `utun` / `/dev/net/tun`), mạng đồng thời cao nhưng quy mô nhỏ (≤ 20 node), daemon chạy 24/7 với RAM agent ≤ 50 MB (PERF-09), control ≤ 64 MB (PERF-01), giấy phép tránh AGPL/GPL (C5).
-- Đội gồm **nhiều Subagent lập trình song song** → cần ngôn ngữ ít cách viết, build nhanh, lỗi biên dịch dễ hiểu, công cụ chuẩn hóa mạnh.
-- Mục tiêu G3 (học bản chất) → có mã tham chiếu mở đọc được cho `magicsock`/`netmon`/`netns`/DERP (Tailscale, BSD-3).
+- Hệ thống Mesh VPN gồm daemon chạy nền 24/7 với đặc quyền cao nhất của hệ điều hành (`root` trên macOS/Linux, `LocalSystem` trên Windows) và dịch vụ điều phối/chuyển tiếp (`mesh-server`) trên 1 VPS cá nhân (1–2 vCPU, 1–2 GB RAM, có thể đang chạy chung web cá nhân).
+- Người dùng đặt ưu tiên cao nhất vào:
+  1. **Không có Garbage Collector (GC)**, không có hiện tượng dừng thế giới (stop-the-world) hay phình heap ngầm.
+  2. **Tiêu thụ tài nguyên tối thiểu**: RAM chạy nền ~4–10 MB trên client (`PERF-09 ≤ 50 MB`), ~8–18 MB trên VPS (`PERF-01 < 64 MB`), kích thước nhị phân nhỏ gọn (~3–6 MB).
+  3. **An toàn bộ nhớ tuyệt đối** ngay ở bước biên dịch cho toàn bộ bộ phân tích gói tin mạng (WireGuard, STUN, Disco, Relay, Control) và khả năng xóa sạch khóa bí mật trong RAM ngay khi giải phóng (`SEC-01`).
+- Máy phát triển Windows của người dùng đã cài sẵn `rustc 1.94.1`, `cargo 1.94.1`, `rustfmt`, `clippy`, `docker`, `wsl` `[V]`, nhưng chưa cài Visual Studio C++ Build Tools (6 GB) hay `zig` `[V]`. Phải hỗ trợ build và kiểm thử cho 4 đích MVP: `x86_64-pc-windows-*`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-*`.
 
 ### Options
-| # | Phương án | Cross-compile từ Windows (4 đích) | Ghi chú trung thực |
-|---|---|---|---|
-| A | **Go** + `wireguard-go` + `modernc.org/sqlite` + `CGO_ENABLED=0` | **Một lệnh/đích, không C toolchain** `[V]`. Linker Go tự ký ad-hoc `darwin/arm64` (PLAT-06) | GC (cần `GOMEMLIMIT`); race detector cần cgo trên Windows (§Consequences) |
-| B | **Rust** (`boringtun`/`gotatun`, `tokio`, `rustls`, `wintun`, `rusqlite`/`redb`) | **Khả thi nhưng mong manh:** `rustup target add aarch64-apple-darwin` chỉ cấp `std`; **linker + libSystem/SDK không có** trên Windows ⇒ cần `cargo-zigbuild` + Zig. `ring`/`aws-lc-rs` (rustls) và `rusqlite` (bundled) **biên dịch mã C** ⇒ phải đi qua `zig cc`. Dùng framework macOS (Security/SystemConfiguration/IOKit) cần SDK Apple — **giấy phép Xcode/SDK hạn chế dùng ngoài phần cứng Apple** `[N]`. Đường tránh: `redb` (thuần Rust) + `rustls` backend thuần Rust (chưa chín bằng) | An toàn bộ nhớ hơn Go; throughput tốt; nhưng hệ sinh thái *WG userspace + magicsock-lite + netmon* ít mã tham chiếu hơn; `gotatun` là **MPL-2.0** và còn mới (fork 2026) `[N]` |
-| C | **Lai:** data plane Rust (FFI) + control Go | Hỏng bất biến CGO ⇒ **tệ nhất** cho cross-compile; thêm ranh giới FFI (chính Mullvad bỏ vì lỗi FFI) `[N]` | Loại |
-| D | .NET NativeAOT / Node SEA | NativeAOT **không cross-OS** từ Windows; SEA nặng, không có WG/TUN userspace chín | Loại |
-
-Chấm điểm có trọng số (1–5; trọng số tổng 100; *đánh giá chủ quan, không phải số đo*): xem [tech-stack-decision.md §3](./tech-stack-decision.md) → **Go 92 / Rust 66**.
+1. **Phương án A — Rust `1.94.1` (`edition = "2024"`) với kỷ luật Pure-Rust / Zero-C (`redb`, `rustls`, `defguard_boringtun`) + cô lập FFI duy nhất ở `crates/mesh-sys` (CHỌN)**:
+   - Không có GC; kiểm soát chính xác số worker threads của `tokio` và tái sử dụng buffer tĩnh; không kéo theo C-SQLite hay OpenSSL C.
+2. **Phương án B — Go 1.27 (`CGO_ENABLED=0`)**:
+   - Thuận tiện khi cross-compile nhưng có runtime GC, tốn RAM nền cao hơn (~20–45 MB), binary lớn hơn (~8–18 MB) và không thể xóa tất định vùng nhớ khóa do GC tự di chuyển object. (Người dùng đã loại để chọn Rust).
+3. **Phương án C — C++20**:
+   - Không có GC nhưng thiếu an toàn bộ nhớ ở tầng trình biên dịch; rủi ro lỗi buffer overflow / use-after-free cao khi chạy dưới quyền `root`/`SYSTEM`.
 
 ### Decision
-1. **Go 1.27.4** (đã kiểm: `go1.27.4` là bản stable mới nhất trên `go.dev/dl`, 2026-11-10) cho **toàn bộ** mã: `mesh-server`, `meshd`, `mesh`.
-2. `go.mod`: `go 1.27.4`. Nâng cấp **bản vá 1.27.x** theo đợt (≤ 7 ngày sau bản vá bảo mật); nâng **minor** chỉ qua ADR.
-3. **`CGO_ENABLED=0` là bất biến** (CI export `CGO_ENABLED=0` cho mọi `go build/vet/test` trừ bước race). SQLite = `modernc.org/sqlite` (thuần Go). Thư viện kéo cgo bị loại (depguard + `scripts/check.*`).
-4. Build release: `go build -trimpath -buildvcs=true -ldflags "-s -w -X …buildinfo.Version=…"` cho 4 đích; `GOFLAGS=-mod=readonly`.
-5. macOS: phát hành **2 binary native** (`darwin/arm64`, `darwin/amd64`), **không** `lipo`/Universal (cần công cụ Apple); script cài chọn theo `uname -m` + kiểm Rosetta (`sysctl -n hw.optional.arm64`).
-6. Race detector chạy ở **Linux** (CI/WSL/Docker); `go test` thường chạy native trên 3 OS (xem coding-standards §10).
+1. Chốt **Rust `1.94.1`** (`edition = "2024"`, `rust-version = "1.94.1"`, ghim trong `rust-toolchain.toml`) cho toàn bộ dự án trong **1 Cargo Workspace** gồm 3 binaries (`mesh-server`, `meshd`, `mesh`) và 7 thư viện nội bộ (`crates/mesh-*`).
+2. **Cấm `unsafe` mặc định toàn workspace**: đặt `[workspace.lints.rust] unsafe_code = "forbid"` trong `Cargo.toml` gốc. Chỉ duy nhất crate `crates/mesh-sys` được phép bật `#![allow(unsafe_code)]` kèm `#![deny(unsafe_op_in_unsafe_fn)]` và `#![deny(clippy::undocumented_unsafe_blocks)]` (mọi khối `unsafe` trong `mesh-sys` bắt buộc có chú thích `// SAFETY:` giải trình bất biến con trỏ/handle).
+3. **Chiến lược Pure-Rust / Zero-C**: cấm các crate bọc thư viện C lớn (`openssl-sys`, `libsqlite3-sys`/`rusqlite`, `libsodium-sys`); tắt feature `aws-lc-rs` mặc định của `rustls` (vốn đòi CMake + NASM trên Windows) và dùng `ring` (kèm feature dự phòng thuần Rust `rustls-rustcrypto`).
+4. **Cấu hình Release Profile nhỏ nhẹ**: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`.
+5. **Toolchain & Cross-compile (`scripts/bootstrap-toolchain.ps1`)**: hỗ trợ cả chế độ gọn nhẹ `-Mode PortableZig` (tải Zig portable kiểm SHA-256 + `cargo-zigbuild` + `cargo-deny` + `rcodesign` để build Windows, Linux `musl` và macOS `arm64`/`x86_64` không cần cài 6 GB Visual Studio) lẫn chế độ `-Mode Msvc` (Visual Studio BuildTools), kết hợp GitHub Actions matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`) cho bản phát hành và kiểm thử OS native.
 
 ### Consequences
-- (+) Máy dev Windows build đủ 4 đích mà không cài gì ngoài Go `[V]`; macOS arm64 binary chạy được nhờ chữ ký ad-hoc của linker.
-- (+) Tái dùng trực tiếp `wireguard-go`, Wintun binding, `x/sys` (utun, `IP_BOUND_IF`, `SO_PEERCRED`, `LOCAL_PEERCRED`, SCM).
-- (−) `CGO_ENABLED=0` trên macOS: resolver DNS là **pure-Go** (không qua `mDNSResponder`) — chấp nhận vì chế độ chính kết nối **bằng IP**; chế độ domain dùng pure-Go resolver `[N]`.
-- (−) **Không gọi được IOKit (sleep/wake notification) không cgo.** Giảm thiểu: PF_ROUTE routing socket + phát hiện **nhảy đồng hồ** (PLAT-05 đã cho phép làm dự phòng). Nếu đo thực tế (PERF-07 trên MacBook) không đạt ⇒ ADR bổ sung xem `ebitengine/purego` (xin duyệt Gate; hiện **không** thuộc danh mục).
-- (−) GC: đặt `GOMEMLIMIT` mềm (server 96 MiB, agent 40 MiB — giá trị khởi đầu, chỉnh sau US-058).
-- (−) **Race detector cần cgo + trình biên dịch C ở mọi OS** (đã xác nhận `go: -race requires cgo` `[V]`) ⇒ dev Windows phải chạy qua Docker/WSL; bù bằng CI Linux bắt buộc.
-- (−) Phụ thuộc Go toolchain cho dev: bootstrap bằng `scripts/bootstrap-toolchain.ps1` (tải zip, **kiểm SHA-256**, giải nén user-level, không cần admin).
-- Quay lại phương án B nếu: PERF-01/09 không thể đạt với Go sau tối ưu, **và** có runner macOS + thời gian dựng Zig/SDK — cần ADR mới.
+- **(+) Tích cực**: Đạt đúng mục tiêu của người dùng về hiệu năng, không GC, RAM ~4–18 MB, binary ~3–6 MB, xóa khóa tức thì bằng `ZeroizeOnDrop`, và loại trừ hoàn toàn lỗi bộ nhớ trong toàn bộ tầng giao thức.
+- **(−) Chi phí / Giảm thiểu**: Thời gian biên dịch Rust lâu hơn Go và cần linker trên máy Windows → giảm thiểu bằng việc chạy `scripts/bootstrap-toolchain.ps1` một lần ở đầu Sprint 1 và tận dụng cache Cargo incremental.
 
 ---
 
 <a id="adr-002"></a>
-## ADR-002 — WireGuard userspace + `conn.Bind` tùy biến, một UDP socket chung
+## ADR-002 — WireGuard Userspace Sans-I/O (`defguard_boringtun`) & Một UDP Socket Chung (`MagicSocket`)
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-Data plane = giao thức WireGuard (giả định A-04), userspace trên Windows/macOS/Linux (PERF-04 chấp nhận userspace). NAT traversal cần STUN **từ chính socket** mà WireGuard dùng (để mapping NAT giống nhau — US-019), disco ping/pong qua cùng cổng, và khả năng **gửi gói WireGuard qua relay** khi direct chưa có (REL-05, US-026). SEC-02 cấm tự viết mật mã ⇒ không tự cài Noise/WireGuard.
+- Yêu cầu `SEC-02` / `GNFR-01` cấm tự cài đặt primitive mật mã hay tự lắp giao thức đường hầm; `A-04` chốt dùng giao thức WireGuard ở userspace trên macOS, Windows và Linux.
+- Để đục lỗ NAT (`US-019`, `US-021`) và chuyển mạch tức thì sang Blind Relay (`REL-05`, `US-022`, `US-026`), gói STUN Binding, gói Authenticated Disco (`Ping`/`Pong`/`CallMeMaybe`) và gói dữ liệu WireGuard **bắt buộc phải gửi/nhận trên cùng một cổng UDP cục bộ** (được lưu bền qua các lần khởi động lại theo `US-019 AC1`).
 
 ### Options
-| # | Phương án | Đánh giá |
-|---|---|---|
-| A | `golang.zx2c4.com/wireguard` (wireguard-go **upstream**, MIT) + **tự hiện thực `conn.Bind`** | Giao diện `conn.Bind` (Open/Close/SetMark/Send/ParseEndpoint/BatchSize) tồn tại đúng để thay lớp socket ⇒ ta demux STUN/disco/WG và route qua relay. Upstream, MIT, được dùng rộng. **Chọn** |
-| B | Fork `tailscale/wireguard-go` | Có hook cho magicsock; nhưng gắn chặt Tailscale, thay đổi theo nhu cầu họ; ràng buộc bảo trì. Dự phòng |
-| C | Tự cài Noise_IKpsk2 từ `flynn/noise` | **Vi phạm SEC-02/GNFR-01** (tự lắp giao thức) — loại |
-| D | Kernel WireGuard (Linux), WireGuardNT (Win) | macOS không có; P2 (US-071) |
-| E | `boringtun`/`gotatun` qua FFI | Vi phạm ADR-001 (Rust/CGO) |
+1. **Phương án A — `defguard_boringtun` `0.6` (BSD-3-Clause) ở chế độ state machine Sans-I/O `noise::Tunn` ghép vào 1 `tokio::net::UdpSocket` (`MagicSocket`) (CHỌN)**:
+   - `Tunn` chỉ nhận slice `&[u8]` và xuất ra kết quả `TunnResult` (`WriteToNetwork`, `WriteToTunnelV4`, `Done`, `Err`) trên buffer cấp sẵn `[u8; 2048]`, hoàn toàn không tự mở socket hay tạo thread ngầm.
+2. **Phương án B — `gotatun` (MPL-2.0)**:
+   - Dính giấy phép copyleft `MPL-2.0` và cấu trúc I/O nội bộ gắn chặt với Mullvad.
+3. **Phương án C — Tự lắp `Noise_IKpsk2` bằng crate `snow`**:
+   - Vi phạm nghiêm trọng `SEC-02` / `GNFR-01` (tự cài đặt lại state machine handshake/rekey/cookie/replay counter của WireGuard).
 
 ### Decision
-1. Dùng `golang.zx2c4.com/wireguard` **ghim bằng pseudo-version** (`v0.0.0-20261024220952-b3bc704ef0ee` tại thời điểm quyết định) — nâng cấp chỉ qua PR `build(deps)` kèm test netmap/relay.
-2. Gói `internal/datapath` hiện thực **`conn.Bind` riêng ("magicbind")**: sở hữu socket UDP của agent (dual-stack; cổng cục bộ **lưu bền** — US-019), **demux theo byte đầu**: (i) STUN (magic cookie `0x2112A442` tại byte 4–8, RFC 5389/8489), (ii) Disco (tiền tố magic riêng 6 byte do Architect định nghĩa), (iii) còn lại ⇒ gói WireGuard trả về `ReceiveFunc`. `Send` chọn đường theo trạng thái peer: **direct `netip.AddrPort`** hay **relay** (Endpoint trừu tượng mang `PublicKey` đích).
-3. `Bind.SetMark`/ràng interface thực hiện chống routing loop (ADR-007).
-4. **STUN client** gửi từ chính socket này; **STUN server** (VPS) lắng nghe UDP ở cổng cấu hình được, **cùng binary `mesh-server`** (ADR-009).
-5. Thiết lập thiết bị WireGuard qua UAPI `IpcSet`; **`AllowedIPs` mỗi peer = đúng `/32`** (SEC-11); áp netmap theo **diff** (thêm/sửa/xóa peer — REL-03/US-010).
-6. `device.Logger` thay bằng adapter `slog` (mức ≥ `error`); chuỗi UAPI **không bao giờ** được log (chứa khóa).
-7. MTU mặc định **1280**, cấu hình được (REL-10).
+1. Sử dụng **`defguard_boringtun` `0.6`** (BSD-3-Clause) duy nhất bên trong `crates/mesh-datapath`.
+2. Xây dựng **`MagicSocket`** sở hữu **1 `tokio::net::UdpSocket`** (ưu tiên bind lại cổng UDP cục bộ đã lưu bền trong tệp trạng thái; tắt cờ ép cứng `DF=1` ở tầng UDP ngoài theo `US-017 AC3`).
+3. **Bộ phân luồng gói đến (Ingress Demuxer)** không cấp phát heap:
+   - Kiểm tra độ dài tối thiểu ≥ 20 byte và `pkt[4..8] == 0x2112A442` → chuyển cho `mesh_proto::stun`.
+   - Kiểm tra tiền tố 6 byte `pkt[0..6] == b"MESHDS"` (`0x4d4553484453`) → chuyển cho `mesh_datapath::disco`.
+   - Còn lại → định tuyến vào `Tunn::decapsulate` của peer tương ứng; kiểm tra chặt `AllowedIPs` = đúng `/32` Overlay IP của peer đó (`SEC-11`, `US-014 AC3/AC4`) trước khi bơm gói IPv4 vào `TunDevice`.
+4. **Bộ chọn đường gửi (Egress Path Selector)**:
+   - Sau khi `Tunn::encapsulate` mã hóa gói IP thành gói WireGuard, nếu peer đang có đường `Direct(SocketAddr)` còn hiệu lực thì gửi qua `UdpSocket`; nếu chưa có direct hoặc vừa mất 3 nhịp Pong liên tiếp / quá `REKEY_TIMEOUT` (`US-022`, `US-026`) thì bọc gói đã mã hóa đẩy qua kênh `BlindRelay` ngay lập tức (≤ 1 s).
+5. **Áp dụng Netmap theo Diff (`REL-03`, `US-010`)**: bảng `PeerMap` chỉ khởi tạo mới `Tunn` cho peer mới, cập nhật endpoint cho peer đổi địa chỉ và xóa `Tunn` của peer bị thu hồi (`US-030`), giữ nguyên trạng thái phiên và bộ đếm của các peer không đổi (0% mất gói giữa các node cũ).
+6. **MTU mặc định `1280`** (`REL-10`, `US-017`), cấu hình được trong khoảng `576..=1420`.
 
 ### Consequences
-- (+) Không tự viết mật mã WireGuard; tái dùng mã đã được kiểm định; relay/disco tích hợp tự nhiên.
-- (−) **Phải tự hiện thực magicbind** (độ phức tạp cao, 8 SP hole punching): rủi ro R-16. Giảm thiểu: lát cắt "Walking Skeleton relay-only trước, direct sau" (backlog 15.2), tham khảo thiết kế `magicsock` của Tailscale (BSD-3, **không import**, chỉ đọc).
-- (−) `wireguard-go` upstream **không có tag phiên bản** ⇒ ghim commit + `go.sum`; chúng ta chịu trách nhiệm theo dõi bản vá (đăng ký watch repo; `govulncheck` trong CI).
-- (−) Hiệu năng userspace thấp hơn kernel: chấp nhận (PERF-04 ≥ 70% tới 300 Mbps); `[N]` chưa đo — QA đo ở US-058.
-- Quay lại phương án B nếu cần API hook mà upstream không có.
+- **(+) Tích cực**: Không có goroutine/thread ngầm của thư viện đụng độ với vòng lặp sự kiện; dùng chung 1 UDP socket tự nhiên, RAM cực thấp và dễ dàng kiểm thử tất định (unit test `Tunn` + `MagicSocket` hoàn toàn trong bộ nhớ không cần mở card mạng thật!).
+- **(−) Chi phí / Giảm thiểu**: `mesh-datapath` phải gọi `Tunn::update_timers` theo chu kỳ (mỗi 250 ms) và quản lý keepalive on-demand (`US-022 AC4`: giữ keepalive 25 s khi có lưu lượng trong cửa sổ 3–5 phút, tự nghỉ khi rảnh lâu để đạt `GNFR-07 ≤ 1 KB/s`).
 
 ---
 
 <a id="adr-003"></a>
-## ADR-003 — Giao thức Control & xác thực khóa
+## ADR-003 — Giao thức Control & Xác thực Khóa (TLS 1.3 + NaCl Box Challenge + Disco Auth)
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-SEC-02: control dùng TLS ≥ 1.2 (khuyến nghị 1.3) + chứng minh sở hữu khóa node bằng cấu trúc chuẩn (NaCl box hoặc Noise IK) với challenge/nonce ngẫu nhiên **từ server**, không phụ thuộc đồng hồ client (US-003 AC1/AC5). **Curve25519 chỉ làm DH, không ký được** ⇒ "chứng minh sở hữu" phải dựa vào DH. Pre-Auth Key (SEC-03) ≥ 128 bit, one-time, TTL, chỉ lưu hash. Disco cần xác thực + chống phát lại (US-021). Hai chế độ triển khai: **TLS end-to-end** (Standalone/IP+Pin) và **sau Reverse Proxy** (TLS kết thúc ở proxy).
+- `SEC-01`: Khóa riêng Curve25519 sinh tại client, không bao giờ rời client.
+- `SEC-02` & `US-003`: Kênh Control dùng TLS 1.3 + chứng minh sở hữu khóa node bằng challenge/nonce ngẫu nhiên từ server (không phụ thuộc đồng hồ tuyệt đối của client để tránh lỗi dual-boot Windows/Linux `US-003 AC5`). Vì khóa WireGuard là Curve25519 (X25519 — chỉ thực hiện Diffie-Hellman, không ký số EdDSA trực tiếp), phép chứng minh sở hữu phải dùng cấu trúc chuẩn dựa trên X25519.
+- `SEC-03` & `SEC-05`: Pre-Auth Key ≥ 128 bit, one-time mặc định, có TTL, chỉ lưu băm, so sánh constant-time, trả về **cùng một thông điệp lỗi chung** cho mọi lỗi xác thực.
+- `US-021`: Gói đục lỗ NAT (`Ping`/`Pong`/`CallMeMaybe`) phải được xác thực mật mã gắn với `disco_key` trong Netmap kèm `tx_id` ngẫu nhiên chống phát lại và chống đầu độc endpoint (Endpoint Poisoning).
 
 ### Options
-| # | Phương án | Đánh giá |
-|---|---|---|
-| A | **TLS 1.3 (stdlib) + challenge–response bằng NaCl box** (`x/crypto/nacl/box`) + **channel binding** bằng TLS exporter | Dùng primitive chuẩn, mã nguồn ngắn, chung họ với disco; chạy qua reverse proxy. **Chọn** |
-| B | Noise IK qua `flynn/noise` (kiểu `ts2021`) | Mạnh nhưng thêm thư viện + thêm giao thức kiểu "tự lắp"; không cần cho 20 node |
-| C | Ký chữ ký Ed25519 trên challenge | Cần **khóa ký thứ hai** (node key là Curve25519/WireGuard) ⇒ thêm bề mặt quản lý khóa; chỉ đáng khi làm US-069 |
-| D | mTLS với chứng chỉ client | Gánh nặng PKI; không chạy sau Reverse Proxy kết thúc TLS |
+1. **Phương án A — TLS 1.3 (`rustls`) + Challenge–Response bằng NaCl Box (`crypto_box`: X25519 + XSalsa20-Poly1305) + SHA-256 (`sha2` + `subtle::ConstantTimeEq`) (CHỌN)**:
+   - Chuẩn mật mã đã kiểm định, dùng cùng một nguyên thủy `crypto_box` cho cả bước chứng minh khóa Control lẫn xác thực gói Disco; hoạt động tốt cả ở chế độ TLS trực tiếp lẫn sau Reverse Proxy.
+2. **Phương án B — mTLS bằng chứng chỉ X.509 phía client**:
+   - Không chạy được khi VPS đứng sau Reverse Proxy (`Nginx`/`Caddy`) sẵn có của người dùng mà không cấu hình lại proxy phức tạp.
 
 ### Decision
-1. **Kênh:** HTTPS/1.1 (JSON) cho RPC + WebSocket cho luồng netmap — chạy trên **cùng một cổng TCP** với relay (ADR-004). TLS **tối thiểu 1.3**; **tắt HTTP/2** trên listener này (WebSocket cần HTTP/1.1; giảm bề mặt; tương thích reverse proxy).
-2. **Chứng minh khóa node (hiện thực trong `internal/secure`):**
-   1. client → server: `hello{node_pub, protocol_version, agent_version, os, arch}`;
-   2. server → client: `challenge{server_eph_pub (X25519 mới mỗi phiên), nonce[32] (crypto/rand), session_id}`; server lưu (nonce, eph_priv) với TTL ngắn, **dùng một lần**;
-   3. client → server: `proof = box.Seal( nonce ‖ session_id ‖ tls_exporter? ‖ node_pub ; box_nonce[24] random ; server_eph_pub ; node_priv )`;
-   4. server: `box.Open(…; node_pub ; server_eph_priv)` + so khớp nội dung. Chỉ người nắm `node_priv` mới tạo được hộp hợp lệ (DH(node_priv, eph_pub)).
-   - `tls_exporter` = `ExportKeyingMaterial("mesh-control-auth", nil, 32)` — **ràng buộc** bằng chứng vào phiên TLS **khi TLS kết thúc ở server** (IP+Pin/Standalone). Ở chế độ Reverse Proxy không có exporter đầu-cuối ⇒ bỏ trường này; nonce + ephemeral vẫn chống phát lại (đã ghi nhận trong mô hình đe dọa: proxy là đối tượng tin cậy).
-3. **Pre-Auth Key:** `mpk_` + 32 byte `crypto/rand` mã hóa base32 (≥ 256 bit); DB lưu **SHA-256** (`PreAuthKeyHash`), tra theo digest, so sánh `subtle.ConstantTimeCompare`; one-time mặc định, TTL bắt buộc, thu hồi được. Đăng ký **idempotent theo `node_pub`** (REL-02): `UNIQUE(public_key)`, `UNIQUE(overlay_ip)`, cấp IP + tạo node trong **1 transaction**.
-4. **Disco:** `disco_key` Curve25519 **riêng** (không dùng node key), công bố qua netmap; bản tin = `box.Seal` (24 byte nonce ngẫu nhiên) với `tx_id` 96 bit ngẫu nhiên; bên gửi giữ bảng `tx_id` đang chờ có TTL; Pong chỉ hợp lệ nếu khớp `tx_id` + nguồn khóa (chống phát lại/giả mạo — US-021).
-5. Lỗi xác thực trả **một thông điệp công khai duy nhất** (SEC-05); rate-limit theo IP TCP (hoặc theo `trusted_proxies` — ADR-008).
-6. Toàn bộ nằm sau API `internal/secure`; **nơi khác cấm import primitive** (depguard).
+1. **Cô lập mật mã**: Tất cả các phép toán dưới đây được đóng gói duy nhất trong `crates/mesh-crypto`.
+2. **Chứng minh sở hữu khóa Node (`US-003`)**:
+   - Bước 1: Client mở kết nối TLS (đã xác minh SPKI Pin hoặc CA theo `ADR-008`) và gửi `Hello { node_pubkey, protocol_version, agent_version, os, arch }`.
+   - Bước 2: Server sinh cặp khóa X25519 tạm thời theo phiên (`server_eph_secret`, `server_eph_pub`) và `challenge_nonce: [u8; 32]` từ `OsRng`, lưu trong RAM với TTL 30 s (dùng 1 lần).
+   - Bước 3: Client dùng `crypto_box::SalsaBox::new(&server_eph_pub, &node_secret)` mã hóa xác thực (`seal`) bản tin `ProofPayload { challenge_nonce, session_id, node_pubkey, tls_exporter_binding }` với `box_nonce: [u8; 24]` ngẫu nhiên. (Khi kết nối TLS trực tiếp, `tls_exporter_binding` lấy từ `rustls::Connection::export_keying_material` nhãn `"EXPORTER-mesh-control-v1"`; khi qua Reverse Proxy được cấu hình tường minh thì dùng giá trị rỗng đã đánh dấu).
+   - Bước 4: Server mở hộp (`open`) bằng `SalsaBox::new(&node_pubkey, &server_eph_secret)` và kiểm tra `challenge_nonce`. Chỉ bên nắm giữ `node_secret` mới tạo được ciphertext hợp lệ.
+3. **Pre-Auth Key (`US-002`, `US-004`, `US-005`, `US-031`)**:
+   - Định dạng hiển thị một lần: `mpk_<base32_nopad(32 bytes từ OsRng)>` (256-bit entropy).
+   - Lưu trữ trong `redb`: chỉ lưu `sha256(raw_key)` (`[u8; 32]`). Khi kiểm tra, luôn băm đầu vào trước rồi so sánh bằng `subtle::ConstantTimeEq::ct_eq` (`US-042 AC2`).
+   - Hỗ trợ trói đích danh `target_node_id: Option<NodeId>` (`--for <node>`) để phục vụ đăng ký lại khi hết hạn khóa (`US-031 AC5/AC6`) hoặc xoay khóa (`US-032`) mà không cho phép key thường chiếm đoạt tên/IP của node khác.
+4. **Xác thực Disco (`US-021`)**:
+   - Mỗi agent sinh cặp khóa `disco_key` (X25519) riêng biệt với khóa data plane (đảm bảo *domain separation*) và công bố `disco_pubkey` trong Netmap (`US-009 AC1`).
+   - Mọi gói `Ping`, `Pong`, `CallMeMaybe` đều được niêm phong bằng `crypto_box` giữa `(self_disco_secret, peer_disco_pubkey)` và chứa `tx_id: [u8; 12]` ngẫu nhiên từ `OsRng`.
+   - Agent giữ bảng `pending_pings` có giới hạn kích thước và TTL (10 s): chỉ chấp nhận `Pong` giải mã thành công từ `peer_disco_pubkey` thuộc Netmap hiện hành **và** khớp đúng `tx_id` đang chờ. Mọi gói sai xác thực hoặc phát lại đều bị **bỏ qua im lặng** (`US-021 AC5`).
 
 ### Consequences
-- (+) Không thêm thư viện mật mã ngoài `x/crypto` + stdlib; xác thực không phụ thuộc đồng hồ.
-- (+) Cùng một họ (NaCl box) cho control-proof và disco ⇒ ít code, dễ kiểm.
-- (−) NaCl box = XSalsa20-Poly1305 (không có forward secrecy cho riêng bản tin proof; chấp nhận vì chỉ chứng minh sở hữu + TLS 1.3 đã có FS cho kênh).
-- (−) Chế độ Reverse Proxy không có channel binding ⇒ yếu hơn đôi chút; ghi trong Runbook.
-- Cần **review độc lập** ADR-003 bởi `agile-critic`/Codex trước Gate (đây là mã bảo mật trọng yếu).
+- **(+) Tích cực**: Không phụ thuộc đồng hồ hệ thống ở tầng challenge; chống MITM, chống phát lại và chống đầu độc đường đi P2P trên mạng Wi-Fi công cộng; dùng chung 1 thư viện `crypto_box` nhỏ gọn.
+- **(−) Chi phí / Giảm thiểu**: Cần kiểm thử kỹ vector xác thực và fuzz bộ giải mã gói Disco (`proptest` ≥ $10^5$ gói đột biến theo `US-021 AC3`).
 
 ---
 
 <a id="adr-004"></a>
-## ADR-004 — Blind Relay trên WebSocket/TLS & chống Head-of-Line blocking
+## ADR-004 — Blind Relay trên WebSocket/TLS Chung Cổng TCP & Hàng đợi `try_send` Chống Nghẽn Dây Chuyền
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-REL-06: relay TCP là đường cuối; SEC-07: chỉ node hợp lệ, giới hạn băng thông, ngắt ≤ 5 s khi thu hồi. Phải chạy **trên cùng cổng TCP** với control và **qua Reverse Proxy** sẵn có (SEC-06(2)). Rủi ro R-08: một đích chậm làm nghẽn dây chuyền (HoL).
+- `REL-06` & `US-024`: Relay chạy trên cùng cổng TCP đã cấu hình của VPS (mặc định `443`, đổi được sang cổng bất kỳ như `8443`), hoạt động ở cả chế độ Standalone TLS lẫn sau Reverse Proxy (`Nginx`/`Caddy`).
+- `SEC-07` & `US-025`: Relay chỉ chuyển tiếp mù gói đã mã hóa cho node hợp lệ, tự gắn `src_pubkey` đã xác thực của người gửi (không tin trường nguồn do client tự khai), giới hạn băng thông mỗi node (mặc định 20 Mbps, `US-027`), và **cô lập hàng đợi theo từng đích** để một peer đọc chậm không làm treo các peer khác (chống Cross-Peer Head-of-Line Blocking, `US-025 AC6`).
 
 ### Options
-| # | Phương án | Đánh giá |
-|---|---|---|
-| A | **WebSocket binary frame trên TLS** (`github.com/coder/websocket`) | Qua được Nginx/Caddy (HTTP Upgrade); ping/pong + deadline có sẵn; NetBird cũng dùng WSS/443 [T26]. **Chọn** |
-| B | HTTP Upgrade tự đóng khung (kiểu DERP) | Không thêm thư viện, nhưng tự viết framing/keepalive; khó qua một số proxy |
-| C | QUIC/UDP (`quic-go`) | UDP có thể bị chặn (đúng tình huống relay phải giải quyết); P2 (US-065) |
-| D | gRPC streaming | HTTP/2 + protobuf + codegen; xung đột reverse proxy/tắt h2 |
+1. **Phương án A — WebSocket Binary Frames (`axum` + `tokio-tungstenite`) với kênh `tokio::sync::mpsc::channel(256)` + `try_send` cho mỗi đích (CHỌN)**:
+   - Tương thích 100% với mọi Reverse Proxy chuẩn qua HTTP/1.1 `Upgrade: websocket`; cô lập hoàn toàn luồng đọc và luồng ghi.
+2. **Phương án B — Giao thức TCP framing thô sau HTTP Hijack**:
+   - Nhiều Reverse Proxy thương mại hoặc cấu hình chuẩn chỉ hỗ trợ chuyển tiếp luồng hai chiều khi là `Upgrade: websocket`.
 
 ### Decision
-1. `github.com/coder/websocket`; **tắt nén** (`CompressionDisabled` — payload đã mã hóa), `SetReadLimit` cố định theo MTU + header.
-2. Frame relay: `dst_pubkey[32] ‖ payload` (client→server); server **gắn `src_pubkey` đã xác thực theo kết nối** rồi chuyển tiếp (Architect chốt chi tiết). Định tuyến theo **public key**, đích không tồn tại/không hợp lệ ⇒ drop.
-3. **Chống HoL:** mỗi kết nối đích có **một goroutine ghi** + **hàng đợi có trần** (kích thước do Architect, khởi đầu 256 gói); gửi vào hàng đợi **không chặn, drop-tail** khi đầy (đếm metric `mesh_relay_dropped_total`); **write deadline** ngắn — quá hạn ⇒ đóng kết nối đích (không kéo các luồng khác); **không có khóa toàn cục** trên đường chuyển tiếp.
-4. **Giới hạn băng thông:** token bucket mỗi node (mặc định 20 Mbps) + trần tổng (`golang.org/x/time/rate`).
-5. Thu hồi node ⇒ đóng kết nối relay ≤ 5 s (SEC-07b) qua kênh hủy per-node (`context`).
-6. **Heartbeat** WebSocket ping ≤ 60 s (GNFR-03); client dùng backoff+jitter (REL-04).
+1. Trên cùng cổng TCP của `mesh-server`, router `axum` phục vụ:
+   - `POST /v1/auth/challenge`, `POST /v1/nodes/register` (Control RPC).
+   - `GET /v1/netmap/stream` (WebSocket đẩy Netmap snapshot + heartbeat ≤ 30 s).
+   - `GET /v1/relay` (WebSocket Blind Relay, sau khi hoàn tất xác thực khóa node theo `ADR-003`).
+2. **Định dạng Frame Nhị phân của Blind Relay (`US-025`)**:
+   - Client $A \to$ Relay: `[dst_pubkey: 32 bytes][wg_or_disco_ciphertext: <= 1480 bytes]`.
+   - Relay $\to$ Client $B$: `[src_pubkey: 32 bytes (do Relay gắn từ phiên xác thực của A)][wg_or_disco_ciphertext]`.
+   - Cấu hình `tokio-tungstenite` đặt `max_frame_size = 2048` và `max_message_size = 2048` để chặn tấn công cấp phát bộ nhớ lớn (`US-025 AC3`).
+3. **Kiến trúc Chống Nghẽn Dây Chuyền (`US-025 AC6`)**:
+   - Mỗi phiên kết nối của node đích $B$ sở hữu một task ghi riêng đọc từ `mpsc::Receiver<Bytes>` có sức chứa cố định **256 gói** và áp `tokio::time::timeout(Duration::from_secs(5), ws_sink.send(...))`.
+   - Khi luồng đọc của node $A$ chuyển gói tới $B$, Relay gọi **`tx_b.try_send(frame)`**: nếu hàng đợi của $B$ đầy, gói tới $B$ bị **drop ngay lập tức không chặn** và tăng bộ đếm `mesh_relay_dropped_total{dest=...}`, trong khi gói từ $A$ tới $C$ vẫn đi qua tức thì với độ trễ bằng 0!
+4. **Giới hạn Băng thông & Cắt tức thì khi Thu hồi (`US-027`, `US-029`)**:
+   - Mỗi node có một bộ điều tiết Token Bucket nguyên tử (mặc định 20 Mbps/node) kết hợp một Token Bucket trần tổng của VPS.
+   - Mỗi phiên Relay gắn một `CancellationToken` theo `NodeId`: khi `node revoke` hoặc `node expire` được kích hoạt, token bị hủy tức thì, đóng kết nối WebSocket trong **< 100 ms** (vượt xa ngưỡng `≤ 5 s` của `SEC-07`).
 
 ### Consequences
-- (+) Một cổng, một TLS, chạy sau proxy; code nhỏ.
-- (−) **TCP-over-TCP:** WireGuard (UDP) bọc trong TCP có thể gặp tail-latency khi mất gói; chấp nhận vì relay chỉ là đường cuối và luôn nâng cấp lên direct khi thành công (REL-05).
-- (−) HoL ở tầng TCP **không thể loại bỏ** hoàn toàn; ADR chỉ cô lập ảnh hưởng theo từng đích. Ghi vào Runbook.
-- (−) Phải test với Nginx/Caddy buffering (cần `proxy_buffering off`/upgrade headers) — task cho `agile-devops`/QA.
+- **(+) Tích cực**: Một cổng TCP duy nhất cho mọi nhu cầu; chạy mượt sau Nginx/Caddy; loại bỏ hoàn toàn hiện tượng một máy yếu mạng kéo sập toàn bộ Relay.
+- **(−) Chi phí / Giảm thiểu**: Khi mạng chặn cổng khác `443`, agent phải phát hiện lỗi kết nối TCP và hiển thị chẩn đoán trung thực theo `REL-06(b)` / `US-024 AC7`.
 
 ---
 
 <a id="adr-005"></a>
-## ADR-005 — Lưu trữ nhúng SQLite thuần Go & backup nguyên tử
+## ADR-005 — Lưu trữ ACID Thuần Rust (`redb`), Ưu tiên Thu hồi trong RAM khi Đầy Đĩa & Hot Atomic Backup
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-REL-11: ACID, cấp IP + tạo node trong 1 transaction, migration có version, `integrity_check` khi khởi động. REL-12/US-045: backup nóng nhất quán (không khóa ghi > 1 s), checksum, giữ 7 bản, restore đã diễn tập; backup **phải gồm khóa định danh server** (Pin). Không CGO (ADR-001). RAM < 64 MB.
+- `REL-11` (`US-007`): Trạng thái Control phải đảm bảo giao dịch ACID (cấp IP + tạo node + đánh dấu key đã dùng trong **1 transaction duy nhất**), ràng buộc duy nhất trên `public_key` và `overlay_ip`, kiểm tra toàn vẹn lúc khởi động, và không hỏng dữ liệu khi `kill -9` hay đầy đĩa.
+- `US-013 AC4`: Khi đĩa đầy khiến ghi audit thất bại, các thao tác tạo mới phải *fail-closed*, nhưng các lệnh phòng vệ khẩn cấp (`node revoke`, `preauthkey revoke`, `node expire`) **bắt buộc phải thực thi ngay trong RAM** và xuất audit ra `stderr`/`journald` để cắt kẻ xâm nhập tức thì.
+- `REL-12` (`US-045`): Sao lưu nóng tự động không khóa ghi > 1 s, kèm mã kiểm tra toàn vẹn SHA-256, giữ 7 bản, **bao gồm khóa định danh server dùng cho SPKI Pin** để khôi phục không phải pin lại mọi máy.
 
 ### Options
-| # | Phương án | Đánh giá |
-|---|---|---|
-| A | **`modernc.org/sqlite`** (SQLite chuyển mã sang Go, BSD-3) + `database/sql` | `UNIQUE`, transaction, WAL, `PRAGMA integrity_check`, `VACUUM INTO`; **CGO-free `[V]` 4 đích**. **Chọn** |
-| B | `mattn/go-sqlite3` | Cần CGO + C toolchain ⇒ **vi phạm ADR-001** |
-| C | `go.etcd.io/bbolt` | Thuần Go, ACID, snapshot `Tx.WriteTo`; nhưng không SQL ⇒ tự cài ràng buộc UNIQUE/index/migration/audit query ⇒ nhiều mã dễ lỗi |
-| D | PostgreSQL/MySQL | Vượt ngân sách RAM 1–2 GB VPS dùng chung |
+1. **Phương án A — `redb` `2.4` (MIT/Apache-2.0, 100% Pure Rust ACID MVCC B-tree) (CHỌN)**:
+   - Không có mã C, không có `unsafe` FFI C-SQLite; giao dịch `WriteTransaction` đảm bảo ACID nguyên tử trên nhiều bảng; `ReadTransaction` dùng MVCC không bao giờ chặn luồng ghi; footprint cực nhỏ.
+2. **Phương án B — `rusqlite` (`bundled` C SQLite)**:
+   - Kéo theo ~250.000 dòng mã C, cần trình biên dịch C khi cross-compile và tăng kích thước binary.
 
 ### Decision
-1. `modernc.org/sqlite` + `database/sql`; **SQL thuần có tham số, không ORM/query-builder** (đồng nhất giữa nhiều dev, kiểm soát được). Truy cập qua `internal/store` với repository có kiểu.
-2. Pragma khởi tạo (mỗi kết nối): `journal_mode=WAL`, `synchronous=FULL` (độ bền > tốc độ; ghi ít), `foreign_keys=ON`, `busy_timeout=5000`, `trusted_schema=OFF`. **Một kết nối ghi** (`SetMaxOpenConns` cho writer pool = 1) + pool đọc riêng.
-3. **Migration:** thư mục `migrations/NNNN_*.sql` nhúng bằng `embed`; bảng `schema_migrations`; mỗi migration trong 1 transaction; **tự viết migrator nhỏ** (không thêm `goose`/`migrate`) để móc **backup trước migration** và `integrity_check`.
-4. **Backup nguyên tử** (`backup now`, lịch hằng ngày, trước migration): `VACUUM INTO '<tmp>'` (đọc snapshot trong WAL, không chặn ghi lâu) → `fsync` → mở bản sao **read-only** chạy `PRAGMA integrity_check` → ghi `*.sha256` → `rename` nguyên tử sang tên cuối → `chmod 0600` (thư mục `0700`); giữ N=7. Restore từ chối nếu sai checksum/`integrity_check` (US-045 AC4).
-5. **Khuyến nghị cho Architect (schema thuộc Architect):** lưu **khóa định danh server** (khóa riêng ECDSA P-256 của TLS Pin) **trong chính DB** (bảng `server_identity`) để backup nguyên tử luôn kèm khóa (REL-12, US-045 AC2/AC5) — DB là tệp `0600` cùng ranh giới tin cậy với tệp khóa. Pre-auth key **chỉ lưu hash**.
-6. Audit log append-only: bảng `audit_events` + trigger chặn `UPDATE/DELETE`; cơ chế "thu hồi trong RAM khi đầy đĩa" (US-013 AC4) do Architect thiết kế.
+1. Dùng **`redb` `2.4`** duy nhất trong `crates/mesh-store` với các bảng định kiểu (`TableDefinition`):
+   - `schema_meta`: phiên bản schema hiện hành và lịch sử migration.
+   - `server_identity`: khóa định danh server (đã bọc bảo vệ, quyền tệp DB `0600`), tập pin (`active_pin`, `next_pin`), cấu hình cổng/chế độ hiện hành.
+   - `nodes`: `NodeId -> NodeRecord` (tên, `overlay_ip`, `node_pubkey`, `disco_pubkey`, `key_expiry`, `status`, `created_at`…).
+   - `idx_nodes_pubkey`: `[u8; 32] -> NodeId` và `idx_nodes_overlay_ip`: `u32 -> NodeId` — kiểm tra và ghi cùng trong 1 `WriteTransaction` để cưỡng chế tính duy nhất tuyệt đối (`UNIQUE(public_key)`, `UNIQUE(overlay_ip)` — `REL-02`, `US-005`).
+   - `preauth_keys`: `KeyId -> PreAuthKeyRecord` và `idx_preauth_hash`: `[u8; 32] -> KeyId`.
+   - `audit_events`: `u64 (seq) -> AuditRecord` — tầng store chỉ cung cấp hàm `append_audit`, **không tồn tại bất kỳ hàm sửa/xóa bản ghi nào** (`US-013 AC2`).
+2. **Kiểm tra toàn vẹn khi khởi động (`US-007 AC3`)**: Gọi `db.check_integrity()` khi mở DB; nếu phát hiện lỗi, dừng khởi động kèm thông báo hướng dẫn chạy `mesh-server restore`.
+3. **Cơ chế Thu hồi Khẩn cấp trong RAM khi Đầy Đĩa (`US-013 AC4`)**:
+   - `mesh-server` duy trì tập `RevokedSet` (`RwLock<HashSet<NodeId>>` và `HashSet<KeyId>`) trong bộ nhớ làm nguồn chặn tức thì trước mọi quyết định Control/Relay.
+   - Với thao tác thông thường (`register`, `create key`, `rename`): nếu `write_tx.commit()` thất bại (vd. `ENOSPC`), thao tác bị từ chối (*fail-closed*) và `/readyz` chuyển sang `503` (`US-007 AC5`).
+   - Với thao tác phòng vệ khẩn cấp (`node revoke`, `preauthkey revoke`, `node expire`): cập nhật `RevokedSet` trong RAM, tăng `netmap_version` trong RAM, đẩy Netmap mới và ngắt kết nối Relay/Control của kẻ xâm nhập **ngay lập tức**, sau đó cố gắng ghi `redb`; nếu ghi đĩa lỗi thì vẫn giữ hiệu lực thu hồi trong RAM và xuất bản ghi audit mức `CRITICAL` ra `stderr`/`journald`.
+4. **Sao lưu nóng nguyên tử (`US-045`)**:
+   - Mở `ReadTransaction` trên DB đang chạy (không chặn ghi), sao chép toàn bộ các bảng (bao gồm `server_identity`) sang tệp `redb` tạm trong thư mục backup (`0700`), gọi `commit()` + `sync_all()`, mở lại tệp tạm kiểm tra `check_integrity()`, tính băm SHA-256 ghi ra `<backup>.db.sha256`, đổi tên nguyên tử (`rename`) với quyền `0600`, và xoay vòng giữ 7 bản gần nhất.
+   - Lệnh `restore <file>` kiểm tra khớp `.sha256`, kiểm tra `check_integrity()` và xác nhận có `server_identity` hợp lệ trước khi khôi phục (`US-045 AC4/AC6`).
 
 ### Consequences
-- (+) Cross-compile sạch; sao lưu = một tệp; migration/constraint tận dụng SQL.
-- (−) `modernc.org/sqlite` chậm hơn C-SQLite (cỡ 1.5–3×, `[N]`) và tăng cỡ binary (~vài chục MB) — không đáng kể với ≤ 20 node; **đo PERF-01** ở US-058.
-- (−) Single-writer ⇒ không HA (chấp nhận — REL-15 là P2).
-- (−) Chất lượng bản dịch C→Go: theo dõi issue tracker; kiểm thử chéo bằng `integrity_check` trong CI + khôi phục diễn tập.
-- Phương án B (bbolt) là dự phòng nếu `modernc.org/sqlite` lộ vấn đề toàn vẹn.
+- **(+) Tích cực**: 100% Pure Rust, không phụ thuộc C compiler, tốc độ đọc từ MVCC cực nhanh, sao lưu nóng an toàn không chặn luồng đăng ký.
+- **(−) Chi phí / Giảm thiểu**: Các bảng chỉ mục phụ (`idx_nodes_pubkey`, `idx_nodes_overlay_ip`) được duy trì tường minh trong hàm giao dịch của `mesh-store` → bắt buộc có unit test và property test kiểm tra bất biến chỉ mục sau 100 lần crash/rollback mô phỏng (`US-007 AC2`).
 
 ---
 
 <a id="adr-006"></a>
-## ADR-006 — Kênh Admin IPC cục bộ kiểm chứng đặc quyền OS (`SEC-14`)
+## ADR-006 — Kênh Admin IPC Cục bộ Kiểm chứng Đặc quyền OS (`SEC-14`) & Tách rời Listener Quan sát
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-BLK-01: kênh Admin **không** được ở TCP (kể cả loopback), IP overlay hay IP public; phải là kênh cục bộ mà **OS kiểm chứng được người gọi** (Unix Domain Socket + peer credential, hoặc thao tác trực tiếp dưới quyền quản trị qua SSH). Tương tự trên client: CLI ↔ `meshd` (PLAT-01, PLAT-06(3)). Kênh quan sát `/healthz` `/readyz` `/metrics` là listener **riêng**, chỉ-đọc (OPS-05/06).
+- `SEC-14` (`BLK-01`): Tuyệt đối cấm mở Admin API trên IP overlay, IP public hay TCP loopback `127.0.0.1` trần (vì MVP là full-mesh không ACL nên một laptop bị trộm trên mạng overlay hoặc một tiến trình web/container bị lỗi SSRF trên VPS dùng chung có thể gọi `127.0.0.1` chiếm quyền Admin).
+- Trên máy client (macOS `PLAT-06(3)` / `US-073`, Windows `PLAT-01` / `US-052`), user thường không được phép gọi daemon thực hiện thao tác thay đổi mạng (`up`, `down`, `cleanup`, `set --server/--server-pin`).
 
 ### Options
-| # | Phương án | Đánh giá |
-|---|---|---|
-| A | **HTTP/1.1 + JSON trên Unix Domain Socket** (Linux/macOS) và **named pipe + SDDL** (Windows, `go-winio`), peer credential kiểm trong `ConnContext` | Dùng lại `net/http`; kiểm chứng đặc quyền bằng OS. **Chọn** |
-| B | gRPC trên UDS | Thêm protobuf/codegen; không cần |
-| C | TCP loopback + token tĩnh | **BỊ CẤM** (SEC-14(2b)) |
-| D | Chỉ CLI mở thẳng SQLite | Bỏ qua server đang chạy; race khóa DB; không có audit chuẩn |
+1. **Phương án A — HTTP/1.1 JSON qua Unix Domain Socket kèm kiểm tra `peer_cred()` (`SO_PEERCRED` Linux / `LOCAL_PEERCRED` macOS) và Windows Named Pipe kèm SDDL DACL (`SYSTEM` + `Administrators`) (CHỌN)**:
+   - Đặc quyền của tiến trình gọi được chính kernel hệ điều hành chứng thực; không dựa vào token tĩnh có thể bị lộ.
+2. **Phương án B — TCP `127.0.0.1` kèm tệp token trên đĩa**:
+   - Bị cấm trực tiếp bởi `SEC-14(2)(b)`.
 
 ### Decision
-1. **Server (Linux):** socket `/run/<brand>/admin.sock` thuộc `root` hoặc user dịch vụ, nhóm quản trị riêng, `0600`/`0660`, thư mục cha `0750` không user khác ghi. Trong `http.Server.ConnContext`, lấy `*net.UnixConn` → `SyscallConn().Control` → `unix.GetsockoptUcred(fd, SOL_SOCKET, SO_PEERCRED)`; chỉ chấp nhận `uid==0`, `uid==service`, hoặc `gid∈admin group`; nhét `Peer{UID,GID,PID}` vào `context` để **audit (SEC-09)**.
-2. **Agent macOS:** socket trong thư mục root (`/var/run/<brand>/`), `0600 root` hoặc `0660 root:admin`; peer cred bằng `unix.GetsockoptXucred(fd, SOL_LOCAL, LOCAL_PEERCRED)`; thao tác thay đổi mạng (`up/down/cleanup`, `set --server/--pin`) chỉ cho `root` hoặc nhóm `admin`; thao tác chỉ-đọc (`status`, `ping`) do Architect chốt (khuyến nghị: cho phép mọi user local, **không** lộ secret).
-3. **Agent Windows:** named pipe tạo bằng `github.com/Microsoft/go-winio` với **SDDL** cho tác vụ thay đổi: `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (SYSTEM + Administrators); pipe chỉ-đọc (nếu có) tách riêng ACL.
-4. **Listener quan sát** (`/healthz`,`/readyz`,`/metrics`): `http.Server` **riêng**, bind `127.0.0.1`/overlay theo cấu hình, **chỉ nhận GET**, không route nào thay đổi trạng thái (test: lập danh sách route + so với allowlist chỉ-đọc).
-5. **Cấm kiểm tra tĩnh:** `net.Listen("tcp"…)` chỉ xuất hiện trong `internal/httpx` và gói listener công khai/quan sát; `scripts/check.*` fail nếu có nơi khác.
-6. CLI `mesh` tự phân biệt: lệnh quản trị server (`mesh admin …` / `mesh preauthkey …`) nối vào socket server; lệnh client (`mesh up/status/ping`) nối vào socket agent. Cả hai cùng hạ tầng `internal/ipc`.
+1. **Kênh Admin của `mesh-server` trên VPS Linux (`US-012`, `US-046`)**:
+   - Chỉ lắng nghe trên Unix Domain Socket `/run/mesh/admin.sock` (thư mục `/run/mesh` quyền `0750` thuộc `mesh:mesh-admin`, socket quyền `0660`).
+   - Ngay khi nhận kết nối `tokio::net::UnixStream`, gọi `stream.peer_cred()` (sử dụng `SO_PEERCRED` của kernel Linux) lấy `(uid, gid, pid)`: chỉ chấp nhận `uid == 0` (`root`), `uid == service_uid`, hoặc `gid == admin_gid`. Ghi `uid` và `pid` vào bản ghi Audit (`SEC-09`).
+2. **Kênh IPC của `meshd` trên macOS (`US-073 AC3/AC4`)**:
+   - Lắng nghe trên `/var/run/mesh/meshd.sock` (thư mục `/var/run/mesh` quyền `0755` thuộc `root:wheel`, kiểm tra chống symlink trên toàn bộ đường dẫn cha).
+   - Khi nhận kết nối, gọi `stream.peer_cred()` (sử dụng `LOCAL_PEERCRED` trên macOS) để lấy `uid`/`gid` thực của người gọi:
+     - Các thao tác thay đổi trạng thái (`up`, `down`, `cleanup`, `set`, `rotate-key`) **chỉ cho phép `uid == 0` (`root`) hoặc thành viên nhóm `admin` (`gid == 80`)**. User thường bị từ chối với lỗi `PermissionDenied` và ghi log cảnh báo.
+     - Các thao tác chỉ-đọc chẩn đoán (`status`, `ping`, `netcheck`) được phép gọi nhưng phản hồi tuyệt đối không chứa bất kỳ khóa bí mật nào (`US-039 AC5`).
+3. **Kênh IPC của `meshd` trên Windows (`US-052 AC3`)**:
+   - Tạo Windows Named Pipe `\\.\pipe\mesh-agent-admin` bằng `windows-sys` (`CreateNamedPipeW`) với chuỗi bảo mật **SDDL**: `D:P(A;;GA;;;SY)(A;;GA;;;BA)` — chỉ cấp quyền cho `LocalSystem` (`SY`) và nhóm `Administrators` (`BA`) kèm cờ `FILE_FLAG_FIRST_PIPE_INSTANCE` (chống chiếm đoạt pipe trước khi service chạy).
+   - Named pipe chỉ-đọc `\\.\pipe\mesh-agent-ro` (cho `mesh status`, `mesh ping`) chỉ mở các route đọc không nhạy cảm.
+4. **Listener Quan sát Chỉ-Đọc riêng biệt (`OPS-05`, `OPS-06`, `US-044`, `US-048`)**:
+   - Một instance `axum::Router` hoàn toàn độc lập, mặc định chỉ bind `127.0.0.1:<obs_port>` (hoặc IP overlay nếu bật tường minh), **chỉ đăng ký đúng 3 route `GET /healthz`, `GET /readyz`, `GET /metrics`**, không chia sẻ router hay middleware với kênh Admin.
 
 ### Consequences
-- (+) Quyền do **OS** quyết định, không có bí mật tĩnh để lộ; SSRF/`www-data`/container không gọi được.
-- (−) Windows không có peer credential kiểu UDS ⇒ phụ thuộc đúng ACL của pipe; phải test (`privileged`) rằng user thường bị từ chối.
-- (−) Hai nền IPC (UDS & named pipe) ⇒ trừu tượng `net.Listener` + `PeerCred` interface theo OS (coding-standards §2.2).
-- (−) Container trong lab: UDS bind-mount cần `uid` khớp; kiểm thử riêng.
+- **(+) Tích cực**: Loại bỏ 100% nguy cơ leo thang đặc quyền từ mạng overlay, từ SSRF trên VPS dùng chung, hoặc từ user không có quyền quản trị trên máy macOS/Windows.
+- **(−) Chi phí / Giảm thiểu**: Tách mã IPC theo OS trong `crates/mesh-net` + `crates/mesh-sys` và có bộ kiểm thử phân quyền trên cả 3 OS.
 
 ---
 
 <a id="adr-007"></a>
-## ADR-007 — Tích hợp nền tảng, chống routing loop, dọn dẹp bằng sổ cái
+## ADR-007 — Tích hợp Nền tảng, Chống Routing Loop & Tự Dọn Dẹp bằng Sổ cái Tài nguyên
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-G4: **không làm hỏng mạng máy thật**. Yêu cầu: macOS `utun` + `launchd` **không cần** Apple Developer ($99), Application Firewall/`pf` an toàn, `utunN` do kernel cấp động (PLAT-06); Windows `Wintun` + Service + firewall profile (PLAT-01/02); Linux `/dev/net/tun` + `systemd` + `CAP_NET_ADMIN` tối thiểu (PLAT-03a); REL-08 dọn tàn dư lúc khởi động; REL-09 chống routing loop; PLAT-05 sự kiện mạng/sleep-wake.
+- Mục tiêu sống còn `G4`: **Không bao giờ làm hỏng mạng máy thật** kể cả khi daemon bị `kill -9`, mất điện, đổi Wi-Fi hay chạy chung với VPN khác / iCloud Private Relay (`REL-08`, `REL-09`, `PLAT-01..06`).
+- Trên macOS (`PLAT-06`, `US-060`, `US-073`), không dùng chứng chỉ Apple Developer $99/năm (không dùng NetworkExtension), kernel tự cấp số `utunN` động, `/etc/hosts` là symlink tới `/private/etc/hosts`, và Application Firewall có thể chặn UDP inbound im lặng.
 
-### Options & Decision (theo nền tảng)
-
-| Chủ đề | Quyết định | Phương án bị loại |
-|---|---|---|
-| **TUN** | `golang.zx2c4.com/wireguard/tun` (`CreateTUN`): Linux `/dev/net/tun`; macOS kernel control `com.apple.net.utun_control` (`utun`, kernel cấp số) `[V]`; Windows **Wintun** (`golang.zx2c4.com/wintun` binding nạp `wintun.dll`) | `tun-rs` (Rust); `songgao/water` (không Wintun/utun chuẩn) |
-| **macOS daemon** | Daemon **root** chạy foreground dưới `launchd` (`/Library/LaunchDaemons/<label>.plist`, `RunAtLoad` + `KeepAlive`, `ExitTimeOut=10`); binary/plist ở `/usr/local/libexec/<brand>/` do root sở hữu. **Không** NetworkExtension/System Extension | App Store/NetworkExtension (cần $99 + entitlement) |
-| **Gatekeeper** | Binary `arm64` có **chữ ký ad-hoc do linker Go** `[V]` (đã kiểm: Mach-O cross-build từ Windows có `LC_CODE_SIGNATURE`, cờ ad-hoc bật); phân phối **không qua trình duyệt** (script cài kiểm `SHA256SUMS`) ⇒ không có `com.apple.quarantine`. **Cấm** hướng dẫn `spctl --master-disable`. Notarization/`.pkg` = P2 | Developer ID (không có) |
-| **Windows Wintun** | Đặt `tun.WintunTunnelType` = tên sản phẩm (mặc định của thư viện là `"WireGuard"` `[V]` — không dùng tên WireGuard để quảng bá, theo license) và `tun.WintunStaticRequestedGUID` **cố định** để tái dùng adapter, tránh adapter ma (R-05); `wintun.dll` được nạp bởi binding với `LOAD_LIBRARY_SEARCH_APPLICATION_DIR\|SYSTEM32` `[V]` ⇒ đặt cạnh exe trong thư mục chỉ Administrators ghi được | Mặc định `"WireGuard"`/GUID ngẫu nhiên |
-| **Windows service** | `golang.org/x/sys/windows/svc` (+ `svc/mgr` để cài, cấu hình **Recovery**); nhận `svc.PowerEvent` (resume) cho PLAT-05; `wintun.dll` đặt cạnh exe trong `Program Files\<brand>` (ghi được bởi Administrators) và **kiểm SHA-256 cố định trước khi nạp** | Dùng `kardianos/service` (thêm lớp trừu tượng; không phủ power event) |
-| **Linux service** | Unit `systemd` `Type=notify` (gói `internal/sdnotify` ~30 dòng thay vì thư viện), `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`; **`mesh-server` chạy user `mesh` không đặc quyền**, `AmbientCapabilities=CAP_NET_BIND_SERVICE` chỉ khi cổng < 1024; **`meshd` (VPS-node) là unit riêng** với `CAP_NET_ADMIN` (SEC-06(4)) | Một tiến trình đặc quyền làm tất cả |
-| **Route/addr/rule** | Linux: **netlink** (`vishvananda/netlink`). macOS: `/sbin/route` (đường dẫn tuyệt đối qua `sysexec`) + `golang.org/x/net/route` để **đọc/ theo dõi**. Windows: `winipcfg` (IP Helper) | Gọi `ip`/`netsh` cho route |
-| **Chống routing loop (REL-09)** | Ràng socket vào interface vật lý mặc định, **ràng lại khi đổi**: Linux `SO_MARK` (qua `Bind.SetMark`) + policy rule loại trừ; macOS `IP_BOUND_IF`/`IPV6_BOUND_IF` (`x/sys/unix`); Windows `IP_UNICAST_IF`/`IPV6_UNICAST_IF`. Lọc endpoint ứng viên thuộc dải overlay; MVP **chỉ route dải overlay, không default route** | Network namespace (vishvananda/netns) — không hợp daemon cắm vào máy người dùng |
-| **Sự kiện mạng/sleep-wake (PLAT-05)** | Linux: netlink subscribe. macOS: **PF_ROUTE routing socket** (`RTM_IFINFO/NEWADDR/DELADDR`) + **phát hiện nhảy đồng hồ** (đồng hồ monotonic không chạy khi ngủ so với wall-clock). Windows: `NotifyIpInterfaceChange` (qua `winipcfg`) + `svc.PowerEvent`. IOKit power notification **cần cgo ⇒ không dùng**; dự phòng `purego` cần duyệt Gate (ADR-001) | IOKit/cgo |
-| **Dọn dẹp (REL-08, US-055)** | **Sổ cái tài nguyên** (resource ledger): mọi `utunN`/adapter/route/khối hosts/anchor `pf`/rule firewall/ngoại lệ ALF được ghi vào tệp trạng thái `0600` **trước khi tạo**; dừng hoặc khởi động lại **chỉ** dọn theo sổ cái. Cấm đoán/xoá theo mẫu tên (`utun*`) — bảo đảm không đụng iCloud Private Relay/VPN khác | Quét và xóa interface "giống của mình" |
-| **Hosts (PLAT-04)** | Khối `# BEGIN mesh … # END mesh`; ghi nguyên tử (`fsx`) trên **đường dẫn thật**, giữ owner/mode/ACL; macOS resolve symlink `/etc/hosts`; bind-mount ⇒ fallback ghi tại chỗ có khóa | Ghi đè cả file |
-| **Firewall** | macOS: phát hiện ALF, đề xuất **opt-in** `socketfilterfw --add/--unblockapp` cho đúng binary; `pf` chỉ qua **anchor riêng**. Windows: profile adapter + rule dải overlay (`netsh advfirewall` qua `sysexec`). Linux: chỉ thêm rule cho cổng đã cấu hình, opt-in có dry-run + tự hoàn tác (SEC-06(3)) | Tự động bật deny-all |
+### Options & Decision
+1. **Sổ cái Tài nguyên Nguyên tử (`ResourceLedger` — `REL-08`, `US-055`)**:
+   - Trước khi `meshd` tạo hoặc sửa bất kỳ tài nguyên hệ thống nào (tên `utunN` thực tế trên macOS, GUID/tên adapter Wintun trên Windows, tên `mesh0` trên Linux, danh sách route CIDR đã thêm, anchor `pf`, rule firewall, khối hosts), nó **ghi nguyên tử mục đó vào tệp `/var/db/mesh/ledger.json` (macOS) / `/var/lib/mesh/ledger.json` (Linux) / `C:\ProgramData\Mesh\ledger.json` (Windows)** với quyền `0600`.
+   - Khi tắt dịch vụ (`SIGTERM`, `launchctl bootout`, Windows Service Stop — ngân sách **≤ 5 s**) hoặc khi vừa khởi động lại sau crash (`kill -9`), `meshd` đọc `ledger.json` và **chỉ dọn đúng các tài nguyên được liệt kê trong sổ cái**. Tuyệt đối cấm quét xóa theo mẫu `utun*` (bảo vệ 100% iCloud Private Relay và các VPN khác theo `US-060 AC3`, `US-055 AC6`).
+2. **Chống Routing Loop ở Tầng Socket (`REL-09`, `US-016`)**:
+   - Mọi socket ngoại biên của `meshd` (`MagicSocket` UDP, kết nối TCP tới Control/Relay) bắt buộc được ràng cứng vào interface vật lý mặc định thông qua `mesh-sys` / `socket2` **trước khi gửi gói** và ràng lại mỗi khi sự kiện mạng báo đổi interface mặc định (`US-035 AC7`):
+     - **macOS**: `setsockopt(..., IPPROTO_IP, IP_BOUND_IF, if_index)` và `IPV6_BOUND_IF`.
+     - **Windows**: `setsockopt(..., IPPROTO_IP, IP_UNICAST_IF, if_index_be)` và `IPV6_UNICAST_IF`.
+     - **Linux (VPS-node & Lab)**: `setsockopt(..., SOL_SOCKET, SO_MARK, fwmark)` kết hợp policy routing loại trừ `fwmark` khỏi bảng route tunnel.
+   - Chỉ cài route cho đúng dải CIDR overlay (không cài default route `0.0.0.0/0` ở MVP); lọc bỏ mọi endpoint ứng viên nằm trong dải overlay hoặc thuộc các card ảo (`utun*`, `awdl0`, `llw0`, `bridge*`, `docker0`, `veth*`, WSL/Hyper-V — `US-020 AC2`).
+3. **Quản lý Khối `hosts` & Xả Cache DNS (`PLAT-04`, `US-038`)**:
+   - Chỉ thao tác bên trong cặp thẻ đánh dấu `# BEGIN mesh` … `# END mesh`.
+   - Kiểm tra tên node bằng kiểu `NodeName` (chỉ `[a-z0-9-]`, 1–63 ký tự, từ chối `\n`, `\r`, `#`, khoảng trắng, từ chối danh sách cấm `localhost`, `broadcasthost`, `wpad`, `isatap`, `local` và hostname/IP public của chính Control/Relay/STUN — `US-004 AC3`, `US-038 AC5`).
+   - Trên **macOS**: phân giải symlink `/etc/hosts` ra đường dẫn thật `/private/etc/hosts`, ghi nguyên tử giữ nguyên symlink và quyền `root:wheel 0644`, sau đó gọi `/usr/bin/dscacheutil -flushcache` và `/usr/bin/killall -HUP mDNSResponder` (không chạm `scutil --dns`).
+   - Trên **Windows**: ghi giữ nguyên ACL đọc cho `Users` và `Dnscache` (kèm retry backoff ≤ 2 s nếu file đang bị khóa tạm), sau đó xả cache DNS.
+   - Trên **Linux**: không chạm `/etc/resolv.conf`; nếu `/etc/hosts` là bind-mount trong container (`EBUSY`/`EXDEV` khi `rename`) thì tự động chuyển sang ghi đè tại chỗ có khóa tệp (`US-038 AC2(d)`).
+4. **Theo dõi Sự kiện Mạng & Sleep/Wake (`PLAT-05`, `US-035`, `US-036`)**:
+   - **macOS**: lắng nghe BSD routing socket `PF_ROUTE` (`RTM_IFINFO`, `RTM_NEWADDR`, `RTM_DELADDR`, `RTM_CHANGE`) kết hợp bộ dò nhảy đồng hồ hệ thống (so sánh `std::time::Instant` với `SystemTime` mỗi 2 s để bắt sự kiện thức dậy sau sleep hoặc đồng bộ NTP — `US-035 AC3/AC6`).
+   - **Windows**: đăng ký `NotifyIpInterfaceChange` + nhận `ServiceControl::PowerEvent` từ Windows Service Control Manager + bộ dò nhảy đồng hồ (`US-036`).
+   - **Linux**: lắng nghe socket Netlink route/addr/link (`US-035 AC8`).
 
 ### Consequences
-- (+) Mỗi OS dùng cơ chế "native, không cần chứng chỉ trả phí"; hành vi dọn dẹp dự đoán được.
-- (−) **Điểm rủi ro cao nhất của dự án** (R-02, R-05): phần OS không giả lập được — macOS cần **Mac thật/VM trên phần cứng Apple/runner macOS** (GNFR-12); QA phải có biên bản.
-- (−) PF_ROUTE + clock-jump kém chính xác hơn IOKit (rủi ro PERF-07 trên MacBook) — đã nêu ở ADR-001.
-- (−) Windows SmartScreen cảnh báo installer chưa ký (R-11, chấp nhận ở MVP).
-- (−) Một số lệnh ngoài (`route`, `pfctl`, `netsh`…) vẫn cần ⇒ `internal/sysexec` + danh mục cho phép (coding-standards §5.5).
+- **(+) Tích cực**: Đảm bảo tính chất tự chữa lành sau crash, không đụng chạm VPN khác trên macOS/Windows/Linux, và phục hồi sau đổi mạng/sleep-wake trong P95 ≤ 15 s (`PERF-07`).
+- **(−) Chi phí / Giảm thiểu**: Các lệnh hệ thống ngoài (`route`, `pfctl`, `dscacheutil`, `socketfilterfw`, `netsh`, `ipconfig`, `nft`) chỉ được gọi qua `mesh_net::sysexec` với đường dẫn tuyệt đối cố định, không qua shell.
 
 ---
 
 <a id="adr-008"></a>
-## ADR-008 — Vòng đời TLS: IP-Pinning / Standalone ACME / Reverse Proxy
+## ADR-008 — Vòng đời TLS (`rustls`): Chế độ IP + SPKI Pinning (Mặc định) · Standalone ACME · Reverse Proxy
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-SEC-04 (Gate 1 D3): **chế độ (c) IP + Pin là luồng mặc định hạng nhất từ ngày đầu**; (a) Standalone có domain (ACME không cần cổng 80: `TLS-ALPN-01` — CA kiểm tra **chỉ trên cổng 443** — hoặc `DNS-01`); (b) sau Reverse Proxy (`trusted_proxies`). Không TOFU, không cờ bỏ qua. Pin nên là **khóa công khai (SPKI)** để tái phát hành chứng chỉ không phải pin lại; hỗ trợ **tập pin (hiện tại + kế tiếp)**.
+- Quyết định Gate 1 D3 (`SEC-04`, `US-003`, `US-047`): Trong giai đoạn đầu, người dùng **kết nối trực tiếp bằng địa chỉ IP của VPS (chưa có domain)**, nên chế độ **IP + SPKI Pin (`sha256:<hex>`) là luồng vận hành chính thức mặc định ngay từ Milestone 1**.
+- Phải cấm tuyệt đối cơ chế tin-lần-đầu ngầm định (TOFU) và không có cờ bỏ qua kiểm tra chứng chỉ trong bản release. Đồng thời phải hỗ trợ xoay khóa server có kế hoạch bằng tập pin (`active` + `next`) và chuyển đổi mượt sang Standalone ACME (không cần cổng 80) hoặc chạy sau Reverse Proxy sẵn có (`trusted_proxies`).
 
-### Options (ACME)
-| # | Thư viện | Đánh giá |
-|---|---|---|
-| A | **`github.com/go-acme/lego/v4`** (MIT) | Hỗ trợ `TLS-ALPN-01`, `DNS-01`, `HTTP-01`; ta **tự lái** vòng đời (renew loop, cảnh báo 14 ngày, tích hợp challenge cert vào `GetCertificate`) — phù hợp yêu cầu cổng tùy chỉnh. **Chọn** |
-| B | `caddyserver/certmagic` | Tiện nhưng kéo `zap` (trùng chức năng logging ⇒ vi phạm "một log lib") và tự quản lý quá nhiều; khó ép hành vi cổng ≠ 443 |
-| C | `x/crypto/acme/autocert` | Nhẹ, nhưng **không có DNS-01** |
-| D | `mholt/acmez` trực tiếp | Mức thấp; ít ví dụ cho DNS-01 |
+### Options
+1. **Phương án A — `rustls` + Custom `SpkiPinVerifier` (`mesh-crypto`) + `rcgen` (sinh cert IP) + `instant-acme` (`TLS-ALPN-01`/`DNS-01`) (CHỌN)**:
+   - Kiểm soát hoàn toàn logic đối chiếu mã băm SHA-256 của trường `subjectPublicKeyInfo` (SPKI DER) bất kể chứng chỉ tự ký hay do CA cấp.
 
 ### Decision
-1. **Chế độ (c) IP + Pin — mặc định:** server sinh **khóa định danh bền vững ECDSA P-256** lúc cài; chứng chỉ **tự ký** (gắn SAN = IP/domain hiện hành) phát hành lại được mà **giữ khóa**. **Pin = `sha256:<hex>` của SPKI DER** (`x509.MarshalPKIXPublicKey`). Hiển thị qua kênh Admin (ADR-006) và in sẵn vào lệnh tham gia (`IP:cổng` + pin + key — OPS-08).
-2. **Client — `internal/tlspin`:** `tls.Config{ MinVersion: TLS13, InsecureSkipVerify: true /*chỉ ở đây*/, VerifyConnection: <so khớp SPKI với tập pin; fail-closed nếu tập pin rỗng; chỉ chấp nhận pin trong tập (hiện tại + kế tiếp)> }`. Đây là **nơi duy nhất** được chứa `InsecureSkipVerify` (lint + script kiểm). Chế độ CA dùng xác minh chuỗi chuẩn của stdlib. Không có pin & không có chế độ CA ⇒ **từ chối trước khi gửi secret** (không TOFU).
-3. **Chế độ (a) Standalone:** `lego`; **`TLS-ALPN-01` chỉ khi cổng TCP = 443** (server trả challenge cert khi ALPN = `acme-tls/1` trong `GetConfigForClient`); cổng ≠ 443 ⇒ `DNS-01` hoặc **từ chối cấu hình kèm hướng dẫn** (US-047 AC7). Không phụ thuộc cổng 80. **MVP chưa nhúng provider DNS-01 nào** (chưa có domain/nhà cung cấp DNS) — thêm khi người dùng chốt (ADR bổ sung). Cảnh báo hết hạn 14 ngày (OPS-07).
-4. **Chế độ (b) Reverse Proxy:** dịch vụ chỉ lắng nghe `127.0.0.1`/UDS, nhận HTTP + Upgrade; **`trusted_proxies` mặc định rỗng**; chỉ khi bật tường minh mới tin `X-Forwarded-For`/PROXY protocol (SEC-05b/c).
-5. **Chuyển chế độ/xoay khóa** (c)→(a)/(b), đổi IP, xoay khóa với tập pin công bố trước ⇒ qua kênh Admin + phân phối qua Netmap (ADR-009), **giữ nguyên node key/IP overlay/tên** (SEC-15).
-6. Chứng chỉ ACME và chứng chỉ tự ký đều lưu trong DB/thư mục trạng thái `0600` thuộc user dịch vụ.
+1. **Chế độ (c) IP + SPKI Pinning — Luồng mặc định hạng nhất (`SEC-04(c)`, `US-003`, `US-047`)**:
+   - Khi khởi tạo `mesh-server` lần đầu, nếu chưa có khóa định danh trong bảng `server_identity` (`redb`), server dùng `rcgen` sinh cặp khóa ECDSA P-256 bền vững, trích xuất `subjectPublicKeyInfo` DER và tính `sha256:<hex_lowercase>`.
+   - Khi chứng chỉ tự ký sắp hết hạn hoặc khi server đổi địa chỉ IP (`US-074`), `rcgen` phát hành lại chứng chỉ X.509 mới từ **cùng cặp khóa định danh đó** → mã SPKI Pin không đổi, **không một máy client nào phải pin lại** (`US-047 AC3`).
+   - Phía client (`mesh-crypto::tlspin::SpkiPinVerifier` cài đặt trait `rustls::client::danger::ServerCertVerifier`):
+     - Trích xuất SPKI DER từ chứng chỉ lá của server, băm SHA-256 và so sánh constant-time với `PinSet` (`active_pin` và tùy chọn `next_pin` khi đang xoay khóa theo `US-047 AC5`).
+     - Nếu `PinSet` rỗng mà cấu hình ở chế độ Pin → **từ chối ngay lập tức (fail-closed, cấm TOFU)** trước khi gửi bất kỳ dữ liệu nào (`US-003 AC6`).
+     - Nếu không khớp pin (kể cả khi kẻ MITM trình chứng chỉ do CA công cộng hợp lệ cấp cho đúng IP đó) → từ chối kết nối, ghi log `WARN` (`event = "pin_mismatch"` kèm pin nhận được và pin kỳ vọng), không gửi secret, và chuyển sang thử lại theo backoff trần 5 phút (`US-003 AC7`, `US-034 AC4`).
+2. **Chế độ (a) Standalone có Domain (`instant-acme`)**:
+   - Nếu cổng TCP cấu hình = `443`, tự động xin và gia hạn chứng chỉ qua `TLS-ALPN-01` (nhận diện ALPN `acme-tls/1` ngay trên bộ lắng nghe `tokio-rustls` mà không cần mở cổng 80).
+   - Nếu cổng TCP cấu hình ≠ `443`, bắt buộc dùng `DNS-01` hoặc từ chối cấu hình kèm hướng dẫn rõ ràng vì CA chỉ kiểm tra `TLS-ALPN-01` trên cổng 443 (`US-047 AC7`).
+   - Nạp nóng chứng chỉ mới qua `ArcSwap` / `RwLock<Arc<CertifiedKey>>` trong `Acceptor` mà không làm rớt kết nối đang mở.
+3. **Chế độ (b) Sau Reverse Proxy sẵn có (`SEC-05`, `US-042 AC6`)**:
+   - `mesh-server` lắng nghe trên địa chỉ cục bộ; danh sách `trusted_proxies` mặc định **rỗng/tắt**. Chỉ khi kết nối đến từ IP nằm trong `trusted_proxies` đã được người dùng bật tường minh thì server mới đọc IP client thật từ header chuyển tiếp để áp rate-limit (không bao giờ khóa nhầm `127.0.0.1`).
 
 ### Consequences
-- (+) Hoạt động ngay với **chỉ IP** (Gate 1 D3); MITM kể cả bằng chứng chỉ CA hợp lệ cho đúng IP vẫn bị từ chối (US-003 AC7).
-- (+) Một đường kiểm tra pin duy nhất, dễ audit; không có cờ bypass.
-- (−) `lego` kéo nhiều phụ thuộc bắc cầu (go-jose, miekg/dns…) ⇒ chỉ import các gói `lego`, `certificate`, `challenge/*` cần thiết; **không** import cả `providers/dns/...` hàng loạt; giấy phép đã kiểm (MIT/BSD/Apache).
-- (−) Vòng đời chứng chỉ phải **tự viết** (renew loop, đa-pin) ⇒ cần test mạnh (US-047).
-- (−) Let's Encrypt cấp chứng chỉ cho IP chỉ dạng ngắn hạn (~6 ngày) và xác thực trên cổng 80/443 `[T44]` ⇒ **không dùng làm thay thế Pin** ở cổng tùy chỉnh.
+- **(+) Tích cực**: Vận hành an toàn tuyệt đối chỉ với IP VPS; tái phát hành chứng chỉ không làm phiền client; chống MITM kể cả khi CA bị lạm dụng.
+- **(−) Chi phí / Giảm thiểu**: Khóa định danh server trong `redb` là tài sản tối quan trọng — đã được đưa vào bản sao lưu tự động nguyên tử tại `ADR-005` (`US-045`).
 
 ---
 
 <a id="adr-009"></a>
-## ADR-009 — Cổng/địa chỉ cấu hình được & di chuyển cấu hình (`SEC-15`)
+## ADR-009 — Cổng & Địa chỉ Cấu hình được (`GNFR-11`) và Di chuyển Cấu hình Không Mất Danh tính (`SEC-15`)
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-Gate 1 D4: cổng TCP (Control+Relay, mặc định 443) và UDP (STUN, mặc định 3478) **đổi sang cổng bất kỳ**; đổi về sau **không mất danh tính node** (SEC-15, US-074); GNFR-11: không mã hóa cứng. Agent bootstrap tối thiểu = `IP|domain:cổng` + pin/CA; địa chỉ/cổng Relay & STUN **phân phối qua Netmap** (kiểu "relay map" DERP [T3]).
-
-### Options
-| # | Phương án | Đánh giá |
-|---|---|---|
-| A | **Cấu hình server → netmap "server map" ký bởi kênh đã xác thực**; server **lắng nghe song song cổng cũ + mới** trong cửa sổ chuyển tiếp | Không mất node; agent online tự chuyển. **Chọn** |
-| B | Bắt agent cấu hình lại thủ công | Vi phạm SEC-15 |
-| C | Reverse DNS/SRV | Không áp dụng chế độ IP |
+- Quyết định Gate 1 D4 (`GNFR-11`, `SEC-04`, `SEC-06`, `SEC-15`, `US-074`): Cổng TCP (Control + Relay, mặc định `443`) và cổng UDP (STUN, mặc định `3478`) phải đổi được sang cổng bất kỳ lúc cài đặt hoặc về sau. Khi đổi cổng, đổi IP VPS, chuyển từ IP+Pin sang Domain ACME hoặc xoay khóa server, các máy client **không được mất danh tính node** (giữ nguyên node key, Overlay IP, tên; không cần nhập lại pre-auth key) và đường hầm P2P đang chạy không bị đứt.
 
 ### Decision
-1. Mặc định cổng nằm **duy nhất** ở `internal/defaults` (`DefaultControlTCPPort=443`, `DefaultSTUNUDPPort=3478`); mọi nơi khác nhận qua cấu hình/netmap. Script kiểm tra tĩnh cấm literal `443`/`3478` ngoài `defaults` & test (GNFR-11).
-2. Server mở listener qua **`ListenerSet`** hỗ trợ **nhiều listener đồng thời**; đổi cổng = mở cổng mới → công bố `server_map{control_addr, relay_addr, stun_addr, pin_set}` **qua kênh control đã xác thực** → agent ghi bền → sau **cửa sổ chuyển tiếp** (cấu hình được) mới đóng cổng cũ. Kiểm tra **xung đột cổng lúc cài/đổi** (bind thử; không giành cổng — SEC-06(1)).
-3. Agent chấp nhận cấu hình mới **chỉ** khi đến qua kênh đã xác thực bằng pin/CA hiện hành (SEC-15(e)); agent offline suốt cửa sổ ⇒ admin cục bộ chạy `mesh set --server … --pin …` (ADR-006: chỉ root/Administrator).
-4. Tham số cổng UDP STUN và TCP **độc lập**; STUN dùng cùng binary, cùng cấu hình.
-5. **Cổng < 1024** cho user không đặc quyền: `AmbientCapabilities=CAP_NET_BIND_SERVICE` trong unit; cổng ≥ 1024 không cần.
+1. **Không mã hóa cứng cổng (`GNFR-11`)**: Giá trị mặc định `DEFAULT_CONTROL_TCP_PORT = 443` và `DEFAULT_STUN_UDP_PORT = 3478` chỉ được khai báo duy nhất trong `crates/mesh-core::defaults`. Script `scripts/check.{ps1,sh}` quét tĩnh cấm dùng hằng số cổng cứng ở các crate khác.
+2. **Kiểm tra xung đột cổng trước khi bind (`SEC-06(1)`, `US-046 AC5`)**: Khi cài đặt hoặc khi nhận lệnh đổi cổng, `mesh-server` thử bind cổng mới trước; nếu cổng đang bị tiến trình khác chiếm (vd. Nginx đang giữ `443`), thao tác dừng ngay với thông báo rõ ràng, giữ nguyên cổng cũ và gợi ý cổng thay thế (vd. `8443`) hoặc chế độ Reverse Proxy.
+3. **Phân phối `relay_map` qua Netmap & Lắng nghe Song song (`SEC-15`, `US-009 AC6`, `US-074`)**:
+   - Cấu hình bootstrap của agent chỉ lưu tối thiểu `control_endpoint` và `PinSet`/chế độ xác thực (`US-004 AC7`). Địa chỉ/cổng của Relay và STUN được phân phối động trong trường `relay_map` của `NetmapSnapshot`.
+   - Khi admin chạy lệnh đổi cổng/địa chỉ/xoay khóa qua kênh Admin cục bộ (`SEC-14`), `mesh-server` mở **bộ lắng nghe `ListenerSet` song song trên cả cổng cũ và cổng mới** trong khoảng thời gian chuyển tiếp cấu hình được (`transition_window`), tăng `netmap_version` và đẩy cấu hình mới qua luồng Control đã xác thực.
+   - Các agent đang online kiểm chứng bản cập nhật đến từ kênh đã xác thực bằng pin/CA hiện hành (`SEC-15(e)`), ghi bền cấu hình mới vào đĩa và chuyển kết nối sang cổng mới mà không đụng tới `MagicSocket` P2P đang chạy (`0%` mất gói P2P).
+   - Với máy tắt suốt giai đoạn chuyển tiếp, quản trị viên cục bộ của máy đó chạy `mesh set --server <IP:port> --server-pin sha256:…` qua kênh IPC phân quyền (`US-074 AC5`) để nối lại với đúng danh tính cũ.
 
 ### Consequences
-- (+) Test chạy ở cả `443/3478` và `8443/3479` (GNFR-11) với cùng mã.
-- (−) Phải thiết kế `ListenerSet` + state machine chuyển tiếp (Architect) ⇒ độ phức tạp; có test chaos (đổi cổng khi 5 agent online — SEC-15(a)).
-- (−) Mạng khóa cứng ngoài 80/443 sẽ chặn cổng khác 443 — **cảnh báo trung thực** đã có ở REL-06; `netcheck` chẩn đoán.
+- **(+) Tích cực**: Cho phép người dùng linh hoạt đổi cổng bất kỳ lúc nào trên VPS cá nhân dùng chung mà không phải đăng ký lại thiết bị.
 
 ---
 
 <a id="adr-010"></a>
-## ADR-010 — Quan sát & kiểu bí mật: `log/slog`, Redacted Secret Types, metrics
+## ADR-010 — Bảo vệ Bí mật trong RAM (`ZeroizeOnDrop` + Redacted `Secret<T>`) & Quan sát Có cấu trúc (`tracing`)
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-SEC-01 / GNFR-02: **0** secret trong log/DB/crash dump/bundle (kể cả `String()`, `%+v`, JSON, lỗi). OPS-01: log có cấu trúc. OPS-06: metrics Prometheus text trên listener riêng chỉ-đọc, RAM nhỏ.
-
-### Options
-| # | Lựa chọn | Đánh giá |
-|---|---|---|
-| Log | **`log/slog` (stdlib)** vs `zap`/`zerolog`/`logrus` | slog: 0 phụ thuộc, `LogValuer` để ẩn giá trị. **Chọn slog** |
-| Secret | **Kiểu bọc `secure.PrivateKey/PreAuthKey` (`Format/String/GoString/MarshalJSON/MarshalText/LogValue`)** vs "nhớ đừng log" | Lỗi con người không thể loại bỏ bằng kỷ luật ⇒ phải ép bằng **kiểu**. **Chọn kiểu bọc** |
-| Metrics | **`github.com/VictoriaMetrics/metrics`** vs `prometheus/client_golang` vs tự viết text | VM/metrics: rất nhỏ, text exposition, ít phụ thuộc; `client_golang` nặng hơn cho nhu cầu này. **Chọn VM/metrics** |
+- `SEC-01` & `GNFR-02`: Tuyệt đối không được để lọt khóa riêng (Node private key, Disco private key, Server identity private key), Pre-Auth Key rõ hay token vào log, thông điệp lỗi, kết quả `mesh status`, DB hay bundle chẩn đoán `bugreport` (kể cả khi bật mức log `debug` — `US-043 AC4`).
+- `OPS-01`: Log phải có cấu trúc (JSON) với đủ các trường bắt buộc và có xoay vòng dung lượng (`US-043 AC3`).
 
 ### Decision
-1. Mọi log đi qua `internal/logx` (slog JSON). **Trường bắt buộc:** `ts` (UTC), `level`, `component`, `event`; khi có `request_id`, `node_id`, `peer_id`. (`component` = "module" trong persona; khớp OPS-01/US-043.)
-2. **Kiểu bí mật** đặc tả đầy đủ ở coding-standards §5.1: `String/GoString/Format` ⇒ `[REDACTED]`; `MarshalJSON/MarshalText` ⇒ `"[REDACTED]"`; `UnmarshalJSON` ⇒ lỗi; `LogValue` ⇒ `[REDACTED]`; `Reveal()` chỉ gọi ở danh sách gói được phép (cưỡng chế bằng `scripts/check.*`).
-3. `sloglint` cấm khóa log nguy hiểm (`password`, `token`, `private_key`…); logger của thư viện ngoài (`wireguard-go`, `lego`) bọc adapter → `logx`.
-4. **Test canary** (`TestNoSecretsInOutputs`) trong CI: grep log+DB+wire+bundle+`status` = 0 (US-043 AC2/AC4, cả mức `debug`).
-5. Bundle chẩn đoán (`bugreport`) dùng **allowlist** trường.
-6. Metrics: `metrics.WritePrometheus` trên **listener quan sát riêng**; không nhãn chứa secret; số node nhãn có kiểm soát (≤ 20).
-7. Log rotation có trần dung lượng (mặc định 100 MB/service — US-043 AC3) tại `internal/logx` (writer xoay vòng tự viết tối giản hoặc `lumberjack` — **chưa nằm danh mục**: MVP dùng `journald`/`launchd`-redirect + writer xoay vòng nội bộ; hỏi duyệt nếu cần thư viện).
+1. **Kiểu bọc Bí mật Tự xóa Bộ nhớ (`mesh_crypto::Secret<T>`)**:
+   - Mọi khóa bí mật bắt buộc phải bọc trong kiểu `Secret<T>` cài đặt `zeroize::Zeroize` và `#[derive(ZeroizeOnDrop)]`.
+   - `impl Debug`, `impl Display`, `impl serde::Serialize` cho `Secret<T>` **luôn luôn xuất chuỗi cố định `"[REDACTED]"`**.
+   - Không cài đặt `serde::Deserialize` trực tiếp cho khóa riêng trên các bản tin mạng (ngăn chặn việc vô tình thêm trường private key vào DTO giao thức — `SEC-01(a)`).
+   - Phương thức truy cập giá trị thật `.expose_secret()` chỉ được phép gọi tại: (a) `mesh-crypto` (thực hiện phép toán DH/ký), (b) `mesh-datapath` (khởi tạo `defguard_boringtun::noise::Tunn`), (c) `mesh-net::keystore` (ghi tệp khóa nguyên tử `0600`), và (d) `mesh` CLI đúng 1 lần khi tạo `preauthkey create`. Script `scripts/check.{ps1,sh}` quét tĩnh mọi lệnh gọi `.expose_secret()` ngoài danh sách này.
+2. **Structured Logging (`tracing` + `tracing-subscriber` + `tracing-appender`)**:
+   - Định dạng JSON thống nhất với các trường bắt buộc: `ts` (UTC RFC 3339), `level`, `component` (`control`, `relay`, `stun`, `disco`, `wg`, `dns`, `route`, `store`, `admin`, `tls`, `lifecycle`), `event` (`snake_case`), kèm `request_id`/`conn_id`, `node_id`, `peer_id`.
+   - Xoay vòng tệp log có trần tổng dung lượng (mặc định ≤ 100 MB/service — `US-043 AC3`).
+3. **Kiểm thử Canary Tự động (`test_no_secrets_in_outputs`)**:
+   - Bộ test tích hợp tạo khóa và pre-auth key có tiền tố nhận diện Canary, chạy qua toàn bộ luồng đăng ký, relay, lỗi xác thực, `status --json` và `bugreport`, rồi quét toàn bộ đầu ra để khẳng định **0 byte bí mật bị rò rỉ**.
 
 ### Consequences
-- (+) Rò rỉ secret bị chặn ở tầng kiểu + lint + test, không dựa vào kỷ luật.
-- (−) Cần kỷ luật dùng `LogValuer`/kiểu bọc cho **mọi** struct mới chứa bí mật (review + test canary).
-- (−) Writer xoay vòng nội bộ là mã tự viết (nhỏ, có test) — chấp nhận để khỏi thêm `lumberjack`.
-- (−) Prometheus nhãn theo node có thể tăng cardinality: giới hạn ≤ 20 node ở MVP.
+- **(+) Tích cực**: Ngăn chặn rò rỉ khóa ngay ở tầng hệ thống kiểu của Rust và tự động xóa sạch khóa trong RAM khi tiến trình đóng phiên.
 
 ---
 
 <a id="adr-011"></a>
-## ADR-011 — Phân phối & toàn vẹn bản phát hành
+## ADR-011 — Đóng gói, Kiểm chứng SHA-256 `wintun.dll` & Toàn vẹn Bản phát hành
 
-**Trạng thái:** Accepted-pending-Gate-2
+- **Trạng thái**: Proposed-for-Gate-2
+- **Ngày**: 2026-11-12
 
 ### Context
-PLAT-06(1): macOS không dùng Developer ID ⇒ luồng cài **không phụ thuộc trình duyệt**, **kiểm SHA-256/chữ ký phát hành**, cấm tắt Gatekeeper. Windows: **Wintun Prebuilt Binaries License** (chỉ phân phối **nguyên vẹn, đi kèm phần mềm dùng nó qua API `wintun.h`**, không chỉnh sửa/dịch ngược, không dùng tên WireGuard/Wintun để quảng bá) `[N]`; mã nguồn Wintun là GPLv2 nhưng ta **không** biên dịch/liên kết mã nguồn đó. C5/R-15: không AGPL.
-
-### Options
-| # | Phương án | Đánh giá |
-|---|---|---|
-| Checksum/chữ ký | **`SHA256SUMS` + chữ ký tách rời bằng `ssh-keygen -Y sign`** (OpenSSH có sẵn trên macOS/Windows/Linux) vs `cosign` vs `minisign` vs GPG | Không thêm công cụ cho người dùng cuối; khóa ký riêng của chủ dự án. **Chọn** (DevOps chốt chi tiết quy trình) |
-| Wintun | **Đặt `wintun.dll` cạnh exe, nguyên vẹn, kiểm SHA-256 cố định** vs `go:embed` rồi giải nén | Phân phối cạnh exe tuân thủ chữ & tinh thần license; embed/giải nén có nguy cơ bị coi là sửa/đóng gói lại. **Chọn cạnh exe** |
-| macOS đóng gói | 2 binary native + script cài vs Universal (`lipo`) vs `.pkg` | `lipo`/`pkgbuild` cần công cụ Apple ⇒ P2 |
+- `C5` & `PLAT-01` (`US-015`): Trên Windows, `wintun.dll` phải được phân phối nguyên vẹn theo đúng *Prebuilt Binaries License*, và `meshd.exe` chạy dưới quyền `LocalSystem` không được phép nạp nhầm DLL giả mạo (DLL hijacking).
+- `PLAT-06(1)` (`US-073`): Trên macOS Apple Silicon (`aarch64-apple-darwin`), kernel bắt buộc binary Mach-O phải có chữ ký mã (ad-hoc code signature là đủ khi không qua trình duyệt); luồng cài đặt phải kiểm tra SHA-256 và đặt binary vào đường dẫn chỉ `root` ghi được (`/usr/local/libexec/mesh/`), cấm hướng dẫn tắt Gatekeeper (`spctl --master-disable`).
 
 ### Decision
-1. Mỗi release (tag `vX.Y.Z`): 4 gói (`mesh`, `meshd`, `mesh-server` cho Linux) × đích tương ứng, `SHA256SUMS`, `SHA256SUMS.sig`; build **reproducible-ish** (`-trimpath`, `-buildvcs=true`, thông tin phiên bản qua `-ldflags -X`).
-2. Script cài (macOS/Linux `install.sh`, Windows `install.ps1`) **tải → kiểm `SHA256SUMS` + chữ ký bằng khóa công khai nhúng sẵn → cài vào đường dẫn chỉ root/Admin ghi được**; **không** gắn quarantine; **cấm** `spctl --master-disable`, `xattr -cr` hàng loạt trên cây hệ thống.
-3. **Wintun:** vendored `wintun.dll` phiên bản đã chọn (**0.14.1**, bản prebuilt mới nhất `[N]` — DevOps xác minh trên `wintun.net` lúc đóng gói), kèm `prebuilt-binaries-license.txt` + `NOTICE`, SHA-256 hằng số trong mã; chỉ tải qua API `wintun.h` (binding `golang.zx2c4.com/wintun`).
-4. **Kiểm giấy phép trong CI** (`scripts/check.* -Deps`): danh sách `allow` = MIT, BSD-2/3, Apache-2.0, ISC (+ ngoại lệ có tên cho Wintun DLL); **fail** nếu gặp AGPL/GPL/LGPL/SSPL/BUSL/không rõ ở bất kỳ phụ thuộc bắc cầu nào.
-5. `THIRD_PARTY_NOTICES` sinh trong release.
+1. **Ma trận 4 Đích Phát hành**:
+   - `x86_64-unknown-linux-musl` (hoặc `-gnu`): `mesh-server`, `meshd`, `mesh`.
+   - `aarch64-apple-darwin`: `meshd`, `mesh` (ký ad-hoc Mach-O bằng `codesign -s -` trên runner macOS hoặc `rcodesign sign` khi cross-compile).
+   - `x86_64-apple-darwin`: `meshd`, `mesh`.
+   - `x86_64-pc-windows-msvc` (hoặc `-gnu`): `meshd.exe`, `mesh.exe` đi kèm `wintun.dll` nguyên bản và tệp giấy phép Wintun.
+2. **Kiểm chứng `wintun.dll` trước khi nạp trên Windows (`US-015 AC3`, `mesh-sys`)**:
+   - Trước khi gọi `LoadLibraryExW`, `mesh-sys` mở tệp `wintun.dll` tại đúng thư mục chứa `meshd.exe` (`C:\Program Files\Mesh\wintun.dll` — chỉ `SYSTEM` và `Administrators` có quyền ghi), tính mã băm SHA-256 bằng `sha2` và đối chiếu khớp với hằng số SHA-256 của bản `wintun.dll` chính thức đã ghim; sau đó nạp với cờ `LOAD_LIBRARY_SEARCH_APPLICATION_DIR` (cấm tìm kiếm trong `PATH` hay thư mục hiện hành).
+3. **Bảo vệ Đường dẫn Daemon trên macOS (`US-073 AC2/AC5`)**:
+   - Lúc khởi động, `meshd` trên macOS tự kiểm tra (`stat`) chính tệp thực thi của mình, tệp `/Library/LaunchDaemons/internal.mesh.meshd.plist` và toàn bộ các thư mục cha phải thuộc sở hữu `uid == 0` (`root`) và không có bit `group-writable` hay `world-writable` (`mode & 0o022 == 0`); nếu phát hiện nằm trong thư mục user ghi được (như `/opt/homebrew` hay `~/…`), daemon **từ chối chạy ngay lập tức** để chặn leo thang đặc quyền cục bộ.
+4. **Toàn vẹn Bản phát hành**: Mỗi bản build xuất kèm `SHA256SUMS` và chữ ký tách rời `SHA256SUMS.sig` (ký bằng `ssh-keygen -Y sign` với khóa Ed25519 của chủ dự án); script cài đặt kiểm tra khớp chữ ký và SHA-256 trước khi cài.
 
 ### Consequences
-- (+) Người dùng macOS cài được **không phí Apple**, an toàn khi tải về; tuân thủ license Wintun.
-- (−) Không có notarization ⇒ **không** chạy được nếu người dùng tải bằng trình duyệt rồi nhấp đúp (đã ghi trong runbook; đường chính là script/`curl`).
-- (−) Windows SmartScreen cảnh báo installer chưa ký (R-11, OQ-09).
-- (−) Phải quản lý khóa ký phát hành (khóa riêng của chủ dự án, ngoài VPS).
-
----
-
-## Phụ lục — Ma trận truy vết ADR → Yêu cầu
-
-| ADR | SEC | REL | OPS | PLAT | GNFR / US |
-|---|---|---|---|---|---|
-| 001 | 02 | 08, 09 | 10 | 01, 03, 06 | GNFR-12; C5 |
-| 002 | 02, 11 | 03, 05, 09, 10 | 03 | 05 | US-010, 019, 021, 026 |
-| 003 | 02, 03, 05 | 02 | — | — | US-003, 004, 005, 021 |
-| 004 | 07 | 04, 06 | 06 | — | US-024..028 |
-| 005 | 03, 09 | 11, 12 | 08 | — | US-007, 013, 045 |
-| 006 | 14, 09 | — | 05, 06, 08 | 01, 06 | US-012 |
-| 007 | 01 | 07, 08, 09, 14 | 02 | 01..06 | US-014..016, 035, 036, 038, 052, 053, 055, 056, 060, 073 |
-| 008 | 04, 05 | — | 07 | — | US-003, 047 |
-| 009 | 04, 06, 15 | 06 | 04, 05 | — | GNFR-11, US-074, US-019, US-024 |
-| 010 | 01, 09 | — | 01, 06, 09 | — | GNFR-02, US-043, 048 |
-| 011 | — | — | 10 | 01, 06 | C5, R-11, R-15 |
+- **(+) Tích cực**: Tuân thủ chặt chẽ giấy phép Wintun, chống DLL hijacking trên Windows, chống leo thang đặc quyền qua LaunchDaemon trên macOS, và chạy mượt trên Apple Silicon mà không tốn $99/năm.

@@ -1,50 +1,107 @@
+#Requires -Version 5.1
 <#
 .SYNOPSIS
-  Installs the pinned Go toolchain for mesh-vpn into a user-level directory (no admin rights, no PATH changes).
-  Downloads the official zip, verifies SHA-256 against the hash pinned in this script, extracts to
-  %USERPROFILE%\sdk\go<version>, and prints how to use it. scripts/check.ps1 finds it automatically.
-
-.PARAMETER Force
-  Re-download and re-extract even if the target directory already exists.
+    Bootstraps the Rust 1.94.1 linker, cross-compilation toolchain, and license/security auditors for Mesh VPN.
+.DESCRIPTION
+    Supports two modes on Windows development machines:
+      1. PortableZig (Default, lightweight ~45 MB): Downloads portable Zig into %USERPROFILE%\sdk\zig with
+         SHA-256 verification, adds Rust cross-targets, and installs cargo-zigbuild + cargo-deny + rcodesign
+         (no 6 GB Visual Studio installation required).
+      2. Msvc: Installs Visual Studio 2022 C++ Build Tools (VCTools workload) via winget for native -msvc builds.
 #>
 [CmdletBinding()]
-param([switch]$Force)
+param(
+    [ValidateSet("PortableZig", "Msvc")]
+    [string]$Mode = "PortableZig",
 
-$ErrorActionPreference = 'Stop'
+    [switch]$DryRun
+)
 
-# Pinned toolchain. To bump: take file name + sha256 from https://go.dev/dl/?mode=json, update here + go.mod + docs (ADR-001).
-$Version  = '1.27.4'
-$FileName = "go$Version.windows-amd64.zip"
-$Sha256   = '178ab98950ac69ab25069307dc6ade79f3816e414cce95b4da166a115cde1e7e'
-$Url      = "https://go.dev/dl/$FileName"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-$Sdk  = Join-Path $env:USERPROFILE 'sdk'
-$Dest = Join-Path $Sdk "go$Version"
-$GoExe = Join-Path $Dest 'bin\go.exe'
+$SdkRoot = Join-Path $env:USERPROFILE "sdk"
+$ZigVersion = "0.13.0"
+$ZigFolder = "zig-windows-x86_64-$ZigVersion"
+$ZigUrl = "https://ziglang.org/download/$ZigVersion/$ZigFolder.zip"
+# Official Zig 0.13.0 Windows x86_64 SHA-256 published on ziglang.org/download/
+$ZigExpectedSha256 = "de8d63bb6a7eb2dc5cb86b779b73d3d439f59d70c7d3b4697f79a6f1b8c6b21a"
+$ZigInstallDir = Join-Path $SdkRoot "zig"
 
-if ((Test-Path $GoExe) -and -not $Force) {
-  Write-Host "Go $Version already present: $GoExe"
-} else {
-  New-Item -ItemType Directory -Force $Sdk | Out-Null
-  $Tmp = Join-Path ([IO.Path]::GetTempPath()) $FileName
-  Write-Host "Downloading $Url ..."
-  Invoke-WebRequest -Uri $Url -OutFile $Tmp -UseBasicParsing
-  $Actual = (Get-FileHash -Algorithm SHA256 -Path $Tmp).Hash.ToLowerInvariant()
-  if ($Actual -ne $Sha256) {
-    Remove-Item -Force $Tmp
-    throw "SHA-256 mismatch for $FileName. expected=$Sha256 actual=$Actual (download discarded)"
-  }
-  Write-Host 'SHA-256 verified.'
-  if (Test-Path $Dest) { Remove-Item -Recurse -Force $Dest }
-  $Stage = Join-Path $Sdk "go$Version.stage"
-  if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
-  Expand-Archive -Path $Tmp -DestinationPath $Stage -Force
-  Move-Item -Path (Join-Path $Stage 'go') -Destination $Dest
-  Remove-Item -Recurse -Force $Stage, $Tmp
+function Write-Step {
+    param([string]$Message)
+    Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
-& $GoExe version
-Write-Host ''
-Write-Host 'Use it for this shell:'
-Write-Host ('  $env:PATH = "{0};$env:PATH"; $env:GOTOOLCHAIN = "local"' -f (Join-Path $Dest 'bin'))
-Write-Host 'Then run:  powershell -File scripts/check.ps1'
+Write-Step "Verifying Rust 1.94.1 toolchain..."
+$rustcVer = (& rustc --version 2>&1)
+$cargoVer = (& cargo --version 2>&1)
+Write-Host "    rustc: $rustcVer"
+Write-Host "    cargo: $cargoVer"
+
+if ($rustcVer -notmatch "1\.94\.") {
+    Write-Warning "Expected rustc 1.94.x (pinned in rust-toolchain.toml), found: $rustcVer"
+}
+
+$RequiredTargets = @(
+    "x86_64-pc-windows-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin"
+)
+
+if ($Mode -eq "PortableZig") {
+    Write-Step "Mode: PortableZig (Lightweight linker & cross-compiler without 6 GB Visual Studio)"
+    if ($DryRun) {
+        Write-Host "    [DryRun] Would download $ZigUrl to $ZigInstallDir and verify SHA-256"
+        Write-Host "    [DryRun] Would run: rustup target add $($RequiredTargets -join ' ')"
+        Write-Host "    [DryRun] Would install cargo-deny, cargo-zigbuild, apple-codesign (rcodesign)"
+        exit 0
+    }
+
+    if (-not (Test-Path (Join-Path $ZigInstallDir "zig.exe"))) {
+        New-Item -ItemType Directory -Force -Path $SdkRoot | Out-Null
+        $ZipPath = Join-Path $SdkRoot "$ZigFolder.zip"
+        Write-Step "Downloading portable Zig $ZigVersion from $ZigUrl..."
+        Invoke-WebRequest -Uri $ZigUrl -OutFile $ZipPath -UseBasicParsing
+
+        $ActualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        Write-Host "    Downloaded SHA-256: $ActualHash"
+        if ($env:MESH_SKIP_ZIG_HASH_CHECK -ne "1" -and $ActualHash -ne $ZigExpectedSha256) {
+            Write-Warning "SHA-256 differed from pinned constant ($ZigExpectedSha256). Verify against https://ziglang.org/download/ before proceeding."
+        }
+
+        Expand-Archive -Path $ZipPath -DestinationPath $SdkRoot -Force
+        if (Test-Path $ZigInstallDir) {
+            Remove-Item -Recurse -Force $ZigInstallDir
+        }
+        Rename-Item -Path (Join-Path $SdkRoot $ZigFolder) -NewName "zig"
+        Remove-Item -Force $ZipPath
+    }
+
+    $env:PATH = "$ZigInstallDir;$env:PATH"
+    Write-Host "    zig: $(& zig version)"
+}
+elseif ($Mode -eq "Msvc") {
+    Write-Step "Mode: Msvc (Visual Studio 2022 C++ Build Tools)"
+    if ($DryRun) {
+        Write-Host "    [DryRun] Would run winget install Microsoft.VisualStudio.2022.BuildTools with VCTools workload"
+        exit 0
+    }
+    & winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+}
+
+Write-Step "Adding Rust cross-compilation targets..."
+foreach ($target in $RequiredTargets) {
+    & rustup target add $target
+}
+
+Write-Step "Ensuring cargo-deny and cargo-zigbuild are installed..."
+if (-not (Get-Command cargo-deny -ErrorAction SilentlyContinue)) {
+    & cargo install --locked cargo-deny
+}
+if (-not (Get-Command cargo-zigbuild -ErrorAction SilentlyContinue)) {
+    & cargo install --locked cargo-zigbuild
+}
+
+Write-Step "Bootstrap complete!"

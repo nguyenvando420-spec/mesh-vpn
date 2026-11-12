@@ -1,0 +1,86 @@
+# cargo-deny configuration — Mesh VPN
+# Enforces C5 / R-15 (strict ban on AGPL/GPL/LGPL/MPL-2.0 and C-library bloat), CVE checks, and duplicate crate hygiene.
+
+[graph]
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "x86_64-pc-windows-gnu" },
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Strictly permissive licenses only (C5: NO AGPL, GPL, LGPL, MPL-2.0)
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+
+[ licenses.private ]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Explicitly banned crates (Tech Stack Decision §7.2)
+deny = [
+    # Copyleft / MPL-2.0 WireGuard fork
+    { name = "gotatun", reason = "Uses MPL-2.0 license; use defguard_boringtun (BSD-3-Clause) instead" },
+    # C-library wrappers that break Pure-Rust / Zero-C cross-compilation
+    { name = "openssl", reason = "C OpenSSL is banned; use rustls (Pure-Rust / ring)" },
+    { name = "openssl-sys", reason = "C OpenSSL FFI is banned; use rustls" },
+    { name = "native-tls", reason = "OS native TLS is banned; use rustls with SpkiPinVerifier" },
+    { name = "rusqlite", reason = "C SQLite is banned; use pure-Rust redb (ADR-005)" },
+    { name = "libsqlite3-sys", reason = "C SQLite FFI is banned; use pure-Rust redb (ADR-005)" },
+    { name = "libsodium-sys", reason = "C libsodium FFI is banned; use pure-Rust crypto_box / x25519-dalek" },
+    { name = "aws-lc-rs", reason = "Requires CMake and NASM on Windows; configure rustls with ring or rustls-rustcrypto" },
+    { name = "aws-lc-sys", reason = "Requires CMake and NASM on Windows; configure rustls with ring or rustls-rustcrypto" },
+    # Weak / obsolete cryptography (SEC-02)
+    { name = "md5", reason = "Weak hash algorithm banned by SEC-02; use sha2 (SHA-256)" },
+    { name = "md-5", reason = "Weak hash algorithm banned by SEC-02; use sha2 (SHA-256)" },
+    { name = "sha1", reason = "Weak hash algorithm banned by SEC-02; use sha2 (SHA-256)" },
+    # Duplicate runtimes / web frameworks / loggers / DBs
+    { name = "async-std", reason = "Use tokio as the single async runtime" },
+    { name = "smol", reason = "Use tokio as the single async runtime" },
+    { name = "actix-web", reason = "Use axum for HTTP/WebSocket routing" },
+    { name = "warp", reason = "Use axum for HTTP/WebSocket routing" },
+    { name = "rocket", reason = "Use axum for HTTP/WebSocket routing" },
+    { name = "sled", reason = "Unstable embedded DB; use pure-Rust redb (ADR-005)" },
+    { name = "sqlx", reason = "Use pure-Rust redb (ADR-005)" },
+    { name = "diesel", reason = "Use pure-Rust redb (ADR-005)" },
+    { name = "sea-orm", reason = "Use pure-Rust redb (ADR-005)" },
+    { name = "env_logger", reason = "Use tracing + tracing-subscriber for structured JSON logging" },
+    { name = "log4rs", reason = "Use tracing + tracing-subscriber for structured JSON logging" },
+    # Loose error handling
+    { name = "anyhow", reason = "Use thiserror and mesh_core::error::AppError for typed error handling" },
+    { name = "eyre", reason = "Use thiserror and mesh_core::error::AppError for typed error handling" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

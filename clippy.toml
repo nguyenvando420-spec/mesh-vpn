@@ -1,0 +1,23 @@
+# Clippy configuration — Mesh VPN (Rust 1.94.1)
+# Enforces complexity thresholds, secret hygiene, and bans unsafe/blocking patterns.
+
+msrv = "1.94.1"
+cognitive-complexity-threshold = 20
+too-many-arguments-threshold = 6
+too-many-lines-threshold = 80
+type-complexity-threshold = 250
+
+# Allow unwrap/expect/panic/dbg inside #[cfg(test)] unit/integration tests for concise assertions
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+allow-print-in-tests = true
+
+# Disallow blocking sleep or unauthenticated/legacy primitives in async/security code
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "Use tokio::time::sleep in async tasks to avoid blocking Tokio worker threads" },
+    { path = "std::env::set_var", reason = "Mutating process environment at runtime is not thread-safe in Rust 2024" },
+    { path = "std::env::remove_var", reason = "Mutating process environment at runtime is not thread-safe in Rust 2024" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "Unbounded channels risk OOM and Head-of-Line blocking (US-025 AC6); use bounded mpsc::channel with try_send" },
+]

@@ -1,142 +1,103 @@
 #!/bin/sh
-# Standard Check Commands for mesh-vpn (macOS / Linux / CI). Must be GREEN (exit 0) before any hand-over.
-# Mirrors scripts/check.ps1 (see docs/03-system-design/coding-standards.md section 10).
-#
-# Usage: sh scripts/check.sh [--race] [--deps] [--fix] [--quick]
-#   --race   run `go test -race` (needs cgo + C compiler; on Linux/macOS runs natively)
-#   --deps   also run govulncheck + licence policy (mandatory in CI)
-#   --fix    apply formatter fixes instead of only checking
-#   --quick  local iteration only (skips cross-OS lint/build matrix and race). NOT acceptable for hand-over.
+# Standard Check Command for Mesh VPN (Rust 1.94.1) on Linux / macOS.
+# Enforces static repository & security rules, rustfmt, clippy (-D warnings), unit/property tests, and cargo-deny.
+
 set -eu
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+cd "$REPO_ROOT"
 
-RACE=0 DEPS=0 FIX=0 QUICK=0
-for a in "$@"; do
-  case "$a" in
-    --race) RACE=1 ;;
-    --deps) DEPS=1 ;;
-    --fix) FIX=1 ;;
-    --quick) QUICK=1 ;;
-    *) echo "unknown flag: $a" >&2; exit 2 ;;
+CROSS=0
+for arg in "$@"; do
+  case "$arg" in
+    --cross) CROSS=1 ;;
+    *)
+      echo "Unknown option: $arg (supported: --cross)" >&2
+      exit 2
+      ;;
   esac
 done
 
-PINNED_GO="1.27"
-TARGETS="linux/amd64 darwin/arm64 darwin/amd64 windows/amd64"
-LINT_OS="linux darwin windows"
-FAILED=""
+echo "==> [1/5] Checking Rust toolchain version..."
+rustc --version
+cargo --version
 
-GO="${MESH_GO:-go}"
-if ! command -v "$GO" >/dev/null 2>&1; then
-  if [ -x "$HOME/sdk/go1.27.4/bin/go" ]; then GO="$HOME/sdk/go1.27.4/bin/go"; else echo "Go toolchain not found" >&2; exit 2; fi
+echo "==> [2/5] Enforcing static repository & security rules..."
+
+# 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF)
+BOM_FILES=$(find . -type f \
+  -not -path './.git/*' \
+  -not -path './target/*' \
+  -not -path './docs/04-sprint-management/*' \
+  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
+  -exec awk 'NR==1 && /^\xEF\xBB\xBF/ { print FILENAME }' {} +)
+
+if [ -n "$BOM_FILES" ]; then
+  echo "ERROR: UTF-8 BOM detected in files (must be UTF-8 without BOM):" >&2
+  echo "$BOM_FILES" >&2
+  exit 1
 fi
 
-# golangci-lint itself shells out to `go`: make sure the chosen toolchain is first on PATH.
-case "$GO" in */*) PATH="$(dirname "$GO"):$PATH"; export PATH ;; esac
-
-export CGO_ENABLED=0   # invariant (ADR-001); only the race step overrides it
-export GOTOOLCHAIN=local
-export GOFLAGS=-mod=readonly
-
-step() { # step "name" command...
-  name="$1"; shift
-  printf '==> %s\n' "$name"
-  if ! "$@"; then
-    printf '    FAILED: %s\n' "$name" >&2
-    FAILED="$FAILED | $name"
-  fi
-}
-
-host_os=$($GO env GOOS)
-host_arch=$($GO env GOARCH)
-
-get_tool() { env -u GOOS -u GOARCH "$GO" tool -n -modfile=tools/go.mod "$1" | tail -n 1; }
-
-check_go_version() {
-  v=$($GO version); echo "    $v"
-  case "$v" in *" go$PINNED_GO."*) return 0 ;; esac
-  echo "expected Go $PINNED_GO.x, got: $v" >&2; return 1
-}
-
-check_module() { "$GO" mod verify && "$GO" mod tidy -diff; }
-
-check_repo_rules() {
-  rc=0
-  files=$(find . -name '*.go' -not -path './.git/*' -not -path './tools/*' -not -path '*/testdata/*' -not -path './vendor/*')
-  # shellcheck disable=SC2086
-  [ -n "$files" ] || { true; }
-  for f in $files; do
-    p=${f#./}
-    case "$p" in *_test.go) is_test=1 ;; *) is_test=0 ;; esac
-    awk -v P="$p" -v T="$is_test" '
-      { l=$0; t=l; sub(/^[ \t]+/, "", t); if (substr(t,1,2)=="//") next }
-      l ~ /InsecureSkipVerify/ && P !~ /^internal\/tlspin\// { printf "    %s:%d InsecureSkipVerify outside internal/tlspin (SEC-04)\n", P, NR; bad=1 }
-      T==0 && P !~ /^internal\/defaults\// && l ~ /(^|[^A-Za-z0-9_.])(443|3478)([^A-Za-z0-9_.]|$)/ { printf "    %s:%d hard-coded port 443/3478 (GNFR-11): use internal/defaults\n", P, NR; bad=1 }
-      T==0 && P !~ /^internal\/(httpx|listener)\// && l ~ /(net\.Listen\("tcp|net\.ListenTCP|tls\.Listen\(|http\.ListenAndServe)/ { printf "    %s:%d TCP listener outside internal/httpx|listener (SEC-14)\n", P, NR; bad=1 }
-      T==0 && P !~ /^(internal\/(secure|keystore|adminapi)\/|internal\/datapath\/wgcfg\/|cmd\/mesh\/)/ && l ~ /\.Reveal\(\)/ { printf "    %s:%d Reveal() outside allowed packages (SEC-01)\n", P, NR; bad=1 }
-      l ~ /import "C"/ { printf "    %s:%d cgo is forbidden (ADR-001)\n", P, NR; bad=1 }
-      l ~ /spctl[ \t]+--master-disable/ { printf "    %s:%d disabling Gatekeeper is forbidden (PLAT-06)\n", P, NR; bad=1 }
-      END { exit bad }' "$f" || rc=1
-  done
-  # UTF-8 BOM check
-  for f in $(find . \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' -o -name '*.toml' -o -name '*.yml' -o -name '*.yaml' -o -name '*.json' -o -name '*.sql' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' \) -not -path './.git/*'); do
-    if head -n 1 "$f" | LC_ALL=C grep -q "^$(printf '\357\273\277')"; then echo "    $f has a UTF-8 BOM" >&2; rc=1; fi
-  done
-  return $rc
-}
-
-# Decide by the presence of .go files, NOT by `go list` success: a syntax error must never look like "no code yet".
-has_go_packages() { [ -n "$(find . -name '*.go' -not -path './.git/*' -not -path './tools/*' -not -path '*/testdata/*' -not -path './vendor/*' | head -n 1)" ]; }
-
-lint_all() {
-  lint=$(get_tool golangci-lint)
-  for os in $1; do
-    echo "    -> GOOS=$os"
-    GOOS=$os "$lint" run ./... || return 1
-  done
-}
-
-vet_build_all() {
-  for t in $1; do
-    os=${t%/*}; arch=${t#*/}
-    echo "    -> $t"
-    GOOS=$os GOARCH=$arch "$GO" vet ./... || return 1
-    GOOS=$os GOARCH=$arch "$GO" build -trimpath ./... || return 1
-  done
-}
-
-race_tests() {
-  CGO_ENABLED=1 "$GO" test -race -shuffle=on -count=1 -timeout 10m ./...
-}
-
-step "toolchain: go version" check_go_version
-step "module: go mod verify + tidy -diff" check_module
-step "repo rules: forbidden patterns, BOM, cgo" check_repo_rules
-
-if has_go_packages; then
-  lint_bin=$(get_tool golangci-lint)
-  if [ "$FIX" = 1 ]; then step "format (fix)" "$lint_bin" fmt; else step "format check (gofumpt + gci)" "$lint_bin" fmt --diff; fi
-
-  if [ "$QUICK" = 1 ]; then os_list="$host_os"; tg="$host_os/$host_arch"; else os_list="$LINT_OS"; tg="$TARGETS"; fi
-  step "lint (golangci-lint) for: $os_list" lint_all "$os_list"
-  step "vet + build for: $tg" vet_build_all "$tg"
-  step "unit tests (native)" "$GO" test -shuffle=on -count=1 -timeout 5m ./...
-
-  if [ "$RACE" = 1 ] && [ "$QUICK" = 0 ]; then
-    step "race tests (cgo + C compiler required)" race_tests
-  elif [ "$QUICK" = 0 ]; then
-    echo "==> race tests: SKIPPED locally (add --race; CI Linux race job must be green before merge)"
+# 2b. Rust source code static invariants (when crates/ exists)
+if [ -d "crates" ]; then
+  # Rule: unsafe is forbidden outside crates/mesh-sys/
+  UNSAFE_HITS=$(find crates -type f -name '*.rs' -not -path 'crates/mesh-sys/*' \
+    -exec grep -HnE '(^[[:space:]]*(pub[[:space:]]+)?unsafe[[:space:]]+(fn|trait|impl)[^a-zA-Z0-9_]|unsafe[[:space:]]*\{)' {} + || true)
+  if [ -n "$UNSAFE_HITS" ]; then
+    echo "ERROR: Forbidden 'unsafe' usage outside crates/mesh-sys/:" >&2
+    echo "$UNSAFE_HITS" >&2
+    exit 1
   fi
 
-  if [ "$DEPS" = 1 ]; then
-    step "govulncheck" "$(get_tool govulncheck)" ./...
-    step "dependency licence policy" sh scripts/check-licenses.sh
+  # Rule: .expose_secret() restricted to mesh-crypto, mesh-datapath, mesh-net, mesh
+  EXPOSE_HITS=$(find crates -type f -name '*.rs' \
+    -not -path 'crates/mesh-crypto/*' \
+    -not -path 'crates/mesh-datapath/*' \
+    -not -path 'crates/mesh-net/*' \
+    -not -path 'crates/mesh/*' \
+    -exec grep -HnE '\.expose_secret[[:space:]]*\(' {} + || true)
+  if [ -n "$EXPOSE_HITS" ]; then
+    echo "ERROR: Forbidden '.expose_secret()' call outside allowlisted crates (SEC-01):" >&2
+    echo "$EXPOSE_HITS" >&2
+    exit 1
   fi
-else
-  echo "==> no Go packages yet: fmt/lint/vet/build/test skipped (Foundation sprint adds code)"
+
+  # Rule: GNFR-11 no hardcoded :443 or :3478 outside crates/mesh-core and tests
+  PORT_HITS=$(find crates -type f -name '*.rs' \
+    -not -path 'crates/mesh-core/*' \
+    -not -path '*/tests/*' \
+    -exec awk '/#\[cfg\(test\)\]/ { exit } /:(443|3478)([^0-9]|$)/ { print FILENAME ":" FNR ":" $0 }' {} + || true)
+  if [ -n "$PORT_HITS" ]; then
+    echo "ERROR: Hardcoded default port ':443' or ':3478' outside crates/mesh-core (GNFR-11):" >&2
+    echo "$PORT_HITS" >&2
+    exit 1
+  fi
 fi
 
-echo
-if [ -n "$FAILED" ]; then echo "CHECK FAILED:$FAILED" >&2; exit 1; fi
-echo "CHECK PASSED"
+echo "    Static repository rules PASSED."
+
+if [ ! -f "Cargo.toml" ]; then
+  echo "==> [SKIP] Cargo.toml workspace not yet initialized (pre-Gate-2 design phase). Static checks PASSED."
+  exit 0
+fi
+
+echo "==> [3/5] Running cargo fmt --all -- --check..."
+cargo fmt --all -- --check
+
+echo "==> [4/5] Running cargo clippy (-D warnings) and cargo test..."
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+
+echo "==> [5/5] Running cargo-deny (licenses, bans, advisories, sources)..."
+cargo deny check advisories bans licenses sources
+
+if [ "$CROSS" -eq 1 ]; then
+  echo "==> [Cross] Checking cross-compilation targets..."
+  for target in x86_64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu; do
+    echo "    cargo check --workspace --target $target"
+    cargo check --workspace --target "$target"
+  done
+fi
+
+echo "==> ALL CHECKS PASSED!"

@@ -16,7 +16,8 @@
 | 2026-11-12 | Gate 1 | agile-critic | gemini-4-carbon-high | Tái thẩm định độc lập Gate 1 Vòng 2 | 0 | 0 (Xác nhận 10/10 mục đóng, `[APPROVED FOR GATE]`) | Không (đã đối chiếu chéo từng mã AC & yêu cầu) | 195.7 s | Không | Duyệt Gate 1 |
 | 2026-11-12 | Gate 2 (Sync) | agile-researcher | claude-opus-5-5-high | Đồng bộ `production-readiness-requirements.md` v1.2 (macOS `PLAT-06`, IP Pinning, custom port, `SEC-15`) | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng 222 dòng, 8 nguồn mới `[T38..T45]`) | 451.3 s | Không | Theo yêu cầu người dùng tại Gate 1 |
 | 2026-11-12 | Gate 2 (Sync) | agile-po-ba | claude-sonnet-5-5-high | Đồng bộ `product-backlog.md` v1.2 (997 dòng), `charter` v1.2, `vision` v1.1, `personas` v1.1 | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng khớp 100% số đếm 51 Must / 234 SP & ma trận truy vết) | 972.9 s | Không | Theo yêu cầu người dùng tại Gate 1 |
-| 2026-11-12 | Gate 2 | agile-tech-lead | claude-sonnet-5-5-high | Chốt Tech Stack (Go 1.27.4 `CGO_ENABLED=0`), 11 ADRs, Coding Standards, `.agents/rules/coding-standards.md`, `.golangci.yml`, `scripts/check.*` | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng đủ 12 file hoàn chỉnh 100%, không bị cắt dòng, frontmatter `always_on` < 10 KB; phiên CLI hết 1800s ngay sau khi ghi xong) | 1800.0 s | Không | Chờ Gate 2 |
+| 2026-11-12 | Gate 2 | agile-tech-lead | claude-sonnet-5-5-high | Chốt Tech Stack (Go 1.27.4 `CGO_ENABLED=0`), 11 ADRs, Coding Standards, `.agents/rules/coding-standards.md`, `.golangci.yml`, `scripts/check.*` | 0 | Thay thế bởi Rust v2.0 | Không (đã kiểm chứng đủ 12 file hoàn chỉnh 100%, không bị cắt dòng, frontmatter `always_on` < 10 KB; phiên CLI hết 1800s ngay sau khi ghi xong) | 1800.0 s | Không | Người dùng đổi sang Rust 21:01 |
+| 2026-11-12 | Gate 2 | agile-tech-lead | gemini-4-argon-high | Chốt Tech Stack v2.0 (**Rust 1.94.1** `edition="2024"`, 10 crates, `defguard_boringtun`, `redb`, `rustls`), 11 ADRs, Coding Standards, `.agents/rules/coding-standards.md`, `rustfmt/clippy/deny.toml`, `scripts/check.*` | 0 | Chờ Critic/Codex Gate 2 | Không (đã kiểm chứng từng file + chạy `scripts/check.ps1` exit 0, frontmatter `always_on` 9.7 KB < 10 KB) | 1017.8 s | Không | Chờ Gate 2 |
 
 ## Chỉ số riêng cho vai trò AI (ghi thêm khi vai trò AI bàn giao)
 
@@ -29,6 +30,8 @@
 |---|---|---|---|---|---|---|
 | 2026-11-12 18:19 | agile-researcher | claude-opus-5-5-high | gemini-4-argon-high | Hết nhóm quota Claude (`RESOURCE_EXHAUSTED 429`, bao gồm cả dự phòng `claude-sonnet-5-5-high`) giữa Vòng sửa 1 | ~19:05+07:00 (sau 45m21s) | Có (quay lại `claude-opus-5-5-high` lúc 19:51) |
 | 2026-11-12 18:19 | agile-po-ba | claude-sonnet-5-5-high | gemini-4-carbon-high | Hết nhóm quota Claude (`RESOURCE_EXHAUSTED 429`) khi bắt đầu Vòng sửa 1; chuyển đúng model dự phòng trong `model-routing.md` | ~19:05+07:00 (sau 45m28s) | Có (quay lại `claude-sonnet-5-5-high` lúc 20:01) |
+| 2026-11-12 21:11 | agile-tech-lead | claude-sonnet-5-5-high | gemini-4-argon-high | Chạm trần nhóm quota tuần của Claude (`RESOURCE_EXHAUSTED 429`, `Resets in 136h31m20s`) khi chạy Rust Stack; chuyển sang đúng model dự phòng trong `model-routing.md` | ~2026-11-18 13:43+07:00 | Chưa |
+| 2026-11-12 21:11 | agile-architect | claude-opus-5-5-high | gemini-4-argon-high | Nhóm quota tuần của Claude đã cạn (`Resets in 136h31m20s`); chuyển sang đúng model dự phòng trong `model-routing.md` (độc lập họ model ở Gate 2 vẫn được bảo toàn nhờ `agile-codex` họ OpenAI `gpt-6.1-sol`) | ~2026-11-18 13:43+07:00 | Chưa |
 
 ## Tổng hợp tại Gate 3
 

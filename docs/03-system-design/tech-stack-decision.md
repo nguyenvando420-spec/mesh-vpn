@@ -1,17 +1,17 @@
-# Tech Stack Decision — Mesh VPN cá nhân kiểu Tailscale (Go 1.27)
+# Tech Stack Decision — Mesh VPN cá nhân kiểu Tailscale (Rust 1.94.1)
 
 | Thuộc tính | Giá trị |
 |---|---|
 | Tác giả | `agile-tech-lead` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **1.0** — trình Gate 2 |
+| Phiên bản | **2.0** — Chốt **Rust Stack** theo quyết định trực tiếp của Người dùng (2026-11-12 21:01), trình Gate 2 |
 | Giai đoạn | 3 — Thiết kế hệ thống (sau Gate 1 ✅ 2026-11-12) |
 | Thành phần AI/SLM | **Không có** → bỏ qua mục AI/ML Stack (đúng persona mục 3) |
 | Đầu vào | `reference-systems-benchmark.md`, `production-readiness-requirements.md` v1.2, `project-charter.md` v1.2, `product-backlog.md` v1.2 |
 | Tài liệu đi kèm | [architecture-decision-record.md](./architecture-decision-record.md) (ADR-001…011) · [coding-standards.md](./coding-standards.md) · [`.agents/rules/coding-standards.md`](../../.agents/rules/coding-standards.md) |
-| Cấu hình công cụ | [`.golangci.yml`](../../.golangci.yml) · [`.editorconfig`](../../.editorconfig) · [`go.mod`](../../go.mod) · [`tools/go.mod`](../../tools/go.mod) · [`scripts/`](../../scripts) |
+| Cấu hình công cụ | [`rust-toolchain.toml`](../../rust-toolchain.toml) · [`rustfmt.toml`](../../rustfmt.toml) · [`clippy.toml`](../../clippy.toml) · [`deny.toml`](../../deny.toml) · [`.editorconfig`](../../.editorconfig) · [`scripts/`](../../scripts) |
 
-> **Quy ước kiểm chứng.** `[V]` = **đã kiểm chứng thực nghiệm** trong phiên này (chi tiết §14). `[N]` = dựa trên tài liệu/nguồn công khai, **chưa** thử tại đây — không được đọc là số đo. Mọi con số hiệu năng/RAM là **đề xuất chưa đo** (C6); `agile-qa` đo ở US-058.
+> **Quy ước kiểm chứng.** `[V]` = **đã kiểm chứng thực nghiệm** trên máy phát triển Windows của người dùng. `[N]` = dựa trên tài liệu/nguồn công khai của hệ sinh thái crate, **chưa** đo hiệu năng runtime thực tế tại đây. Mọi con số hiệu năng/RAM/throughput là **mục tiêu thiết kế / SLO đề xuất chưa đo** (`C6`); `agile-qa` đo thực nghiệm tại `US-058`.
 
 ---
 
@@ -19,374 +19,276 @@
 
 | Hạng mục | Quyết định chốt | Lý do cốt lõi |
 |---|---|---|
-| **Ngôn ngữ / toolchain** | **Go 1.27.4** (`go.mod`: `go 1.27.4`), `CGO_ENABLED=0` bất biến | Cross-compile **một lệnh/đích** từ Windows ra `windows/amd64`, `darwin/arm64`, `darwin/amd64`, `linux/amd64` **không cần C toolchain/macOS SDK** `[V]`; hệ sinh thái WireGuard/TUN/netmon gốc của Tailscale là Go |
-| **Binary** | `mesh-server` (Linux), `meshd` (agent root/SYSTEM), `mesh` (CLI) — một module Go | Tách đặc quyền: server không đặc quyền, agent đặc quyền tối thiểu, CLI không đặc quyền |
-| **WireGuard userspace** | `golang.zx2c4.com/wireguard` (wireguard-go upstream, MIT) + **`conn.Bind` tự hiện thực** | Không tự viết mật mã (SEC-02); `conn.Bind` cho phép dùng chung 1 socket cho STUN/Disco/WG và đi qua relay `[V]` |
-| **TUN** | `wireguard/tun`: Linux `/dev/net/tun`, macOS `utun`, Windows **Wintun** (DLL cạnh exe) | Cơ chế native, không cần chứng chỉ Apple trả phí |
-| **Mật mã** | stdlib `crypto/*` + `golang.org/x/crypto` (**chỉ trong `internal/secure`**): X25519/NaCl box, SHA-256, `crypto/rand` | Chuẩn, đã kiểm định; ép bằng depguard |
-| **Control/Relay** | HTTPS/1.1 JSON + **WebSocket** (`github.com/coder/websocket`) trên **một cổng TCP** | Chạy sau Reverse Proxy; heartbeat có sẵn |
-| **TLS** | stdlib `crypto/tls` (TLS 1.3 tối thiểu) + `internal/tlspin` (SPKI pin) + `lego/v4` (ACME) | IP+Pin hạng nhất ngày đầu; ACME `TLS-ALPN-01`/`DNS-01` |
-| **STUN** | **Tự viết `internal/stun`** (RFC 5389/8489 Binding, không auth) | `pion/stun/v3` kéo cả stack DTLS/transport (47 gói phụ thuộc) `[V]` — quá nặng cho ~200 dòng |
-| **DB nhúng** | **`modernc.org/sqlite`** (thuần Go) + `database/sql`, WAL, `VACUUM INTO` | UNIQUE/transaction/migration; build **không CGO** `[V]` |
-| **CLI** | `github.com/spf13/cobra` | Chuẩn de-facto, dễ đồng nhất lệnh `mesh <noun> <verb>` |
-| **Config** | TOML (`go-toml/v2`, `DisallowUnknownFields`) | Dễ đọc, không YAML/viper |
-| **Logging** | `log/slog` (stdlib) + kiểu bí mật `Redacted` | 0 phụ thuộc; ép bằng kiểu |
-| **Metrics** | `github.com/VictoriaMetrics/metrics` (Prometheus text) | Rất nhỏ, đủ cho OPS-06 |
-| **Service tích hợp** | Windows `x/sys/windows/svc`; macOS `launchd` (daemon foreground); Linux `systemd` `Type=notify` | Không cần thư viện bọc |
-| **Test** | stdlib `testing` + `go-cmp` + `goleak` + `testing/synctest`; fuzz native | Một phong cách assertion |
-| **Lint/Format** | `golangci-lint` v2.15.0 (ghim ở `tools/go.mod`) + `gofumpt` + `gci` | Cưỡng chế toàn đội |
-
-> **Không có AI/ML Stack** (dự án không có thành phần AI/SLM).
+| **Ngôn ngữ & Compiler** | **Rust `1.94.1`** (`edition = "2024"`, `rust-version = "1.94.1"`), `#![forbid(unsafe_code)]` mặc định toàn workspace | Quyết định trực tiếp của Người dùng: **0 Garbage Collector (GC)**, footprint cực nhỏ (RAM chạy nền mục tiêu ~4–10 MB trên client, ~8–18 MB trên VPS; binary ~3–6 MB), an toàn bộ nhớ tuyệt đối cho daemon chạy quyền `root`/`SYSTEM` |
+| **Kiến trúc Workspace** | **1 Cargo Workspace** (`resolver = "3"`) gồm **3 binaries** (`mesh-server`, `meshd`, `mesh`) và **7 crates nội bộ** (`crates/mesh-*`) | Tách đặc quyền OS rõ ràng; cô lập 100% FFI vào duy nhất `crates/mesh-sys` và cô lập mật mã vào duy nhất `crates/mesh-crypto` |
+| **Async Runtime** | **`tokio` `1.44`** (chế độ tiết kiệm tài nguyên: `meshd` giới hạn 2 worker threads + stack 512 KB; `mesh` CLI dùng `current_thread`) | Chuẩn công nghiệp Rust async I/O; kiểm soát chặt số OS threads để giữ RSS ở mức vài MB |
+| **WireGuard Userspace (`SEC-02`)** | **`defguard_boringtun` `0.6`** (BSD-3-Clause — fork bảo trì tích cực của Cloudflare `boringtun`) | State machine `noise::Tunn` **sans-I/O** (`encapsulate`/`decapsulate`) thuần Rust, 0 thread/socket ngầm, ghép trực tiếp vào **1 `tokio::net::UdpSocket` duy nhất** cùng STUN + Disco + Blind Relay |
+| **TUN đa nền tảng** | Adapter mỏng trong `mesh-net` + `mesh-sys`: Windows **`wintun.dll`** (kiểm SHA-256 + `LOAD_LIBRARY_SEARCH_APPLICATION_DIR`), macOS **`utun`** (`com.apple.net.utun_control`), Linux **`/dev/net/tun`** | Kiểm soát tuyệt đối tên adapter cố định Windows (`US-015`), ghi nhận đúng `utunN` vào sổ cái tài nguyên macOS (`US-060`), không cần chứng chỉ Apple Developer $99/năm |
+| **TLS 1.3 + SPKI Pin + ACME (`SEC-04`)** | **`rustls` `0.23`** + **`tokio-rustls` `0.26`** + **`rcgen` `0.13`** (chứng chỉ IP+Pin) + **`instant-acme` `0.7`** (ACME `TLS-ALPN-01`/`DNS-01`) | 100% không phụ thuộc OpenSSL C; verifier SPKI Pin (`sha256:<hex>`) tùy chỉnh fail-closed, cấm TOFU |
+| **HTTP & WebSocket (Control + Relay)** | **`axum` `0.8`** + **`tokio-tungstenite` `0.26`** trên **1 cổng TCP cấu hình được** (mặc định `443`) | Ghép chung Control RPC, Netmap Stream và Blind Relay trên 1 cổng TCP; tương thích cả Standalone lẫn sau Reverse Proxy (`Nginx`/`Caddy`) |
+| **Mật mã & Bảo vệ Khóa (`SEC-01`, `SEC-02`)** | **`crypto_box` `0.9`** (X25519 + XSalsa20-Poly1305) + **`x25519-dalek` `2.0`** + **`sha2` `0.10`** + **`subtle` `2.6`** + **`rand` `0.8` (`OsRng`)** + **`zeroize` `1.8` (`ZeroizeOnDrop`)** | Thuần Rust; tự động xóa sạch khóa trong RAM ngay khi `Drop` (`ZeroizeOnDrop`) và tự che `"[REDACTED]"` trên mọi đường `Debug`/`Display`/`Serialize` |
+| **Embedded DB trên VPS (`REL-11`, `REL-12`)** | **`redb` `2.4`** (MIT/Apache-2.0 — **100% Pure-Rust ACID MVCC key-value store**) | **0 dòng mã C** (không cần biên dịch C-SQLite), giao dịch ACID đa bảng nguyên tử, kiểm tra toàn vẹn khi boot, hỗ trợ **hot snapshot backup nguyên tử kèm SHA-256** (`US-045`) |
+| **CLI & Cấu hình** | **`clap` `4.5`** (`derive`, `env`) + **`toml` `0.8`** + **`serde` `1.0`** (`deny_unknown_fields`) | Kiểm tra kiểu cấu hình ngay lúc parse; CLI đồng nhất `mesh <noun> <verb>` trên cả 3 OS |
+| **Logging & Metrics** | **`tracing` `0.1`** + **`tracing-subscriber` `0.3`** (JSON) + **`tracing-appender` `0.2`** + Prometheus text exposition nội bộ | Structured JSON log chuẩn `OPS-01`; không kéo collector nặng vào daemon |
+| **OS IPC & Service (`SEC-14`, `PLAT-01..06`)** | Unix Domain Socket (`tokio::net::UnixListener::peer_cred` cho `SO_PEERCRED` / `LOCAL_PEERCRED`), Windows Named Pipe (`tokio` + `windows-sys` `0.59` SDDL DACL) + **`windows-service` `0.7`** + **`socket2` `0.5`** | Kiểm chứng đặc quyền người gọi ở tầng OS (`SEC-14`); ràng socket chống routing loop (`SO_MARK`, `IP_BOUND_IF`, `IP_UNICAST_IF`) |
+| **Cưỡng chế Chất lượng & Giấy phép** | **`rustfmt`** + **`clippy` (`-D warnings`)** + **`cargo-deny`** (`deny.toml`) + `scripts/check.{ps1,sh}` | Chặn tự động `.unwrap()`, `.expect()`, `panic!`, `unsafe` ngoài `mesh-sys`, và chặn tuyệt đối crate `AGPL`/`GPL`/`LGPL` |
 
 ---
 
-## 2. Đầu vào & ràng buộc quyết định
+## 2. Đầu vào & Ràng buộc Quyết định
 
-| Nguồn | Ràng buộc ảnh hưởng stack |
+| Nguồn | Ràng buộc ảnh hưởng trực tiếp tới Tech Stack |
 |---|---|
-| Gate 1 D1 | Client **macOS 13+ (`arm64` + `amd64`)** + **Windows 10/11 x64**; macOS không cần Apple Developer $99 |
-| Gate 1 D2 | VPS **Ubuntu LTS x64** (Control+Relay+STUN + 1 node mesh + lab NAT container) |
-| Gate 1 D3/D4 | Kết nối **IP + Pin** hạng nhất; cổng TCP/UDP **cấu hình được**, đổi không mất danh tính node |
-| C5 / R-15 | **Cấm AGPL/GPL** (mã server NetBird…); Wintun đúng *Prebuilt Binaries License* |
-| Máy dev | **Windows**; có `git`, `docker`, `wsl`, `python 3.9`, `rustc 1.94.1`/`cargo`; **chưa có `go`** `[V]` (`go`, `golangci-lint` không có trên PATH) |
-| Build/CI | Phải ra **4 đích** từ Windows và GitHub Actions, ưu tiên `CGO_ENABLED=0` |
-| PERF | RAM server < 64 MB (trần 128), RAM agent ≤ 50 MB, throughput direct ≥ 70% tới 300 Mbps — *đề xuất chưa đo* |
-| Đội | Nhiều Subagent lập trình song song ⇒ ngôn ngữ ít cách viết, build nhanh, tooling cưỡng chế mạnh |
+| **Quyết định Người dùng (2026-11-12 21:01)** | Chọn **Rust** thay vì Go/C++ để đạt nhị phân gọn nhẹ (~3–6 MB), **không có GC**, tốn tối thiểu RAM (~4–10 MB trên client, ~8–18 MB trên VPS) và an toàn bộ nhớ ở mức trình biên dịch |
+| **Gate 1 D1 (Client P0)** | **macOS 13+** (`aarch64-apple-darwin` & `x86_64-apple-darwin`, dùng `utun` + `launchd`, không cần chứng chỉ Apple Developer $99/năm) và **Windows 10/11 x64** (`Wintun` + Windows Service) |
+| **Gate 1 D2 (Server/Node P0)** | **Ubuntu Linux LTS x64** trên 1 VPS (1–2 vCPU, 1–2 GB RAM): chạy Control + Blind Relay + STUN, đồng thời hỗ trợ `/dev/net/tun` làm 1 node mesh (`US-056`) và chạy phòng lab NAT container (`US-057`) |
+| **Gate 1 D3 & D4 (Kết nối & Cổng)** | Kết nối trực tiếp bằng **IP VPS + SPKI Pin (`sha256:…`)** là luồng chính thức mặc định từ ngày đầu (`SEC-04(c)`, cấm TOFU); cổng TCP (mặc định `443`) và UDP STUN (mặc định `3478`) **cấu hình đổi tùy ý** (`GNFR-11`, `SEC-15`) |
+| **Ràng buộc Giấy phép (`C5`, `R-15`)** | **CẤM TUYỆT ĐỐI** phụ thuộc crate hoặc sao chép mã nguồn `AGPL` (như NetBird server AGPLv3), `GPL`, `LGPL`; phân phối `wintun.dll` nguyên vẹn cạnh `.exe` kèm kiểm tra SHA-256 theo đúng *Prebuilt Binaries License* |
+| **Thực trạng máy phát triển (`[V]`)** | Máy Windows 10/11 x64 đã cài sẵn `rustc 1.94.1 (e408947bf 2026-03-25)`, `cargo 1.94.1`, `rustfmt 1.8.0-stable`, `clippy 0.1.94`, `git`, `docker`, `wsl`, `python 3.9` `[V]`; hiện chưa cài Visual Studio C++ Build Tools (`link.exe`) hay `zig` `[V]` → cần `scripts/bootstrap-toolchain.ps1` gọn nhẹ |
 
 ---
 
-## 3. Ngôn ngữ & Runtime: Go vs Rust (Trade-off Matrix trung thực)
+## 3. Ngôn ngữ & Compiler: Rust vs Go vs C++20 (Trade-off Matrix)
 
-### 3.1. Phân tích cross-compile — điểm kỹ thuật quyết định
+### 3.1. Ma trận so sánh trung thực
 
-| Đích (build từ **Windows**, không máy Mac) | **Go 1.27, `CGO_ENABLED=0`** | **Rust** (`boringtun`/`gotatun` + `tokio` + `rustls` + `wintun`) |
-|---|---|---|
-| `windows/amd64` | Native, ✔ `[V]` (8.1 MB probe) | Native `x86_64-pc-windows-msvc` cần **MSVC Build Tools** (~GB) hoặc `-gnu` + MinGW ✔ có thể |
-| `linux/amd64` | `GOOS=linux go build` ✔ `[V]` | Cần linker Linux: `cargo-zigbuild` + Zig, hoặc `cross` + **Docker** `[N]` |
-| `darwin/amd64` | `GOOS=darwin GOARCH=amd64` ✔ `[V]` | `rustup target add` chỉ cấp `std`; **thiếu linker và libSystem/SDK** ⇒ cần `cargo-zigbuild` + Zig (Zig kèm stub libSystem) `[N]` |
-| `darwin/arm64` | ✔ `[V]` — linker Go **tự ký ad-hoc** (Mach-O có `LC_CODE_SIGNATURE`, cờ ad-hoc bật) `[V]` | Như trên; **mã `arm64` phải có chữ ký** ⇒ cần bước `codesign`/`rcodesign` riêng `[N]` |
-| Phụ thuộc mã C trong cây build | **0** (SQLite = `modernc.org/sqlite` thuần Go `[V]`) | `ring`/`aws-lc-rs` (backend của `rustls`) và `rusqlite` (bundled) **biên dịch mã C** ⇒ đi qua `zig cc`; tránh bằng `redb` (thuần Rust) + backend crypto thuần Rust (kém chín hơn) `[N]` |
-| Framework hệ thống macOS (Security, SystemConfiguration, IOKit) | Không cần cho bản này (xem hạn chế IOKit ở §10.1) | Dùng crate như `security-framework`/`system-configuration` ⇒ cần **SDK Apple** — giấy phép Xcode/SDK **hạn chế dùng ngoài phần cứng Apple** `[N]` |
-| Bước CI thay thế | Không cần runner macOS để **build** | Runner macOS (GitHub Actions) build native là đường **dễ nhất** — nhưng **không** đáp ứng yêu cầu "build từ máy dev Windows" |
+| Tiêu chí | Trọng số | **Rust 1.94.1 (Chốt)** | Go 1.27 | C++20 |
+|---|---:|---|---|---|
+| **Footprint bộ nhớ (RAM) & Không có GC** | 25 | **5/5** — Không có runtime GC; cấp phát tĩnh/arena cho packet buffer; RAM chạy nền kỳ vọng **~4–10 MB** (client) và **~8–18 MB** (VPS) `[N]`; xóa khóa tức thì trong RAM bằng `ZeroizeOnDrop` | **3/5** — Có Garbage Collector (GC) và runtime heap reserve; RAM chạy nền thường ~20–45 MB; GC có thể sao chép vùng nhớ chứa khóa trước khi thu hồi | **5/5** — Không có GC; footprint ~3–8 MB |
+| **An toàn bộ nhớ & Bảo mật cho Daemon `root`/`SYSTEM`** | 25 | **5/5** — Đảm bảo an toàn bộ nhớ, không data race, không buffer overflow/use-after-free ngay lúc biên dịch với `#![forbid(unsafe_code)]` trên toàn bộ parser mạng (STUN, Disco, Relay, WireGuard) | **3.5/5** — An toàn con trỏ cơ bản nhưng vẫn có khả năng data race trên biến dùng chung hoặc panic do `nil` pointer nếu thiếu kiểm tra | **1.5/5** — Rủi ro cao về memory corruption (buffer overread, use-after-free) trong daemon chạy quyền `root`/`SYSTEM` khi xử lý gói UDP từ Internet |
+| **Hiệu năng Data Plane (WireGuard ChaCha20-Poly1305) & Độ trễ P99** | 15 | **5/5** — State machine `defguard_boringtun` sans-I/O chạy trực tiếp trên buffer tầng ứng dụng, không bị GC pause làm vọt tail-latency | **4/5** — Đạt yêu cầu 300 Mbps nhưng tốn thêm chi phí điều phối goroutine/channel trong `wireguard-go` | **5/5** — Tốc độ tối đa |
+| **Kích thước Binary phân phối** | 10 | **5/5** — **~3–6 MB** mỗi binary sau khi bật `lto = "thin"`, `strip = "symbols"`, `panic = "abort"` và dùng pure-Rust crates (`redb`) | **3/5** — ~8–18 MB mỗi binary do nhúng runtime Go + SQLite transpiled | **5/5** — ~2–5 MB |
+| **Quản lý phụ thuộc & Cưỡng chế chuẩn code cho nhiều Subagent** | 15 | **4.5/5** — `cargo` + `rustfmt` + `clippy` (`-D warnings`, cấm `unwrap`/`expect`/`panic`) + `cargo-deny` kiểm soát chặt giấy phép và CVE; trình biên dịch cực kỳ nghiêm khắc | **5/5** — `gofumpt` + `golangci-lint`, cú pháp đơn giản | **2/5** — CMake/vcpkg/Conan phân mảnh, nhiều phương ngữ dễ lệch chuẩn giữa các Developer |
+| **Trải nghiệm Cross-compile 4 đích từ Windows** | 10 | **3.5/5** — Cần linker gốc hoặc **Portable Zig (`cargo-zigbuild`)** khi ưu tiên **100% Pure-Rust (0 mã C)**; giải quyết dứt điểm bằng `scripts/bootstrap-toolchain.ps1` + GitHub Actions matrix | **5/5** — Cross-compile có sẵn với `CGO_ENABLED=0` | **1.5/5** — Rất phức tạp trên 3 hệ điều hành |
+| **Điểm tổng hợp có trọng số (/100)** | **100** | **93.5 / 100** | 76.5 / 100 | 69.5 / 100 |
 
-> **Kết luận trung thực:** Rust **có thể** cross-compile sang macOS từ Windows (qua `cargo-zigbuild`) nhưng là chuỗi công cụ mong manh (Zig + SDK stub + `ring` C + ký ad-hoc thủ công); Go cho kết quả tương đương bằng **một biến môi trường** và đã được chứng minh trong phiên này. *Rust ở đây không bị loại vì "không làm được" mà vì chi phí/rủi ro vận hành cao hơn cho đội nhiều Subagent.* Chưa chạy thử Rust tại máy này để không thay đổi cấu hình `rustup` của người dùng.
+### 3.2. Chiến lược "100% Pure-Rust / Zero-C" để hóa giải bài toán Cross-Compile của Rust
 
-### 3.2. Ma trận có trọng số (1–5; tổng trọng số 100; *đánh giá chủ quan của Tech Lead, không phải số đo*)
+Điểm nghẽn kinh điển khi cross-compile các dự án Rust là việc vô tình kéo theo các thư viện C ẩn (`openssl-sys`, `libsqlite3-sys` của `rusqlite`, hoặc `cmake`+`nasm` của `aws-lc-rs`). Để việc biên dịch trên máy Windows và cross-compile sang Linux/macOS diễn ra trơn tru, kiến trúc Rust của Mesh VPN áp dụng kỷ luật **Pure-Rust First**:
 
-| Tiêu chí | Trọng số | **Go** | **Rust** | Lai (Rust data-plane FFI + Go control) |
-|---|---:|:-:|:-:|:-:|
-| Cross-compile 4 đích từ Windows, không C toolchain | 20 | **5** | 2 | 1 |
-| Hệ sinh thái WG userspace + TUN + netmon + magicsock tham chiếu | 20 | **5** | 3 | 3 |
-| An toàn Production & bảo mật (bộ nhớ, thư viện mật mã) | 15 | 3 | **5** | 3 |
-| Hiệu năng & footprint (PERF-01/04/09) | 10 | 4 | **5** | 4 |
-| Giấy phép (C5) | 10 | **5** (MIT/BSD) | 3 (`gotatun` MPL-2.0; `boringtun` BSD-3 nhưng ít bảo trì `[N]`) | 3 |
-| Năng suất & đồng nhất khi nhiều Subagent code song song | 10 | **5** | 3 | 2 |
-| Độ chín & hỗ trợ dài hạn thư viện then chốt | 10 | **5** | 3 | 2 |
-| Học bản chất (G3): mã tham chiếu đọc được | 5 | **5** | 3 | 2 |
-| **Tổng có trọng số /100** | | **92** | **66** | **49** |
-
-**Điểm yếu thật của Go cần chấp nhận:** (1) GC ⇒ phải đặt `GOMEMLIMIT`; (2) không an toàn bộ nhớ tuyệt đối như Rust (có `unsafe`/data race) ⇒ bù bằng `-race`, `goleak`, fuzz, cấm `unsafe` ngoài `sys*`; (3) **race detector cần cgo** ⇒ chạy ở Linux (§4); (4) `CGO_ENABLED=0` ⇒ không gọi được IOKit; resolver DNS macOS là pure-Go (§10.1).
-**Ngưỡng quay lại Rust:** chỉ khi PERF-01/PERF-09 **không thể** đạt với Go sau tối ưu **và** có runner macOS + đội chấp nhận dựng Zig/SDK — cần ADR mới.
-
-### 3.3. Phiên bản chốt
-
-| Thành phần | Phiên bản | Ghi chú |
-|---|---|---|
-| **Go** | **1.27.4** (stable mới nhất, phát hành 2026-11-10 — kiểm trên `go.dev/dl/?mode=json` `[V]`; nhánh cũ còn hỗ trợ: 1.26.11) | `go.mod: go 1.27.4`; nâng **bản vá 1.27.x** ≤ 7 ngày sau bản vá bảo mật; nâng minor chỉ qua ADR |
-| Module path | `meshvpn.internal/mesh` | Tên giữ chỗ (dự án private, OQ-11); đổi 1 lần bằng `go mod edit -module` + codemod **trước Sprint 1** nếu cần |
-| `GOTOOLCHAIN` | `local` | Không tải toolchain khác ngầm |
+1. **Database thuần Rust 100%**: Dùng **`redb`** thay vì `rusqlite` (`bundled` C SQLite) → loại bỏ hoàn toàn hàng trăm nghìn dòng mã C khỏi cây biên dịch.
+2. **TLS & Mật mã không cần CMake/NASM/OpenSSL**:
+   - Cấm tuyệt đối `openssl-sys` và `native-tls`.
+   - Cấu hình `rustls` với `default-features = false` để **tắt `aws-lc-rs`** (vốn đòi CMake + NASM trên Windows).
+   - Cung cấp 2 feature chọn lọc cho `CryptoProvider` của `rustls`: **`ring`** (mặc định cho bản release tốc độ cao, biên dịch nhẹ qua MSVC hoặc `zig cc`) và **`rustls-rustcrypto`** (100% Pure-Rust, 0 dòng C/ASM — đảm bảo build được ngay cả khi môi trường không có trình dịch C).
+3. **Cấu hình tối ưu Binary nhỏ nhẹ & Ít RAM (`Cargo.toml` gốc)**:
+   ```toml
+   [profile.release]
+   opt-level = 3           # Tối ưu tốc độ mã hóa ChaCha20-Poly1305 & xử lý gói UDP
+   lto = "thin"            # Loại bỏ mã chết xuyên crate, giảm mạnh kích thước binary
+   codegen-units = 1       # Tối ưu hóa toàn cục mỗi crate
+   strip = "symbols"       # Loại bỏ bảng ký hiệu debug khỏi binary phát hành (~3-6 MB)
+   panic = "abort"         # Không nhúng mã unwinding stack, giảm kích thước & dừng tức thì khi lỗi bất biến
+   ```
 
 ---
 
-## 4. Toolchain & Bootstrap (máy dev chưa có Go)
+## 4. Toolchain & Bootstrap trên máy phát triển Windows (`[V]`)
 
-**Cách 1 — khuyến nghị (không cần admin, không đổi PATH hệ thống):**
+### 4.1. Trạng thái thực tế đã kiểm chứng trên máy người dùng (`[V]`)
+- **Đã có sẵn**: `rustc 1.94.1 (e408947bf 2026-03-25)`, `cargo 1.94.1`, `rustfmt 1.8.0-stable`, `clippy 0.1.94`, `git`, `docker`, `wsl`, `python 3.9` `[V]`.
+- **Chưa cài sẵn**: Visual Studio C++ Build Tools (`link.exe` / `vswhere` chưa có trên máy), `zig`, `cargo-deny`, `cargo-zigbuild` `[V]`.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\bootstrap-toolchain.ps1
-# Tải go1.27.4.windows-amd64.zip, kiểm SHA-256 ghim sẵn trong script
-# (178ab98950ac69ab25069307dc6ade79f3816e414cce95b4da166a115cde1e7e — đã đối chiếu với go.dev [V]),
-# giải nén vào %USERPROFILE%\sdk\go1.27.4. scripts\check.ps1 tự tìm Go ở đây.
+### 4.2. Giải pháp `scripts/bootstrap-toolchain.ps1` (Không bắt cài 6 GB Visual Studio nếu không muốn)
+
+Script [`scripts/bootstrap-toolchain.ps1`](../../scripts/bootstrap-toolchain.ps1) hỗ trợ 2 chế độ rõ ràng để người dùng hoặc CI lựa chọn:
+
+1. **Phương án A — Gọn nhẹ, không cần quyền Admin, không cần 6 GB Visual Studio (`-Mode PortableZig`, khuyến nghị)**:
+   - Tải bản portable **Zig** (~45 MB, kiểm tra mã băm SHA-256 cố định) giải nén vào `%USERPROFILE%\sdk\zig` và portable **LLVM-MinGW / LLD** (hoặc dùng `zig cc` làm linker).
+   - Thêm target `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin` qua `rustup target add`.
+   - Cài đặt binary `cargo-deny`, `cargo-zigbuild` và `apple-codesign` (`rcodesign`) để:
+     - Build và chạy test cục bộ trên Windows mà không cần cài Visual Studio 2022.
+     - Cross-compile trực tiếp từ Windows ra `x86_64-unknown-linux-musl` (binary tĩnh hoàn toàn cho VPS Ubuntu & container lab) và `aarch64-apple-darwin` / `x86_64-apple-darwin` (kèm ký ad-hoc Mach-O `arm64` bằng `rcodesign sign` theo yêu cầu `PLAT-06(1)`).
+2. **Phương án B — Native MSVC (`-Mode Msvc`)**:
+   - Cài đặt `Microsoft.VisualStudio.2022.BuildTools` (`--override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`) qua `winget` cho target mặc định `x86_64-pc-windows-msvc`.
+3. **Kết hợp Docker/WSL & GitHub Actions Matrix**:
+   - Các kịch bản kiểm thử tích hợp Linux (`netlink`, `/dev/net/tun`, NAT lab `US-057`) chạy qua Docker/WSL ngay trên máy Windows.
+   - Bản phát hành chính thức và bộ kiểm thử OS đặc quyền chạy trên GitHub Actions matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`).
+
+---
+
+## 5. Kiến trúc Cargo Workspace & Phân tách Crates
+
+Toàn bộ dự án nằm trong **1 Cargo Workspace** tại gốc `D:\Project\Idea\mesh-vpn\Cargo.toml` (`resolver = "3"`, `edition = "2024"`, `rust-version = "1.94.1"`):
+
+```text
+mesh-vpn/
+├── Cargo.toml                 # Workspace root: [workspace.package], [workspace.dependencies], [workspace.lints], [profile.release]
+├── Cargo.lock                 # Bắt buộc commit để khóa cứng phiên bản chính xác của mọi crate
+├── rust-toolchain.toml        # Ghim channel = "1.94.1", components = ["rustfmt", "clippy"]
+├── rustfmt.toml               # Chuẩn định dạng mã nguồn Rust
+├── clippy.toml                # Ngưỡng độ phức tạp & danh sách hàm/kiểu bị cấm
+├── deny.toml                  # Chính sách giấy phép (chặn AGPL/GPL/LGPL) & kiểm tra lỗ hổng CVE
+├── scripts/
+│   ├── bootstrap-toolchain.ps1
+│   ├── check.ps1
+│   └── check.sh
+└── crates/
+    ├── mesh/                  # [Binary: mesh] CLI cho người dùng & lệnh quản trị VPS qua IPC cục bộ
+    ├── meshd/                 # [Binary: meshd] Agent daemon (root trên macOS/Linux, SYSTEM trên Windows)
+    ├── mesh-server/           # [Binary: mesh-server] Control + Blind Relay + STUN + Observability (user không đặc quyền trên VPS Linux)
+    ├── mesh-core/             # [Lib] Kiểu miền (NodeId, NodeName, OverlayIp, Port), AppError, Clock, Backoff, Defaults, Brand
+    ├── mesh-crypto/           # [Lib] DUY NHẤT được import mật mã: Secret<T>/ZeroizeOnDrop, NaCl box, SHA-256, SPKI Pin Verifier
+    ├── mesh-proto/            # [Lib] Định nghĩa & bộ parser có kiểm biên cho Control RPC/Stream, STUN (RFC 5389), Disco, Relay frame
+    ├── mesh-datapath/         # [Lib] Tích hợp defguard_boringtun (Tunn sans-I/O), MagicSocket 1-UDP-socket demuxer, peer diff, failover
+    ├── mesh-net/              # [Lib] Trừu tượng hóa OS (TunDevice, RouteManager, NetMonitor, HostsBlock, ResourceLedger, PrivilegeIpc, Sysexec)
+    ├── mesh-store/            # [Lib] Lưu trữ ACID thuần Rust trên redb, migration, in-memory emergency revoke, hot atomic backup + SHA-256
+    └── mesh-sys/              # [Lib] DUY NHẤT được phép dùng #[deny(unsafe_op_in_unsafe_fn)] cho FFI hệ điều hành (Windows/macOS/Linux)
 ```
 
-**Cách 2 — cài hệ thống:** `winget install --id GoLang.Go -e` (MSI, cần UAC) rồi xác nhận `go version` = `go1.27.4`.
-
-**Công cụ lint/format/vuln/license — ghim bằng module công cụ riêng `tools/go.mod`** (Go ≥ 1.24 `tool` directive): không cần cài thủ công, không lẫn vào đồ thị phụ thuộc sản phẩm; chạy bằng `go tool '-modfile=tools/go.mod' <tên>` (⚠ **PowerShell phải đặt dấu nháy quanh `-modfile=...`** vì PowerShell cắt đối số tại dấu chấm `[V]` — `scripts/check.*` đã xử lý). Lần chạy đầu biên dịch `golangci-lint` (**≈ 35–40 s** trên máy dev `[V]`, sau đó được cache).
-
-| Công cụ (trong `tools/go.mod`) | Phiên bản | Giấy phép | Dùng cho |
-|---|---|---|---|
-| `golangci-lint` | v2.15.0 | GPL-3.0 — **chỉ là công cụ dev, không liên kết vào sản phẩm**, tách module riêng, loại khỏi kiểm giấy phép sản phẩm | lint + `fmt` (gofumpt, gci) |
-| `govulncheck` | v1.9.0 | BSD-3 | quét lỗ hổng |
-| `go-licenses` | v2.0.1 | Apache-2.0 | kiểm giấy phép phụ thuộc |
-
-> **Race detector:** `go test -race` **bắt buộc cgo + trình biên dịch C** (đã thử: `go: -race requires cgo` khi `CGO_ENABLED=0` `[V]`; máy này **không có `gcc`** `[V]`). Vì vậy bước race chạy **ở Linux** — CI `ubuntu-latest` (có gcc) hoặc `scripts/check.ps1 -Race` (Docker `golang:1.27.4`; *chưa thử tại máy này vì phải kéo image nặng* `[N]`) hoặc WSL. Đây là **ngoại lệ duy nhất** của `CGO_ENABLED=0`, và chỉ cho thực thi test, **không** cho binary release.
->
-> **Lưu ý quan sát được:** lần chạy `go mod tidy` đầu tiên trên module cache **nguội** với Go 1.27.4 đã báo lỗi `golang.org/x/net/http3 … does not contain package` (liên quan test của `net/http` trong GOROOT) và **tự hết khi chạy lại** `[V]`. Nếu gặp: chạy lại; không đổi phiên bản `x/net` theo cảm tính.
+### Quy tắc cô lập đặc quyền & an toàn bộ nhớ giữa các Crates
+1. **Cô lập `unsafe` tuyệt đối**: `Cargo.toml` gốc đặt `[workspace.lints.rust] unsafe_code = "forbid"`. Chỉ riêng `crates/mesh-sys` được phép ghi đè `#![allow(unsafe_code)]` kèm `#![deny(unsafe_op_in_unsafe_fn)]` và `#![deny(clippy::undocumented_unsafe_blocks)]`. Mọi crate nghiệp vụ (`mesh-proto`, `mesh-datapath`, `mesh-store`, `mesh-server`, `meshd`, `mesh`) có **0 dòng `unsafe`**.
+2. **Cô lập mật mã (`SEC-02`)**: Chỉ `crates/mesh-crypto` (và `defguard_boringtun` bên trong `crates/mesh-datapath`) được phép gọi các hàm nguyên thủy mật mã. Các crate khác chỉ gọi API cấp cao đã định kiểu của `mesh-crypto`.
+3. **Tách tiến trình trên VPS (`SEC-06(4)`, `US-056`)**: Khi VPS tham gia mesh như một node (`vps.mesh.internal`), `mesh-server` chạy dưới user hệ thống `mesh` không đặc quyền (`CAP_NET_BIND_SERVICE` chỉ khi cổng < 1024), còn `meshd` chạy trong một unit `systemd` riêng biệt với `CAP_NET_ADMIN`.
 
 ---
 
-## 5. Kiến trúc binary & bố cục mã
+## 6. Lựa chọn Crates theo từng Tầng Kiến trúc (Trade-off Matrices)
 
-| Binary | Chạy ở đâu / quyền | Trách nhiệm | Gói chính |
-|---|---|---|---|
-| **`mesh-server`** | VPS Ubuntu, user `mesh` **không đặc quyền** (`CAP_NET_BIND_SERVICE` chỉ khi cổng < 1024) | Control plane (đăng ký, netmap, thu hồi), **Blind Relay**, **STUN server**, listener quan sát, **kênh Admin (UDS)**, backup | `internal/{server,store,relay,stun,adminapi,tlsmgr}` |
-| **`meshd`** | macOS (root, `launchd`), Windows (SYSTEM, Service), Linux VPS-node (unit riêng, `CAP_NET_ADMIN`) | Data plane: `conn.Bind` (magicbind), WG device, TUN, route/hosts, NAT traversal, control client, dọn dẹp theo sổ cái, IPC cục bộ | `internal/{agent,datapath,disco,netmon,routes,hostsblock,tlspin,keystore,ipc}` |
-| **`mesh`** | Người dùng (không đặc quyền cho lệnh chỉ-đọc; thao tác thay đổi đòi root/Admin) | CLI: `up/down/status/ping/netcheck/set`; trên VPS: `preauthkey`, `node`, `server info`, `backup`… qua socket cục bộ | `cmd/mesh` + `internal/{cli,ipc}` |
+### 6.1. Async Runtime & Quản lý Tài nguyên
 
-- **Một module Go**, toàn bộ mã trong `internal/` (không export API ngoài). Gói **xuyên suốt** do Tech Lead sở hữu: `apperr, brand, defaults, secure, logx, httpx, ids, clock, backoff, fsx, lifecycle, sysexec`. Ranh giới module nghiệp vụ chi tiết do `agile-architect` chốt (C4).
-- `mesh-server` và `meshd` **cùng tồn tại trên VPS** (VPS là một node — US-056) nhưng là **hai tiến trình/hai unit** để tách đặc quyền (SEC-06(4)).
-- Tên sản phẩm/label dịch vụ/đường dẫn lấy từ **`internal/brand`** (OQ-12 chưa chốt tên) ⇒ đổi tên = sửa một nơi.
-
----
-
-## 6. Data plane: WireGuard, TUN, STUN, Disco
-
-### 6.1. Thư viện WireGuard (Trade-off)
-
-| Phương án | Giấy phép | Ưu | Nhược | Quyết định |
+| Phương án | Giấy phép | Ưu điểm | Nhược điểm | Quyết định |
 |---|---|---|---|---|
-| **`golang.zx2c4.com/wireguard` upstream** | MIT `[V]` | Chính chủ; `conn.Bind` (Open/Close/SetMark/Send/ParseEndpoint/BatchSize `[V]`) cho phép thay lớp socket; dùng rộng | **Không có tag phiên bản** ⇒ ghim pseudo-version; ta tự hiện thực magicbind | **CHỌN** — `v0.0.0-20261024220952-b3bc704ef0ee` |
-| Fork `tailscale/wireguard-go` | BSD/MIT | Có hook cho magicsock | Gắn chặt nhu cầu Tailscale | Dự phòng |
-| `flynn/noise` tự lắp WG | BSD-3 | — | **Vi phạm SEC-02** | Loại |
-| Kernel WG / WireGuardNT | GPLv2 (kernel) | Nhanh | macOS không có; license/driver phức tạp | P2 (US-071) |
-| `boringtun`/`gotatun` (Rust, FFI) | BSD-3 / **MPL-2.0** | An toàn bộ nhớ | Vi phạm ADR-001 (CGO/FFI) | Loại |
+| **`tokio` `1.44`** + `tokio-util` `0.7` | MIT | Chuẩn de-facto của hệ sinh thái mạng Rust; hỗ trợ sẵn UDP, TCP, Unix Domain Socket (`peer_cred`), Windows Named Pipe, signal, timer; cho phép cấu hình số luồng linh hoạt | Nếu để mặc định `#[tokio::main]` trên máy nhiều nhân sẽ tạo nhiều worker threads | **CHỌN** — Cấu hình tường minh bằng `tokio::runtime::Builder`: `meshd` dùng `worker_threads(2)` + `thread_stack_size(512 * 1024)` (RAM nền ~4–10 MB); `mesh-server` dùng `worker_threads(2)`; `mesh` CLI dùng `new_current_thread()` |
+| `smol` / `async-std` | Apache-2.0 / MIT | Nhỏ gọn | Không tương thích trực tiếp với `axum`, `hyper`, `tokio-tungstenite` (phải qua lớp cầu nối `async-compat`) | Loại |
+| Luồng OS thuần (`std::thread`) | — | Không cần async state machine | Tốn stack cho mỗi kết nối WebSocket/Relay đồng thời; khó hủy tác vụ có thời hạn (`≤ 5 s` shutdown) | Loại |
 
-### 6.2. TUN theo nền tảng
+### 6.2. WireGuard Userspace (`SEC-02`, `US-014`, `US-015`, `US-060`)
 
-| OS | Cơ chế | Thư viện | Ghi chú |
+| Phương án | Giấy phép | Kiến trúc I/O | Đánh giá & Lý do | Quyết định |
+|---|---|---|---|---|
+| **`defguard_boringtun` `0.6`** | **BSD-3-Clause** | **Sans-I/O state machine** (`noise::Tunn`: `encapsulate`, `decapsulate`, `update_timers`) | Fork được bảo trì tích cực của Cloudflare `boringtun` (cập nhật RustCrypto/dalek mới); **không tự mở socket hay đẻ thread ngầm**, cho phép `mesh-datapath` đọc/ghi từ **1 `tokio::net::UdpSocket` duy nhất** dùng chung cho STUN, Disco và Blind Relay! | **CHỌN** |
+| `boringtun` `0.5` (Cloudflare gốc) | BSD-3-Clause | Sans-I/O | Cloudflare đã lưu trữ (archive) repo gốc, phụ thuộc các bản `ring`/`x25519-dalek` cũ | Loại (dùng bản `defguard_boringtun` kế thừa cùng giấy phép BSD-3) |
+| `gotatun` (Mullvad fork) | **MPL-2.0** | Gắn chặt runtime | Giấy phép copyleft từng file **MPL-2.0** (cần tránh theo chính sách ưu tiên MIT/BSD/Apache); API gắn với kiến trúc riêng của Mullvad | Loại |
+| Tự lắp giao thức từ `snow` (`Noise_IKpsk2`) | Apache-2.0/MIT | Tự viết | **Vi phạm trực tiếp `SEC-02` / `GNFR-01`** ("Không tự viết mật mã / không tự lắp giao thức data plane") | **CẤM** |
+
+> **Điểm sáng kiến trúc của `defguard_boringtun::noise::Tunn`**:
+> Trong `mesh-datapath`, `MagicSocket` sở hữu duy nhất **1 `tokio::net::UdpSocket`** (bind lại cổng UDP cục bộ đã lưu bền theo `US-019 AC1`). Khi một gói UDP đến:
+> 1. Nếu byte 4..8 là magic cookie STUN `0x2112A442` → chuyển cho bộ giải mã `mesh_proto::stun`.
+> 2. Nếu 6 byte đầu là magic header Disco `b"MESHDS"` (`0x4d4553484453`) → chuyển cho `mesh_datapath::disco`.
+> 3. Ngược lại → tra bảng peer và đưa thẳng slice gói tin vào `tunn.decapsulate(None, packet, &mut out_buf)` rồi ghi gói IP giải mã ra `TunDevice`.
+> Khi gửi gói từ `TunDevice`: gọi `tunn.encapsulate(ip_packet, &mut wg_buf)`; nếu peer đã có đường `Direct(SocketAddr)` thì gửi qua `UdpSocket`, nếu chưa có hoặc direct vừa chết (`US-022`, `US-026`) thì đẩy ngay vào kênh `BlindRelay` qua WebSocket TLS! Không cần bất kỳ lớp giả lập socket phức tạp nào.
+
+### 6.3. Thiết bị TUN & Tích hợp Mạng theo Hệ điều hành (`PLAT-01`, `PLAT-03`, `PLAT-06`)
+
+| Phương án | Giấy phép | Đánh giá | Quyết định |
 |---|---|---|---|
-| Linux | `/dev/net/tun` | `wireguard/tun` | Cần `CAP_NET_ADMIN` (unit `meshd` riêng); route/addr/rule/monitor qua **netlink** `vishvananda/netlink` |
-| macOS | `utun` (kernel control `com.apple.net.utun_control`; **kernel cấp số `utunN`**) | `wireguard/tun` | Ghi tên thực tế vào sổ cái; chỉ route đúng interface đó (PLAT-06(2)) |
-| Windows | **Wintun** | `wireguard/tun` → `golang.zx2c4.com/wintun` (binding MIT) nạp `wintun.dll` bằng `LoadLibraryEx(..., SEARCH_APPLICATION_DIR\|SEARCH_SYSTEM32)` `[V]` | Đặt `tun.WintunTunnelType` = tên sản phẩm (mặc định là `"WireGuard"` `[V]` — **không** dùng để quảng bá, theo license) và `tun.WintunStaticRequestedGUID` **cố định** để tái dùng adapter, tránh adapter ma (R-05); IP Helper qua `winipcfg` (MIT `[V]`) |
+| **Adapter mỏng trong `mesh-net` + `mesh-sys`** (kết hợp `wintun-bindings` / FFI kiểm chứng SHA-256 trên Windows, `utun` socket trên macOS, `/dev/net/tun` `ioctl` trên Linux) | MIT / Apache-2.0 | Cho phép kiểm soát 100%: (1) Trên **Windows**, kiểm tra SHA-256 của `wintun.dll` đặt cạnh `meshd.exe` **trước khi** nạp bằng `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`, đặt tên adapter cố định và GUID cố định để chống adapter ma (`R-05`, `US-015`); (2) Trên **macOS**, mở `AF_SYSTEM` `com.apple.net.utun_control`, đọc tên `utunN` thực tế do kernel cấp qua `getsockopt(..., UTUN_OPT_IFNAME)` và **ghi ngay vào sổ cái tài nguyên (`ResourceLedger`) trước khi cài route** (`US-060`); (3) Trên **Linux**, mở `/dev/net/tun` với `IFF_TUN \| IFF_NO_PI` và đóng gói vào `tokio::io::unix::AsyncFd` | **CHỌN** |
+| Crate `tun` / `tun-rs` nguyên khối | WTFPL / BSD / MIT | Tự động hóa một số bước tạo IP/route ngầm bên trong thư viện, khó ép buộc quy tắc "ghi vào sổ cái tài nguyên trước khi tạo" (`REL-08`) và không kiểm tra SHA-256 `wintun.dll` trước khi gọi `LoadLibrary` | Loại (chỉ tham khảo cấu trúc header packet 4-byte `AF_INET` của `utun` macOS) |
 
-### 6.3. STUN — tự viết, không `pion/stun`
+### 6.4. TLS 1.3, SPKI Pinning & ACME (`SEC-04`, `US-003`, `US-047`)
 
-| Phương án | Phụ thuộc bắc cầu (đo bằng `go list -deps`) | Quyết định |
-|---|---|---|
-| `github.com/pion/stun/v3` v3.1.7 (MIT) | **47 gói** gồm `pion/dtls/v3` (cả stack DTLS + crypto), `pion/transport`, `pion/logging`, `wlynxg/anet` `[V]` | Loại: đưa thêm một stack mật mã **không dùng** vào binary, trái tinh thần SEC-02/“một chức năng một thư viện”, vì ~200 dòng đủ |
-| **`internal/stun` tự viết** | 0 (stdlib: `encoding/binary`, `hash/crc32`, `net/netip`) | **CHỌN**: STUN **Binding** theo RFC 5389/8489 — request/response, `XOR-MAPPED-ADDRESS`, `FINGERPRINT`; **không** `MESSAGE-INTEGRITY`/TURN. Phải có `FuzzXxx` + test vector RFC 5769. *Không phải mật mã* (CRC32 không dùng cho bảo mật) |
-
-Cổng UDP STUN cấu hình được (mặc định 3478 — chỉ ở `internal/defaults`); STUN server chạy **cùng binary `mesh-server`**; client gửi từ **chính socket magicbind** (US-019).
-
-### 6.4. Disco, MTU
-
-Disco = NaCl box (`golang.org/x/crypto/nacl/box`) + `disco_key` + `tx_id` (ADR-003 §4). MTU tunnel mặc định **1280** (REL-10). Chi tiết bản tin do Architect.
-
----
-
-## 7. Mật mã & Giao thức xác thực (SEC-02)
-
-| Nhu cầu (SEC-02) | Thư viện / cơ chế | Vị trí | Ghi chú |
+| Thành phần | Crate chọn | Thay thế bị loại | Lý do kỹ thuật |
 |---|---|---|---|
-| Khóa Curve25519 (node, disco) | `golang.org/x/crypto/nacl/box` (`GenerateKey`) + `crypto/rand` | `internal/secure` | Khóa là `[32]byte` bọc `PrivateKey` |
-| Chứng minh sở hữu khóa node (challenge/nonce **từ server**) | NaCl box với **ephemeral X25519 của server** + nonce 32 B + (tùy chọn) **TLS exporter** làm channel binding | `internal/secure` | ADR-003 — không phụ thuộc đồng hồ client |
-| Xác thực gói **Disco** (`disco_key` + `tx_id`) | NaCl box, nonce 24 B ngẫu nhiên, bảng `tx_id` đang chờ có TTL | `internal/secure` + `internal/disco` | Chống phát lại/giả mạo |
-| Băm Pre-Auth Key | **SHA-256** (`crypto/sha256`) của khóa ≥ 256 bit; so sánh `crypto/subtle.ConstantTimeCompare`; DB chỉ lưu hash | `internal/secure` | Khóa entropy cao ⇒ không cần KDF chậm (bcrypt/argon2) |
-| TLS | `crypto/tls`, **TLS 1.3 tối thiểu**; Pin = SHA-256 của **SPKI DER** | `internal/tlspin`, `internal/tlsmgr` | Khóa danh tính server **ECDSA P-256** |
-| Ngẫu nhiên | `crypto/rand` | `internal/secure` | Cấm `math/rand` v1; jitter `math/rand/v2` chỉ ở `internal/backoff` |
-| **Cấm** | tự cài cipher/MAC/KDF; MD5/SHA-1/DES/RC4; so sánh bí mật bằng `==` | — | depguard + gosec |
+| **TLS Engine** | **`rustls` `0.23`** + **`tokio-rustls` `0.26`** (`default-features = false`, bật TLS 1.3, provider `ring` `0.17` kèm feature dự phòng `rustls-rustcrypto`) | `native-tls` / `openssl-sys` | Không phụ thuộc OpenSSL C; tắt `aws-lc-rs` mặc định để không đòi CMake + NASM trên Windows; hỗ trợ `ServerCertVerifier` tùy chỉnh để kiểm tra SPKI Pin (`sha256:<hex>`) và hỗ trợ `ExportKeyingMaterial` (RFC 5705 / RFC 8446) làm channel binding cho bước chứng minh khóa node (`ADR-003`) |
+| **Sinh chứng chỉ IP + Pin** | **`rcgen` `0.13`** + **`sha2` `0.10`** | Gọi lệnh `openssl` ngoài | Thuần Rust; sinh cặp khóa định danh server ECDSA P-256 bền vững, tính `sha256` trên phần DER của `subjectPublicKeyInfo` (SPKI), và cho phép tái phát hành chứng chỉ X.509 giữ nguyên khóa công khai để client không phải pin lại (`US-047 AC3`) |
+| **ACME Client (`TLS-ALPN-01` & `DNS-01`)** | **`instant-acme` `0.7`** | `tokio-rustls-acme` (thiếu kiểm soát sâu `DNS-01` và cổng tùy chỉnh) | Thuần Rust, gọn nhẹ; cho phép `mesh-server` tự điều khiển vòng đời: dùng `TLS-ALPN-01` (ALPN `acme-tls/1`) khi cổng TCP = `443`, và bắt buộc chuyển sang `DNS-01` hoặc từ chối cấu hình có hướng dẫn khi cổng TCP ≠ `443` (`US-047 AC7`), hoàn toàn không cần mở cổng 80 |
 
-**Giao thức Control tóm tắt (chi tiết Architect):** HTTPS/1.1 JSON RPC (đăng ký, challenge) + WebSocket stream netmap, cùng cổng TCP với relay; tắt HTTP/2 trên listener này; không gRPC/protobuf/QUIC ở MVP (ADR-003/004).
+### 6.5. HTTP Control Plane & WebSocket Blind Relay (`US-009`, `US-024`, `US-025`)
 
----
+| Phương án | Giấy phép | Ưu điểm | Nhược điểm | Quyết định |
+|---|---|---|---|---|
+| **`axum` `0.8`** + **`tokio-tungstenite` `0.26`** + **`hyper` `1.6`** + **`tower` `0.5`** | MIT | Cùng hệ sinh thái chính chủ của `tokio`; định tuyến HTTP/1.1 + nâng cấp WebSocket (`GET /v1/netmap/stream` và `GET /v1/relay`) ngay trên **cùng 1 cổng TCP**; kiểm soát chặt `max_frame_size`/`max_message_size` theo MTU | — | **CHỌN** |
+| `actix-web` | MIT/Apache-2.0 | Nhanh | Dùng mô hình runtime local riêng, dư thừa khi đã dùng `tokio` | Loại |
+| `warp` | MIT | Nhẹ | Hệ thống kiểu filter phức tạp, bảo trì chậm | Loại |
 
-## 8. TLS, ACME, Relay, Reverse Proxy
+### 6.6. Mật mã & Bảo vệ Bí mật trong RAM (`SEC-01`, `SEC-02`)
 
-### 8.1. ACME (Trade-off)
-
-| Phương án | Giấy phép | `TLS-ALPN-01` | `DNS-01` | Kéo logging lib khác? | Quyết định |
-|---|---|:-:|:-:|:-:|---|
-| **`go-acme/lego/v4`** v4.35.2 | MIT `[V]` | ✔ | ✔ | Không (dùng `log` chuẩn có thể thay) | **CHỌN** — ta tự lái vòng đời; chỉ import `lego`, `certificate`, `challenge/*` |
-| `caddyserver/certmagic` | Apache-2.0 | ✔ | ✔ | **Có (`zap`)** ⇒ trùng chức năng log | Loại |
-| `x/crypto/acme/autocert` | BSD-3 | ✔ | ✘ | Không | Loại (thiếu DNS-01) |
-
-- **IP + Pin (mặc định):** khóa ECDSA P-256 sinh lúc cài; chứng chỉ tự ký giữ khóa khi tái phát hành; **Pin = `sha256:` SPKI**; tập pin (hiện tại + kế tiếp) cho xoay khóa; client `internal/tlspin` fail-closed, **không TOFU, không cờ bỏ qua** (ADR-008).
-- **Standalone domain:** `TLS-ALPN-01` **chỉ khi cổng TCP = 443** (CA kiểm trên 443 — RFC 8737 `[T44]`), cổng khác ⇒ `DNS-01` hoặc **từ chối cấu hình có hướng dẫn**; không cần cổng 80. **MVP chưa nhúng provider DNS-01** (chưa có domain) — thêm khi người dùng chốt nhà cung cấp.
-- **Reverse Proxy:** dịch vụ nghe `127.0.0.1`/UDS; `trusted_proxies` mặc định rỗng (SEC-05).
-- Let's Encrypt cấp cert cho **IP** chỉ dạng ngắn hạn (~6 ngày) và xác thực trên cổng 80/443 `[T44]` ⇒ **không** thay được Pin ở cổng tùy chỉnh.
-
-### 8.2. WebSocket cho Blind Relay & Control stream
-
-| Phương án | Giấy phép | Nhận xét | Quyết định |
+| Nhu cầu | Crate được chọn (100% Pure-Rust) | Vị trí cho phép duy nhất | Cơ chế an toàn |
 |---|---|---|---|
-| **`github.com/coder/websocket`** v1.8.15 | ISC `[V]` | API `context`-first, `SetReadLimit`, ping/pong, tương thích Nginx/Caddy; (tiền thân `nhooyr.io/websocket`) | **CHỌN** |
-| `gorilla/websocket` | BSD-2 | Phổ biến nhưng API không `context`-first | Loại (một thư viện WebSocket) |
-| HTTP Upgrade tự đóng khung (kiểu DERP) | — | Tự viết framing/keepalive | Loại |
-| QUIC (`quic-go`), gRPC | — | UDP có thể bị chặn / h2+protobuf | Loại ở MVP |
+| **Zeroization & Redaction (`SEC-01`)** | **`zeroize` `1.8`** (`Zeroize`, `ZeroizeOnDrop`) + kiểu bọc `Secret<T>` trong `mesh-crypto` | Định nghĩa tại `crates/mesh-crypto` | Khi biến chứa private key hoặc pre-auth key ra khỏi phạm vi (`Drop`), bộ nhớ RAM bị ghi đè bằng `0` thông qua phép ghi volatile chống trình biên dịch tối ưu hóa bỏ qua; `Debug`, `Display`, `Serialize` luôn xuất `"[REDACTED]"` |
+| **Chứng minh khóa Node & Xác thực Disco (`SEC-02`, `US-003`, `US-021`)** | **`crypto_box` `0.9`** (NaCl box: X25519 + XSalsa20-Poly1305) + **`x25519-dalek` `2.0`** | `crates/mesh-crypto` | Chứng minh sở hữu khóa Curve25519 bằng challenge nonce 32-byte từ server + khóa ephemeral X25519 của server; xác thực gói Disco (`Ping`/`Pong`/`CallMeMaybe`) kèm `tx_id` 96-bit ngẫu nhiên chống phát lại |
+| **Băm Pre-Auth Key & So sánh Constant-Time (`SEC-03`, `SEC-05`)** | **`sha2` `0.10`** + **`subtle` `2.6`** (`ConstantTimeEq`) | `crates/mesh-crypto` | Pre-auth key sinh từ `rand::rngs::OsRng` (≥ 256-bit); DB chỉ lưu băm SHA-256; đối chiếu bằng `ct_eq` |
+| **STUN Binding (`US-019`)** | Tự hiện thực codec ~200 dòng trong **`crates/mesh-proto::stun`** + **`crc32fast` `1.4`** | `crates/mesh-proto` | Chỉ cài đặt đúng RFC 5389 / RFC 8489 Binding Request/Response (`XOR-MAPPED-ADDRESS`, `FINGERPRINT`), **không** kéo cả bộ stack WebRTC/DTLS khổng lồ của `webrtc-rs`/`stun` crate; bắt buộc kèm kiểm thử vector RFC 5769 và `proptest`/fuzz |
 
-Chống HoL: hàng đợi per-đích có trần, **drop-tail không chặn**, write deadline ngắn, không khóa toàn cục (ADR-004). Giới hạn băng thông: `golang.org/x/time/rate`.
+### 6.7. Cơ sở dữ liệu nhúng trên VPS (`REL-11`, `REL-12`, `US-007`, `US-045`)
 
----
-
-## 9. Lưu trữ nhúng (US-045 — backup nguyên tử)
-
-| Phương án | Giấy phép | CGO | Ưu | Nhược | Quyết định |
-|---|---|:-:|---|---|---|
-| **`modernc.org/sqlite`** v1.62.0 | BSD-3 `[V]` | **Không** `[V]` | SQL, UNIQUE, WAL, `integrity_check`, `VACUUM INTO` | Chậm hơn C-SQLite (cỡ 1.5–3× `[N]`); binary lớn hơn | **CHỌN** |
-| `mattn/go-sqlite3` | MIT | **Có** | Nhanh, chín | Vi phạm `CGO_ENABLED=0` | Loại |
-| `go.etcd.io/bbolt` v1.5.0 | MIT | Không | Thuần Go, ACID, snapshot `Tx.WriteTo` | Không SQL ⇒ tự cài UNIQUE/index/migration/audit | Dự phòng |
-| Postgres/MySQL | — | — | HA | Vượt ngân sách RAM VPS dùng chung | Loại |
-
-**Quy ước truy cập (một phong cách cho mọi dev):** `database/sql` + **SQL thuần có tham số**, repository có kiểu trong `internal/store`; **không ORM/query-builder/sqlc**; migrator nhỏ tự viết (`embed` + `schema_migrations`, mỗi migration một transaction, backup trước migration + `integrity_check`).
-**Pragma:** `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000`, `trusted_schema=OFF`; một kết nối ghi.
-**Backup nguyên tử:** `VACUUM INTO <tmp>` → `fsync` → `integrity_check` trên bản sao (mở read-only) → `*.sha256` → `rename` → `0600`; giữ 7 bản; restore từ chối khi sai checksum. **Khuyến nghị cho Architect:** lưu khóa định danh server **trong DB** để backup luôn kèm khóa (REL-12).
+| Phương án | Giấy phép | Mã C (FFI) | Đánh giá trung thực | Quyết định |
+|---|---|---|---|---|
+| **`redb` `2.4`** | **MIT OR Apache-2.0** | **0 dòng C (100% Pure Rust)** | Kho dữ liệu ACID nhúng viết hoàn toàn bằng Rust an toàn; dùng cây B-tree Copy-on-Write (MVCC): `begin_write()` tạo giao dịch ACID nguyên tử xuyên nhiều bảng (`nodes`, `nodes_by_pubkey`, `nodes_by_ip`, `preauth_keys`, `audit_events`, `server_identity`); `begin_read()` tạo snapshot đọc cô lập **không bao giờ chặn luồng ghi**; có sẵn `check_integrity()`; kích thước mã và RAM cực kỳ nhỏ (~1–2 MB) | **CHỌN** |
+| `rusqlite` `0.33` (`bundled`) | MIT (SQLite Public Domain) | **Có (~250K dòng C)** | Rất chín muồi nhưng buộc phải biên dịch mã C (`libsqlite3-sys`), cần C toolchain khi cross-compile, làm phình binary và đưa một khối FFI `unsafe` lớn vào `mesh-server` | Loại (giữ đúng ưu tiên Pure-Rust / Zero-C) |
+| `sled` | MIT/Apache-2.0 | Không | Chưa bao giờ ra bản 1.0 ổn định, tiêu tốn RAM và ghi đĩa nền nhiều | **CẤM** |
+| `sqlx` / `sea-orm` / `diesel` | MIT/Apache-2.0 | Có | Quá nặng cho quy mô 3–20 node trên 1 VPS | **CẤM** |
 
 ---
 
-## 10. Tích hợp nền tảng, CLI, cấu hình, quan sát, kiểm thử
+## 7. Dependency Policy (Danh mục Crates Được phép & Bị cấm)
 
-### 10.1. Tích hợp nền tảng
+### 7.1. Danh mục Crates **ĐƯỢC PHÉP** (Ghim trong `[workspace.dependencies]` của `Cargo.toml`)
 
-| Nền tảng | Cơ chế chốt | Thư viện | Hạn chế trung thực |
+> **Quy tắc bất biến**: Một chức năng chỉ dùng đúng **một** crate trong bảng dưới đây. Mọi thay đổi/bổ sung crate ngoài bảng này là **thay đổi kiến trúc** → Developer phải **DỪNG LẠI và báo Scrum Master** (không tự ý chạy `cargo add`).
+
+| Crate | Phiên bản | Giấy phép | Crate nội bộ được phép import | Mục đích sử dụng |
+|---|---|---|---|---|
+| `tokio` | `1.44` | MIT | `mesh`, `meshd`, `mesh-server`, `mesh-datapath`, `mesh-net` | Async runtime, TCP/UDP, UDS (`peer_cred`), Windows Named Pipe, signal, timer, sync |
+| `tokio-util` | `0.7` | MIT | `meshd`, `mesh-server`, `mesh-datapath`, `mesh-net` | `CancellationToken`, `TaskTracker` (graceful shutdown ≤ 5 s), framing codec |
+| `defguard_boringtun` | `0.6` | BSD-3-Clause | **Chỉ `mesh-datapath`** | State machine WireGuard userspace sans-I/O (`noise::Tunn`) |
+| `rustls` | `0.23` | Apache-2.0 OR ISC OR MIT | `mesh-crypto`, `mesh-net`, `mesh-server` | TLS 1.3 client/server, custom `ServerCertVerifier` cho SPKI Pin |
+| `tokio-rustls` | `0.26` | MIT OR Apache-2.0 | `mesh-net`, `mesh-server` | Tích hợp `rustls` với stream `tokio` |
+| `rustls-pemfile` / `pki-types` (`rustls-pki-types`) | `2.1` / `1.11` | MIT OR Apache-2.0 | `mesh-crypto`, `mesh-server` | Kiểu dữ liệu chứng chỉ X.509 / DER / SPKI |
+| `ring` *(hoặc `rustls-rustcrypto`)* | `0.17` | ISC / MIT | `mesh-crypto`, `mesh-datapath` | Provider mật mã cho `rustls` & `defguard_boringtun` |
+| `rcgen` | `0.13` | MIT OR Apache-2.0 | **Chỉ `mesh-crypto` / `mesh-server`** | Sinh khóa định danh server & chứng chỉ tự ký cho chế độ IP + SPKI Pin (`US-047`) |
+| `instant-acme` | `0.7` | Apache-2.0 | **Chỉ `mesh-server`** | Giao thức ACME thuần Rust (`TLS-ALPN-01` & `DNS-01`, không cần cổng 80) |
+| `axum` | `0.8` | MIT | `mesh-server`, `mesh-net` (IPC/Observability) | HTTP/1.1 router cho Control Plane, `/healthz`, `/readyz`, `/metrics` và Admin IPC |
+| `hyper` / `hyper-util` | `1.6` / `0.1` | MIT | `mesh-server`, `mesh-net` | Nền tảng HTTP/1.1 cấp thấp cho kết nối UDS / Named Pipe / `ListenerSet` |
+| `tokio-tungstenite` | `0.26` | MIT | `mesh-server`, `mesh-datapath`, `mesh-net` | WebSocket binary stream cho Blind Relay (`US-024/025`) và Netmap Stream (`US-009`) |
+| `reqwest` *(hoặc `hyper` client)* | `0.12` (`default-features = false`, `rustls-tls-manual-roots-no-provider`) | MIT OR Apache-2.0 | `mesh-net`, `mesh-server` (webhook cảnh báo `US-049`) | HTTP client dùng đúng `rustls` config đã gắn SPKI Pin Verifier |
+| `crypto_box` | `0.9` | Apache-2.0 OR MIT | **Chỉ `mesh-crypto`** | NaCl box (X25519 + XSalsa20-Poly1305) cho chứng minh khóa node & xác thực Disco |
+| `x25519-dalek` | `2.0` | BSD-3-Clause | **Chỉ `mesh-crypto`** | Khóa công khai/riêng tư Curve25519 |
+| `chacha20poly1305` | `0.10` | Apache-2.0 OR MIT | **Chỉ `mesh-crypto`** | AEAD chuẩn |
+| `sha2` | `0.10` | Apache-2.0 OR MIT | **Chỉ `mesh-crypto`** | Băm SHA-256 cho Pre-Auth Key, SPKI Pin và kiểm tra toàn vẹn `wintun.dll`/backup |
+| `subtle` | `2.6` | BSD-3-Clause | **Chỉ `mesh-crypto`** | So sánh `ConstantTimeEq` chống timing attack (`SEC-03`, `SEC-05`) |
+| `zeroize` | `1.8` | Apache-2.0 OR MIT | **`mesh-crypto`**, `mesh-core` | `Zeroize`, `ZeroizeOnDrop` xóa sạch khóa trong RAM ngay khi giải phóng (`SEC-01`) |
+| `rand` / `getrandom` | `0.8` / `0.2` | MIT OR Apache-2.0 | `mesh-crypto`, `mesh-core` (`backoff`) | Sinh số ngẫu nhiên mật mã học (`OsRng`) và jitter backoff |
+| `redb` | `2.4` | MIT OR Apache-2.0 | **Chỉ `mesh-store`** | Cơ sở dữ liệu ACID MVCC thuần Rust 100% trên VPS (`US-007`, `US-045`) |
+| `serde` / `serde_json` | `1.0` | MIT OR Apache-2.0 | Toàn workspace | Tuần tự hóa JSON (Control RPC, Netmap cache, IPC, `status --json`) |
+| `toml` | `0.8` | MIT OR Apache-2.0 | `mesh-core`, `meshd`, `mesh-server` | Đọc/ghi cấu hình TOML (`#[serde(deny_unknown_fields)]`) |
+| `clap` | `4.5` | MIT OR Apache-2.0 | `mesh`, `meshd`, `mesh-server` | Phân tích dòng lệnh CLI (`derive`, `env`) |
+| `thiserror` | `2.0` | MIT OR Apache-2.0 | Toàn workspace | Định nghĩa kiểu lỗi có cấu trúc (`AppError`, domain errors) |
+| `tracing` / `tracing-subscriber` / `tracing-appender` | `0.1` / `0.3` / `0.2` | MIT | Toàn workspace | Structured JSON logging (`OPS-01`) & xoay vòng file log (`US-043`) |
+| `bytes` | `1.10` | MIT | `mesh-proto`, `mesh-datapath`, `mesh-server` | Quản lý buffer gói mạng zero-copy |
+| `crc32fast` | `1.4` | MIT OR Apache-2.0 | `mesh-proto` | Tính `FINGERPRINT` CRC-32 cho gói STUN (RFC 5389) |
+| `base64` / `data-encoding` | `0.22` / `2.8` | MIT | `mesh-core`, `mesh-crypto` | Mã hóa hiển thị khóa công khai, fingerprint `sha256:…` và `mpk_…` |
+| `socket2` | `0.5` | MIT OR Apache-2.0 | `mesh-sys`, `mesh-net`, `mesh-datapath` | Cấu hình socket cấp thấp (`SO_MARK`, `IP_BOUND_IF`, `IP_UNICAST_IF`, buffer size) |
+| `libc` *(Unix)* | `0.2` | MIT OR Apache-2.0 | **Chỉ `mesh-sys`** (`cfg(unix)`) | Hằng số và cấu trúc syscall cho Linux (`/dev/net/tun`, `SO_PEERCRED`) & macOS (`utun`, `LOCAL_PEERCRED`, `PF_ROUTE`) |
+| `windows-sys` *(Windows)* | `0.59` | MIT OR Apache-2.0 | **Chỉ `mesh-sys`** (`cfg(windows)`) | API Win32 chính chủ Microsoft (0 macro nặng): `LoadLibraryExW`, Named Pipe SDDL, IP Helper, `IP_UNICAST_IF` |
+| `windows-service` *(Windows)* | `0.7` | MIT OR Apache-2.0 | `mesh-net` / `meshd` (`cfg(windows)`) | Tích hợp Windows Service Control Manager & nhận sự kiện `PowerEvent` (`US-036`, `US-052`) |
+| `proptest` *(dev-dependencies)* | `1.6` | MIT OR Apache-2.0 | `[dev-dependencies]` | Kiểm thử dựa trên thuộc tính (Property-based testing / fuzzing) cho mọi bộ parser mạng & hosts |
+| `tempfile` *(dev-dependencies)* | `3.17` | MIT OR Apache-2.0 | `[dev-dependencies]` | Tạo thư mục/tệp tạm tự dọn trong unit/integration test |
+
+### 7.2. Danh mục Crates & Hành vi **BỊ CẤM** (Cưỡng chế bằng `deny.toml` & `clippy.toml`)
+
+| Nhóm | Bị cấm tuyệt đối | Lý do & Giải pháp thay thế | Cơ chế cưỡng chế |
 |---|---|---|---|
-| **macOS 13+** | Daemon root foreground dưới `launchd` (`/Library/LaunchDaemons`, `RunAtLoad`+`KeepAlive`); `utun`; không NetworkExtension; binary `arm64` ký ad-hoc bởi linker `[V]`; cài qua script kiểm checksum | `x/sys/unix` (`IP_BOUND_IF`, `LOCAL_PEERCRED`), `x/net/route` (PF_ROUTE), `/sbin/route` qua `sysexec` | **Không IOKit (cần cgo)**: sleep/wake dùng PF_ROUTE + **phát hiện nhảy đồng hồ**; DNS resolver pure-Go (cgo off). Nếu PERF-07 trên MacBook không đạt ⇒ xin duyệt `ebitengine/purego` (ngoài danh mục) |
-| **Windows 10/11** | Service (`x/sys/windows/svc` + `svc/mgr`, Recovery), Wintun, named pipe + SDDL, `winipcfg` | `x/sys/windows`, `go-winio`, `wireguard/windows/tunnel/winipcfg` | `wintun.dll` kèm nguyên vẹn + kiểm SHA-256; firewall qua `netsh`; installer chưa ký ⇒ SmartScreen (R-11) |
-| **Ubuntu LTS** | `systemd` `Type=notify` (`internal/sdnotify` ~30 dòng, không thư viện); `mesh-server` user `mesh`; `meshd` unit riêng `CAP_NET_ADMIN`; netlink | `x/sys/unix`, `vishvananda/netlink` | Test lab: `--cap-add=NET_ADMIN --device /dev/net/tun`, không `--privileged` |
-
-Chi tiết quyết định ở **ADR-006/007**; chống routing loop: Linux `SO_MARK`, macOS `IP_BOUND_IF`/`IPV6_BOUND_IF`, Windows `IP_UNICAST_IF`/`IPV6_UNICAST_IF`.
-
-### 10.2. CLI, cấu hình, quan sát, kiểm thử
-
-| Hạng mục | Chốt | Thay thế bị loại |
-|---|---|---|
-| **CLI** | `spf13/cobra` v1.10.2 (Apache-2.0 `[V]`) — `mesh <noun> <verb>` | `urfave/cli`, `kong`, `flag` thuần |
-| **Config** | TOML `pelletier/go-toml/v2` v2.4.3 (MIT) strict | `viper`, YAML |
-| **Validation** | **Không thư viện validate** — kiểu miền có constructor `(T, error)` (parse, don't validate) | `go-playground/validator` |
-| **HTTP** | `net/http` + `ServeMux` (Go 1.22+ pattern) | gin/chi/echo/mux |
-| **Logging** | `log/slog` + `internal/logx`; trường bắt buộc `ts, level, component, event` (+ `request_id`, `node_id`, `peer_id`) | zap/zerolog/logrus, package `log` |
-| **Tracing** | Không OpenTelemetry ở MVP (single-process, 20 node) — `request_id` correlation đủ | OTel |
-| **Metrics** | `VictoriaMetrics/metrics` v1.45.0 (MIT `[V]`), listener riêng chỉ-đọc | `prometheus/client_golang` |
-| **Test** | stdlib `testing`, `google/go-cmp` v0.7.0, `go.uber.org/goleak` v1.3.0, `testing/synctest`, fuzz native | `testify` |
-| **ID** | `internal/ids` (`crypto/rand`) | `uuid`, `ulid` |
+| **Giấy phép lây nhiễm** | **`AGPL-3.0`**, **`GPL-2.0`**, **`GPL-3.0`**, **`LGPL-*`**, **`SSPL-1.0`**, **`MPL-2.0`** (như `gotatun`, mã server NetBird) | Vi phạm ràng buộc `C5` / `R-15` | `cargo deny check licenses` (`deny.toml`) |
+| **Thư viện C ẩn / OpenSSL** | `openssl`, `openssl-sys`, `native-tls`, `libsqlite3-sys`, `rusqlite`, `libsodium-sys`, `curl-sys` | Phá vỡ chiến lược Pure-Rust / Zero-C, gây lỗi cross-compile và tăng bề mặt lỗ hổng C | `deny.toml` (`[bans] deny`) |
+| **Lỗi lỏng lẻo** | `anyhow`, `eyre` trong các crate thư viện (`mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-datapath`, `mesh-net`, `mesh-store`, `mesh-sys`) | Làm mất kiểu lỗi (`ErrorKind`), khiến tầng biên không phân biệt được lỗi cần retry (`Unavailable`), `PinMismatch` hay `Unauthenticated` → **bắt buộc dùng `thiserror` + `AppError`** | `deny.toml` + Clippy |
+| **Trùng chức năng Async/HTTP/Log** | `async-std`, `smol`, `actix-web`, `warp`, `rocket`, `ureq`, `surf`, `log4rs`, `env_logger`, `fern`, `slog` | Tránh mỗi Developer cài một framework khác nhau; chỉ dùng `tokio` + `axum` + `tracing` | `deny.toml` (`[bans] deny`) |
+| **DB nhúng không ổn định** | `sled`, `rocksdb`, `leveldb`, `diesel`, `sea-orm`, `sqlx` | Chỉ dùng `redb` | `deny.toml` (`[bans] deny`) |
+| **Gây crash tiến trình** | `.unwrap()`, `.expect()`, `panic!()`, `todo!()`, `unimplemented!()`, `dbg!()`, `println!()`, `eprintln!()` trong code production (trừ `crates/mesh` CLI in kết quả qua writer chuẩn) | VPN daemon chạy 24/7 dưới quyền `root`/`SYSTEM` không được phép panic khi gặp gói mạng dị dạng | `[workspace.lints.clippy]` (`unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `todo = "deny"`, `dbg_macro = "deny"`) |
+| **Mã `unsafe` bừa bãi** | Từ khóa `unsafe` ở bất kỳ đâu ngoài `crates/mesh-sys` | Bảo đảm an toàn bộ nhớ tuyệt đối cho toàn bộ giao thức & nghiệp vụ | `[workspace.lints.rust] unsafe_code = "forbid"` |
 
 ---
 
-## 11. Dependency Policy
+## 8. Ngân sách Tài nguyên & Tinh chỉnh Runtime (Đáp ứng mục tiêu của Người dùng)
 
-### 11.1. Danh mục **ĐƯỢC PHÉP** (ghim; thêm = hỏi Scrum Master + ADR)
+Để hiện thực hóa mục tiêu của người dùng (**RAM chạy nền ~4–10 MB trên client, ~8–18 MB trên VPS; binary ~3–6 MB**), kiến trúc áp dụng các kỹ thuật cấp phát tĩnh sau:
 
-> Phiên bản = phiên bản `@latest` trên `proxy.golang.org` tại 2026-11-12 `[V]`; giấy phép = đọc từ file LICENSE trong module đã tải `[V]` trừ khi đánh dấu `[N]`.
-
-| Thư viện | Phiên bản ghim | Giấy phép | Binary / OS | Gói duy nhất được import | Mục đích |
-|---|---|---|---|---|---|
-| Go stdlib | 1.27.4 | BSD-3 | tất cả | — | `net/http`, `crypto/*`, `log/slog`, `database/sql`, `embed`, `net/netip`, `testing/synctest`… |
-| `golang.zx2c4.com/wireguard` | `v0.0.0-20261024220952-b3bc704ef0ee` | MIT | `meshd` | `internal/datapath/**` | `device`, `conn`, `tun`, `ipc` |
-| `golang.zx2c4.com/wintun` | `v0.0.0-20230126152724-0fa3db229ce2` | MIT | `meshd`/windows | (bắc cầu qua `wireguard/tun`) | binding nạp `wintun.dll` |
-| `golang.zx2c4.com/wireguard/windows` | `v1.1.1` | MIT | `meshd`/windows | `internal/datapath` (`_windows.go`): `tunnel/winipcfg` **chỉ** | IP Helper |
-| `golang.org/x/crypto` | `v0.59.0` | BSD-3 | server, `meshd` | `internal/secure/**` | `nacl/box` (+ gói cần thiết khác trong `secure`) |
-| `golang.org/x/sys` | `v0.50.0` | BSD-3 | tất cả | các file `_<os>.go`, `internal/sys*` | `unix`, `windows`, `windows/svc`, `svc/mgr` |
-| `golang.org/x/net` | `v0.62.0` | BSD-3 | `meshd` | `route`, `ipv4`, `ipv6` **chỉ** | PF_ROUTE, socket options |
-| `golang.org/x/sync` | `v0.25.0` | BSD-3 | tất cả | `internal/lifecycle` | `errgroup` |
-| `golang.org/x/time` | `v0.16.0` | BSD-3 | server | `internal/relay` | `rate` |
-| `modernc.org/sqlite` | `v1.62.0` | BSD-3 (+ `libc`, `mathutil`, `memory` BSD-3) | server | `internal/store` | SQLite thuần Go |
-| `github.com/coder/websocket` | `v1.8.15` | ISC | server, `meshd` | `internal/{relay,controlclient,...}` | WebSocket |
-| `github.com/spf13/cobra` | `v1.10.2` | Apache-2.0 (+ `pflag` BSD-3, `mousetrap` Apache-2.0) | `mesh`, `meshd`, `mesh-server` | `cmd/**`, `internal/cli` | CLI |
-| `github.com/pelletier/go-toml/v2` | `v2.4.3` | MIT | server, `meshd` | `internal/config` | Config TOML |
-| `github.com/go-acme/lego/v4` | `v4.35.2` | MIT (+ `go-jose` Apache-2.0, `miekg/dns` BSD-3, `cenkalti/backoff` MIT) | **chỉ `mesh-server`** | `internal/tlsmgr` | ACME |
-| `github.com/VictoriaMetrics/metrics` | `v1.45.0` | MIT (+ `valyala/histogram`, `fastrand` MIT) | server (`meshd` tùy) | `internal/obs` | Metrics Prometheus text |
-| `github.com/Microsoft/go-winio` | `v0.6.4` | MIT | `meshd`/windows | `internal/ipc` (`_windows.go`) | Named pipe + SDDL |
-| `github.com/vishvananda/netlink` | `v1.3.1` | Apache-2.0 (+ `netns` Apache-2.0) `[V]` | `meshd`+`mesh-server`/linux | `internal/{routes,netmon}` (`_linux.go`) | netlink |
-| `github.com/google/go-cmp` | `v0.7.0` | BSD-3 | **test** | `_test.go` | So sánh/diff |
-| `go.uber.org/goleak` | `v1.3.0` | MIT | **test** | `_test.go` | Rò goroutine |
-
-*Thư viện bắc cầu* của các mục trên được phép khi `go-licenses` xác nhận giấy phép thuộc allowlist (§11.3). **Không** import trực tiếp thư viện bắc cầu nếu nó không có trong bảng.
-
-**Phụ thuộc ngoài Go:** `wintun.dll` **0.14.1** (bản prebuilt mới nhất theo hiểu biết hiện tại `[N]` — DevOps xác minh trên `wintun.net` khi đóng gói) — *Prebuilt Binaries License*: phân phối **nguyên vẹn, đi kèm phần mềm dùng nó qua API `wintun.h`**, không sửa/dịch ngược, không dùng tên WireGuard/Wintun để quảng bá `[N]`; mã nguồn Wintun GPLv2 **không** được biên dịch/liên kết.
-
-### 11.2. Danh mục **BỊ CẤM**
-
-| Nhóm | Cấm | Lý do / Thay bằng | Cưỡng chế |
-|---|---|---|---|
-| **Giấy phép** | **AGPL**, **GPL**, **LGPL**, SSPL, BUSL, CC-BY-NC, giấy phép không rõ | C5/R-15 — lây nhiễm/không tương thích | `go-licenses` (CI) |
-| **Mã nguồn đối thủ** | Sao chép/phụ thuộc `github.com/netbirdio/netbird` (server AGPLv3), `tailscale.com`, `juanfont/headscale` | AGPL / phụ thuộc khổng lồ ngoài danh mục — chỉ **tham khảo thiết kế** | depguard |
-| **cgo** | `mattn/go-sqlite3`, bất kỳ gói `import "C"` | ADR-001 | depguard + `scripts/check` |
-| **Mật mã** | Tự viết cipher/MAC/KDF; `crypto/md5`, `sha1`, `des`, `rc4`; `math/rand` v1 cho bảo mật; import primitive ngoài `internal/secure` | SEC-02/GNFR-01 | depguard (`crypto-only-in-secure`), gosec |
-| **Trùng chức năng — log** | `zap`, `zerolog`, `logrus`, package `log` | Chỉ `slog` | depguard |
-| **— HTTP/router** | `gin`, `chi`, `echo`, `gorilla/mux` | Chỉ `net/http` | depguard |
-| **— WebSocket** | `gorilla/websocket`, `nhooyr.io/websocket`, `x/net/websocket` | Chỉ `coder/websocket` | depguard |
-| **— CLI/config** | `urfave/cli`, `viper`, YAML (`yaml.v3`) runtime | Chỉ cobra + TOML | depguard |
-| **— DB** | `sqlx`, `gorm`, ORM/query-builder, `glebarez/go-sqlite` | `database/sql` + SQL thuần; chỉ `modernc` | depguard |
-| **— ACME** | `certmagic`, `autocert` | Chỉ `lego` | depguard |
-| **— Metrics** | `prometheus/client_golang` | Chỉ `VictoriaMetrics/metrics` | depguard |
-| **— STUN** | `pion/stun`, `pion/*` | Tự viết `internal/stun` (§6.3) | review |
-| **— Test** | `testify` | `testing` + `go-cmp` | depguard |
-| **— ID** | `google/uuid`, `oklog/ulid` | `internal/ids` | depguard |
-| **Rust/FFI/WG khác** | `gotatun` (MPL-2.0), `boringtun`, kernel-WG binding | ADR-001/002 | depguard + review |
-| **Hành vi** | `InsecureSkipVerify` ngoài `internal/tlspin`; shell qua `exec`; bỏ Gatekeeper (`spctl --master-disable`) | SEC-04, PLAT-06 | `scripts/check.*`, `forbidigo` |
-
-### 11.3. Quy tắc thêm/nâng cấp & giấy phép cho phép
-
-1. **Allowlist giấy phép:** `MIT`, `BSD-2-Clause`, `BSD-3-Clause`, `Apache-2.0`, `ISC` (+ ngoại lệ có tên cho `wintun.dll`). **MPL-2.0 chỉ khi có ADR riêng.** Mọi thứ khác ⇒ fail.
-2. **Cách thêm đúng phiên bản ghim:** `go get <module>@<phiên-bản-trong-bảng-11.1>` (không dùng `go mod tidy` để tự chọn phiên bản — đã quan sát `tidy` chọn `go-toml/v2 v2.1.0` thay vì `v2.4.3` `[V]`).
-3. **Thêm thư viện mới = thay đổi kiến trúc** → dừng, báo Scrum Master/Người dùng; kèm ADR ngắn: nhu cầu, phương án trong danh mục không đáp ứng, giấy phép, số gói bắc cầu (`go list -deps`), `CGO_ENABLED=0` trên 4 đích, kích thước binary.
-4. **Ứng viên chờ duyệt (KHÔNG được dùng cho tới khi người dùng duyệt):** `ebitengine/purego` (IOKit macOS), provider DNS-01 của `lego` (khi có domain), thư viện xoay vòng log (`lumberjack`), công cụ ký phát hành ngoài OpenSSH.
-5. **Nâng cấp:** PR riêng `build(deps): …`, chạy đủ `scripts/check.* -Deps`; `wireguard-go` và `lego` nâng cấp kèm test tích hợp; theo dõi CVE bằng `govulncheck`.
-6. **Công cụ dev** (`tools/go.mod`) tách khỏi sản phẩm và không đi vào binary release.
+1. **Giới hạn Worker Threads & Stack của Tokio**:
+   - Trên client (`meshd`): dùng `tokio::runtime::Builder::new_multi_thread().worker_threads(2).max_blocking_threads(2).thread_stack_size(512 * 1024)`.
+   - Trên VPS (`mesh-server`): dùng `worker_threads(2)` (khớp VPS 1–2 vCPU).
+2. **Pre-allocated Packet Buffers (Zero Heap Allocation trên đường nóng)**:
+   - Vòng lặp đọc/ghi UDP (`MagicSocket`) và TUN (`TunDevice`) dùng mảng cố định cấp phát sẵn `[u8; 2048]` tái sử dụng cho `defguard_boringtun::noise::Tunn::encapsulate`/`decapsulate`, **không cấp phát `Vec<u8>` mới cho mỗi gói tin**.
+3. **Bounded Queues ở mọi nơi (`US-025 AC6`)**:
+   - Trong Blind Relay, mỗi node đích có đúng 1 kênh `tokio::sync::mpsc::channel(256)` cố định; gửi gói dùng `try_send()` (đầy thì drop-tail ngay lập tức và tăng counter `mesh_relay_dropped_total`, **tuyệt đối không `.send().await`** gây nghẽn dây chuyền Head-of-Line blocking hoặc phình RAM).
+4. **Không bật `last_seen` broadcast (`US-009 AC1`)**:
+   - `mesh-server` chỉ giữ thời điểm heartbeat mới nhất trong RAM và chỉ tăng `netmap_version` + đẩy snapshot khi có thay đổi thực sự về cấu trúc hoặc trạng thái `online ↔ offline` (có debounce), giữ CPU VPS lúc rảnh **< 1%** và băng thông nền **≤ 1 KB/s** (`PERF-02`, `PERF-10`).
 
 ---
 
-## 12. Build, phát hành & CI
-
-| Hạng mục | Quyết định |
-|---|---|
-| Lệnh build | `CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=true -ldflags "-s -w -X …/buildinfo.Version=<tag>" ./cmd/<bin>` |
-| Ma trận | `linux/amd64` (`mesh-server`,`meshd`,`mesh`), `darwin/arm64` + `darwin/amd64` (`meshd`,`mesh`), `windows/amd64` (`meshd`,`mesh` + `wintun.dll`) |
-| macOS | Hai binary native; **không** `lipo`/`.pkg`/notarization (P2); linker Go tự ký ad-hoc `arm64` `[V]`; luồng cài bằng script kiểm `SHA256SUMS` (không gắn quarantine) |
-| Toàn vẹn | `SHA256SUMS` + chữ ký tách rời bằng `ssh-keygen -Y sign` (OpenSSH có sẵn 3 OS); DevOps chốt quy trình khóa ký (ADR-011) |
-| CI (cưỡng chế cùng bộ lệnh) | `lint+vet` (ubuntu) · `test-race` (ubuntu, `CGO_ENABLED=1`) · `test` ma trận `ubuntu/windows/macos` · `cross-build` (4 đích) · `deps` (`govulncheck` + `go-licenses`) |
-| Hạ tầng test macOS | **Mac thật / VM trên phần cứng Apple / runner macOS** (GNFR-12) — không giả lập trong container Linux |
-| Tuning runtime (khởi điểm, chỉnh sau đo US-058) | `GOMEMLIMIT`: server **96 MiB**, agent **40 MiB** (giới hạn mềm); `GOGC` mặc định |
-
----
-
-## 13. Rủi ro công nghệ & Câu hỏi cho Scrum Master
-
-| # | Rủi ro / Điểm cần biết | Mức | Giảm thiểu |
-|---|---|---|---|
-| T1 | `wireguard-go` **không có tag** ⇒ ghim pseudo-version; tự theo dõi bản vá | Trung bình | Ghim + `govulncheck` + watch repo; test netmap/relay khi nâng |
-| T2 | Tự hiện thực **magicbind** (disco/hole punching) — độ phức tạp cao (R-16) | Cao | Walking Skeleton relay-only trước (backlog 15.2); tham khảo (không import) `magicsock` |
-| T3 | **macOS không có IOKit** (cgo off) ⇒ sleep/wake kém chính xác (PERF-07) | Trung bình | PF_ROUTE + nhảy đồng hồ; đo trên MacBook; nếu thiếu ⇒ xin duyệt `purego` |
-| T4 | Race detector cần cgo ⇒ dev Windows phải dùng Docker/WSL | Thấp | CI Linux bắt buộc; `check.ps1 -Race` |
-| T5 | `modernc.org/sqlite` chậm hơn/ít "battle-tested" hơn C-SQLite | Thấp | Đo PERF-01; `integrity_check`; dự phòng `bbolt` |
-| T6 | Windows SmartScreen cảnh báo installer chưa ký (R-11); macOS cần cài không qua trình duyệt | Trung bình | Runbook; code-signing là P2 |
-| T7 | ACME `TLS-ALPN-01` chỉ trên cổng 443; chưa có provider DNS-01 | Thấp | Từ chối cấu hình có hướng dẫn; xin chọn DNS provider khi có domain |
-| T8 | Tuổi của `wintun.dll` 0.14.1 (2021) và binding `wintun` (2023) | Thấp | Ổn định, dùng bởi WireGuard; DevOps xác minh bản mới trên `wintun.net` |
-
-**Cần Scrum Master chuyển người dùng (không chặn Gate 2, quyết trước Sprint 1):**
-1. **Chấp nhận stack Go** + thay đổi so với giả định cũ "Rust có sẵn trên máy" (người dùng có `rustc` nhưng chưa có `go` — bootstrap ở §4).
-2. **Module path** `meshvpn.internal/mesh` (tên giữ chỗ) — có muốn đổi sang `github.com/<owner>/<repo>` không (đổi rẻ nhất trước Sprint 1).
-3. **Khóa ký phát hành** (`ssh-keygen -Y`): người dùng sẽ giữ khóa riêng ở đâu (ngoài VPS)?
-4. **Hạ tầng macOS để QA**: Mac thật nào (Apple Silicon + Intel) hoặc runner CI?
-5. **DNS provider** (nếu sau này có domain) để bật `DNS-01`.
-6. **VPS kiến trúc**: xác nhận `linux/amd64` (nếu VPS là `arm64` ⇒ thêm đích `linux/arm64`, build đã hỗ trợ).
-
----
-
-## 14. Bằng chứng kiểm chứng (phiên 2026-11-12, máy dev Windows)
-
-Probe: module tạm `probe/` (trong thư mục scratch của phiên, **không** nằm trong repo) import đủ các thư viện chủ chốt (`wireguard/{conn,device,tun}`, `modernc.org/sqlite`, `coder/websocket`, `pion/stun/v3`, `x/crypto/nacl/box`, `lego/v4`, `VictoriaMetrics/metrics`, `cobra`; thêm `go-winio`, `x/sys/windows/svc`, `winipcfg` cho Windows) và biên dịch với `CGO_ENABLED=0`, Go 1.27.4 (zip chính thức, SHA-256 khớp go.dev).
-
-| Đích | Kết quả | Kích thước probe (`-s -w`) | Ghi chú |
-|---|---|---|---|
-| `linux/amd64` | ✔ build | 8.1 MB | — |
-| `darwin/arm64` | ✔ build | 7.7 MB | Mach-O `arm64`, **có `LC_CODE_SIGNATURE` (≈ 62 KB), cờ ad-hoc bật** (phân tích header bằng script) |
-| `darwin/amd64` | ✔ build | 8.1 MB | Mach-O `x86_64`, không có chữ ký (không bắt buộc cho amd64) |
-| `windows/amd64` | ✔ build | 8.1 MB | gồm `go-winio`, `svc`, `winipcfg` |
-
-> Kích thước probe **không đại diện** cho binary thật (trình biên dịch loại mã chết; chỉ tham chiếu ký hiệu). Mục đích: chứng minh **liên kết được trên cả 4 đích mà không cần C toolchain**, kể cả SQLite nhúng.
-
-**Đã kiểm chứng `[V]`:** phiên bản Go + SHA-256; bản mới nhất của mọi module trên `proxy.golang.org`; giấy phép MIT/BSD-3/ISC/Apache-2.0 đọc từ LICENSE của `wireguard`, `wireguard/windows`, `wintun`, `metrics`, `coder/websocket`, `cobra`, `go-winio`, `modernc/sqlite`, `lego`, `pion/stun`; chữ ký ad-hoc Mach-O; `conn.Bind` có đúng 6 phương thức; `wintun` nạp DLL với `SEARCH_APPLICATION_DIR|SYSTEM32` và `WintunTunnelType="WireGuard"` mặc định; `-race` cần cgo; `go`/`golangci-lint` chưa có trên máy; PowerShell cắt `-modfile=tools/go.mod`; số gói bắc cầu của `pion/stun`.
-
-**Kiểm chứng bộ công cụ cưỡng chế `[V]` (sandbox mô phỏng repo, ngoài repo):** (1) `golangci-lint config verify` đạt với `.golangci.yml`; (2) mẫu mã **xấu** bị bắt đủ: `fmt.Println`, `log`, `time.Sleep`, `panic`, `os.Exit` (ngoài `cmd/*/main.go`), `x.(T)` không kiểm, `_ = f()`, `crypto/md5`, `crypto/aes` ngoài `internal/secure`, `math/rand`, `http.Get`, `InsecureSkipVerify` ngoài `internal/tlspin` — linter báo 25 issue trên file xấu (sau khi format) và **0 issue** trên mã mẫu "tốt" (kể cả `internal/secure` dùng `crypto/aes`, `internal/tlspin` dùng `InsecureSkipVerify`, `cmd/mesh` dùng `os.Exit`); (3) `scripts/check.ps1 -Deps` chạy **PASS toàn bộ trong ≈ 66 s** (toolchain → module → repo-rules → fmt → lint ×3 OS → vet+build ×4 đích → test → `govulncheck` "No vulnerabilities found" → `go-licenses` ×3 OS); (4) mẫu vi phạm (hằng số cổng `443`, `Reveal()` ngoài danh sách, file `.go` có BOM) ⇒ `CHECK FAILED`, exit 1; (5) probe bổ sung `vishvananda/netlink` (linux), `x/net/route` + `unix.GetsockoptXucred` + `unix.IP_BOUND_IF` (darwin), `go-toml/v2`: **build OK 4 đích, `CGO_ENABLED=0`**, mọi giấy phép ∈ {MIT, BSD-2/3, Apache-2.0, ISC}. Phát hiện kỹ thuật: depguard khớp **tiền tố** (`log` chặn cả `log/slog`) ⇒ dùng `log$`/`math/rand$`; `gofumpt` xóa dòng trống trước `if err != nil`; `extra-rules` của gofumpt đã deprecated ⇒ dùng `extra.group-params/clothe-returns`; một file có BOM làm hỏng `go.mod`/Go tooling (probe đầu tiên bị lỗi `unexpected input character '\ufeff'`) ⇒ đã thêm kiểm BOM vào `scripts/check.*`.
-
-**Mức kiểm chứng của hai script:** `scripts/check.ps1` (+ `check-licenses.ps1`, `bootstrap-toolchain.ps1` chỉ kiểm cú pháp/băm) được chạy **end-to-end** như trên. `scripts/check.sh` + `check-licenses.sh`: cú pháp **đạt `dash`** (Debian/WSL); khối "repo rules" (awk + kiểm BOM) chạy đúng trên `dash`+`mawk` (bắt đủ 4 loại vi phạm, mã sạch ⇒ rc=0); **chưa chạy end-to-end trên macOS/Linux thật** (cần Go Linux/macOS) — `agile-devops` phải chạy thử ở CI Linux/macOS ngay Sprint 1 và báo lỗi nếu có.
-
-**Chưa kiểm chứng `[N]` (cần Sprint/QA xác nhận):** Rust cross-compile qua `cargo-zigbuild` (không chạy thử để không đổi `rustup` của người dùng); `go test -race` trong Docker `golang:1.27.4`; hiệu năng/RAM/throughput (PERF-*); điều khoản chính xác của Wintun *Prebuilt Binaries License* (đọc từ nguồn công khai, DevOps đọc lại bản kèm trong ZIP); hành vi `modernc.org/sqlite` dưới tải thực; phiên bản `wintun.dll` mới nhất.
-
----
-
-## 15. Lịch sử sửa đổi
+## 9. Lịch sử sửa đổi
 
 | Phiên bản | Ngày | Nội dung |
 |---|---|---|
-| 1.0 | 2026-11-12 | Chốt Go 1.27.4 + stack, Dependency Policy, 11 ADR, chuẩn code & cưỡng chế tự động |
+| 1.0 | 2026-11-12 | Bản đề xuất ban đầu (Go 1.27) |
+| **2.0** | **2026-11-12** | **Ghi đè toàn bộ sang Rust `1.94.1` Stack theo quyết định của Người dùng (`"Tôi chọn 2. Đổi sang Rust"`)**: kiến trúc Cargo Workspace 3 binaries + 7 crates, `defguard_boringtun` sans-I/O trên 1 UDP socket, `redb` ACID thuần Rust, `rustls` + SPKI Pin, `ZeroizeOnDrop` xóa khóa trong RAM, cô lập `unsafe` vào duy nhất `mesh-sys`, và cưỡng chế bằng `rustfmt` + `clippy` + `cargo-deny` |

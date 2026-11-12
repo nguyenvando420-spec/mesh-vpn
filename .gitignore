@@ -8,30 +8,31 @@ Desktop.ini
 .vscode/
 .idea/
 
-# Build & Test artifacts
+# Rust / Cargo build & test artifacts (Note: Cargo.lock is tracked in Git for binary workspaces)
+/target/
 /bin/
 /dist/
 /out/
-/target/
 *.exe
 *.dll
 *.so
 *.dylib
-*.test
-*.out
+*.pdb
+*.dSYM/
+*.profraw
+*.profdata
+lcov.info
 coverage.*
 
-# Runtime state, databases & local secrets (SEC-01)
+# Runtime state, databases (redb) & local secrets (SEC-01)
 *.key
 *.pem
 *.crt
 *.csr
 *.pfx
 *.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
+*.redb
+*.bak
 .env
 .env.*
 

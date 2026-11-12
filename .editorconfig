@@ -1,5 +1,5 @@
 # EditorConfig — https://editorconfig.org
-# Chuẩn định dạng thống nhất cho toàn dự án mesh-vpn (xem docs/03-system-design/coding-standards.md §1).
+# Chuẩn định dạng thống nhất cho toàn dự án mesh-vpn (Rust 1.94.1 — xem docs/03-system-design/coding-standards.md §1).
 root = true
 
 [*]
@@ -10,20 +10,14 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 2
 
-# Go: gofmt/gofumpt bắt buộc dùng TAB; độ rộng hiển thị 4 (khớp lll.tab-width trong .golangci.yml).
-[*.go]
-indent_style = tab
+# Rust: chuẩn rustfmt dùng 4 dấu cách (spaces), độ rộng dòng tối đa 100 cột.
+[*.rs]
+indent_style = space
 indent_size = 4
-max_line_length = 120
-
-[{go.mod,go.sum,go.work,go.work.sum}]
-indent_style = tab
-indent_size = 4
-
-[*.sql]
-indent_size = 4
+max_line_length = 100
 
 [*.{toml,yml,yaml,json,plist,service,xml}]
+indent_style = space
 indent_size = 2
 
 [*.md]
@@ -34,8 +28,12 @@ max_line_length = off
 # Script Windows giữ CRLF (khớp .gitattributes).
 [*.{ps1,bat,cmd}]
 end_of_line = crlf
+indent_style = space
+indent_size = 4
 
 [*.sh]
+end_of_line = lf
+indent_style = space
 indent_size = 2
 
 [Makefile]

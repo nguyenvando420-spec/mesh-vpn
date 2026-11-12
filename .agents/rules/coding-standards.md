@@ -2,54 +2,55 @@
 trigger: always_on
 ---
 
-# Mesh VPN — Coding Standards (BẮT BUỘC cho mọi Subagent)
+# Mesh VPN — Rust Coding Standards (BẮT BUỘC cho mọi Subagent)
 
-Chuẩn đầy đủ: `docs/03-system-design/coding-standards.md` · Stack/thư viện: `docs/03-system-design/tech-stack-decision.md` · ADR: `docs/03-system-design/architecture-decision-record.md`. Cấu hình công cụ: `.golangci.yml`, `.editorconfig`, `tools/go.mod`. **Không tự `//nolint` để lách luật. Việc ngoài danh mục/kiến trúc ⇒ DỪNG, báo Scrum Master.**
+Chuẩn đầy đủ: `docs/03-system-design/coding-standards.md` · Stack: `docs/03-system-design/tech-stack-decision.md` · ADR: `docs/03-system-design/architecture-decision-record.md`. Công cụ: `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml`, `deny.toml`, `.editorconfig`. **Cấm tự `#[allow(clippy::...)]` để lách luật. Thay đổi crate/ranh giới module/API/DB contract ⇒ DỪNG, báo Scrum Master.**
 
-## 1. Stack chốt (không tự đổi)
-- **Go 1.27.4**, module `meshvpn.internal/mesh`, **`CGO_ENABLED=0` luôn luôn**. Build ra 4 đích: `linux/amd64`, `darwin/arm64`, `darwin/amd64`, `windows/amd64`. 3 binary: `cmd/mesh` (CLI), `cmd/meshd` (agent root/SYSTEM), `cmd/mesh-server` (control+relay+STUN, Linux). Toàn bộ mã nằm trong `internal/`.
-- **Chỉ dùng thư viện được phép** (một chức năng = một thư viện): stdlib (`net/http` + `ServeMux`, `log/slog`, `crypto/*`, `database/sql`, `net/netip`, `embed`), `golang.zx2c4.com/wireguard` (+`/tun`,`/conn`), `golang.org/x/{crypto,sys,net,sync,time}`, `modernc.org/sqlite`, `github.com/coder/websocket`, `github.com/spf13/cobra`, `github.com/pelletier/go-toml/v2`, `github.com/go-acme/lego/v4`, `github.com/VictoriaMetrics/metrics`, `github.com/Microsoft/go-winio` (windows), `github.com/vishvananda/netlink` (linux), `golang.zx2c4.com/wireguard/windows/tunnel/winipcfg` (windows), `github.com/google/go-cmp/cmp`, `go.uber.org/goleak` (test). Danh mục đầy đủ + phiên bản: tech-stack-decision §11.
-- **CẤM**: AGPL/GPL/LGPL (cấm tuyệt đối mã server NetBird/AGPL), cgo & `mattn/go-sqlite3`, ORM/sqlx/gorm, `testify`, `zap/zerolog/logrus`/package `log`, `gorilla|nhooyr websocket`, gin/chi/echo/mux, urfave/cli, viper, YAML runtime config, `google/uuid`/`ulid`, `prometheus/client_golang`, certmagic/autocert, `tailscale.com`, `math/rand` (v1), MD5/SHA-1/DES/RC4, tự viết cipher/MAC/KDF.
+## 1. Stack & Kiến trúc Workspace chốt (không tự đổi)
+- **Rust `1.94.1`** (`edition = "2024"`, `rust-version = "1.94.1"`), 1 Cargo Workspace (`resolver = "3"`). Đích phát hành: `x86_64-unknown-linux-musl` (hoặc `-gnu`), `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc` (hoặc `-gnu`).
+- **3 Binaries + 7 Library Crates trong `crates/*`**:
+  - Binaries: `crates/mesh` (CLI client + admin), `crates/meshd` (agent daemon `root`/`SYSTEM`), `crates/mesh-server` (Control + Blind Relay + STUN + Observability, chạy user không đặc quyền trên VPS Linux).
+  - Libraries: `mesh-core` (domain types, `AppError`, `Clock`, `Backoff`, `defaults`, `brand`), `mesh-crypto` (**duy nhất** import mật mã & `Secret<T>`), `mesh-proto` (wire messages & bounded parsers: Control, STUN RFC 5389, Disco, Relay), `mesh-datapath` (`defguard_boringtun::noise::Tunn` sans-I/O trên **1 `tokio::net::UdpSocket` duy nhất** `MagicSocket`), `mesh-net` (OS traits + fakes: TUN, route, netmon, hosts, `ResourceLedger`, IPC, `sysexec`), `mesh-store` (`redb` ACID thuần Rust + hot atomic backup), `mesh-sys` (**duy nhất** được dùng `unsafe` cho OS FFI).
+- **Release & Runtime nhỏ nhẹ**: `[profile.release]` bật `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`. `meshd` giới hạn `tokio` `worker_threads(2)` + `thread_stack_size(512 * 1024)` + tái sử dụng buffer tĩnh `[u8; 2048]` (RAM nền ~4–10 MB client, ~8–18 MB VPS).
+- **Chỉ dùng Crates Được phép** (1 chức năng = 1 crate): `tokio`, `tokio-util`, `defguard_boringtun` (`0.6`, BSD-3), `rustls` (`0.23`, tắt `aws-lc-rs`, dùng `ring` / `rustls-rustcrypto`), `tokio-rustls`, `rustls-pemfile`, `rustls-pki-types`, `rcgen`, `instant-acme`, `axum`, `hyper`, `hyper-util`, `tokio-tungstenite`, `reqwest` (rustls), `crypto_box`, `x25519-dalek`, `chacha20poly1305`, `sha2`, `subtle`, `zeroize`, `rand`, `getrandom`, `redb` (`2.4`), `serde`, `serde_json`, `toml`, `clap` (derive), `thiserror`, `tracing`, `tracing-subscriber`, `tracing-appender`, `bytes`, `crc32fast`, `base64`, `data-encoding`, `socket2`, `libc` (unix, chỉ `mesh-sys`), `windows-sys` (windows, chỉ `mesh-sys`), `windows-service` (windows), và dev-deps `proptest`, `tempfile`.
+- **CẤM (`deny.toml`)**: Mọi crate/mã `AGPL` (NetBird server AGPLv3), `GPL`, `LGPL`, `MPL-2.0` (`gotatun`); thư viện C ẩn (`openssl-sys`, `native-tls`, `rusqlite`/`libsqlite3-sys`, `libsodium-sys`, `aws-lc-rs`); `anyhow`/`eyre` trong crate thư viện; `async-std`, `actix-web`, `warp`, `sled`, `sqlx`, `diesel`, `sea-orm`, `env_logger`, `log4rs`; tự viết cipher/MAC/KDF/handshake (`SEC-02`).
 
-## 2. Format & đặt tên
-- Format: `gofumpt` + `gci` (import: stdlib → bên thứ ba → `meshvpn.internal/mesh/...`); tab; dòng ≤ 120; LF (`.ps1/.bat/.cmd` = CRLF); **UTF-8 KHÔNG BOM** (BOM làm hỏng `go.mod`; `check` sẽ fail). Code/comment/log/lỗi/commit bằng **tiếng Anh**.
-- Package: 1 từ thường, cấm `util/common/helpers`. File `snake_case.go`. Type `PascalCase`; hằng `PascalCase` (không ALL_CAPS); sentinel `ErrXxx`; ctx là tham số đầu, không lưu trong struct; getter không có `Get`.
-- DB: bảng/cột `snake_case`, bảng số nhiều, PK `id`, FK `<bảng_số_ít>_id`, thời điểm `*_at` (INTEGER Unix ms UTC), index `idx_/uq_/ck_`. API: `/v1/<danh-từ-số-nhiều>` kebab-case, JSON `snake_case`. Config TOML `snake_case`, env `MESH_*`, CLI `mesh <noun> <verb> --kebab-flag`. Log `event` = `noun_verb` snake_case. Tên service OS lấy từ `internal/brand`.
-- **Mã theo OS**: logic cốt lõi OS-neutral (không import `syscall`/`x/sys`); chạm OS đặt sau interface nhỏ trong file riêng `_linux.go` / `_darwin.go` / `_windows.go` (dùng chung Linux+macOS: `_unix.go` **kèm** `//go:build unix`; fallback `_other.go`). Cấm `runtime.GOOS` rẽ nhánh nghiệp vụ. Mỗi interface OS có fake để test chạy mọi OS; test cần root/Admin gắn `//go:build privileged`.
+## 2. Format, Đặt tên & Tổ chức Mã theo OS
+- **Format (`rustfmt.toml`)**: 4 spaces cho `.rs` (2 spaces cho `.toml/.json/.yml/.sh`), dòng ≤ 100 cột, LF (`.ps1/.bat/.cmd` = CRLF), **UTF-8 KHÔNG BOM**. Code, comment, log, lỗi, commit bằng **tiếng Anh**.
+- **Thứ tự `use`**: (1) `std`/`core`/`alloc` → (2) external crates → (3) `mesh_*`/`crate`/`super`/`self`. Cấm `use ...::*;` ngoài `mod tests`.
+- **Đặt tên**: Crate `kebab-case`; module/file/fn/var `snake_case` (cấm `util.rs`/`common.rs`/`helpers.rs`, getter không có `get_`); struct/enum/trait `PascalCase`; const/static `SCREAMING_SNAKE_CASE`; bảng `redb` & trường JSON/TOML `snake_case`; thời điểm `*_at_ms` (`u64` UTC); env `MESH_*`; CLI `mesh <noun> <verb> --kebab-flag`.
+- **Mã theo OS (`cfg(target_os)`)**: Logic cốt lõi OS-neutral. Phần chạm OS định nghĩa bằng Trait trong `mesh-net` kèm Fake trong bộ nhớ để `cargo test` chạy xanh trên mọi OS không cần root/Admin. Cài đặt OS tách file `<name>_linux.rs`, `<name>_macos.rs`, `<name>_windows.rs` với `#[cfg(target_os = "...")]`. Cấm `std::env::consts::OS` rẽ nhánh nghiệp vụ.
 
-## 3. Lỗi & kiểu (CI đỏ nếu vi phạm)
-- Cấm: `any`/`interface{}` (trừ generic), `x.(T)` không `ok`, nuốt lỗi (`_ = f()`, `if err != nil {}`), `panic`, `os.Exit` ngoài `cmd/*/main.go`, `fmt.Print*`/`log.*`, `time.Sleep`, `context.TODO`, `http.Get/DefaultClient/ListenAndServe`, `net.IP`/string cho địa chỉ (dùng `net/netip`), `unsafe` ngoài gói `sys*`.
-- Lỗi: bọc `fmt.Errorf("verb noun: %w", err)` (chữ thường, không dấu chấm), **xử lý một lần** (log HOẶC return), `errors.Is/As`, không so chuỗi lỗi. Phân loại bằng `*apperr.Error{Kind,Op,Public,Err}`; chỉ `Public` được gửi ra ngoài; xác thực sai trả **một** thông điệp duy nhất (SEC-05).
-- Kiểu miền có constructor `(T, error)` (`NodeName` RFC1123, `Port`, `OverlayIP`, `PublicKey [32]byte`…). Thời lượng = `time.Duration`; giờ qua `clock.Clock`, luôn UTC. Mọi dữ liệu biên (HTTP/WS/UDP/file/IPC) có **giới hạn kích thước**, parser kiểm biên + `FuzzXxx`. SQL **chỉ tham số hóa**.
+## 3. An toàn Bộ nhớ, Kiểu & Xử lý Lỗi (Clippy `-D warnings`)
+- **Cô lập `unsafe`**: Toàn workspace đặt `unsafe_code = "forbid"`. Chỉ riêng `crates/mesh-sys` được dùng `unsafe` với `#![deny(unsafe_op_in_unsafe_fn)]` và `#![deny(clippy::undocumented_unsafe_blocks)]` kèm comment `// SAFETY:` bắt buộc.
+- **Cấm gây panic trong code production**: Cấm `.unwrap()`, `.expect()`, `panic!()`, `todo!()`, `unimplemented!()`, `unreachable!()`, `dbg!()`, `println!()`/`eprintln!()` (trừ CLI `crates/mesh`), truy cập mảng `slice[i]` (dùng `.get(...)` / `split_at_checked`), và bỏ qua `Result` (`let _ = f()`).
+- **Kiểu miền (`mesh-core`)**: Parse ngay tại biên thành newtype (`NodeId`, `NodeName` RFC 1123 1..=63 `[a-z0-9-]`, `OverlayIp`, `Port`, `PublicKey([u8; 32])`, `SpkiPin`). Frame mạng ≤ 2048 B. Cấm mã hóa cứng cổng `443`/`3478` ngoài `mesh_core::defaults` (`GNFR-11`).
+- **Lỗi (`thiserror` + `AppError`)**: Phân loại qua `ErrorKind`. Khi `ErrorKind::Unauthenticated`, luôn trả **duy nhất một thông báo công khai** `"authentication failed"` (`SEC-05`). Xử lý lỗi một lần (return `?` HOẶC log ở biên).
 
-## 4. Concurrency / vòng đời (graceful shutdown ≤ 5 s)
-- Mọi goroutine nền nhận `ctx`, thoát khi `ctx.Done()`, chạy qua `lifecycle.Group`; không `go func(){}` trần. Timer/Ticker phải `Stop()`. Không queue không giới hạn (relay: hàng đợi có trần, drop-tail không chặn). Không giữ mutex khi I/O. Mọi I/O mạng có timeout (connect ≤ 10 s, heartbeat ≤ 60 s). Retry chỉ cho thao tác idempotent qua `internal/backoff` (full jitter). Dừng: gỡ route/hosts/interface theo **sổ cái tài nguyên**.
+## 4. Async / Tokio Concurrency & Vòng đời (`Graceful Shutdown ≤ 5 s`)
+- Mọi task nền nhận `CancellationToken`, chạy trong `TaskTracker`/`JoinSet` (cấm `tokio::spawn` mồ côi) và thoát **≤ 5 s** khi dừng (gỡ route, hosts, `utunN`/adapter theo `ResourceLedger`).
+- Cấm giữ `std::sync::MutexGuard` qua `.await` (`clippy::await_holding_lock = "deny"`). Cấm `std::thread::sleep` trong async.
+- **Blind Relay (`US-025 AC6`)**: Cấm `unbounded_channel`. Mỗi đích dùng `mpsc::channel(256)` + **`try_send()`** (đầy thì drop-tail không chặn + tăng metric, cấm `.send().await` gây Head-of-Line blocking).
+- Mọi I/O mạng có `tokio::time::timeout` (connect ≤ 10 s, heartbeat ≤ 60 s). Reconnect dùng `ExponentialBackoff` + full jitter; lỗi TLS/Captive Portal/clock skew/pin mismatch tiếp tục retry trần 5 phút (chỉ dừng khi nhận `node_revoked`/`node_key_expired` qua kênh TLS hợp lệ — `US-034`).
 
-## 5. Bảo mật khóa & log (SEC-01, SEC-02, SEC-04, SEC-14)
-- **Mọi bí mật** (private key, pre-auth key thô, token, preshared) CHỈ tồn tại dưới `secure.PrivateKey/PreAuthKey…`: `String/GoString/Format/LogValue/MarshalJSON/MarshalText` → `[REDACTED]`, `UnmarshalJSON` → lỗi. **Không** field `string/[]byte/[32]byte` trần mang bí mật. `Reveal()` chỉ trong `internal/secure`, `keystore`, `datapath/wgcfg` (+ in key một lần ở `adminapi`, `cmd/mesh`). Không bí mật qua argv (dùng file/stdin/env). **Không log/lỗi/bundle** chứa key, nonce-proof, UAPI WireGuard, `Authorization`. Test canary `TestNoSecretsInOutputs` phải xanh.
-- Mật mã chỉ import trong `internal/secure/**` (depguard). Control = TLS ≥ 1.3 + challenge NaCl box; random = `crypto/rand`; hash = SHA-256; so sánh bí mật = `subtle.ConstantTimeCompare`. Pre-auth key DB chỉ lưu SHA-256.
-- **Không bỏ qua kiểm tra chứng chỉ**: `InsecureSkipVerify` chỉ trong `internal/tlspin` (SPKI pin, fail-closed). Cấm TOFU. Không giả định cứng cổng `443`/`3478` (chỉ `internal/defaults`).
-- **Admin (SEC-14)**: chỉ Unix socket (`0600/0660` + `SO_PEERCRED`/`LOCAL_PEERCRED`) hoặc named pipe SDDL; **cấm** listener admin trên TCP/loopback/overlay/public. `/healthz /readyz /metrics` = listener riêng chỉ-đọc. File nhạy cảm ghi bằng `fsx.WriteFileAtomic` (`0600`; Windows ACL SYSTEM+Administrators).
-- **Máy thật**: chỉ sửa trong khối `# BEGIN mesh … # END mesh` của hosts (ghi nguyên tử trên đường dẫn thật, giữ owner/mode/ACL; chặn `localhost, wpad, isatap, broadcasthost`, hostname Control/Relay/STUN; từ chối tên có `\n`/`#`/khoảng trắng). **Không chạm gì ngoài khối đó.** Chỉ route dải overlay, không default route. **Chống routing loop**: ràng socket vào NIC vật lý (Linux `SO_MARK`, macOS `IP_BOUND_IF`, Windows `IP_UNICAST_IF`). macOS: chỉ đụng đúng `utunN` ghi trong sổ cái, không flush `pf.conf`, không `spctl --master-disable`. Lệnh ngoài chỉ qua `internal/sysexec` (đường dẫn tuyệt đối, không shell, danh mục cho phép).
-- Log: `log/slog` qua `internal/logx`, message tĩnh, attr snake_case; bắt buộc `ts`(UTC), `level`, `component`, `event`; có thì thêm `request_id`, `node_id`, `peer_id`.
+## 5. Bảo mật Khóa, Kênh Admin & An toàn Máy thật (`SEC-01`, `SEC-04`, `SEC-14`, `G4`)
+- **Bí mật trong RAM (`SEC-01`)**: Private key và pre-auth key thô chỉ tồn tại trong `mesh_crypto::Secret<T>` (`ZeroizeOnDrop`; `Debug`/`Display`/`Serialize` → `"[REDACTED]"`). `.expose_secret()` chỉ gọi trong `mesh-crypto`, `mesh-datapath`, `mesh-net` (keystore) và `mesh` (in key 1 lần). Không nhận key qua argv mặc định. Test `test_no_secrets_in_outputs` phải xanh.
+- **TLS & SPKI Pin (`SEC-04`)**: IP + SPKI Pin (`sha256:<hex>`) là mặc định hạng nhất; `SpkiPinVerifier` đối chiếu SHA-256 của SPKI DER bằng `ConstantTimeEq`, fail-closed khi thiếu pin, **cấm TOFU**, không cờ bypass.
+- **Kênh Admin IPC (`SEC-14`)**: Chỉ Unix Domain Socket (`0600`/`0660` + `peer_cred()` `SO_PEERCRED` Linux / `LOCAL_PEERCRED` macOS) hoặc Windows Named Pipe SDDL (`SYSTEM` + `Administrators`). **Cấm** mở Admin API trên TCP (`127.0.0.1`, overlay, public). `/healthz`, `/readyz`, `/metrics` ở listener riêng chỉ-đọc.
+- **Bảo vệ Máy thật (`G4`)**:
+  - **Sổ cái (`ResourceLedger`)**: Ghi tài nguyên thật (`utunN`, adapter GUID, route, hosts, anchor `pf`, firewall rule) vào đĩa (`0600`) **trước khi tạo**; chỉ dọn theo sổ cái (cấm xóa `utun*`, bảo vệ iCloud Private Relay/VPN khác).
+  - **Chống Routing Loop (`REL-09`)**: Ràng socket ngoại biên vào NIC vật lý (`SO_MARK` Linux, `IP_BOUND_IF` macOS, `IP_UNICAST_IF` Windows) và ràng lại khi đổi mạng; chỉ route dải overlay.
+  - **Khối `hosts` (`PLAT-04`)**: Chỉ sửa trong `# BEGIN mesh … # END mesh`; giữ symlink `/etc/hosts` macOS và ACL đọc Windows; chặn `localhost, broadcasthost, wpad, isatap, local` và hostname/IP public của VPS.
+  - **Windows & macOS**: Kiểm SHA-256 `wintun.dll` trước khi nạp (`LOAD_LIBRARY_SEARCH_APPLICATION_DIR`); macOS kiểm binary/plist thuộc `root` (`mode & 0o022 == 0`), cấm `spctl --master-disable`. Lệnh ngoài chỉ qua `mesh_net::sysexec` (đường dẫn tuyệt đối, không shell).
+- **Log (`OPS-01`)**: `tracing` JSON; bắt buộc có `ts` (UTC), `level`, `component`, `event`.
 
-## 6. Test & Git
-- stdlib `testing` + `go-cmp`; **Arrange–Act–Assert**; table-driven; `Test<Unit>_<Scenario>_<Expected>`; `t.Parallel()`; không `Sleep` (dùng `testing/synctest`); `goleak.VerifyTestMain`; fuzz cho mọi parser; tag `integration` / `privileged`. Mỗi AC của story có ≥ 1 test.
-- **Conventional Commits** tiếng Anh: `type(scope): subject` (≤ 72, mệnh lệnh) + `Refs: US-0xx`. 1 PR = 1 story, squash merge. Cấm force-push/`reset --hard` lên nhánh chính; không commit artifact/khóa/DB.
+## 6. Testing & Git
+- Test theo `// Arrange` – `// Act` – `// Assert`; tên `test_<unit>_<scenario>_<expected>`; mọi parser có `proptest!`; test cần root/Admin gắn `#[ignore = "privileged"]`.
+- **Conventional Commits** tiếng Anh: `type(scope): subject` (≤ 72 ký tự) + `Refs: US-0xx`.
 
-## 7. LỆNH KIỂM ĐỊNH CHUẨN — phải XANH 100% trước khi bàn giao
-Từ gốc repo (đặt `CGO_ENABLED=0`):
+## 7. BỘ LỆNH KIỂM ĐỊNH CHUẨN — Phải XANH 100% trước khi bàn giao
+```text
+Windows   : powershell -ExecutionPolicy Bypass -File scripts/check.ps1
+Linux/Mac : sh scripts/check.sh
 ```
-Windows : pwsh -File scripts/check.ps1          (thêm -Race để chạy race qua Docker/WSL)
-Mac/Linux: sh scripts/check.sh
-```
-Bên trong (có thể chạy riêng; **PowerShell phải đặt `'-modfile=tools/go.mod'` trong dấu nháy**, nếu không bị cắt tại dấu chấm):
-1. `go mod verify` ; `go mod tidy -diff`
-2. **fmt**: `go tool -modfile=tools/go.mod golangci-lint fmt --diff`
-3. **lint** (lần lượt `GOOS=linux|darwin|windows`; đã gồm kiểm gofumpt+gci): `go tool -modfile=tools/go.mod golangci-lint run ./...`
-4. **vet + build 4 đích**: `go vet ./...` và `go build ./...` với `GOOS/GOARCH` ∈ {linux/amd64, darwin/arm64, darwin/amd64, windows/amd64}
-5. **unit test**: `go test -shuffle=on -count=1 -timeout 5m ./...`
-6. **race** (Linux/CI/Docker): `go test -race -shuffle=on -count=1 ./...`
-7. CI/khi đổi dependency: `go tool -modfile=tools/go.mod govulncheck ./...` + kiểm giấy phép.
-
-Thêm dependency, đổi ranh giới module, API/DB contract, cổng/runtime/hạ tầng ⇒ **dừng và hỏi** (không tự quyết).
+Các bước bên trong: (1) Kiểm tĩnh repo (không BOM, không `unsafe` ngoài `mesh-sys`, không `.expose_secret()` trái phép, không cổng cứng `443`/`3478` ngoài `mesh-core`) → (2) `cargo fmt --all -- --check` → (3) `cargo clippy --workspace --all-targets --all-features -- -D warnings` → (4) `cargo test --workspace --all-features` → (5) `cargo deny check advisories bans licenses sources`.
