@@ -19,19 +19,27 @@ for arg in "$@"; do
   esac
 done
 
-echo "==> [1/5] Checking Rust toolchain version..."
-rustc --version
+echo "==> [1/5] Checking Rust toolchain version (pinned 1.94.1)..."
+RUSTC_VER=$(rustc --version)
+echo "    $RUSTC_VER"
+case "$RUSTC_VER" in
+  "rustc 1.94.1 "*) ;;
+  *)
+    echo "ERROR: Toolchain mismatch: expected 'rustc 1.94.1', got '$RUSTC_VER'." >&2
+    exit 1
+    ;;
+esac
 cargo --version
 
 echo "==> [2/5] Enforcing static repository & security rules..."
 
-# 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF)
+# 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF) per file using FNR == 1 (POSIX awk compatible across gawk, mawk, BSD awk)
 BOM_FILES=$(find . -type f \
   -not -path './.git/*' \
   -not -path './target/*' \
   -not -path './docs/04-sprint-management/*' \
   \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
-  -exec awk 'NR==1 && /^\xEF\xBB\xBF/ { print FILENAME }' {} +)
+  -exec awk 'BEGIN { bom = sprintf("%c%c%c", 239, 187, 191) } FNR == 1 && index($0, bom) == 1 { print FILENAME }' {} +)
 
 if [ -n "$BOM_FILES" ]; then
   echo "ERROR: UTF-8 BOM detected in files (must be UTF-8 without BOM):" >&2
@@ -63,11 +71,11 @@ if [ -d "crates" ]; then
     exit 1
   fi
 
-  # Rule: GNFR-11 no hardcoded :443 or :3478 outside crates/mesh-core and tests
+  # Rule: GNFR-11 no hardcoded :443 or :3478 outside crates/mesh-core and tests (resets in_test per file at FNR == 1)
   PORT_HITS=$(find crates -type f -name '*.rs' \
     -not -path 'crates/mesh-core/*' \
     -not -path '*/tests/*' \
-    -exec awk '/#\[cfg\(test\)\]/ { exit } /:(443|3478)([^0-9]|$)/ { print FILENAME ":" FNR ":" $0 }' {} + || true)
+    -exec awk 'FNR == 1 { in_test = 0 } /#\[cfg\(test\)\]/ { in_test = 1 } !in_test && /:(443|3478)([^0-9]|$)/ { print FILENAME ":" FNR ":" $0 }' {} + || true)
   if [ -n "$PORT_HITS" ]; then
     echo "ERROR: Hardcoded default port ':443' or ':3478' outside crates/mesh-core (GNFR-11):" >&2
     echo "$PORT_HITS" >&2

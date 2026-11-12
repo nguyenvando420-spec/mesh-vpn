@@ -4,7 +4,7 @@
 |---|---|
 | Tác giả | `agile-tech-lead` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **2.0** — Cập nhật đồng bộ 100% sang **Rust `1.94.1` Stack** theo quyết định của Người dùng (2026-11-12 21:01), trình Gate 2 |
+| Phiên bản | **2.1 (Gate 2 Round 1 Revision)** — Cập nhật đồng bộ 100% sang **Rust `1.94.1` Stack** theo quyết định của Người dùng (2026-11-12 21:01) và phản biện độc lập `agile-critic` + `agile-codex` |
 | Trạng thái chung | **Accepted-by-User (ADR-001) / Proposed-for-Gate-2 (ADR-002..011)** |
 | Phạm vi | Quyết định công nghệ và ranh giới an toàn hệ thống. Giao thức chi tiết (schema bản tin, DB tables, C4) do `agile-architect` thiết kế dựa trên các ràng buộc bất biến trong tài liệu này |
 | Liên kết | [tech-stack-decision.md](./tech-stack-decision.md) · [coding-standards.md](./coding-standards.md) · [`.agents/rules/coding-standards.md`](../../.agents/rules/coding-standards.md) |
@@ -53,11 +53,14 @@
    - Không có GC nhưng thiếu an toàn bộ nhớ ở tầng trình biên dịch; rủi ro lỗi buffer overflow / use-after-free cao khi chạy dưới quyền `root`/`SYSTEM`.
 
 ### Decision
-1. Chốt **Rust `1.94.1`** (`edition = "2024"`, `rust-version = "1.94.1"`, ghim trong `rust-toolchain.toml`) cho toàn bộ dự án trong **1 Cargo Workspace** gồm 3 binaries (`mesh-server`, `meshd`, `mesh`) và 7 thư viện nội bộ (`crates/mesh-*`).
-2. **Cấm `unsafe` mặc định toàn workspace**: đặt `[workspace.lints.rust] unsafe_code = "forbid"` trong `Cargo.toml` gốc. Chỉ duy nhất crate `crates/mesh-sys` được phép bật `#![allow(unsafe_code)]` kèm `#![deny(unsafe_op_in_unsafe_fn)]` và `#![deny(clippy::undocumented_unsafe_blocks)]` (mọi khối `unsafe` trong `mesh-sys` bắt buộc có chú thích `// SAFETY:` giải trình bất biến con trỏ/handle).
-3. **Chiến lược Pure-Rust / Zero-C**: cấm các crate bọc thư viện C lớn (`openssl-sys`, `libsqlite3-sys`/`rusqlite`, `libsodium-sys`); tắt feature `aws-lc-rs` mặc định của `rustls` (vốn đòi CMake + NASM trên Windows) và dùng `ring` (kèm feature dự phòng thuần Rust `rustls-rustcrypto`).
+1. Chốt **Rust `1.94.1`** (`edition = "2024"`, `rust-version = "1.94.1"`, ghim `channel = "1.94.1"` trong `rust-toolchain.toml`) cho toàn bộ dự án trong **1 Cargo Workspace** gồm 3 binaries (`mesh-server`, `meshd`, `mesh`) và 7 thư viện nội bộ (`crates/mesh-*`).
+2. **Cấm `unsafe` mặc định toàn workspace và tránh lỗi `E0453`**:
+   - Trong Rust, một crate kế thừa `[lints] workspace = true` có `unsafe_code = "forbid"` sẽ không thể ghi đè bằng `#![allow(unsafe_code)]` (lỗi `E0453`).
+   - Do đó, `Cargo.toml` gốc đặt `[workspace.lints.rust] unsafe_code = "forbid"`, và **9/10 crates** (`mesh`, `meshd`, `mesh-server`, `mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-datapath`, `mesh-net`, `mesh-store`) khai báo `[lints] workspace = true` (0 dòng `unsafe`).
+   - Chỉ riêng **`crates/mesh-sys/Cargo.toml` KHÔNG đặt `[lints] workspace = true`**, mà tự khai báo `[lints.rust]` (`unsafe_code = "allow"`, `unsafe_op_in_unsafe_fn = "deny"`) và `[lints.clippy]` (`undocumented_unsafe_blocks = "deny"`, `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `indexing_slicing = "deny"`, v.v.) kèm chú thích `// SAFETY:` bắt buộc trên mọi khối `unsafe`.
+3. **Chiến lược Pure-Rust / Zero-C**: cấm các crate bọc thư viện C lớn (`openssl-sys`, `libsqlite3-sys`/`rusqlite`, `libsodium-sys`); bắt buộc đặt `default-features = false` và chọn rõ feature `ring` trên toàn bộ các crate TLS (`rustls`, `tokio-rustls`, `rcgen`, `instant-acme`, `reqwest`) để chặn hoàn toàn `aws-lc-rs` (vốn đòi CMake + NASM trên Windows).
 4. **Cấu hình Release Profile nhỏ nhẹ**: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`.
-5. **Toolchain & Cross-compile (`scripts/bootstrap-toolchain.ps1`)**: hỗ trợ cả chế độ gọn nhẹ `-Mode PortableZig` (tải Zig portable kiểm SHA-256 + `cargo-zigbuild` + `cargo-deny` + `rcodesign` để build Windows, Linux `musl` và macOS `arm64`/`x86_64` không cần cài 6 GB Visual Studio) lẫn chế độ `-Mode Msvc` (Visual Studio BuildTools), kết hợp GitHub Actions matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`) cho bản phát hành và kiểm thử OS native.
+5. **Toolchain & Cross-compile (`scripts/bootstrap-toolchain.ps1`)**: cưỡng chế `rustc 1.94.1` và kiểm tra SHA-256 ở chế độ **fail-closed** (`Assert-FileSha256`). Hỗ trợ cả chế độ gọn nhẹ `-Mode PortableZig` (cài host toolchain `1.94.1-x86_64-pc-windows-gnu` và tải 5 gói prebuilt chính thức: `winlibs MinGW-w64 GCC 16.2.0 UCRT`, `Zig 0.13.0`, `cargo-deny 0.20.2`, `cargo-zigbuild v0.24.1`, `apple-codesign / rcodesign 0.29.0` để biên dịch cả `proc-macro`/`build.rs` như `ring` lẫn binary trên Windows không có `link.exe`, đồng thời cross-compile ra Linux `musl` và macOS `arm64`/`x86_64`) lẫn chế độ `-Mode Msvc`, kết hợp GitHub Actions matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`).
 
 ### Consequences
 - **(+) Tích cực**: Đạt đúng mục tiêu của người dùng về hiệu năng, không GC, RAM ~4–18 MB, binary ~3–6 MB, xóa khóa tức thì bằng `ZeroizeOnDrop`, và loại trừ hoàn toàn lỗi bộ nhớ trong toàn bộ tầng giao thức.
@@ -86,9 +89,10 @@
 ### Decision
 1. Sử dụng **`defguard_boringtun` `0.6`** (BSD-3-Clause) duy nhất bên trong `crates/mesh-datapath`.
 2. Xây dựng **`MagicSocket`** sở hữu **1 `tokio::net::UdpSocket`** (ưu tiên bind lại cổng UDP cục bộ đã lưu bền trong tệp trạng thái; tắt cờ ép cứng `DF=1` ở tầng UDP ngoài theo `US-017 AC3`).
-3. **Bộ phân luồng gói đến (Ingress Demuxer)** không cấp phát heap:
-   - Kiểm tra độ dài tối thiểu ≥ 20 byte và `pkt[4..8] == 0x2112A442` → chuyển cho `mesh_proto::stun`.
-   - Kiểm tra tiền tố 6 byte `pkt[0..6] == b"MESHDS"` (`0x4d4553484453`) → chuyển cho `mesh_datapath::disco`.
+3. **Bộ phân luồng gói đến (Ingress Demuxer) & Phân biệt Nguồn Gói (`IngressSource`)** không cấp phát heap:
+   - Mọi gói đến đều được gắn nhãn nguồn `IngressSource::DirectUdp(SocketAddr)` (nhận từ `UdpSocket`) hoặc `IngressSource::Relay` (nhận từ kênh WebSocket Blind Relay).
+   - Kiểm tra đầy đủ điều kiện RFC 5389 STUN: `pkt.len() >= 20 && (pkt[0] & 0b1100_0000) == 0 && pkt[4..8] == [0x21, 0x12, 0xA4, 0x42] && u16::from_be_bytes([pkt[2], pkt[3]]) % 4 == 0` → chuyển cho `mesh_proto::stun` (hai bit đầu của STUN luôn bằng `00`, trong khi gói WireGuard có `pkt[0] in 1..=4`, loại trừ 100% trường hợp `sender_index` ngẫu nhiên của WireGuard trùng `0x2112A442`).
+   - Kiểm tra độ dài `pkt.len() >= 172` (`MIN_DISCO_PACKET_LEN`) và tiền tố 6 byte `&pkt[0..6] == b"MESHDS"` (`0x4d4553484453`) → chuyển cho `mesh_datapath::disco` kèm `IngressSource` (`DiscoPong` đến từ `IngressSource::Relay` chỉ dùng để xác nhận liveness qua Relay, **tuyệt đối không** dùng để nâng cấp `DirectAddr` — `HR-G2-04`).
    - Còn lại → định tuyến vào `Tunn::decapsulate` của peer tương ứng; kiểm tra chặt `AllowedIPs` = đúng `/32` Overlay IP của peer đó (`SEC-11`, `US-014 AC3/AC4`) trước khi bơm gói IPv4 vào `TunDevice`.
 4. **Bộ chọn đường gửi (Egress Path Selector)**:
    - Sau khi `Tunn::encapsulate` mã hóa gói IP thành gói WireGuard, nếu peer đang có đường `Direct(SocketAddr)` còn hiệu lực thì gửi qua `UdpSocket`; nếu chưa có direct hoặc vừa mất 3 nhịp Pong liên tiếp / quá `REKEY_TIMEOUT` (`US-022`, `US-026`) thì bọc gói đã mã hóa đẩy qua kênh `BlindRelay` ngay lập tức (≤ 1 s).
@@ -121,19 +125,24 @@
 
 ### Decision
 1. **Cô lập mật mã**: Tất cả các phép toán dưới đây được đóng gói duy nhất trong `crates/mesh-crypto`.
-2. **Chứng minh sở hữu khóa Node (`US-003`)**:
-   - Bước 1: Client mở kết nối TLS (đã xác minh SPKI Pin hoặc CA theo `ADR-008`) và gửi `Hello { node_pubkey, protocol_version, agent_version, os, arch }`.
-   - Bước 2: Server sinh cặp khóa X25519 tạm thời theo phiên (`server_eph_secret`, `server_eph_pub`) và `challenge_nonce: [u8; 32]` từ `OsRng`, lưu trong RAM với TTL 30 s (dùng 1 lần).
-   - Bước 3: Client dùng `crypto_box::SalsaBox::new(&server_eph_pub, &node_secret)` mã hóa xác thực (`seal`) bản tin `ProofPayload { challenge_nonce, session_id, node_pubkey, tls_exporter_binding }` với `box_nonce: [u8; 24]` ngẫu nhiên. (Khi kết nối TLS trực tiếp, `tls_exporter_binding` lấy từ `rustls::Connection::export_keying_material` nhãn `"EXPORTER-mesh-control-v1"`; khi qua Reverse Proxy được cấu hình tường minh thì dùng giá trị rỗng đã đánh dấu).
-   - Bước 4: Server mở hộp (`open`) bằng `SalsaBox::new(&node_pubkey, &server_eph_secret)` và kiểm tra `challenge_nonce`. Chỉ bên nắm giữ `node_secret` mới tạo được ciphertext hợp lệ.
+2. **Chứng minh sở hữu khóa Node & Ràng buộc Kênh TLS (`US-003`, `BLK-G2-02`)**:
+   - Bước 1: Trước mỗi lần handshake (`POST /v1/nodes/register`, nâng cấp `GET /v1/netmap/stream`, nâng cấp `GET /v1/relay`, hoặc gọi REST quản lý trạng thái), client gửi `POST /v1/auth/challenge` trên **cùng kết nối HTTP/1.1 Keep-Alive** để nhận một `challenge_id` dùng một lần (`TTL = 30 s`, giới hạn `MAX_PENDING_CHALLENGES = 4096` với cơ chế đuổi LRU khi đầy), `server_eph_pub: [u8; 32]` và `challenge_nonce: [u8; 32]` sinh từ `OsRng`. (Đồng thời, khi luồng WebSocket `/v1/netmap/stream` đã được xác thực và đang mở, client được phép gửi trực tiếp bản tin `EndpointUpdate` và `CallMeMaybe` bên trong kênh WebSocket đó mà không cần xin challenge mới cho từng lần đổi endpoint).
+   - Bước 2: Client dùng `crypto_box::SalsaBox::new(&server_eph_pub, &node_secret)` mã hóa xác thực (`seal`) bản tin `ProofPayload { challenge_id, challenge_nonce, method, path, body_sha256, node_pubkey, disco_pubkey, timestamp_at_ms, tls_exporter_binding: [u8; 32] }` với `box_nonce: [u8; 24]` ngẫu nhiên.
+   - Bước 3 (`tls_exporter_binding` chống MITM qua Reverse Proxy): Phía client **luôn luôn** trích xuất 32 byte `tls_exporter_binding` từ phiên TLS của chính mình qua `rustls::Connection::export_keying_material(..., b"EXPORTER-mesh-control-v1", None)` (client không có bất kỳ cờ cấu hình nào để gửi mảng `0`). Phía `mesh-server`, khi chạy ở chế độ `StandalonePinned` hoặc `StandaloneAcme`, server trích xuất `tls_exporter_binding` từ kết nối TLS và đối chiếu `ConstantTimeEq` với giá trị trong `ProofPayload`; chỉ khi `mesh-server` được cấu hình tường minh `tls_mode == ReverseProxy` **và** IP nguồn của kết nối TCP nằm trong `trusted_proxies` thì server mới bỏ qua bước so sánh `tls_exporter_binding` (vẫn kiểm tra đầy đủ `challenge_id`, `challenge_nonce`, `method`, `path`, `body_sha256`, `node_pubkey` và chữ ký `crypto_box`).
+   - Bước 4: Server xóa ngay `challenge_id` khỏi bảng chờ (chống phát lại tuyệt đối), mở hộp (`open`) bằng `SalsaBox::new(&node_pubkey, &server_eph_secret)` và kiểm tra khớp toàn bộ các trường ràng buộc. Chỉ bên nắm giữ `node_secret` mới tạo được ciphertext hợp lệ.
 3. **Pre-Auth Key (`US-002`, `US-004`, `US-005`, `US-031`)**:
    - Định dạng hiển thị một lần: `mpk_<base32_nopad(32 bytes từ OsRng)>` (256-bit entropy).
    - Lưu trữ trong `redb`: chỉ lưu `sha256(raw_key)` (`[u8; 32]`). Khi kiểm tra, luôn băm đầu vào trước rồi so sánh bằng `subtle::ConstantTimeEq::ct_eq` (`US-042 AC2`).
    - Hỗ trợ trói đích danh `target_node_id: Option<NodeId>` (`--for <node>`) để phục vụ đăng ký lại khi hết hạn khóa (`US-031 AC5/AC6`) hoặc xoay khóa (`US-032`) mà không cho phép key thường chiếm đoạt tên/IP của node khác.
-4. **Xác thực Disco (`US-021`)**:
+4. **Xác thực Disco & Chống Phản xạ Gói (`US-021`, Codex `#2`)**:
    - Mỗi agent sinh cặp khóa `disco_key` (X25519) riêng biệt với khóa data plane (đảm bảo *domain separation*) và công bố `disco_pubkey` trong Netmap (`US-009 AC1`).
-   - Mọi gói `Ping`, `Pong`, `CallMeMaybe` đều được niêm phong bằng `crypto_box` giữa `(self_disco_secret, peer_disco_pubkey)` và chứa `tx_id: [u8; 12]` ngẫu nhiên từ `OsRng`.
-   - Agent giữ bảng `pending_pings` có giới hạn kích thước và TTL (10 s): chỉ chấp nhận `Pong` giải mã thành công từ `peer_disco_pubkey` thuộc Netmap hiện hành **và** khớp đúng `tx_id` đang chờ. Mọi gói sai xác thực hoặc phát lại đều bị **bỏ qua im lặng** (`US-021 AC5`).
+   - Mọi gói `Ping`, `Pong`, `CallMeMaybe` đều được niêm phong bằng `crypto_box` giữa `(self_disco_secret, peer_disco_pubkey)` (khóa đối xứng DH `SalsaBox` có tính chất hai chiều giữa A và B). Để chặn đứng tấn công phản xạ gói (reflection attack — kẻ tấn công trên mạng LAN bắt gói `Ping` của A gửi cho B rồi đổi địa chỉ nguồn giả làm B gửi ngược lại cho A), phần plaintext `DiscoPayload` bên trong hộp mã hóa **bắt buộc** chứa:
+     - `magic_ctx: [u8; 8] = *b"MESHDSv1"`
+     - `msg_type: u8` (`0x01 = Ping`, `0x02 = Pong`, `0x03 = CallMeMaybe`)
+     - `tx_id: [u8; 12]` ngẫu nhiên từ `OsRng`
+     - `inner_sender_disco_pubkey: [u8; 32]` và `inner_recipient_disco_pubkey: [u8; 32]` (tổng kích thước gói tối thiểu `MIN_DISCO_PACKET_LEN = 172` byte).
+   - Khi nhận gói Disco, agent kiểm tra bắt buộc: `outer_sender_disco_pubkey != self_disco_pubkey`, giải mã thành công, `inner_sender_disco_pubkey == outer_sender_disco_pubkey` **và** `inner_recipient_disco_pubkey == self_disco_pubkey`.
+   - Agent giữ bảng `pending_pings` có giới hạn kích thước và TTL (10 s): chỉ chấp nhận `Pong` khớp đúng `(peer_disco_pubkey, tx_id)` đang chờ; và chỉ nâng cấp đường `Direct(SocketAddr)` khi `Pong` đến từ `IngressSource::DirectUdp(addr)` (`HR-G2-04`). Mọi gói sai xác thực hoặc phát lại đều bị **bỏ qua im lặng** (`US-021 AC5`).
 
 ### Consequences
 - **(+) Tích cực**: Không phụ thuộc đồng hồ hệ thống ở tầng challenge; chống MITM, chống phát lại và chống đầu độc đường đi P2P trên mạng Wi-Fi công cộng; dùng chung 1 thư viện `crypto_box` nhỏ gọn.
@@ -162,9 +171,11 @@
    - `POST /v1/auth/challenge`, `POST /v1/nodes/register` (Control RPC).
    - `GET /v1/netmap/stream` (WebSocket đẩy Netmap snapshot + heartbeat ≤ 30 s).
    - `GET /v1/relay` (WebSocket Blind Relay, sau khi hoàn tất xác thực khóa node theo `ADR-003`).
-2. **Định dạng Frame Nhị phân của Blind Relay (`US-025`)**:
-   - Client $A \to$ Relay: `[dst_pubkey: 32 bytes][wg_or_disco_ciphertext: <= 1480 bytes]`.
-   - Relay $\to$ Client $B$: `[src_pubkey: 32 bytes (do Relay gắn từ phiên xác thực của A)][wg_or_disco_ciphertext]`.
+2. **Định dạng Frame Nhị phân của Blind Relay (`US-025`, Codex `#9`)**:
+   - Mọi frame nhị phân trên WebSocket `/v1/relay` bắt đầu bằng 1 byte định danh loại bản tin (`frame_type`):
+     - `0x01` (`ClientToPeer` — Client $A \to$ Relay): `[0x01: 1 byte][dst_node_pubkey: 32 bytes][wg_or_disco_ciphertext: 1..=1480 bytes]` (tổng `34..=1513` bytes).
+     - `0x02` (`RelayToClient` — Relay $\to$ Client $B$): `[0x02: 1 byte][src_node_pubkey: 32 bytes (do Relay tự gắn từ phiên đã xác thực của A)][wg_or_disco_ciphertext: 1..=1480 bytes]` (tổng `34..=1513` bytes).
+     - `0x03` (`Keepalive` hai chiều): `[0x03: 1 byte][timestamp_at_ms: 8 bytes big-endian]` (tổng đúng `9` bytes).
    - Cấu hình `tokio-tungstenite` đặt `max_frame_size = 2048` và `max_message_size = 2048` để chặn tấn công cấp phát bộ nhớ lớn (`US-025 AC3`).
 3. **Kiến trúc Chống Nghẽn Dây Chuyền (`US-025 AC6`)**:
    - Mỗi phiên kết nối của node đích $B$ sở hữu một task ghi riêng đọc từ `mpsc::Receiver<Bytes>` có sức chứa cố định **256 gói** và áp `tokio::time::timeout(Duration::from_secs(5), ws_sink.send(...))`.
@@ -205,10 +216,12 @@
    - `preauth_keys`: `KeyId -> PreAuthKeyRecord` và `idx_preauth_hash`: `[u8; 32] -> KeyId`.
    - `audit_events`: `u64 (seq) -> AuditRecord` — tầng store chỉ cung cấp hàm `append_audit`, **không tồn tại bất kỳ hàm sửa/xóa bản ghi nào** (`US-013 AC2`).
 2. **Kiểm tra toàn vẹn khi khởi động (`US-007 AC3`)**: Gọi `db.check_integrity()` khi mở DB; nếu phát hiện lỗi, dừng khởi động kèm thông báo hướng dẫn chạy `mesh-server restore`.
-3. **Cơ chế Thu hồi Khẩn cấp trong RAM khi Đầy Đĩa (`US-013 AC4`)**:
+3. **Cơ chế Thu hồi Khẩn cấp trong RAM + Tệp Cấp phát Sẵn khi Đầy Đĩa (`US-013 AC4`, `HR-G2-03`)**:
    - `mesh-server` duy trì tập `RevokedSet` (`RwLock<HashSet<NodeId>>` và `HashSet<KeyId>`) trong bộ nhớ làm nguồn chặn tức thì trước mọi quyết định Control/Relay.
+   - `netmap_version` được cấp theo công thức đơn điệu có sàn thời gian thực: `next_version = max(current_version + 1, now_unix_ms)` để đảm bảo kể cả khi `redb` không ghi được rồi tiến trình khởi động lại, `netmap_version` mới không bao giờ lùi thấp hơn bản mà client đã cache.
+   - Ngay khi khởi tạo DB lần đầu, `mesh-store` tạo sẵn tệp cố định `/var/lib/mesh/emergency-revocations.bin` dung lượng **64 KiB** (đã `fallocate` / ghi đầy byte `0` trước trên đĩa, quyền `0600`, có header + CRC32).
    - Với thao tác thông thường (`register`, `create key`, `rename`): nếu `write_tx.commit()` thất bại (vd. `ENOSPC`), thao tác bị từ chối (*fail-closed*) và `/readyz` chuyển sang `503` (`US-007 AC5`).
-   - Với thao tác phòng vệ khẩn cấp (`node revoke`, `preauthkey revoke`, `node expire`): cập nhật `RevokedSet` trong RAM, tăng `netmap_version` trong RAM, đẩy Netmap mới và ngắt kết nối Relay/Control của kẻ xâm nhập **ngay lập tức**, sau đó cố gắng ghi `redb`; nếu ghi đĩa lỗi thì vẫn giữ hiệu lực thu hồi trong RAM và xuất bản ghi audit mức `CRITICAL` ra `stderr`/`journald`.
+   - Với thao tác phòng vệ khẩn cấp (`node revoke`, `preauthkey revoke`, `node expire`): cập nhật `RevokedSet` trong RAM, tăng `netmap_version` trong RAM, đẩy Netmap mới và ngắt kết nối Relay/Control của kẻ xâm nhập **ngay lập tức**; sau đó cố gắng ghi `redb`. Nếu `redb` trả về lỗi `ENOSPC`, `mesh-store` ghi đè vào vùng 64 KiB đã cấp phát sẵn của `emergency-revocations.bin` (`pwrite` + `fsync`, không cần xin thêm block đĩa mới) và xuất bản ghi audit mức `CRITICAL` ra `stderr`/`journald`. Khi `mesh-server` khởi động lại, nó luôn nạp hợp nhất cả `redb` lẫn `emergency-revocations.bin` trước khi mở cổng mạng!
 4. **Sao lưu nóng nguyên tử (`US-045`)**:
    - Mở `ReadTransaction` trên DB đang chạy (không chặn ghi), sao chép toàn bộ các bảng (bao gồm `server_identity`) sang tệp `redb` tạm trong thư mục backup (`0700`), gọi `commit()` + `sync_all()`, mở lại tệp tạm kiểm tra `check_integrity()`, tính băm SHA-256 ghi ra `<backup>.db.sha256`, đổi tên nguyên tử (`rename`) với quyền `0600`, và xoay vòng giữ 7 bản gần nhất.
    - Lệnh `restore <file>` kiểm tra khớp `.sha256`, kiểm tra `check_integrity()` và xác nhận có `server_identity` hợp lệ trước khi khôi phục (`US-045 AC4/AC6`).
@@ -236,18 +249,19 @@
    - Bị cấm trực tiếp bởi `SEC-14(2)(b)`.
 
 ### Decision
-1. **Kênh Admin của `mesh-server` trên VPS Linux (`US-012`, `US-046`)**:
-   - Chỉ lắng nghe trên Unix Domain Socket `/run/mesh/admin.sock` (thư mục `/run/mesh` quyền `0750` thuộc `mesh:mesh-admin`, socket quyền `0660`).
-   - Ngay khi nhận kết nối `tokio::net::UnixStream`, gọi `stream.peer_cred()` (sử dụng `SO_PEERCRED` của kernel Linux) lấy `(uid, gid, pid)`: chỉ chấp nhận `uid == 0` (`root`), `uid == service_uid`, hoặc `gid == admin_gid`. Ghi `uid` và `pid` vào bản ghi Audit (`SEC-09`).
-2. **Kênh IPC của `meshd` trên macOS (`US-073 AC3/AC4`)**:
-   - Lắng nghe trên `/var/run/mesh/meshd.sock` (thư mục `/var/run/mesh` quyền `0755` thuộc `root:wheel`, kiểm tra chống symlink trên toàn bộ đường dẫn cha).
-   - Khi nhận kết nối, gọi `stream.peer_cred()` (sử dụng `LOCAL_PEERCRED` trên macOS) để lấy `uid`/`gid` thực của người gọi:
-     - Các thao tác thay đổi trạng thái (`up`, `down`, `cleanup`, `set`, `rotate-key`) **chỉ cho phép `uid == 0` (`root`) hoặc thành viên nhóm `admin` (`gid == 80`)**. User thường bị từ chối với lỗi `PermissionDenied` và ghi log cảnh báo.
-     - Các thao tác chỉ-đọc chẩn đoán (`status`, `ping`, `netcheck`) được phép gọi nhưng phản hồi tuyệt đối không chứa bất kỳ khóa bí mật nào (`US-039 AC5`).
-3. **Kênh IPC của `meshd` trên Windows (`US-052 AC3`)**:
-   - Tạo Windows Named Pipe `\\.\pipe\mesh-agent-admin` bằng `windows-sys` (`CreateNamedPipeW`) với chuỗi bảo mật **SDDL**: `D:P(A;;GA;;;SY)(A;;GA;;;BA)` — chỉ cấp quyền cho `LocalSystem` (`SY`) và nhóm `Administrators` (`BA`) kèm cờ `FILE_FLAG_FIRST_PIPE_INSTANCE` (chống chiếm đoạt pipe trước khi service chạy).
-   - Named pipe chỉ-đọc `\\.\pipe\mesh-agent-ro` (cho `mesh status`, `mesh ping`) chỉ mở các route đọc không nhạy cảm.
-4. **Listener Quan sát Chỉ-Đọc riêng biệt (`OPS-05`, `OPS-06`, `US-044`, `US-048`)**:
+1. **Kênh Admin của `mesh-server` trên VPS Linux (`US-012`, `US-046`, `BLK-G2-03`)**:
+   - Chỉ lắng nghe trên Unix Domain Socket `/run/mesh/admin.sock` (thư mục `/run/mesh` quyền `0750` thuộc `mesh:mesh-admin`, socket quyền `0660` thuộc `mesh:mesh-admin`).
+   - Ngay khi nhận kết nối `tokio::net::UnixStream`, gọi `stream.peer_cred()` (sử dụng `SO_PEERCRED` của kernel Linux) lấy `(uid, gid, pid)`: vì `SO_PEERCRED` chỉ trả về `gid` chính (primary group) của người gọi, `mesh-sys::ipc_linux` kiểm tra: cho phép nếu `uid == 0` (`root`), `uid == service_uid`, `gid == admin_gid`, **hoặc** `uid` thuộc nhóm phụ (supplementary group) `mesh-admin` thông qua `getpwuid_r` + `getgrouplist`. Ghi `uid` và `pid` vào bản ghi Audit (`SEC-09`).
+2. **Tách 2 Kênh IPC của `meshd` trên Client (macOS, Linux, Windows — `US-039 AC5`, `US-052 AC3`, `US-073 AC3/AC4`, `BLK-G2-03`, Codex `#11`)**:
+   - Để đáp ứng đồng thời hai yêu cầu: (a) tài khoản quản trị viên máy (`admin` trên macOS, `Administrators` trên Windows, `root` trên Linux) chạy được lệnh thay đổi trạng thái mà không bị kẹt quyền tệp socket, và (b) tài khoản user thường chạy được `mesh status` / `mesh ping` / `mesh netcheck` chỉ-đọc với 0 khóa bí mật, `meshd` mở **2 kênh IPC tách biệt hoàn toàn**:
+     - **Kênh Admin (Read/Write — `up`, `down`, `cleanup`, `set`, `rotate-key`, `bugreport`)**:
+       - **macOS**: `/var/run/mesh/meshd-admin.sock` có mode `0660` thuộc `root:admin` (`gid = 80`). Khi nhận kết nối, `mesh-sys::ipc_macos` đọc `LOCAL_PEERCRED` (`struct xucred`): cho phép nếu `cr_uid == 0` hoặc mảng nhóm `cr_groups` chứa `80` (`admin`) (nếu `cr_ngroups == 16` bị cắt ngọn thì fallback kiểm tra bằng `getpwuid_r` + `getgrouplist`).
+       - **Linux Client**: `/var/run/mesh/meshd-admin.sock` có mode `0660` thuộc `root:root` (hoặc `root:mesh-admin` nếu nhóm tồn tại), kiểm tra `SO_PEERCRED` + `getgrouplist`.
+       - **Windows**: Named Pipe `\\.\pipe\mesh-agent-admin` tạo bằng `CreateNamedPipeW` với SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (`LocalSystem` + `Administrators`) và cờ `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+     - **Kênh Chỉ-Đọc Chẩn Đoán (Read-Only — chỉ gắn 4 route `GET /v1/agent/status`, `GET /v1/agent/peers`, `POST /v1/agent/ping`, `POST /v1/agent/netcheck`, giới hạn body ≤ 4 KiB, 0 trường bí mật)**:
+       - **macOS & Linux**: `/var/run/mesh/meshd-ro.sock` có mode `0666` thuộc `root:wheel` / `root:root` (nằm trong thư mục `/var/run/mesh` quyền `0755` thuộc `root`, kiểm tra chống symlink trên toàn bộ đường dẫn cha).
+       - **Windows**: Named Pipe `\\.\pipe\mesh-agent-ro` với SDDL chỉ cấp quyền đọc/ghi thông điệp trên pipe này cho `Authenticated Users` (`AU`), tách biệt hoàn toàn khỏi router Admin.
+3. **Listener Quan sát Chỉ-Đọc riêng biệt (`OPS-05`, `OPS-06`, `US-044`, `US-048`)**:
    - Một instance `axum::Router` hoàn toàn độc lập, mặc định chỉ bind `127.0.0.1:<obs_port>` (hoặc IP overlay nếu bật tường minh), **chỉ đăng ký đúng 3 route `GET /healthz`, `GET /readyz`, `GET /metrics`**, không chia sẻ router hay middleware với kênh Admin.
 
 ### Consequences
@@ -274,7 +288,11 @@
    - Mọi socket ngoại biên của `meshd` (`MagicSocket` UDP, kết nối TCP tới Control/Relay) bắt buộc được ràng cứng vào interface vật lý mặc định thông qua `mesh-sys` / `socket2` **trước khi gửi gói** và ràng lại mỗi khi sự kiện mạng báo đổi interface mặc định (`US-035 AC7`):
      - **macOS**: `setsockopt(..., IPPROTO_IP, IP_BOUND_IF, if_index)` và `IPV6_BOUND_IF`.
      - **Windows**: `setsockopt(..., IPPROTO_IP, IP_UNICAST_IF, if_index_be)` và `IPV6_UNICAST_IF`.
-     - **Linux (VPS-node & Lab)**: `setsockopt(..., SOL_SOCKET, SO_MARK, fwmark)` kết hợp policy routing loại trừ `fwmark` khỏi bảng route tunnel.
+     - **Linux (VPS-node & Lab — `HR-G2-01`)**: `setsockopt(..., SOL_SOCKET, SO_MARK, 0x5d56)` kết hợp bảng định tuyến chính sách riêng `table 51820` và cặp quy tắc `ip rule` được ghi trước vào `ResourceLedger` (`ledger.json`):
+       - `ip route replace <overlay_cidr> dev mesh0 table 51820`
+       - `ip rule add not fwmark 0x5d56 table 51820 priority 5182`
+       - `ip rule add table main suppress_prefixlength 0 priority 5181`
+       (Đảm bảo 100% gói UDP ngoại biên của `meshd` mang nhãn `0x5d56` luôn đi qua bảng `main` ra NIC vật lý, không bao giờ bị hút ngược vào `mesh0`).
    - Chỉ cài route cho đúng dải CIDR overlay (không cài default route `0.0.0.0/0` ở MVP); lọc bỏ mọi endpoint ứng viên nằm trong dải overlay hoặc thuộc các card ảo (`utun*`, `awdl0`, `llw0`, `bridge*`, `docker0`, `veth*`, WSL/Hyper-V — `US-020 AC2`).
 3. **Quản lý Khối `hosts` & Xả Cache DNS (`PLAT-04`, `US-038`)**:
    - Chỉ thao tác bên trong cặp thẻ đánh dấu `# BEGIN mesh` … `# END mesh`.
@@ -289,7 +307,7 @@
 
 ### Consequences
 - **(+) Tích cực**: Đảm bảo tính chất tự chữa lành sau crash, không đụng chạm VPN khác trên macOS/Windows/Linux, và phục hồi sau đổi mạng/sleep-wake trong P95 ≤ 15 s (`PERF-07`).
-- **(−) Chi phí / Giảm thiểu**: Các lệnh hệ thống ngoài (`route`, `pfctl`, `dscacheutil`, `socketfilterfw`, `netsh`, `ipconfig`, `nft`) chỉ được gọi qua `mesh_net::sysexec` với đường dẫn tuyệt đối cố định, không qua shell.
+- **(−) Chi phí / Giảm thiểu**: Các lệnh hệ thống ngoài (`/sbin/ifconfig`, `/sbin/route`, `/sbin/pfctl`, `/usr/bin/dscacheutil`, `/usr/bin/killall`, `/usr/libexec/ApplicationFirewall/socketfilterfw`, `/bin/launchctl`, `/usr/sbin/ip`, `/sbin/ip`, `/usr/sbin/nft`, `/usr/sbin/iptables`, `/usr/sbin/ufw`, `/usr/bin/systemctl`, và trên Windows lấy thư mục hệ thống qua `GetSystemDirectoryW` để ghép đường dẫn tuyệt đối `...\System32\netsh.exe`, `...\System32\ipconfig.exe`, `...\System32\route.exe`) chỉ được gọi qua `mesh_net::sysexec` với đường dẫn tuyệt đối cố định, không qua shell.
 
 ---
 
@@ -304,18 +322,22 @@
 - Phải cấm tuyệt đối cơ chế tin-lần-đầu ngầm định (TOFU) và không có cờ bỏ qua kiểm tra chứng chỉ trong bản release. Đồng thời phải hỗ trợ xoay khóa server có kế hoạch bằng tập pin (`active` + `next`) và chuyển đổi mượt sang Standalone ACME (không cần cổng 80) hoặc chạy sau Reverse Proxy sẵn có (`trusted_proxies`).
 
 ### Options
-1. **Phương án A — `rustls` + Custom `SpkiPinVerifier` (`mesh-crypto`) + `rcgen` (sinh cert IP) + `instant-acme` (`TLS-ALPN-01`/`DNS-01`) (CHỌN)**:
-   - Kiểm soát hoàn toàn logic đối chiếu mã băm SHA-256 của trường `subjectPublicKeyInfo` (SPKI DER) bất kể chứng chỉ tự ký hay do CA cấp.
+1. **Phương án A — `rustls` + `x509-cert` (`0.2`) + `rustls-webpki` (`0.102+`) + `rustls-native-certs` (`0.8`) + Custom `SpkiPinVerifier` (`mesh-crypto`) + `rcgen` (sinh cert IP) + `instant-acme` (`TLS-ALPN-01`/`DNS-01`) (CHỌN)**:
+   - Kiểm soát hoàn toàn logic giải mã ASN.1 DER chứng chỉ X.509 để trích xuất chính xác trường `tbs_certificate.subject_public_key_info` (SPKI DER) cho cả ECDSA và RSA, kiểm tra hạn `NotBefore`/`NotAfter` để báo lỗi `ErrorKind::ClockSkew` (`US-003 AC5`), và đối chiếu mã băm SHA-256 của SPKI DER bất kể chứng chỉ tự ký hay do CA cấp.
 
 ### Decision
-1. **Chế độ (c) IP + SPKI Pinning — Luồng mặc định hạng nhất (`SEC-04(c)`, `US-003`, `US-047`)**:
-   - Khi khởi tạo `mesh-server` lần đầu, nếu chưa có khóa định danh trong bảng `server_identity` (`redb`), server dùng `rcgen` sinh cặp khóa ECDSA P-256 bền vững, trích xuất `subjectPublicKeyInfo` DER và tính `sha256:<hex_lowercase>`.
+1. **Chế độ (c) IP + SPKI Pinning — Luồng mặc định hạng nhất (`SEC-04(c)`, `US-003`, `US-047`, `BLK-G2-04`)**:
+   - Khi khởi tạo `mesh-server` lần đầu, nếu chưa có khóa định danh trong bảng `server_identity` (`redb`), server dùng `rcgen` (`default-features = false`, `features = ["crypto", "ring", "pem"]`) sinh cặp khóa ECDSA P-256 bền vững, trích xuất `subjectPublicKeyInfo` DER bằng `x509-cert` và tính `sha256:<hex_lowercase>`.
    - Khi chứng chỉ tự ký sắp hết hạn hoặc khi server đổi địa chỉ IP (`US-074`), `rcgen` phát hành lại chứng chỉ X.509 mới từ **cùng cặp khóa định danh đó** → mã SPKI Pin không đổi, **không một máy client nào phải pin lại** (`US-047 AC3`).
    - Phía client (`mesh-crypto::tlspin::SpkiPinVerifier` cài đặt trait `rustls::client::danger::ServerCertVerifier`):
-     - Trích xuất SPKI DER từ chứng chỉ lá của server, băm SHA-256 và so sánh constant-time với `PinSet` (`active_pin` và tùy chọn `next_pin` khi đang xoay khóa theo `US-047 AC5`).
+     - Dùng `x509_cert::Certificate::from_der(end_entity.as_ref())` để:
+       1. Kiểm tra thời hạn chứng chỉ (`tbs_certificate.validity.not_before` / `not_after`) so với thời gian hiện tại; nếu nằm ngoài khoảng hợp lệ vượt quá ngưỡng dung sai thì trả về lỗi có phân loại `ErrorKind::ClockSkew` (`US-003 AC5`) kèm hướng dẫn kiểm tra đồng hồ máy.
+       2. Trích xuất chính xác `tbs_certificate.subject_public_key_info.to_der()` (hỗ trợ cả khóa ECDSA lẫn RSA), băm SHA-256 và so sánh constant-time (`subtle::ConstantTimeEq`) với `PinSet` (`active_pin` và tùy chọn `next_pin` khi đang xoay khóa theo `US-047 AC5`).
+       3. Ủy quyền xác minh chữ ký số TLS 1.3 handshake (`verify_tls12_signature` / `verify_tls13_signature`) cho `rustls::crypto::verify_tls12_signature` / `verify_tls13_signature` của provider `ring`.
      - Nếu `PinSet` rỗng mà cấu hình ở chế độ Pin → **từ chối ngay lập tức (fail-closed, cấm TOFU)** trước khi gửi bất kỳ dữ liệu nào (`US-003 AC6`).
      - Nếu không khớp pin (kể cả khi kẻ MITM trình chứng chỉ do CA công cộng hợp lệ cấp cho đúng IP đó) → từ chối kết nối, ghi log `WARN` (`event = "pin_mismatch"` kèm pin nhận được và pin kỳ vọng), không gửi secret, và chuyển sang thử lại theo backoff trần 5 phút (`US-003 AC7`, `US-034 AC4`).
-2. **Chế độ (a) Standalone có Domain (`instant-acme`)**:
+2. **Chế độ (a) Standalone có Domain (`instant-acme` + `rustls-webpki` + `rustls-native-certs`)**:
+   - Phía client dùng `rustls::client::WebPkiServerVerifier` (`rustls-webpki`) kết hợp kho CA gốc hệ điều hành (`rustls-native-certs`); nếu người dùng cấu hình thêm `--server-pin`, `SpkiPinVerifier` bọc ngoài `WebPkiServerVerifier` để kiểm tra **cả hai** (Chuỗi CA hợp lệ **VÀ** khớp SPKI Pin — `US-047 AC4`).
    - Nếu cổng TCP cấu hình = `443`, tự động xin và gia hạn chứng chỉ qua `TLS-ALPN-01` (nhận diện ALPN `acme-tls/1` ngay trên bộ lắng nghe `tokio-rustls` mà không cần mở cổng 80).
    - Nếu cổng TCP cấu hình ≠ `443`, bắt buộc dùng `DNS-01` hoặc từ chối cấu hình kèm hướng dẫn rõ ràng vì CA chỉ kiểm tra `TLS-ALPN-01` trên cổng 443 (`US-047 AC7`).
    - Nạp nóng chứng chỉ mới qua `ArcSwap` / `RwLock<Arc<CertifiedKey>>` trong `Acceptor` mà không làm rớt kết nối đang mở.

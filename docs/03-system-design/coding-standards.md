@@ -4,7 +4,7 @@
 |---|---|
 | Tác giả | `agile-tech-lead` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **2.0** — Chuẩn kỹ thuật **Rust `1.94.1` (`edition = "2024"`)** ban hành cho Gate 2 |
+| Phiên bản | **2.1 (Gate 2 Round 1 Revision)** — Chuẩn kỹ thuật **Rust `1.94.1` (`edition = "2024"`)** cập nhật sau phản biện độc lập `agile-critic` & `agile-codex` |
 | Áp dụng cho | `agile-developer`, `agile-qa`, `agile-devops` (và toàn bộ mã Rust, PowerShell, POSIX sh, TOML trong dự án) |
 | Liên kết | [tech-stack-decision.md](./tech-stack-decision.md) · [architecture-decision-record.md](./architecture-decision-record.md) · Rule tự nạp [`.agents/rules/coding-standards.md`](../../.agents/rules/coding-standards.md) · Cấu hình [`rust-toolchain.toml`](../../rust-toolchain.toml), [`rustfmt.toml`](../../rustfmt.toml), [`clippy.toml`](../../clippy.toml), [`deny.toml`](../../deny.toml), [`.editorconfig`](../../.editorconfig) |
 | Cưỡng chế | `scripts/check.ps1` (Windows) và `scripts/check.sh` (Linux/macOS) chạy cục bộ **và** trong CI; bắt buộc xanh 100% trước khi bàn giao |
@@ -82,8 +82,32 @@ use crate::peer::PeerTable;
 3. **Tách tệp theo hệ điều hành rõ ràng**:
    - Cài đặt thực tế cho từng OS đặt trong tệp riêng: `<module>_linux.rs`, `<module>_macos.rs`, `<module>_windows.rs` (hoặc `<module>_unix.rs` cho phần dùng chung giữa Linux và macOS), được gắn thuộc tính `#[cfg(target_os = "...")]` tại khai báo `mod`.
    - **Cấm** dùng `std::env::consts::OS` để rẽ nhánh logic nghiệp vụ lúc chạy (chỉ được dùng để điền chuỗi метаdata `os`/`arch` khi báo cáo `OPS-10`).
-4. **Ranh giới FFI duy nhất tại `crates/mesh-sys`**:
+4. **Ranh giới FFI duy nhất tại `crates/mesh-sys` & Cấu hình `[lints]` tránh lỗi `E0453`**:
    - Mọi lệnh gọi hàm C/OS không an toàn (`libc::ioctl`, `libc::setsockopt`, `windows_sys::Win32::...`) **chỉ được phép nằm trong `crates/mesh-sys`** và phải bọc thành hàm Rust an toàn trả về `Result<T, SysError>` trước khi xuất sang `mesh-net`.
+   - Trong Rust, một crate kế thừa `[lints] workspace = true` (nơi `[workspace.lints.rust] unsafe_code = "forbid"`) **không thể** ghi đè bằng `#![allow(unsafe_code)]` (trình biên dịch sẽ báo lỗi `E0453: allow(unsafe_code) overruled by outer forbid(unsafe_code)`). Vì vậy:
+     - **9/10 crates** (`mesh`, `meshd`, `mesh-server`, `mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-datapath`, `mesh-net`, `mesh-store`) khai báo `[lints] workspace = true` trong `Cargo.toml` của mình.
+     - **Chỉ riêng `crates/mesh-sys/Cargo.toml` KHÔNG đặt `[lints] workspace = true`**, mà khai báo bảng lint riêng như sau:
+       ```toml
+       # crates/mesh-sys/Cargo.toml — ONLY crate allowed to perform OS FFI
+       [lints.rust]
+       unsafe_code = "allow"
+       unsafe_op_in_unsafe_fn = "deny"
+       missing_debug_implementations = "warn"
+       unreachable_pub = "warn"
+
+       [lints.clippy]
+       undocumented_unsafe_blocks = "deny"
+       unwrap_used = "deny"
+       expect_used = "deny"
+       panic = "deny"
+       todo = "deny"
+       unimplemented = "deny"
+       dbg_macro = "deny"
+       indexing_slicing = "deny"
+       let_underscore_must_use = "deny"
+       await_holding_lock = "deny"
+       ```
+     - Mọi khối `unsafe { ... }` bên trong `crates/mesh-sys` bắt buộc phải có chú thích `// SAFETY: ...` giải trình bất biến con trỏ, độ dài bộ đệm và vòng đời handle ngay phía trên.
 
 ---
 
@@ -93,7 +117,7 @@ use crate::peer::PeerTable;
 
 | Hành vi bị cấm | Quy tắc Clippy / Cưỡng chế | Giải pháp bắt buộc thay thế |
 |---|---|---|
-| Từ khóa **`unsafe`** ngoài `crates/mesh-sys` | `[workspace.lints.rust] unsafe_code = "forbid"` | Viết mã Rust an toàn 100%; nếu bắt buộc gọi OS API thì đóng gói vào `crates/mesh-sys` kèm chú thích `// SAFETY:` |
+| Từ khóa **`unsafe`** ngoài `crates/mesh-sys` | `[workspace.lints.rust] unsafe_code = "forbid"` (cho 9/10 crates; riêng `mesh-sys` tự khai báo `unsafe_op_in_unsafe_fn = "deny"` + `undocumented_unsafe_blocks = "deny"`) | Viết mã Rust an toàn 100%; nếu bắt buộc gọi OS API thì đóng gói vào `crates/mesh-sys` kèm chú thích `// SAFETY:` |
 | **`.unwrap()`** và **`.expect(...)`** | `clippy::unwrap_used = "deny"`, `clippy::expect_used = "deny"` | Dùng toán tử `?`, `ok_or(...)`, `ok_or_else(...)` hoặc xử lý nhánh `None`/`Err` tường minh |
 | **`panic!(...)`**, **`todo!()`**, **`unimplemented!()`**, **`unreachable!()`** | `clippy::panic = "deny"`, `clippy::todo = "deny"`, `clippy::unimplemented = "deny"` | Trả về `Result<T, AppError>` (`ErrorKind::Internal` hoặc `ErrorKind::InvalidArgument`) |
 | Truy cập mảng/slice trực tiếp **`slice[i]`** trong bộ parser mạng | `clippy::indexing_slicing = "deny"` | Dùng `.get(i)`, `.get(start..end)`, hoặc `split_at_checked()` để không bao giờ panic do `index out of bounds` khi nhận gói UDP/WebSocket dị dạng |
@@ -238,11 +262,20 @@ impl<T: Zeroize> Serialize for Secret<T> {
 
 ### 5.3. Quy tắc An toàn Máy thật & Hạ tầng (`G4`, `SEC-14`, `PLAT-01..06`)
 
-1. **Kênh Admin IPC (`SEC-14`)**: Chỉ lắng nghe trên Unix Domain Socket (`0600`/`0660` kèm kiểm tra `peer_cred()` `SO_PEERCRED` trên Linux và `LOCAL_PEERCRED` trên macOS) hoặc Windows Named Pipe kèm SDDL DACL (`SYSTEM` + `Administrators`). **Cấm tuyệt đối** mở Admin API trên TCP (`127.0.0.1`, IP overlay hay IP public).
-2. **Sổ cái Tài nguyên (`ResourceLedger` — `REL-08`)**: Ghi tên tài nguyên thật (`utunN`, adapter GUID, route CIDR, khối hosts, anchor `pf`, rule firewall) vào sổ cái `0600` **trước khi tạo**; lúc dừng hoặc khởi động lại sau crash chỉ dọn đúng tài nguyên trong sổ cái, tuyệt đối không đụng tới `utun` của iCloud Private Relay hay VPN khác (`US-060 AC3`).
+1. **Kênh Admin IPC & Kênh Chỉ-Đọc Chẩn Đoán (`SEC-14`, `BLK-G2-03`, Codex `#11`)**:
+   - **Cấm tuyệt đối** mở Admin API trên TCP (`127.0.0.1`, IP overlay hay IP public).
+   - **Trên VPS Linux (`mesh-server`)**: Lắng nghe trên `/run/mesh/admin.sock` (thư mục `/run/mesh` quyền `0750` thuộc `mesh:mesh-admin`, socket quyền `0660` thuộc `mesh:mesh-admin`). Kiểm tra `SO_PEERCRED` kết hợp tra cứu nhóm phụ (supplementary groups) qua `getpwuid_r` + `getgrouplist` trong `mesh-sys::ipc_linux` để cho phép `uid == 0`, `uid == service_uid`, `gid == admin_gid`, hoặc thành viên nhóm `mesh-admin`.
+   - **Trên Client (`meshd`)**: Tách làm **2 kênh IPC riêng biệt** trên cả 3 hệ điều hành:
+     - **Kênh Admin (Read/Write — `up`, `down`, `cleanup`, `set`, `rotate-key`, `bugreport`)**: `/var/run/mesh/meshd-admin.sock` (`0660 root:admin` trên macOS — `mesh-sys::ipc_macos` kiểm tra `LOCAL_PEERCRED` `xucred.cr_groups` chứa `gid == 80` kèm fallback `getgrouplist` khi `cr_ngroups == 16`, hoặc `cr_uid == 0`; `0660 root:root` trên Linux) và Windows Named Pipe `\\.\pipe\mesh-agent-admin` với SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (`SYSTEM` + `Administrators`) kèm `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+     - **Kênh Chỉ-Đọc (`status`, `peers`, `ping`, `netcheck` — 0 khóa bí mật, body ≤ 4 KiB)**: `/var/run/mesh/meshd-ro.sock` (`0666` trên macOS/Linux) và Windows Named Pipe `\\.\pipe\mesh-agent-ro` (`US-039 AC5`).
+2. **Sổ cái Tài nguyên (`ResourceLedger` — `REL-08`)**: Ghi tên tài nguyên thật (`utunN`, adapter GUID, route CIDR, `ip rule` / `table 51820`, khối hosts, anchor `pf`, rule firewall) vào sổ cái `0600` **trước khi tạo**; lúc dừng hoặc khởi động lại sau crash chỉ dọn đúng tài nguyên trong sổ cái, tuyệt đối không đụng tới `utun` của iCloud Private Relay hay VPN khác (`US-060 AC3`).
 3. **Khối `hosts` (`PLAT-04`, `US-038`)**: Chỉ sửa trong `# BEGIN mesh` … `# END mesh`; bảo toàn symlink `/etc/hosts -> /private/etc/hosts` và quyền `root:wheel 0644` trên macOS; bảo toàn ACL đọc cho `Users`/`Dnscache` trên Windows; hỗ trợ fallback ghi tại chỗ khi `/etc/hosts` là bind-mount trong container Linux.
-4. **Chống Routing Loop (`REL-09`, `US-016`)**: Mọi socket ngoại biên của agent phải ràng vào interface vật lý mặc định (`SO_MARK` trên Linux, `IP_BOUND_IF` trên macOS, `IP_UNICAST_IF` trên Windows) và ràng lại khi đổi mạng.
-5. **Gọi lệnh hệ thống (`mesh_net::sysexec`)**: Chỉ dùng `tokio::process::Command` với **đường dẫn tuyệt đối cố định** nằm trong danh mục cho phép (`/sbin/route`, `/sbin/pfctl`, `/usr/bin/dscacheutil`, `/usr/bin/killall`, `/usr/libexec/ApplicationFirewall/socketfilterfw`, `/bin/launchctl`, `C:\Windows\System32\netsh.exe`, `ipconfig.exe`, `/usr/sbin/nft`, `/usr/sbin/iptables`, `/usr/sbin/ufw`), **cấm gọi qua shell (`sh -c`, `cmd /c`, `powershell -Command`)** và cấm hướng dẫn `spctl --master-disable`.
+4. **Chống Routing Loop (`REL-09`, `US-016`, `HR-G2-01`)**: Mọi socket ngoại biên của agent phải ràng vào interface vật lý mặc định (`IP_BOUND_IF` trên macOS, `IP_UNICAST_IF` trên Windows, và trên Linux dùng `SO_MARK = 0x5d56` kết hợp bảng định tuyến `table 51820` + cặp `ip rule` `not fwmark 0x5d56 table 51820` & `table main suppress_prefixlength 0`) và ràng lại khi đổi mạng.
+5. **Gọi lệnh hệ thống (`mesh_net::sysexec` — `HR-G2-01`)**: Chỉ dùng `tokio::process::Command` với **đường dẫn tuyệt đối cố định** nằm trong danh mục cho phép theo từng OS:
+   - **macOS**: `/sbin/ifconfig`, `/sbin/route`, `/sbin/pfctl`, `/usr/bin/dscacheutil`, `/usr/bin/killall`, `/usr/libexec/ApplicationFirewall/socketfilterfw`, `/bin/launchctl`.
+   - **Linux**: `/usr/sbin/ip`, `/sbin/ip`, `/usr/sbin/nft`, `/usr/sbin/iptables`, `/usr/sbin/ufw`, `/usr/bin/systemctl`.
+   - **Windows**: Truy vấn thư mục hệ thống qua `GetSystemDirectoryW` để ghép đường dẫn tuyệt đối `...\System32\netsh.exe`, `...\System32\ipconfig.exe`, `...\System32\route.exe` (tuyệt đối không gọi tên lệnh trần như `"ipconfig.exe"` để chống hijacking đường dẫn hiện hành).
+   - **Cấm** gọi qua shell (`sh -c`, `cmd /c`, `powershell -Command`) và cấm hướng dẫn `spctl --master-disable`.
 
 ---
 

@@ -9,6 +9,7 @@
       - cargo clippy --workspace --all-targets --all-features -- -D warnings
       - cargo test --workspace --all-features
       - cargo deny check advisories bans licenses sources
+    Automatically uses +1.94.1-x86_64-pc-windows-gnu when MSVC link.exe is absent.
 #>
 [CmdletBinding()]
 param(
@@ -22,16 +23,26 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Push-Location $RepoRoot
 
 try {
-    # Prepend portable Zig if installed via bootstrap-toolchain.ps1
-    $PortableZig = Join-Path $env:USERPROFILE "sdk\zig"
-    if (Test-Path (Join-Path $PortableZig "zig.exe")) {
-        $env:PATH = "$PortableZig;$env:PATH"
+    # Prepend portable SDK directories installed via scripts/bootstrap-toolchain.ps1
+    $SdkRoot = Join-Path $env:USERPROFILE "sdk"
+    $SdkMingwBin = Join-Path $SdkRoot "mingw64\bin"
+    $SdkZig = Join-Path $SdkRoot "zig"
+    $SdkBin = Join-Path $SdkRoot "bin"
+
+    foreach ($dir in @($SdkBin, $SdkZig, $SdkMingwBin)) {
+        if (Test-Path $dir) {
+            $env:PATH = "$dir;$env:PATH"
+        }
     }
 
-    Write-Host "==> [1/5] Checking Rust toolchain version..." -ForegroundColor Cyan
-    $rustcOut = (& rustc --version 2>&1)
+    Write-Host "==> [1/5] Checking Rust toolchain version (pinned 1.94.1)..." -ForegroundColor Cyan
+    $rustcOut = (& rustc --version 2>&1) | Out-String
+    $rustcOut = $rustcOut.Trim()
     if ($LASTEXITCODE -ne 0) {
         throw "rustc not found on PATH."
+    }
+    if ($rustcOut -notmatch "^rustc 1\.94\.1\b") {
+        throw "Rust compiler version mismatch: expected 'rustc 1.94.1', got '$rustcOut'."
     }
     Write-Host "    $rustcOut"
 
@@ -107,21 +118,39 @@ try {
         exit 0
     }
 
+    # Detect Windows linker: if MSVC link.exe is absent, switch to +1.94.1-x86_64-pc-windows-gnu + MinGW-w64
+    $CargoToolchainArgs = @()
+    $CargoTargetArgs = @()
+    if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
+        if (-not (Get-Command x86_64-w64-mingw32-gcc.exe -ErrorAction SilentlyContinue)) {
+            throw "Neither MSVC 'link.exe' nor MinGW 'x86_64-w64-mingw32-gcc.exe' was found on PATH. Run 'powershell -ExecutionPolicy Bypass -File scripts/bootstrap-toolchain.ps1' first."
+        }
+        $toolchains = (& rustup toolchain list 2>&1) | Out-String
+        if ($toolchains -match "1\.94\.1-x86_64-pc-windows-gnu") {
+            $CargoToolchainArgs = @("+1.94.1-x86_64-pc-windows-gnu")
+            Write-Host "    [Linker] MSVC link.exe not found; using host toolchain +1.94.1-x86_64-pc-windows-gnu (MinGW-w64 UCRT)" -ForegroundColor Yellow
+        }
+        else {
+            $CargoTargetArgs = @("--target", "x86_64-pc-windows-gnu")
+            Write-Host "    [Linker] MSVC link.exe not found; using --target x86_64-pc-windows-gnu" -ForegroundColor Yellow
+        }
+    }
+
     Write-Host "==> [3/5] Running cargo fmt --all -- --check..." -ForegroundColor Cyan
-    & cargo fmt --all -- --check
+    & cargo @CargoToolchainArgs fmt --all -- --check
     if ($LASTEXITCODE -ne 0) {
         Write-Error "cargo fmt check failed. Run 'cargo fmt --all' to fix formatting."
         exit 1
     }
 
     Write-Host "==> [4/5] Running cargo clippy (-D warnings) and cargo test..." -ForegroundColor Cyan
-    & cargo clippy --workspace --all-targets --all-features -- -D warnings
+    & cargo @CargoToolchainArgs clippy --workspace --all-targets --all-features @CargoTargetArgs -- -D warnings
     if ($LASTEXITCODE -ne 0) {
         Write-Error "cargo clippy failed."
         exit 1
     }
 
-    & cargo test --workspace --all-features
+    & cargo @CargoToolchainArgs test --workspace --all-features @CargoTargetArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Error "cargo test failed."
         exit 1
@@ -129,7 +158,7 @@ try {
 
     Write-Host "==> [5/5] Running cargo-deny (licenses, bans, advisories, sources)..." -ForegroundColor Cyan
     if (Get-Command cargo-deny -ErrorAction SilentlyContinue) {
-        & cargo deny check advisories bans licenses sources
+        & cargo-deny check advisories bans licenses sources
         if ($LASTEXITCODE -ne 0) {
             Write-Error "cargo deny check failed."
             exit 1
@@ -143,9 +172,16 @@ try {
     if ($Cross) {
         Write-Host "==> [Cross] Checking cross-compilation targets..." -ForegroundColor Cyan
         $CrossTargets = @("x86_64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin")
+        $hasZigbuild = [bool](Get-Command cargo-zigbuild -ErrorAction SilentlyContinue)
         foreach ($t in $CrossTargets) {
-            Write-Host "    cargo check --workspace --target $t"
-            & cargo check --workspace --target $t
+            if ($hasZigbuild) {
+                Write-Host "    cargo zigbuild --workspace --target $t"
+                & cargo @CargoToolchainArgs zigbuild --workspace --target $t
+            }
+            else {
+                Write-Host "    cargo check --workspace --target $t"
+                & cargo @CargoToolchainArgs check --workspace --target $t
+            }
             if ($LASTEXITCODE -ne 0) {
                 Write-Error "Cross-check failed for target $t"
                 exit 1

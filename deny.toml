@@ -22,6 +22,7 @@ unsound = "all"
 version = 2
 confidence-threshold = 0.8
 # Strictly permissive licenses only (C5: NO AGPL, GPL, LGPL, MPL-2.0)
+# CDLA-Permissive-2.0 is included for webpki-roots 1.0+ (non-copyleft open data license; MPL-2.0 remains banned).
 allow = [
     "MIT",
     "MIT-0",
@@ -30,6 +31,7 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "CDLA-Permissive-2.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
@@ -37,7 +39,7 @@ allow = [
     "BSL-1.0",
 ]
 
-[ licenses.private ]
+[licenses.private]
 ignore = true
 
 [bans]
@@ -56,12 +58,13 @@ deny = [
     { name = "rusqlite", reason = "C SQLite is banned; use pure-Rust redb (ADR-005)" },
     { name = "libsqlite3-sys", reason = "C SQLite FFI is banned; use pure-Rust redb (ADR-005)" },
     { name = "libsodium-sys", reason = "C libsodium FFI is banned; use pure-Rust crypto_box / x25519-dalek" },
-    { name = "aws-lc-rs", reason = "Requires CMake and NASM on Windows; configure rustls with ring or rustls-rustcrypto" },
-    { name = "aws-lc-sys", reason = "Requires CMake and NASM on Windows; configure rustls with ring or rustls-rustcrypto" },
+    { name = "aws-lc-rs", reason = "Requires CMake and NASM on Windows; configure TLS crates with default-features = false and ring" },
+    { name = "aws-lc-sys", reason = "Requires CMake and NASM on Windows; configure TLS crates with default-features = false and ring" },
     # Weak / obsolete cryptography (SEC-02)
     { name = "md5", reason = "Weak hash algorithm banned by SEC-02; use sha2 (SHA-256)" },
     { name = "md-5", reason = "Weak hash algorithm banned by SEC-02; use sha2 (SHA-256)" },
-    { name = "sha1", reason = "Weak hash algorithm banned by SEC-02; use sha2 (SHA-256)" },
+    # RFC 6455 WebSocket handshake requires SHA-1 strictly inside tungstenite; banned everywhere else
+    { name = "sha1", wrappers = ["tungstenite"], reason = "SHA-1 is banned by SEC-02 everywhere except RFC 6455 Sec-WebSocket-Accept inside tungstenite" },
     # Duplicate runtimes / web frameworks / loggers / DBs
     { name = "async-std", reason = "Use tokio as the single async runtime" },
     { name = "smol", reason = "Use tokio as the single async runtime" },

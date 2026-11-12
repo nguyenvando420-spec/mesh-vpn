@@ -1,5 +1,4 @@
 [toolchain]
-# Uses the pre-installed stable toolchain: rustc 1.94.1 (e408947bf 2026-03-25)
-channel = "stable"
+channel = "1.94.1"
 components = ["rustfmt", "clippy"]
 profile = "default"

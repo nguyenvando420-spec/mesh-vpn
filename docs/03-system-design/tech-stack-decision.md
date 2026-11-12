@@ -4,7 +4,7 @@
 |---|---|
 | Tác giả | `agile-tech-lead` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **2.0** — Chốt **Rust Stack** theo quyết định trực tiếp của Người dùng (2026-11-12 21:01), trình Gate 2 |
+| Phiên bản | **2.1 (Gate 2 Round 1 Revision)** — Chốt **Rust Stack** theo quyết định trực tiếp của Người dùng (2026-11-12 21:01), cập nhật sau phản biện độc lập `agile-critic` & `agile-codex` |
 | Giai đoạn | 3 — Thiết kế hệ thống (sau Gate 1 ✅ 2026-11-12) |
 | Thành phần AI/SLM | **Không có** → bỏ qua mục AI/ML Stack (đúng persona mục 3) |
 | Đầu vào | `reference-systems-benchmark.md`, `production-readiness-requirements.md` v1.2, `project-charter.md` v1.2, `product-backlog.md` v1.2 |
@@ -19,12 +19,12 @@
 
 | Hạng mục | Quyết định chốt | Lý do cốt lõi |
 |---|---|---|
-| **Ngôn ngữ & Compiler** | **Rust `1.94.1`** (`edition = "2024"`, `rust-version = "1.94.1"`), `#![forbid(unsafe_code)]` mặc định toàn workspace | Quyết định trực tiếp của Người dùng: **0 Garbage Collector (GC)**, footprint cực nhỏ (RAM chạy nền mục tiêu ~4–10 MB trên client, ~8–18 MB trên VPS; binary ~3–6 MB), an toàn bộ nhớ tuyệt đối cho daemon chạy quyền `root`/`SYSTEM` |
+| **Ngôn ngữ & Compiler** | **Rust `1.94.1`** (`edition = "2024"`, `rust-version = "1.94.1"`), `unsafe_code = "forbid"` cho 9/10 crates (chỉ `mesh-sys` bật `unsafe_op_in_unsafe_fn = "deny"` + `undocumented_unsafe_blocks = "deny"`) | Quyết định trực tiếp của Người dùng: **0 Garbage Collector (GC)**, footprint cực nhỏ (RAM chạy nền mục tiêu ~4–10 MB trên client, ~8–18 MB trên VPS; binary ~3–6 MB), an toàn bộ nhớ tuyệt đối cho daemon chạy quyền `root`/`SYSTEM` |
 | **Kiến trúc Workspace** | **1 Cargo Workspace** (`resolver = "3"`) gồm **3 binaries** (`mesh-server`, `meshd`, `mesh`) và **7 crates nội bộ** (`crates/mesh-*`) | Tách đặc quyền OS rõ ràng; cô lập 100% FFI vào duy nhất `crates/mesh-sys` và cô lập mật mã vào duy nhất `crates/mesh-crypto` |
 | **Async Runtime** | **`tokio` `1.44`** (chế độ tiết kiệm tài nguyên: `meshd` giới hạn 2 worker threads + stack 512 KB; `mesh` CLI dùng `current_thread`) | Chuẩn công nghiệp Rust async I/O; kiểm soát chặt số OS threads để giữ RSS ở mức vài MB |
 | **WireGuard Userspace (`SEC-02`)** | **`defguard_boringtun` `0.6`** (BSD-3-Clause — fork bảo trì tích cực của Cloudflare `boringtun`) | State machine `noise::Tunn` **sans-I/O** (`encapsulate`/`decapsulate`) thuần Rust, 0 thread/socket ngầm, ghép trực tiếp vào **1 `tokio::net::UdpSocket` duy nhất** cùng STUN + Disco + Blind Relay |
 | **TUN đa nền tảng** | Adapter mỏng trong `mesh-net` + `mesh-sys`: Windows **`wintun.dll`** (kiểm SHA-256 + `LOAD_LIBRARY_SEARCH_APPLICATION_DIR`), macOS **`utun`** (`com.apple.net.utun_control`), Linux **`/dev/net/tun`** | Kiểm soát tuyệt đối tên adapter cố định Windows (`US-015`), ghi nhận đúng `utunN` vào sổ cái tài nguyên macOS (`US-060`), không cần chứng chỉ Apple Developer $99/năm |
-| **TLS 1.3 + SPKI Pin + ACME (`SEC-04`)** | **`rustls` `0.23`** + **`tokio-rustls` `0.26`** + **`rcgen` `0.13`** (chứng chỉ IP+Pin) + **`instant-acme` `0.7`** (ACME `TLS-ALPN-01`/`DNS-01`) | 100% không phụ thuộc OpenSSL C; verifier SPKI Pin (`sha256:<hex>`) tùy chỉnh fail-closed, cấm TOFU |
+| **TLS 1.3 + SPKI Pin + ACME (`SEC-04`)** | **`rustls` `0.23`** + **`tokio-rustls` `0.26`** + **`x509-cert` `0.2`** + **`rustls-webpki` `0.102+`** + **`rustls-native-certs` `0.8`** + **`rcgen` `0.13`** + **`instant-acme` `0.7`** (`default-features = false`, `ring`) | 100% không phụ thuộc OpenSSL C hay `aws-lc-rs`; trích xuất chính xác `tbs_certificate.subject_public_key_info` DER + kiểm tra hạn chứng chỉ (`ClockSkew`) bằng `x509-cert`, cấm TOFU |
 | **HTTP & WebSocket (Control + Relay)** | **`axum` `0.8`** + **`tokio-tungstenite` `0.26`** trên **1 cổng TCP cấu hình được** (mặc định `443`) | Ghép chung Control RPC, Netmap Stream và Blind Relay trên 1 cổng TCP; tương thích cả Standalone lẫn sau Reverse Proxy (`Nginx`/`Caddy`) |
 | **Mật mã & Bảo vệ Khóa (`SEC-01`, `SEC-02`)** | **`crypto_box` `0.9`** (X25519 + XSalsa20-Poly1305) + **`x25519-dalek` `2.0`** + **`sha2` `0.10`** + **`subtle` `2.6`** + **`rand` `0.8` (`OsRng`)** + **`zeroize` `1.8` (`ZeroizeOnDrop`)** | Thuần Rust; tự động xóa sạch khóa trong RAM ngay khi `Drop` (`ZeroizeOnDrop`) và tự che `"[REDACTED]"` trên mọi đường `Debug`/`Display`/`Serialize` |
 | **Embedded DB trên VPS (`REL-11`, `REL-12`)** | **`redb` `2.4`** (MIT/Apache-2.0 — **100% Pure-Rust ACID MVCC key-value store**) | **0 dòng mã C** (không cần biên dịch C-SQLite), giao dịch ACID đa bảng nguyên tử, kiểm tra toàn vẹn khi boot, hỗ trợ **hot snapshot backup nguyên tử kèm SHA-256** (`US-045`) |
@@ -91,14 +91,19 @@
 
 ### 4.2. Giải pháp `scripts/bootstrap-toolchain.ps1` (Không bắt cài 6 GB Visual Studio nếu không muốn)
 
-Script [`scripts/bootstrap-toolchain.ps1`](../../scripts/bootstrap-toolchain.ps1) hỗ trợ 2 chế độ rõ ràng để người dùng hoặc CI lựa chọn:
+Script [`scripts/bootstrap-toolchain.ps1`](../../scripts/bootstrap-toolchain.ps1) cưỡng chế khớp phiên bản `rustc 1.94.1` (`^rustc 1\.94\.1\b`), kiểm tra mã băm SHA-256 ở chế độ **fail-closed** (`Assert-FileSha256` xóa tệp và `throw` ngay nếu sai băm, không có biến môi trường bỏ qua kiểm tra băm), và hỗ trợ 2 chế độ rõ ràng:
 
-1. **Phương án A — Gọn nhẹ, không cần quyền Admin, không cần 6 GB Visual Studio (`-Mode PortableZig`, khuyến nghị)**:
-   - Tải bản portable **Zig** (~45 MB, kiểm tra mã băm SHA-256 cố định) giải nén vào `%USERPROFILE%\sdk\zig` và portable **LLVM-MinGW / LLD** (hoặc dùng `zig cc` làm linker).
-   - Thêm target `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin` qua `rustup target add`.
-   - Cài đặt binary `cargo-deny`, `cargo-zigbuild` và `apple-codesign` (`rcodesign`) để:
-     - Build và chạy test cục bộ trên Windows mà không cần cài Visual Studio 2022.
-     - Cross-compile trực tiếp từ Windows ra `x86_64-unknown-linux-musl` (binary tĩnh hoàn toàn cho VPS Ubuntu & container lab) và `aarch64-apple-darwin` / `x86_64-apple-darwin` (kèm ký ad-hoc Mach-O `arm64` bằng `rcodesign sign` theo yêu cầu `PLAT-06(1)`).
+1. **Phương án A — Gọn nhẹ, không cần quyền Admin, không cần 6 GB Visual Studio (`-Mode PortableZig`, mặc định)**:
+   - **Hóa giải triệt để việc thiếu `link.exe` / `ml64.exe` cho cả `proc-macro` / `build.rs` (như `ring 0.17`) lẫn binary**:
+     - Cài đặt host toolchain GNU `rustup toolchain install 1.94.1-x86_64-pc-windows-gnu --component rustfmt,clippy` để cả `proc-macro` / `build.rs` lẫn các crate trong workspace trên máy Windows chưa có Visual Studio đều biên dịch bằng ABI `-gnu` (thay vì `-msvc` đòi `link.exe`).
+     - Thêm các target phát hành (`x86_64-pc-windows-gnu`, `x86_64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin`) trên cả 2 toolchain.
+   - **Tải 5 gói prebuilt chính thức vào `$SdkRoot` (`%USERPROFILE%\sdk` hoặc `.tools`) — KHÔNG gọi `cargo install` biên dịch từ source**:
+     1. **MinGW-w64 GCC UCRT (`winlibs 16.2.0-r3`)**: cung cấp `gcc.exe`, `x86_64-w64-mingw32-gcc.exe`, `dlltool.exe`, `windres.exe`, `ar.exe`, `libgcc_eh.a` tương thích 100% với `1.94.1-x86_64-pc-windows-gnu` và `ring 0.17` (`SHA-256: 3c69305081e4a647144339a936244fcf7d3d9e558319e1ad7be2cd2886d4b6a1`).
+     2. **Zig `0.13.0` Windows x86_64**: làm cross-linker cho Linux `musl` và macOS (`SHA-256: d859994725ef9402381e557c60bb57497215682e355204d754ee3df75ee3c158`).
+     3. **`cargo-deny` `0.20.2` prebuilt Windows x86_64**: giải nén bằng `$env:SystemRoot\System32\tar.exe -xzf` vào `$SdkRoot\bin\cargo-deny.exe` (`SHA-256: 975a22143262fd27476d19ee00c7af67978426e40e1dee94eed6bbade1cf87dc`).
+     4. **`cargo-zigbuild` `v0.24.1` prebuilt Windows x86_64**: giải nén vào `$SdkRoot\bin\cargo-zigbuild.exe` (`SHA-256: 7f660482f8dada6dfcd495bfc52a4c4f0cf6b2e01ac9740811855a1de7c4f60a`).
+     5. **`apple-codesign` (`rcodesign.exe`) `0.29.0` prebuilt Windows x86_64**: phục vụ ký ad-hoc Mach-O `arm64` theo `ADR-011` / `PLAT-06(1)` (`SHA-256: 54bb500e2da7a8de02fcae0f331d1cac6e6d7173b4281042ff9c528ba3159aaa`).
+   - Script `scripts/check.ps1` tự động nạp `$SdkRoot\bin`, `$SdkRoot\zig`, `$SdkRoot\mingw64\bin` vào `$env:PATH` và tự động chọn `+1.94.1-x86_64-pc-windows-gnu` khi máy không có `link.exe`.
 2. **Phương án B — Native MSVC (`-Mode Msvc`)**:
    - Cài đặt `Microsoft.VisualStudio.2022.BuildTools` (`--override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"`) qua `winget` cho target mặc định `x86_64-pc-windows-msvc`.
 3. **Kết hợp Docker/WSL & GitHub Actions Matrix**:
@@ -137,7 +142,10 @@ mesh-vpn/
 ```
 
 ### Quy tắc cô lập đặc quyền & an toàn bộ nhớ giữa các Crates
-1. **Cô lập `unsafe` tuyệt đối**: `Cargo.toml` gốc đặt `[workspace.lints.rust] unsafe_code = "forbid"`. Chỉ riêng `crates/mesh-sys` được phép ghi đè `#![allow(unsafe_code)]` kèm `#![deny(unsafe_op_in_unsafe_fn)]` và `#![deny(clippy::undocumented_unsafe_blocks)]`. Mọi crate nghiệp vụ (`mesh-proto`, `mesh-datapath`, `mesh-store`, `mesh-server`, `meshd`, `mesh`) có **0 dòng `unsafe`**.
+1. **Cô lập `unsafe` tuyệt đối (tránh lỗi `E0453` của `rustc`)**:
+   - Trong Rust, một crate kế thừa `[lints] workspace = true` có `unsafe_code = "forbid"` sẽ **không thể** ghi đè bằng `#![allow(unsafe_code)]` (trình biên dịch sẽ báo lỗi `E0453: allow(unsafe_code) overruled by outer forbid(unsafe_code)`).
+   - Do đó, `Cargo.toml` gốc đặt `[workspace.lints.rust] unsafe_code = "forbid"`, và **9/10 crates** (`mesh`, `meshd`, `mesh-server`, `mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-datapath`, `mesh-net`, `mesh-store`) khai báo `[lints] workspace = true` → có **0 dòng `unsafe`**.
+   - Riêng **`crates/mesh-sys/Cargo.toml` KHÔNG đặt `[lints] workspace = true`**, mà tự khai báo bảng `[lints.rust]` và `[lints.clippy]` riêng giữ nguyên mọi lint nghiêm ngặt nhưng thay `unsafe_code = "forbid"` bằng bộ đôi `unsafe_code = "allow"` + `unsafe_op_in_unsafe_fn = "deny"` + `clippy::undocumented_unsafe_blocks = "deny"` (bắt buộc mọi khối `unsafe` trong `mesh-sys` có chú thích `// SAFETY:`).
 2. **Cô lập mật mã (`SEC-02`)**: Chỉ `crates/mesh-crypto` (và `defguard_boringtun` bên trong `crates/mesh-datapath`) được phép gọi các hàm nguyên thủy mật mã. Các crate khác chỉ gọi API cấp cao đã định kiểu của `mesh-crypto`.
 3. **Tách tiến trình trên VPS (`SEC-06(4)`, `US-056`)**: Khi VPS tham gia mesh như một node (`vps.mesh.internal`), `mesh-server` chạy dưới user hệ thống `mesh` không đặc quyền (`CAP_NET_BIND_SERVICE` chỉ khi cổng < 1024), còn `meshd` chạy trong một unit `systemd` riêng biệt với `CAP_NET_ADMIN`.
 
@@ -164,8 +172,8 @@ mesh-vpn/
 
 > **Điểm sáng kiến trúc của `defguard_boringtun::noise::Tunn`**:
 > Trong `mesh-datapath`, `MagicSocket` sở hữu duy nhất **1 `tokio::net::UdpSocket`** (bind lại cổng UDP cục bộ đã lưu bền theo `US-019 AC1`). Khi một gói UDP đến:
-> 1. Nếu byte 4..8 là magic cookie STUN `0x2112A442` → chuyển cho bộ giải mã `mesh_proto::stun`.
-> 2. Nếu 6 byte đầu là magic header Disco `b"MESHDS"` (`0x4d4553484453`) → chuyển cho `mesh_datapath::disco`.
+> 1. Nếu thỏa đầy đủ điều kiện RFC 5389 STUN (`pkt.len() >= 20 && (pkt[0] & 0b1100_0000) == 0 && pkt[4..8] == [0x21, 0x12, 0xA4, 0x42] && u16::from_be_bytes([pkt[2], pkt[3]]) % 4 == 0`, loại trừ 100% va chạm với gói WireGuard có `pkt[0] in 1..=4`) → chuyển cho bộ giải mã `mesh_proto::stun`.
+> 2. Nếu độ dài ≥ 172 byte và 6 byte đầu là magic header Disco `b"MESHDS"` (`0x4d4553484453`) → chuyển cho `mesh_datapath::disco`.
 > 3. Ngược lại → tra bảng peer và đưa thẳng slice gói tin vào `tunn.decapsulate(None, packet, &mut out_buf)` rồi ghi gói IP giải mã ra `TunDevice`.
 > Khi gửi gói từ `TunDevice`: gọi `tunn.encapsulate(ip_packet, &mut wg_buf)`; nếu peer đã có đường `Direct(SocketAddr)` thì gửi qua `UdpSocket`, nếu chưa có hoặc direct vừa chết (`US-022`, `US-026`) thì đẩy ngay vào kênh `BlindRelay` qua WebSocket TLS! Không cần bất kỳ lớp giả lập socket phức tạp nào.
 
@@ -180,15 +188,25 @@ mesh-vpn/
 
 | Thành phần | Crate chọn | Thay thế bị loại | Lý do kỹ thuật |
 |---|---|---|---|
-| **TLS Engine** | **`rustls` `0.23`** + **`tokio-rustls` `0.26`** (`default-features = false`, bật TLS 1.3, provider `ring` `0.17` kèm feature dự phòng `rustls-rustcrypto`) | `native-tls` / `openssl-sys` | Không phụ thuộc OpenSSL C; tắt `aws-lc-rs` mặc định để không đòi CMake + NASM trên Windows; hỗ trợ `ServerCertVerifier` tùy chỉnh để kiểm tra SPKI Pin (`sha256:<hex>`) và hỗ trợ `ExportKeyingMaterial` (RFC 5705 / RFC 8446) làm channel binding cho bước chứng minh khóa node (`ADR-003`) |
-| **Sinh chứng chỉ IP + Pin** | **`rcgen` `0.13`** + **`sha2` `0.10`** | Gọi lệnh `openssl` ngoài | Thuần Rust; sinh cặp khóa định danh server ECDSA P-256 bền vững, tính `sha256` trên phần DER của `subjectPublicKeyInfo` (SPKI), và cho phép tái phát hành chứng chỉ X.509 giữ nguyên khóa công khai để client không phải pin lại (`US-047 AC3`) |
-| **ACME Client (`TLS-ALPN-01` & `DNS-01`)** | **`instant-acme` `0.7`** | `tokio-rustls-acme` (thiếu kiểm soát sâu `DNS-01` và cổng tùy chỉnh) | Thuần Rust, gọn nhẹ; cho phép `mesh-server` tự điều khiển vòng đời: dùng `TLS-ALPN-01` (ALPN `acme-tls/1`) khi cổng TCP = `443`, và bắt buộc chuyển sang `DNS-01` hoặc từ chối cấu hình có hướng dẫn khi cổng TCP ≠ `443` (`US-047 AC7`), hoàn toàn không cần mở cổng 80 |
+| **TLS Engine & WebPKI** | **`rustls` `0.23`** + **`tokio-rustls` `0.26`** + **`rustls-webpki` `0.102+`** + **`rustls-native-certs` `0.8`** (`default-features = false`, provider `ring` `0.17`) | `native-tls` / `openssl-sys` / `aws-lc-rs` | Không phụ thuộc OpenSSL C; bắt buộc tắt `default-features` trên toàn bộ hệ sinh thái TLS để không kéo `aws-lc-rs` (đòi CMake + NASM trên Windows); hỗ trợ `ServerCertVerifier` tùy chỉnh cho SPKI Pin, `WebPkiServerVerifier` cho chế độ Domain (`SEC-04(a)`), nạp CA gốc hệ điều hành cho ACME/Webhook không dính `MPL-2.0`, và `export_keying_material` (RFC 5705 / RFC 8446) làm channel binding (`ADR-003`) |
+| **Phân tích DER Chứng chỉ X.509 & Kiểm tra Hạn (`ClockSkew`)** | **`x509-cert` `0.2`** (RustCrypto `der`, Apache-2.0 OR MIT, `default-features = false`, `features = ["std"]`) | Cắt lát byte thủ công hoặc `x509-parser` (`nom`) | Thuần Rust 100%, chuẩn ASN.1 DER chặt chẽ: trích xuất chính xác `cert.tbs_certificate.subject_public_key_info.to_der()` cho cả khóa ECDSA lẫn RSA và kiểm tra `validity.not_before` / `validity.not_after` để trả về đúng mã lỗi `ErrorKind::ClockSkew` (`US-003 AC5`, `US-047 AC4`) |
+| **Sinh chứng chỉ IP + Pin** | **`rcgen` `0.13`** (`default-features = false`, `features = ["crypto", "ring", "pem"]`) + **`sha2` `0.10`** | Gọi lệnh `openssl` ngoài | Thuần Rust; sinh cặp khóa định danh server ECDSA P-256 bền vững, tính `sha256` trên phần DER của `subjectPublicKeyInfo` (SPKI), và cho phép tái phát hành chứng chỉ X.509 giữ nguyên khóa công khai để client không phải pin lại (`US-047 AC3`) |
+| **ACME Client (`TLS-ALPN-01` & `DNS-01`)** | **`instant-acme` `0.7`** (`default-features = false`, `features = ["ring"]`) | `tokio-rustls-acme` (thiếu kiểm soát sâu `DNS-01` và cổng tùy chỉnh) | Thuần Rust, gọn nhẹ; cho phép `mesh-server` tự điều khiển vòng đời: dùng `TLS-ALPN-01` (ALPN `acme-tls/1`) khi cổng TCP = `443`, và bắt buộc chuyển sang `DNS-01` hoặc từ chối cấu hình có hướng dẫn khi cổng TCP ≠ `443` (`US-047 AC7`), hoàn toàn không cần mở cổng 80 |
+
+**Cấu hình bắt buộc trong `[workspace.dependencies]` để chặn triệt để `aws-lc-rs`**:
+```toml
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+instant-acme = { version = "0.7", default-features = false, features = ["ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots-no-provider", "json"] }
+```
 
 ### 6.5. HTTP Control Plane & WebSocket Blind Relay (`US-009`, `US-024`, `US-025`)
 
 | Phương án | Giấy phép | Ưu điểm | Nhược điểm | Quyết định |
 |---|---|---|---|---|
-| **`axum` `0.8`** + **`tokio-tungstenite` `0.26`** + **`hyper` `1.6`** + **`tower` `0.5`** | MIT | Cùng hệ sinh thái chính chủ của `tokio`; định tuyến HTTP/1.1 + nâng cấp WebSocket (`GET /v1/netmap/stream` và `GET /v1/relay`) ngay trên **cùng 1 cổng TCP**; kiểm soát chặt `max_frame_size`/`max_message_size` theo MTU | — | **CHỌN** |
+| **`axum` `0.8`** + **`tokio-tungstenite` `0.26`** + **`hyper` `1.6`** + **`hyper-util` `0.1`** | MIT | Cùng hệ sinh thái chính chủ của `tokio`; định tuyến HTTP/1.1 + nâng cấp WebSocket (`GET /v1/netmap/stream` và `GET /v1/relay`) ngay trên **cùng 1 cổng TCP**; dùng trực tiếp `axum::middleware::from_fn` và `axum::extract::DefaultBodyLimit` có sẵn trong `axum 0.8` (không cần kéo thêm crate `tower` độc lập); kiểm soát chặt `max_frame_size`/`max_message_size` theo MTU | — | **CHỌN** |
 | `actix-web` | MIT/Apache-2.0 | Nhanh | Dùng mô hình runtime local riêng, dư thừa khi đã dùng `tokio` | Loại |
 | `warp` | MIT | Nhẹ | Hệ thống kiểu filter phức tạp, bảo trì chậm | Loại |
 
@@ -223,16 +241,19 @@ mesh-vpn/
 | `tokio` | `1.44` | MIT | `mesh`, `meshd`, `mesh-server`, `mesh-datapath`, `mesh-net` | Async runtime, TCP/UDP, UDS (`peer_cred`), Windows Named Pipe, signal, timer, sync |
 | `tokio-util` | `0.7` | MIT | `meshd`, `mesh-server`, `mesh-datapath`, `mesh-net` | `CancellationToken`, `TaskTracker` (graceful shutdown ≤ 5 s), framing codec |
 | `defguard_boringtun` | `0.6` | BSD-3-Clause | **Chỉ `mesh-datapath`** | State machine WireGuard userspace sans-I/O (`noise::Tunn`) |
-| `rustls` | `0.23` | Apache-2.0 OR ISC OR MIT | `mesh-crypto`, `mesh-net`, `mesh-server` | TLS 1.3 client/server, custom `ServerCertVerifier` cho SPKI Pin |
-| `tokio-rustls` | `0.26` | MIT OR Apache-2.0 | `mesh-net`, `mesh-server` | Tích hợp `rustls` với stream `tokio` |
+| `rustls` | `0.23` (`default-features = false`, `features = ["ring", "tls12", "std", "logging"]`) | Apache-2.0 OR ISC OR MIT | `mesh-crypto`, `mesh-net`, `mesh-server` | TLS 1.3 client/server, custom `ServerCertVerifier` cho SPKI Pin |
+| `tokio-rustls` | `0.26` (`default-features = false`, `features = ["ring", "tls12", "logging"]`) | MIT OR Apache-2.0 | `mesh-net`, `mesh-server` | Tích hợp `rustls` với stream `tokio` |
 | `rustls-pemfile` / `pki-types` (`rustls-pki-types`) | `2.1` / `1.11` | MIT OR Apache-2.0 | `mesh-crypto`, `mesh-server` | Kiểu dữ liệu chứng chỉ X.509 / DER / SPKI |
+| `rustls-webpki` | `0.102+` | ISC | `mesh-crypto`, `mesh-net`, `mesh-server` | Xác thực chuỗi chứng chỉ CA chuẩn WebPKI cho chế độ Domain (`SEC-04(a)`) |
+| `rustls-native-certs` | `0.8` | Apache-2.0 OR MIT OR ISC | `mesh-net`, `mesh-server` | Nạp kho chứng chỉ gốc của OS cho ACME/Webhook HTTPS (không dính `MPL-2.0`) |
+| `x509-cert` | `0.2` (`default-features = false`, `features = ["std"]`) | Apache-2.0 OR MIT | **Chỉ `mesh-crypto`** | Parse ASN.1 DER X.509: trích xuất `tbs_certificate.subject_public_key_info` DER và kiểm tra hạn `NotBefore`/`NotAfter` (`ClockSkew` `US-003 AC5`, `US-047 AC4`) |
 | `ring` *(hoặc `rustls-rustcrypto`)* | `0.17` | ISC / MIT | `mesh-crypto`, `mesh-datapath` | Provider mật mã cho `rustls` & `defguard_boringtun` |
-| `rcgen` | `0.13` | MIT OR Apache-2.0 | **Chỉ `mesh-crypto` / `mesh-server`** | Sinh khóa định danh server & chứng chỉ tự ký cho chế độ IP + SPKI Pin (`US-047`) |
-| `instant-acme` | `0.7` | Apache-2.0 | **Chỉ `mesh-server`** | Giao thức ACME thuần Rust (`TLS-ALPN-01` & `DNS-01`, không cần cổng 80) |
+| `rcgen` | `0.13` (`default-features = false`, `features = ["crypto", "ring", "pem"]`) | MIT OR Apache-2.0 | **Chỉ `mesh-crypto` / `mesh-server`** | Sinh khóa định danh server & chứng chỉ tự ký cho chế độ IP + SPKI Pin (`US-047`) |
+| `instant-acme` | `0.7` (`default-features = false`, `features = ["ring"]`) | Apache-2.0 | **Chỉ `mesh-server`** | Giao thức ACME thuần Rust (`TLS-ALPN-01` & `DNS-01`, không cần cổng 80) |
 | `axum` | `0.8` | MIT | `mesh-server`, `mesh-net` (IPC/Observability) | HTTP/1.1 router cho Control Plane, `/healthz`, `/readyz`, `/metrics` và Admin IPC |
 | `hyper` / `hyper-util` | `1.6` / `0.1` | MIT | `mesh-server`, `mesh-net` | Nền tảng HTTP/1.1 cấp thấp cho kết nối UDS / Named Pipe / `ListenerSet` |
 | `tokio-tungstenite` | `0.26` | MIT | `mesh-server`, `mesh-datapath`, `mesh-net` | WebSocket binary stream cho Blind Relay (`US-024/025`) và Netmap Stream (`US-009`) |
-| `reqwest` *(hoặc `hyper` client)* | `0.12` (`default-features = false`, `rustls-tls-manual-roots-no-provider`) | MIT OR Apache-2.0 | `mesh-net`, `mesh-server` (webhook cảnh báo `US-049`) | HTTP client dùng đúng `rustls` config đã gắn SPKI Pin Verifier |
+| `reqwest` *(hoặc `hyper` client)* | `0.12` (`default-features = false`, `features = ["rustls-tls-native-roots-no-provider", "json"]`) | MIT OR Apache-2.0 | `mesh-net`, `mesh-server` (webhook cảnh báo `US-049`) | HTTP client dùng đúng `rustls` provider `ring` & `SpkiPinVerifier` |
 | `crypto_box` | `0.9` | Apache-2.0 OR MIT | **Chỉ `mesh-crypto`** | NaCl box (X25519 + XSalsa20-Poly1305) cho chứng minh khóa node & xác thực Disco |
 | `x25519-dalek` | `2.0` | BSD-3-Clause | **Chỉ `mesh-crypto`** | Khóa công khai/riêng tư Curve25519 |
 | `chacha20poly1305` | `0.10` | Apache-2.0 OR MIT | **Chỉ `mesh-crypto`** | AEAD chuẩn |
@@ -260,13 +281,13 @@ mesh-vpn/
 
 | Nhóm | Bị cấm tuyệt đối | Lý do & Giải pháp thay thế | Cơ chế cưỡng chế |
 |---|---|---|---|
-| **Giấy phép lây nhiễm** | **`AGPL-3.0`**, **`GPL-2.0`**, **`GPL-3.0`**, **`LGPL-*`**, **`SSPL-1.0`**, **`MPL-2.0`** (như `gotatun`, mã server NetBird) | Vi phạm ràng buộc `C5` / `R-15` | `cargo deny check licenses` (`deny.toml`) |
-| **Thư viện C ẩn / OpenSSL** | `openssl`, `openssl-sys`, `native-tls`, `libsqlite3-sys`, `rusqlite`, `libsodium-sys`, `curl-sys` | Phá vỡ chiến lược Pure-Rust / Zero-C, gây lỗi cross-compile và tăng bề mặt lỗ hổng C | `deny.toml` (`[bans] deny`) |
+| **Giấy phép lây nhiễm** | **`AGPL-3.0`**, **`GPL-2.0`**, **`GPL-3.0`**, **`LGPL-*`**, **`SSPL-1.0`**, **`MPL-2.0`** (như `gotatun`, mã server NetBird) | Vi phạm ràng buộc `C5` / `R-15` (riêng `CDLA-Permissive-2.0` được cho phép trong `deny.toml` cho gói dữ liệu CA `webpki-roots 1.0+`) | `cargo deny check licenses` (`deny.toml`) |
+| **Thư viện C ẩn / OpenSSL / Thuật toán yếu** | `openssl`, `openssl-sys`, `native-tls`, `aws-lc-rs`, `aws-lc-sys`, `libsqlite3-sys`, `rusqlite`, `libsodium-sys`, `curl-sys`, `md-5`, `sha1` (trừ ngoại lệ hẹp `wrappers = ["tungstenite"]` cho header `Sec-WebSocket-Accept` RFC 6455) | Phá vỡ chiến lược Pure-Rust / Zero-C hoặc dùng hàm băm yếu (`SEC-02`) | `deny.toml` (`[bans] deny`) |
 | **Lỗi lỏng lẻo** | `anyhow`, `eyre` trong các crate thư viện (`mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-datapath`, `mesh-net`, `mesh-store`, `mesh-sys`) | Làm mất kiểu lỗi (`ErrorKind`), khiến tầng biên không phân biệt được lỗi cần retry (`Unavailable`), `PinMismatch` hay `Unauthenticated` → **bắt buộc dùng `thiserror` + `AppError`** | `deny.toml` + Clippy |
 | **Trùng chức năng Async/HTTP/Log** | `async-std`, `smol`, `actix-web`, `warp`, `rocket`, `ureq`, `surf`, `log4rs`, `env_logger`, `fern`, `slog` | Tránh mỗi Developer cài một framework khác nhau; chỉ dùng `tokio` + `axum` + `tracing` | `deny.toml` (`[bans] deny`) |
 | **DB nhúng không ổn định** | `sled`, `rocksdb`, `leveldb`, `diesel`, `sea-orm`, `sqlx` | Chỉ dùng `redb` | `deny.toml` (`[bans] deny`) |
 | **Gây crash tiến trình** | `.unwrap()`, `.expect()`, `panic!()`, `todo!()`, `unimplemented!()`, `dbg!()`, `println!()`, `eprintln!()` trong code production (trừ `crates/mesh` CLI in kết quả qua writer chuẩn) | VPN daemon chạy 24/7 dưới quyền `root`/`SYSTEM` không được phép panic khi gặp gói mạng dị dạng | `[workspace.lints.clippy]` (`unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `todo = "deny"`, `dbg_macro = "deny"`) |
-| **Mã `unsafe` bừa bãi** | Từ khóa `unsafe` ở bất kỳ đâu ngoài `crates/mesh-sys` | Bảo đảm an toàn bộ nhớ tuyệt đối cho toàn bộ giao thức & nghiệp vụ | `[workspace.lints.rust] unsafe_code = "forbid"` |
+| **Mã `unsafe` bừa bãi** | Từ khóa `unsafe` ở bất kỳ đâu ngoài `crates/mesh-sys` | Bảo đảm an toàn bộ nhớ tuyệt đối cho toàn bộ giao thức & nghiệp vụ (9/10 crates kế thừa `[workspace.lints.rust] unsafe_code = "forbid"`; riêng `crates/mesh-sys` bật `unsafe_op_in_unsafe_fn = "deny"` + `undocumented_unsafe_blocks = "deny"`) | `Cargo.toml` lints + `scripts/check.{ps1,sh}` |
 
 ---
 
@@ -291,4 +312,5 @@ mesh-vpn/
 | Phiên bản | Ngày | Nội dung |
 |---|---|---|
 | 1.0 | 2026-11-12 | Bản đề xuất ban đầu (Go 1.27) |
-| **2.0** | **2026-11-12** | **Ghi đè toàn bộ sang Rust `1.94.1` Stack theo quyết định của Người dùng (`"Tôi chọn 2. Đổi sang Rust"`)**: kiến trúc Cargo Workspace 3 binaries + 7 crates, `defguard_boringtun` sans-I/O trên 1 UDP socket, `redb` ACID thuần Rust, `rustls` + SPKI Pin, `ZeroizeOnDrop` xóa khóa trong RAM, cô lập `unsafe` vào duy nhất `mesh-sys`, và cưỡng chế bằng `rustfmt` + `clippy` + `cargo-deny` |
+| 2.0 | 2026-11-12 | Ghi đè toàn bộ sang Rust `1.94.1` Stack theo quyết định của Người dùng (`"Tôi chọn 2. Đổi sang Rust"`) |
+| **2.1** | **2026-11-12** | **Gate 2 Round 1 Revision (`agile-critic` & `agile-codex`)**: (1) `bootstrap-toolchain.ps1` chế độ `PortableZig` cài `1.94.1-x86_64-pc-windows-gnu` + tải 5 gói prebuilt chính thức (`winlibs MinGW-w64`, `Zig 0.13.0`, `cargo-deny 0.20.2`, `cargo-zigbuild v0.24.1`, `rcodesign 0.29.0`) kiểm SHA-256 fail-closed; (2) sửa cấu hình `[lints]` riêng cho `crates/mesh-sys` để tránh lỗi `E0453`; (3) bổ sung `x509-cert 0.2`, `rustls-webpki`, `rustls-native-certs` và ép `default-features = false` + `ring` trên toàn bộ crate TLS; (4) cấu hình ngoại lệ hẹp `sha1` (`wrappers = ["tungstenite"]`) và `CDLA-Permissive-2.0` trong `deny.toml` |

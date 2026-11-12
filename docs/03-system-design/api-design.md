@@ -4,8 +4,8 @@
 |---|---|
 | Tác giả | `agile-architect` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **2.0** — Khóa cứng 100% Hợp đồng Giao tiếp (REST, WebSocket, Binary Relay, STUN/Disco/WG UDP, Local IPC, Observability) |
-| Trạng thái | **Proposed-for-Gate-2** |
+| Phiên bản | **2.1** — Gate 2 Round 1 Revision: Khóa cứng 100% Hợp đồng Giao tiếp (REST, WebSocket, Binary Relay, STUN/Disco/WG UDP, Dual Local IPC, Observability) |
+| Trạng thái | **Proposed-for-Gate-2 (Revised)** |
 | Thành phần AI | **Không có** (Không có JSON Schema đầu ra AI) |
 | Đầu vào | [production-readiness-requirements.md](../01-discovery/production-readiness-requirements.md) (v1.2) · [product-backlog.md](../02-product-planning/product-backlog.md) (v1.2) · [tech-stack-decision.md](./tech-stack-decision.md) (v2.0) · [architecture-decision-record.md](./architecture-decision-record.md) (v2.0 `ADR-002..010`) · [coding-standards.md](./coding-standards.md) (v2.0) |
 | Crate thực thi | `crates/mesh-proto` (DTOs & parsers), `crates/mesh-datapath`, `crates/mesh-server`, `crates/meshd`, `crates/mesh` |
@@ -14,33 +14,38 @@
 > 1. Mọi endpoint HTTP/WebSocket dùng tiền tố **`/v1/`** (`coding-standards.md` §2.1).
 > 2. Mọi trường JSON dùng **`snake_case`**, mọi trường thời gian kết thúc bằng **`_at_ms`** (`u64` Unix epoch milliseconds UTC), gắn `#[serde(deny_unknown_fields)]` ở đầu vào.
 > 3. **Không một DTO mạng nào có trường chứa khóa riêng (`private_key`)** (`SEC-01(a)`).
-> 4. Giới hạn kích thước body HTTP tối đa **`MAX_HTTP_BODY_BYTES = 65_536` (64 KiB)**; giới hạn khung nhị phân WebSocket/UDP tối đa **`MAX_FRAME_SIZE = 2048` bytes**.
+> 4. Giới hạn kích thước body HTTP tối đa **`MAX_HTTP_BODY_BYTES = 65_536` (64 KiB)** (riêng kênh IPC chỉ-đọc `meshd-ro` giới hạn `4096` bytes); giới hạn khung nhị phân WebSocket/UDP tối đa **`MAX_FRAME_SIZE = 2048` bytes**.
 
 ---
 
 ## 1. Control Public HTTPS & WebSocket API (Trên Cổng TCP Cấu Hình Được, Mặc Định `443`)
 
-Toàn bộ các endpoint trong mục này chạy trên cổng TCP công khai do người dùng cấu hình (mặc định `DEFAULT_CONTROL_TCP_PORT = 443` trong `mesh_core::defaults`, đổi được sang bất kỳ cổng nào như `8443` theo `GNFR-11`, `US-074`), hỗ trợ cả 3 chế độ TLS (`ADR-008`):
-- **Chế độ (c) IP + SPKI Pinning (Mặc định hạng nhất — `SEC-04(c)`, `US-003`, `US-047`)**: Client kiểm chứng mã băm `sha256:<64_hex>` của `subjectPublicKeyInfo` DER bằng `SpkiPinVerifier` (`ConstantTimeEq`), **cấm TOFU**.
-- **Chế độ (a) Standalone Domain ACME (`instant-acme`)**: `TLS-ALPN-01` khi cổng = `443`, `DNS-01` khi cổng ≠ `443`.
+Toàn bộ các endpoint trong mục này chạy trên cổng TCP công khai do người dùng cấu hình (mặc định `DEFAULT_CONTROL_TCP_PORT = 443` trong `mesh_core::defaults`, đổi được sang bất kỳ cổng nào như `8443` theo `GNFR-11`, `US-074`), hỗ trợ cả 3 chế độ TLS (`ADR-008`, `BLK-G2-04`):
+- **Chế độ (c) IP + SPKI Pinning (Mặc định hạng nhất — `SEC-04(c)`, `US-003`, `US-047`, `BLK-G2-04`)**:
+  - `SpkiPinVerifier` trong `crates/mesh-crypto::tlspin` giải mã chứng chỉ lá DER bằng **`x509-cert` (`0.2`, `RustCrypto`)** để: (1) kiểm tra `validity.not_before <= now <= validity.not_after` (nếu lệch giờ thì phân loại `ErrorKind::ClockSkew` theo `US-003 AC5` và từ chối chứng chỉ hết hạn theo `US-047 AC4`), (2) trích xuất nguyên vẹn lát cắt DER của `tbs_certificate.subject_public_key_info` (hỗ trợ cả ECDSA P-256 và RSA theo `US-003 AC7`), tính SHA-256 và đối chiếu `ConstantTimeEq` với `PinSet` (`active_pin` / `next_pin`), **cấm TOFU**.
+  - Kiểm tra chữ ký bắt tay TLS (`verify_tls12_signature`, `verify_tls13_signature`) bắt buộc ủy quyền cho `rustls::crypto::ring::default_provider().signature_verification_algorithms`.
+- **Chế độ (a) Standalone Domain ACME (`instant-acme`)**: `TLS-ALPN-01` khi cổng = `443`, `DNS-01` khi cổng ≠ `443`; client xác thực bằng `rustls-webpki` + `rustls-native-certs` (hoặc kết hợp SPKI Pin).
 - **Chế độ (b) Sau Reverse Proxy sẵn có (`Nginx`/`Caddy`)**: đi kèm `trusted_proxies` bật tường minh (`US-042 AC6`).
 
-### 1.1. Quy tắc Kiểm chứng Đầu vào Chung (Validation Rules — `US-004 AC3`, `US-038 AC5`)
+### 1.1. Quy tắc Kiểm chứng Đầu vào Chung (Validation Rules — `US-004 AC3`, `US-038 AC5`, `US-056`, `Codex #8`)
 
 | Kiểu Miền (`mesh-core`) | Quy tắc Kiểm chứng Bắt buộc tại Biên |
 |---|---|
 | `NodeName` | Độ dài `1..=63` ký tự ASCII; chỉ gồm `[a-z0-9-]`; không bắt đầu hoặc kết thúc bằng `'-'`; cấm tuyệt đối `\n`, `\r`, `#`, khoảng trắng; **từ chối danh sách tên cấm**: `localhost`, `broadcasthost`, `wpad`, `isatap`, `local`, và chính `public_host`/domain của Control/Relay/STUN. |
 | `PublicKey` | Chuỗi Base64 chuẩn (44 ký tự) hoặc Hex (64 ký tự) giải mã ra đúng `[u8; 32]`, không phải điểm bậc thấp (low-order point) trên Curve25519. |
 | `SpkiPin` | Định dạng `"sha256:<64_hex_lowercase>"` giải mã ra đúng `[u8; 32]`. |
-| `CandidateEndpoint` | `SocketAddr` hợp lệ; **từ chối** địa chỉ thuộc `overlay_cidr`, loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), multicast, broadcast, unspecified (`0.0.0.0`, `::`), và địa chỉ IP public của chính VPS (`US-020 AC2/AC4`, `US-038 AC5`). |
+| `CandidateEndpoint` | `SocketAddr` (`IP:port`) hợp lệ; **từ chối** địa chỉ thuộc `overlay_cidr`, loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), multicast, broadcast, unspecified (`0.0.0.0`, `::`), các interface ảo (`mesh*`, `utun*`, `wg*`, `tailscale*`, `docker*`, `veth*`), **VÀ từ chối đúng cặp `SocketAddr` (`IP:port`) trùng với `control_tcp_endpoint` hoặc `stun_udp_endpoint` của `mesh-server`** (`US-020 AC2/AC4`, `Codex #8`). **Cho phép** địa chỉ IP public của VPS ở cổng UDP khác (vd. `<vps_public_ip>:51820`) để `vps.mesh.internal` (`US-056`) thiết lập Direct P2P UDP! |
 
 ---
 
-### 1.2. `POST /v1/auth/challenge` — Khởi Tạo Phiên & Nhận Thách Đố Mật Mã (`US-003`, `ADR-003`)
+### 1.2. `POST /v1/auth/challenge` — Xin Thách Đố Dùng Một Lần (`challenge_id` — `US-003`, `ADR-003`, `BLK-G2-02`)
 
 - **Ánh xạ User Story**: `US-003 AC1/AC4/AC5`, `US-050 AC1/AC2`.
 - **Xác thực**: Chưa cần token (nhưng phải qua kênh TLS đã xác minh SPKI Pin hoặc CA; chịu giới hạn tốc độ theo IP nguồn `US-042`).
-- **Mục đích**: Client gửi khóa công khai và thông tin phiên bản; Server kiểm tra `protocol_version` tối thiểu (`US-050 AC2`) và sinh cặp khóa X25519 tạm thời (`server_eph_pubkey`) kèm `challenge_nonce` ngẫu nhiên 32 byte có TTL **30 giây** (dùng 1 lần).
+- **Mục đích & Ràng buộc Single-Use (`BLK-G2-02`)**:
+  - Trước mỗi lần gọi `POST /v1/nodes/register`, nâng cấp WebSocket `GET /v1/netmap/stream`, nâng cấp WebSocket `GET /v1/relay`, hoặc gọi REST dự phòng, Client gửi `POST /v1/auth/challenge` trên **cùng kết nối HTTP/1.1 Keep-Alive (cùng phiên TLS 1.3)**.
+  - Server kiểm tra `protocol_version` tối thiểu (`US-050 AC2`), sinh `challenge_id` (UUIDv4), cặp khóa X25519 tạm thời (`server_eph_pubkey`) và `challenge_nonce` ngẫu nhiên 32 byte từ `OsRng`, lưu vào bảng trong bộ nhớ có giới hạn cứng **`MAX_PENDING_CHALLENGES = 4096`** với **`TTL = 30_000 ms` (30 giây)**.
+  - Mỗi `challenge_id` **chỉ dùng được đúng 1 lần**: ngay khi request kế tiếp gửi kèm `X-Mesh-Challenge-Id`, server thực hiện `pending_challenges.remove(&challenge_id)` nguyên tử trước khi giải mã (chống phát lại 100%).
 
 #### Request JSON (`ChallengeRequest`)
 ```json
@@ -58,7 +63,7 @@ Toàn bộ các endpoint trong mục này chạy trên cổng TCP công khai do 
 #### Response JSON (`200 OK` — `ChallengeResponse`)
 ```json
 {
-  "session_id": "019321c0-1122-7333-8444-5566778899aa",
+  "challenge_id": "019321c0-1122-7333-8444-5566778899aa",
   "server_eph_pubkey": "c2VydmVyLWVwaGVtZXJhbC14MjU1MTktcHVia2V5LTI=",
   "challenge_nonce": "Y2hhbGxlbmdlLW5vbmNlLTMyLWJ5dGVzLWZyb20tb3Nybmc=",
   "server_time_at_ms": 1762958151000,
@@ -66,34 +71,57 @@ Toàn bộ các endpoint trong mục này chạy trên cổng TCP công khai do 
 }
 ```
 
-#### Cấu trúc `ProofPayload` được Client niêm phong bằng `crypto_box::SalsaBox` (`ADR-003`)
+#### Cấu trúc `ProofPayload` được Client niêm phong bằng `crypto_box::SalsaBox` (`ADR-003`, `BLK-G2-02`)
 Client tạo mảng byte JSON của cấu trúc dưới đây rồi gọi `SalsaBox::new(&server_eph_pubkey, node_secret.expose_secret()).encrypt(&box_nonce, payload_bytes)`:
 ```json
 {
-  "session_id": "019321c0-1122-7333-8444-5566778899aa",
+  "challenge_id": "019321c0-1122-7333-8444-5566778899aa",
   "challenge_nonce": "Y2hhbGxlbmdlLW5vbmNlLTMyLWJ5dGVzLWZyb20tb3Nybmc=",
+  "method": "POST",
+  "path": "/v1/nodes/register",
+  "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "node_pubkey": "bWVzaC1ub2RlLXB1YmtleS0zMi1ieXRlcy1iYXNlNjQ=",
   "disco_pubkey": "bWVzaC1kaXNjby1wdWJrZXktMzItYnl0ZXMtYmFzZTY0",
+  "timestamp_at_ms": 1762958151120,
   "tls_exporter_binding": "dGxzLTEuMy1leHBvcnRlci0zMi1ieXRlcy1iaW5kaW5n"
 }
 ```
-> **Ghi chú `tls_exporter_binding`**: Lấy 32 byte từ `rustls::Connection::export_keying_material(..., b"EXPORTER-mesh-control-v1", None)`. Nếu kết nối đi qua Reverse Proxy (`trusted_proxies` bật), server chấp nhận giá trị binding của kết nối TLS hoặc cờ `"reverse_proxy_mode"`. Nhờ dùng `challenge_nonce` ngẫu nhiên của server, bước chứng minh khóa **không phụ thuộc đồng hồ hệ thống của client** (chống lỗi lệch giờ dual-boot Windows/Linux theo `US-003 AC5`).
+> **Quy tắc kiểm chứng nhất quán `ProofPayload` & `tls_exporter_binding` (`BLK-G2-02`)**:
+> 1. **Phía Client (`meshd`)**:
+>    - **Luôn luôn** trích xuất 32 byte từ `rustls::Connection::export_keying_material(..., b"EXPORTER-mesh-control-v1", None)` trên kết nối TLS 1.3 hiện tại để điền vào `tls_exporter_binding` (Client không cần biết Server đang chạy Standalone hay sau Reverse Proxy).
+>    - Tính `body_sha256 = SHA256(raw_http_body)` (đối với yêu cầu `GET` nâng cấp WebSocket `/v1/netmap/stream` hoặc `/v1/relay`, `body_sha256 = SHA256(b"")`).
+>    - Tính `timestamp_at_ms = challenge_resp.server_time_at_ms + elapsed_monotonic_ms` (giúp không bao giờ bị lỗi lệch đồng hồ hệ thống dual-boot Windows/Linux theo `US-003 AC5`).
+> 2. **Phía Server (`mesh-server`)**:
+>    - Lấy và xóa nguyên tử `challenge_id` khỏi `pending_challenges` (nếu không tồn tại hoặc đã quá `expires_at_ms` $\to$ trả `401 "authentication failed"`).
+>    - Mở hộp `SalsaBox` bằng `(server_eph_secret, node_pubkey, box_nonce)` và kiểm tra khớp chính xác: `challenge_id`, `ConstantTimeEq(challenge_nonce)`, `method`, `path`, `ConstantTimeEq(body_sha256)`, `node_pubkey`, `disco_pubkey`, và `|now_ms - timestamp_at_ms| <= 60_000`.
+>    - **Khi `tls_mode` là `StandalonePinned` (`ip_pinned`) hoặc `StandaloneAcme` (`acme_tls_alpn_01` / `acme_dns_01`)**: Server trích xuất 32 byte `export_keying_material(..., b"EXPORTER-mesh-control-v1", None)` từ `rustls::ServerConnection` của chính kết nối đó và bắt buộc đối chiếu `ConstantTimeEq(server_exporter, proof.tls_exporter_binding)`.
+>    - **Khi `tls_mode == ReverseProxy` (`reverse_proxy`) VÀ địa chỉ IP của kết nối TCP nằm trong `trusted_proxies`**: Server **chỉ bỏ qua bước so sánh `tls_exporter_binding`** (vì TLS kết thúc tại Nginx/Caddy; tính chống phát lại và toàn vẹn request đã được khóa chặt bởi `challenge_id` dùng 1 lần + `SalsaBox` trói `(challenge_nonce, method, path, body_sha256)`). Nếu IP kết nối TCP không nằm trong `trusted_proxies`, từ chối ngay với `401 "authentication failed"`.
 
 ---
 
-### 1.3. `POST /v1/nodes/register` — Đăng Ký Thiết Bị Idempotent / Re-auth / Xoay Khóa (`US-004`, `US-005`, `US-031`, `US-032`)
+### 1.3. Header Xác Thực Chuẩn Hóa Cho Mọi Yêu Cầu Đã Có `challenge_id` (`X-Mesh-*` — `BLK-G2-02`)
+
+Mọi yêu cầu cần chứng minh sở hữu `node_pubkey` (`POST /v1/nodes/register`, `GET /v1/netmap/stream`, `GET /v1/relay`, `POST /v1/endpoints`, `POST /v1/disco/call-me-maybe`) đều truyền **4 header chuẩn**:
+- `X-Mesh-Challenge-Id: <uuid_v4>`
+- `X-Mesh-Node-Pubkey: <base64_32_bytes>`
+- `X-Mesh-Box-Nonce: <base64_24_bytes>`
+- `X-Mesh-Auth-Proof: <base64_salsabox_ciphertext_of_ProofPayload>`
+
+---
+
+### 1.4. `POST /v1/nodes/register` — Đăng Ký Thiết Bị Idempotent / Re-auth / Xoay Khóa (`US-004`, `US-005`, `US-031`, `US-032`)
 
 - **Ánh xạ User Story**: `US-004 AC1..AC7`, `US-005 AC1..AC4`, `US-006`, `US-031 AC5/AC6`, `US-032 AC1..AC3`.
-- **Idempotency**: Khóa Idempotency tự nhiên là `node_pubkey` (đã được chứng minh sở hữu qua `proof_ciphertext`). Gửi lại cùng `node_pubkey` + cùng `preauth_key` trả về `200 OK` với đúng `NodeId` và `OverlayIp` đã cấp, không tiêu hao thêm lượt dùng key (`US-005 AC1`).
+- **Headers**: Bắt buộc đính kèm 4 header `X-Mesh-Challenge-Id`, `X-Mesh-Node-Pubkey`, `X-Mesh-Box-Nonce`, `X-Mesh-Auth-Proof` (§1.3).
+- **Idempotency & Chặn Node hết hạn (`HR-G2-03`)**:
+  - Khóa Idempotency tự nhiên là `node_pubkey` (đã được chứng minh sở hữu qua `X-Mesh-Auth-Proof`). Gửi lại cùng `node_pubkey` đang `Active` + cùng `preauth_key` trả về `200 OK` với đúng `NodeId` và `OverlayIp` đã cấp, không tiêu hao thêm lượt dùng key (`US-005 AC1`).
+  - Nếu `node_pubkey` thuộc một node có `status == Expired` hoặc `status == Revoked`: từ chối ngay với `401 "authentication failed"` (`SEC-05`, buộc client sinh khóa mới + dùng key `--for <node>`).
 
 #### Request JSON (`RegisterNodeRequest`)
 ```json
 {
-  "session_id": "019321c0-1122-7333-8444-5566778899aa",
   "node_pubkey": "bWVzaC1ub2RlLXB1YmtleS0zMi1ieXRlcy1iYXNlNjQ=",
   "disco_pubkey": "bWVzaC1kaXNjby1wdWJrZXktMzItYnl0ZXMtYmFzZTY0",
-  "box_nonce": "MjQtYnl0ZXMtbm9uY2UtZm9yLW5hY2xib3g=",
-  "proof_ciphertext": "c2Fsc2Fib3gtY2lwaGVydGV4dC1wcm92aW5nLW5vZGUta2V5",
   "preauth_key": "mpk_7q2w3e4r5t6y7u8i9o0p1a2s3d4f5g6h7j8k9l0z1x2c3v4b5n6m",
   "node_name": "macbook-pro",
   "previous_node_pubkey": null
@@ -150,19 +178,11 @@ Client tạo mảng byte JSON của cấu trúc dưới đây rồi gọi `Salsa
 
 ---
 
-### 1.4. Header Xác Thực Phiên Cho Node Đã Đăng Ký (`X-Mesh-Auth-*`)
-
-Sau khi đã đăng ký, đối với các endpoint cập nhật trạng thái (`POST /v1/endpoints`, `POST /v1/disco/call-me-maybe`) và khi nâng cấp WebSocket (`GET /v1/netmap/stream`, `GET /v1/relay`), client lấy `session_id` từ `POST /v1/auth/challenge` và đính kèm 3 header chứng minh sở hữu `node_pubkey` (không bao giờ dùng bearer token tĩnh):
-- `X-Mesh-Session-Id: <uuid>`
-- `X-Mesh-Box-Nonce: <base64_24_bytes>`
-- `X-Mesh-Auth-Proof: <base64_salsabox_ciphertext>`
-
----
-
 ### 1.5. `POST /v1/endpoints` — Công Bố Candidate Endpoints & Xác Nhận Đổi Cổng (`US-019`, `US-020`, `US-074`)
 
 - **Ánh xạ User Story**: `US-019 AC1/AC2`, `US-020 AC1..AC4`, `US-074 AC1/AC7`.
-- **Hành vi**: Cập nhật danh sách địa chỉ ứng viên (`lan`, `ipv6`, `reflexive`), loại NAT quan sát được, và phiên bản cấu hình server (`acked_endpoint_version`) mà agent vừa áp dụng thành công. Chỉ khi danh sách `endpoints` thực sự thay đổi so với bản đang lưu thì server mới tăng `netmap_version` và đẩy bản cập nhật cho các peer.
+- **Xác thực**: Đính kèm 4 header `X-Mesh-*` (§1.3) với một `challenge_id` mới (hoặc gửi trực tiếp khung `ClientControlFrame::EndpointUpdate` trên luồng WebSocket `/v1/netmap/stream` đang mở — xem §1.7).
+- **Hành vi**: Cập nhật danh sách địa chỉ ứng viên (`lan`, `ipv6`, `reflexive`), loại NAT quan sát được, và phiên bản cấu hình server (`acked_endpoint_version`) mà agent vừa áp dụng thành công. Chỉ khi danh sách `endpoints` thực sự thay đổi so với bản đang lưu thì server mới cấp `netmap_version` mới qua `MonotonicNetmapVersion::allocate_next` và đẩy bản cập nhật cho các peer.
 
 #### Request JSON (`UpdateEndpointsRequest`)
 ```json
@@ -196,32 +216,66 @@ Sau khi đã đăng ký, đối với các endpoint cập nhật trạng thái (
 
 ---
 
-### 1.6. `POST /v1/disco/call-me-maybe` — Tín Hiệu Khởi Động Đục Lỗ NAT Đồng Thời (`US-021`)
+### 1.6. `POST /v1/disco/call-me-maybe` — Tín Hiệu Khởi Động Đục Lỗ NAT Đồng Thời (`US-021`, `HR-G2-04`)
 
 - **Ánh xạ User Story**: `US-021 AC1/AC5`.
-- **Hành vi**: Khi Node A muốn bắt đầu đục lỗ NAT tới Node B, A gửi kèm một hộp mật mã `disco_ciphertext` (được niêm phong bằng `SalsaBox(A_disco_secret, B_disco_pubkey)` chứa `tx_id`, `sent_at_ms` và danh sách `endpoints[]` mới nhất của A). Server kiểm tra A và B đều đang `Active` rồi chuyển tiếp tức thì qua WebSocket `/v1/netmap/stream` cho B.
+- **Xác thực**: Đính kèm 4 header `X-Mesh-*` (§1.3) (hoặc gửi trực tiếp `ClientControlFrame::CallMeMaybe` qua WebSocket `/v1/netmap/stream` đang mở — §1.7).
+- **Khóa định dạng `disco_frame_b64` (`HR-G2-04`)**:
+  - Khi Node A muốn bắt đầu đục lỗ NAT tới Node B, A tạo một **khung nhị phân `b"MESHDS"` hoàn chỉnh (`msg_type = 0x03 = DiscoCallMeMaybe`, độ dài `172..=1024 bytes` theo đúng đặc tả §3.3)** đã được mã hóa `SalsaBox(A_disco_secret, B_disco_pubkey)` (bên trong có `magic_ctx = *b"MESHDSv1"`, `inner_sender_disco_pubkey = A_disco_pub`, `inner_recipient_disco_pubkey = B_disco_pub`, `tx_id`, `sent_at_ms` và danh sách `endpoints[]` của A) rồi mã hóa Base64 vào trường `disco_frame_b64`.
+  - Server kiểm tra: (1) A và B đều đang `Active`, (2) `disco_frame_b64` giải mã ra mảng byte có độ dài `172..=1024` bytes, (3) 7 byte đầu là `b"MESHDS\x01"`, và (4) `outer_sender_disco_pubkey` (`bytes[7..39]`) khớp 100% với `disco_pubkey` đã đăng ký của A. Nếu hợp lệ, server chuyển tiếp nguyên vẹn `disco_frame_b64` qua WebSocket `/v1/netmap/stream` cho B trong sự kiện `ServerControlFrame::CallMeMaybeRelay`.
 
 #### Request JSON (`CallMeMaybeRequest`)
 ```json
 {
   "dst_node_id": "019321b4-9999-7000-8000-010203040507",
-  "box_nonce": "MjQtYnl0ZXMtbm9uY2UtZm9yLWRpc2NvLWJveA==",
-  "disco_ciphertext": "c2Fsc2Fib3gtZW5jcnlwdGVkLWNhbGwtbWUtbWF5YmUtcGF5bG9hZA=="
+  "disco_frame_b64": "TUVTSERTAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=..."
 }
 ```
 
 ---
 
-### 1.7. `GET /v1/netmap/stream?known_version=<u64>` — Luồng Đồng Bộ Netmap Thời Gian Thực (`US-009`, `US-029`, `US-031`, `US-074`)
+### 1.7. `GET /v1/netmap/stream?known_version=<u64>` — Luồng Đồng Bộ Netmap & Tín Hiệu Điều Khiển Hai Chiều (`US-009`, `US-029`, `US-031`, `US-074`, `BLK-G2-02`, `HR-G2-04`)
 
 - **Ánh xạ User Story**: `US-009 AC1..AC6`, `US-029 AC1..AC3`, `US-031 AC1`, `US-034 AC5`, `US-074 AC1/AC2`.
-- **Giao thức**: HTTP/1.1 `Upgrade: websocket` (khung JSON Text/Binary ≤ 64 KiB).
+- **Xác thực khi nâng cấp (`BLK-G2-02`)**: Yêu cầu `GET /v1/netmap/stream` (`Upgrade: websocket`) bắt buộc đính kèm 4 header `X-Mesh-Challenge-Id`, `X-Mesh-Node-Pubkey`, `X-Mesh-Box-Nonce`, `X-Mesh-Auth-Proof` (§1.3, với `method = "GET"`, `path = "/v1/netmap/stream"`, `body_sha256 = SHA256(b"")`).
 - **Quy tắc chống bão lưu lượng nền (`US-009 AC1`, `GNFR-07`)**:
-  - Server gửi khung `heartbeat` nhẹ mỗi **25 giây** để giữ kết nối qua NAT/Reverse Proxy; nếu quá **60 giây** không có khung nào, client đóng và kết nối lại (`US-009 AC4`).
+  - Server và Client gửi khung `heartbeat` nhẹ mỗi **25 giây** để giữ kết nối qua NAT/Reverse Proxy; nếu quá **60 giây** không có khung nào, bên kia đóng và kết nối lại (`US-009 AC4`).
   - Server **TUYỆT ĐỐI KHÔNG** tăng `netmap_version` hay đẩy lại `NetmapSnapshot` cho các nhịp heartbeat `last_seen`.
 
-#### Các Loại Bản Tin Từ Server $\to$ Client (`ControlStreamServerEvent`)
+#### (a) Các Loại Bản Tin Từ Client $\to$ Server Trên `/v1/netmap/stream` (`ClientControlFrame` — `BLK-G2-02`)
+Sau khi luồng WebSocket `/v1/netmap/stream` đã được xác thực và nâng cấp, Client có thể gửi trực tiếp 3 loại khung JSON sau mà không tốn thêm RTT xin `challenge_id`:
+1. **`endpoint_update`**:
+   ```json
+   {
+     "frame_type": "endpoint_update",
+     "endpoints": [
+       { "addr": "192.168.1.45:51829", "source": "lan" },
+       { "addr": "198.51.100.77:51829", "source": "reflexive" }
+     ],
+     "nat_type": "eim_or_adm",
+     "acked_endpoint_version": 2
+   }
+   ```
+2. **`call_me_maybe`**:
+   ```json
+   {
+     "frame_type": "call_me_maybe",
+     "dst_node_id": "019321b4-9999-7000-8000-010203040507",
+     "disco_frame_b64": "TUVTSERTAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=..."
+   }
+   ```
+3. **`heartbeat`**:
+   ```json
+   {
+     "frame_type": "heartbeat",
+     "sent_at_ms": 1762958170000,
+     "acked_netmap_version": 14
+   }
+   ```
 
+#### (b) Các Loại Bản Tin Từ Server $\to$ Client Trên `/v1/netmap/stream` (`ServerControlFrame`)
+
+- **Sự kiện đồng bộ bản đồ mạng (`netmap_snapshot` / `netmap_delta`)**:
 ```json
 {
   "event_type": "netmap_snapshot",
@@ -246,14 +300,13 @@ Sau khi đã đăng ký, đối với các endpoint cập nhật trạng thái (
 }
 ```
 
-- **Sự kiện chuyển tiếp đục lỗ NAT (`call_me_maybe`)**:
+- **Sự kiện chuyển tiếp đục lỗ NAT (`call_me_maybe_relay` — `HR-G2-04`)**:
 ```json
 {
-  "event_type": "call_me_maybe",
+  "event_type": "call_me_maybe_relay",
   "src_node_id": "019321b4-7c8a-7000-8000-010203040506",
-  "src_disco_pubkey": "bWVzaC1kaXNjby1wdWJrZXktMzItYnl0ZXMtYmFzZTY0",
-  "box_nonce": "MjQtYnl0ZXMtbm9uY2UtZm9yLWRpc2NvLWJveA==",
-  "disco_ciphertext": "c2Fsc2Fib3gtZW5jcnlwdGVkLWNhbGwtbWUtbWF5YmUtcGF5bG9hZA==",
+  "src_node_pubkey": "bWVzaC1ub2RlLXB1YmtleS0zMi1ieXRlcy1iYXNlNjQ=",
+  "disco_frame_b64": "TUVTSERTAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=...",
   "sent_at_ms": 1762958172000
 }
 ```
@@ -272,11 +325,12 @@ Sau khi đã đăng ký, đối với các endpoint cập nhật trạng thái (
 
 ---
 
-## 2. Blind Relay Wire Protocol (`GET /v1/relay` WebSocket Binary Frames — `ADR-004`, `US-024`, `US-025`, `US-027`)
+## 2. Blind Relay Wire Protocol (`GET /v1/relay` WebSocket Binary Frames — `ADR-004`, `US-024`, `US-025`, `US-027`, `BLK-G2-02`)
 
 - **Ánh xạ User Story**: `US-024 AC1..AC8`, `US-025 AC1..AC6`, `US-026 AC1..AC4`, `US-027 AC1..AC5`.
-- **Bước chứng minh khóa trước khi nâng cấp (`US-024 AC1/AC2`, `US-027 AC1`)**:
-  - Yêu cầu `GET /v1/relay` (`Upgrade: websocket`) bắt buộc đính kèm `X-Mesh-Session-Id`, `X-Mesh-Box-Nonce`, `X-Mesh-Auth-Proof` đã xác thực sở hữu `node_pubkey` thuộc Netmap hiện hành và chưa bị thu hồi/hết hạn. Nếu sai hoặc chưa đăng ký, server trả HTTP `401`/`403` ngay từ bước HTTP handshake, **không mở phiên WebSocket và không chuyển tiếp bất kỳ byte nào**.
+- **Bước chứng minh khóa bằng Single-Use `challenge_id` trước khi nâng cấp (`US-024 AC1/AC2`, `US-027 AC1`, `BLK-G2-02`)**:
+  - Trước khi mở kết nối Relay, Client gọi `POST /v1/auth/challenge` trên cùng kết nối HTTP/1.1 Keep-Alive (cùng phiên TLS 1.3) để lấy `challenge_id` dùng 1 lần, rồi gửi `GET /v1/relay` (`Upgrade: websocket`) kèm 4 header `X-Mesh-Challenge-Id`, `X-Mesh-Node-Pubkey`, `X-Mesh-Box-Nonce`, `X-Mesh-Auth-Proof` (§1.3, với `method = "GET"`, `path = "/v1/relay"`, `body_sha256 = SHA256(b"")`).
+  - Nếu `challenge_id` không hợp lệ/đã dùng hoặc `node_pubkey` chưa đăng ký/đã bị thu hồi/hết hạn, server trả HTTP `401`/`403` ngay từ bước HTTP handshake, **không mở phiên WebSocket và không chuyển tiếp bất kỳ byte nào**.
   - Nếu cùng một `NodeId` mở kết nối Relay mới hợp lệ, kết nối Relay cũ của `NodeId` đó bị đóng ngay lập tức (đảm bảo tối đa 1 phiên Relay hoạt động/node — `US-024 AC5`).
 - **Giới hạn kích thước Frame (`US-025 AC3`)**:
   - `tokio-tungstenite` cấu hình cứng `max_frame_size = Some(2048)` và `max_message_size = Some(2048)`. Với MTU đường hầm `1280` bytes + overhead WireGuard tối đa `80` bytes + header Relay `33` bytes = `1393` bytes (< `2048` bytes, thỏa mãn `US-017 AC3`).
@@ -292,8 +346,8 @@ Sau khi đã đăng ký, đối với các endpoint cập nhật trạng thái (
 
 | `frame_type` | Tên Frame | Chiều | Cấu trúc Byte Chính Xác | Quy tắc Xử lý trên Relay & Agent |
 |---:|---|---|---|---|
-| **`0x01`** | `ClientToPeerPacket` | Client $A \to$ Relay | `[0x01: 1B][dst_pubkey: 32B][ciphertext: 1..=1480B]`<br/>*(Tổng độ dài: `34..=1513` bytes)* | Relay kiểm tra Token Bucket của $A$ (mặc định **20 Mbps**, `US-027 AC2`). Tra phiên của `dst_pubkey` ($B$). Nếu $B$ không online hoặc không thuộc Netmap $\to$ **drop im lặng** + tăng metric (`US-025 AC2`). Nếu $B$ online $\to$ tạo frame `0x02` với **`src_pubkey = pubkey_đã_xác_thực_của_A`** và gọi **`tx_b.try_send(frame)`** trên kênh `mpsc::channel(256)` của $B$ (`US-025 AC1/AC6`). |
-| **`0x02`** | `RelayToClientPacket` | Relay $\to$ Client $B$ | `[0x02: 1B][src_pubkey: 32B (do Relay chứng thực)][ciphertext: 1..=1480B]`<br/>*(Tổng độ dài: `34..=1513` bytes)* | Agent $B$ kiểm tra `src_pubkey` có thuộc `PeerMap` trong Netmap hiện hành không (`US-026 AC2`); nếu hợp lệ thì chuyển `ciphertext` vào `DiscoEngine` (nếu bắt đầu bằng `b"MESHDS"`) hoặc `Tunn::decapsulate`. |
+| **`0x01`** | `ClientToPeerPacket` | Client $A \to$ Relay | `[0x01: 1B][dst_pubkey: 32B][ciphertext: 1..=1480B]`<br/>*(Tổng độ dài: `34..=1513` bytes)* | Relay kiểm tra Token Bucket của $A$ (mặc định **20 Mbps**, `US-027 AC2`). Tra phiên của `dst_pubkey` ($B$). Nếu $B$ không online hoặc không thuộc Netmap $\to$ **drop im lặng** + tăng metric (`US-025 AC2`). Nếu $B$ online $\to$ tạo frame **`0x02`** với **`src_pubkey = pubkey_đã_xác_thực_của_A`** và gọi **`tx_b.try_send(frame)`** trên kênh `mpsc::channel(256)` của $B$ (`US-025 AC1/AC6`). |
+| **`0x02`** | `RelayToClientPacket` | Relay $\to$ Client $B$ | `[0x02: 1B][src_pubkey: 32B (do Relay chứng thực)][ciphertext: 1..=1480B]`<br/>*(Tổng độ dài: `34..=1513` bytes)* | Agent $B$ kiểm tra `src_pubkey` có thuộc `PeerMap` trong Netmap hiện hành không (`US-026 AC2`); nếu hợp lệ thì chuyển `ciphertext` vào `DiscoEngine` kèm **`IngressSource::Relay { verified_src_node_pubkey: src_pubkey }`** (nếu bắt đầu bằng `b"MESHDS"` và `len >= 172`) hoặc `Tunn::decapsulate`. |
 | **`0x03`** | `RelayKeepAlive` | Hai chiều | `[0x03: 1B][sent_at_ms: u64 big-endian (8B)]`<br/>*(Tổng độ dài: đúng `9` bytes)* | Gửi mỗi **25 giây** khi kết nối Relay rảnh để giữ NAT/Reverse Proxy không ngắt (`US-024 AC4`). |
 | **`0x04`** | `RelayControlNotice` | Relay $\to$ Client | `[0x04: 1B][notice_code: 1B][reserved: 6B]`<br/>`notice_code`: `0x01` = `Throttled`, `0x02` = `NodeRevoked`, `0x03` = `NodeKeyExpired`, `0x04` = `ServerMigratingPort` | Thông báo trạng thái điều tiết băng thông (`US-027 AC4`) hoặc lý do đóng phiên. |
 
@@ -303,20 +357,33 @@ Sau khi đã đăng ký, đối với các endpoint cập nhật trạng thái (
 
 Trên mỗi thiết bị chạy `meshd`, `MagicSocket` mở duy nhất **1 `tokio::net::UdpSocket`** (ưu tiên bind lại cổng `local_udp_port` đã lưu bền trong `netmap-cache.json` theo `US-019 AC1`; tắt cờ ép cứng `DF=1` ở tầng UDP ngoài theo `US-017 AC3`).
 
-### 3.1. Bảng Phân Loại Gói Tin Đến Không Mơ Hồ (Zero-Allocation Demultiplexing Table)
+### 3.1. Bảng Phân Loại Gói Tin Đến Không Mơ Hồ (Zero-Allocation Demultiplexing Table — `Codex #1`, `IMP-G2-01`)
 
-Khi `MagicSocket::recv_from(&mut buf[0..2048])` nhận được một gói UDP có độ dài `len`:
+Khi `MagicSocket::recv_from(&mut buf[0..2048])` nhận được một gói UDP có độ dài `len` (`let buf = &buf[..len];`):
 
-| Thứ tự kiểm tra | Giao thức | Điều kiện Byte Đầu Tiên Chính Xác (Không thể trùng lặp) | Lý do Không Giao Nhau Toán Học |
+| Thứ tự kiểm tra | Giao thức | Điều kiện Byte Chính Xác (Không thể trùng lặp) | Lý do Không Giao Nhau Toán Học |
 |---:|---|---|---|
-| **1** | **Authenticated Disco** (`US-021`) | `len >= 62 && buf.get(0..6) == Some(b"MESHDS")` (`[0x4D, 0x45, 0x53, 0x48, 0x44, 0x53]`) | Byte `0` = `0x4D` (`'M'`, có 2 bit đầu `01` $\neq 00$ của STUN và `0x4D` $\notin 1..=4$ của WireGuard). |
-| **2** | **STUN RFC 5389 / 8489** (`US-019`) | `len >= 20 && (buf[0] & 0b1100_0000) == 0 && (buf[1] & 0b0000_0011) == 0 && buf.get(4..8) == Some(&[0x21, 0x12, 0xA4, 0x42])` | Gói STUN luôn có 2 bit đầu bằng `00`, `msg_type` (`0x0001` Request / `0x0101` Response) và 4 byte Magic Cookie cố định `0x2112A442` ở vị trí `4..8`. |
-| **3** | **WireGuard (`defguard_boringtun`)** (`US-014..017`) | `len >= 32 && matches!(buf[0], 1..=4) && buf.get(1..4) == Some(&[0x00, 0x00, 0x00])` | WireGuard chỉ có 4 loại gói (`1` = Handshake Init 148B, `2` = Handshake Resp 92B, `3` = Cookie Reply 64B, `4` = Transport Data ≥ 32B) và 3 byte reserved `1..4` luôn bằng `[0, 0, 0]`. |
+| **1** | **Authenticated Disco** (`US-021`, `IMP-G2-01`) | `buf.len() >= 172 && buf.get(0..6) == Some(b"MESHDS") && buf[6] == 0x01` (`MIN_DISCO_PACKET_LEN = 172`) | Byte `0` = `0x4D` (`'M'`, có 2 bit đầu `01` $\neq 00$ của STUN và `0x4D` $\notin 1..=4$ của WireGuard). Độ dài tối thiểu `172` bytes khớp chính xác `63B (outer) + 93B (inner header) + 16B (Poly1305 tag)`. |
+| **2** | **STUN RFC 5389 / 8489** (`US-019`, `Codex #1`) | `buf.len() >= 20 && (buf[0] & 0b1100_0000) == 0 && (buf[3] & 0b0000_0011) == 0 && buf[4..8] == [0x21, 0x12, 0xA4, 0x42] && (20 + usize::from(u16::from_be_bytes([buf[2], buf[3]]))) <= buf.len()` | Theo RFC 5389 §6, 2 bit cao nhất của `buf[0]` bằng `00`, **2 bit thấp nhất của Message Length (`buf[2..4]`, tức `buf[3] & 0b0000_0011 == 0`) bằng `00`** (vì mọi attribute STUN đều căn lề 4 byte; `buf[1]` có thể bằng `0x01` cho cả Binding Request `0x0001` lẫn Success Response `0x0101`!), kèm 4 byte Magic Cookie `0x2112A442` ở `buf[4..8]`. |
+| **3** | **WireGuard (`defguard_boringtun`)** (`US-014..017`) | `buf.len() >= 32 && matches!(buf[0], 1..=4) && buf.get(1..4) == Some(&[0x00, 0x00, 0x00])` | WireGuard chỉ có 4 loại gói (`1` = Handshake Init 148B, `2` = Handshake Resp 92B, `3` = Cookie Reply 64B, `4` = Transport Data ≥ 32B) và 3 byte reserved `1..4` luôn bằng `[0, 0, 0]`. |
 | **4** | **Gói Lạ / Nhiễu Internet** | Mọi gói không thỏa 3 điều kiện trên | **Drop im lặng ngay lập tức** (0 cấp phát heap, 0 panic, 0 phản hồi để chống khuếch đại UDP — `US-021 AC3/AC5`). |
+
+#### Hàm Demux Chuẩn Hóa Trong `crates/mesh-proto/src/lib.rs`
+```rust
+pub const MIN_DISCO_PACKET_LEN: usize = 172; // 63 (outer) + 93 (inner) + 16 (Poly1305 tag)
+
+pub fn is_stun_rfc5389(buf: &[u8]) -> bool {
+    buf.len() >= 20
+        && (buf[0] & 0b1100_0000) == 0
+        && (buf[3] & 0b0000_0011) == 0
+        && buf[4..8] == [0x21, 0x12, 0xA4, 0x42]
+        && (20 + usize::from(u16::from_be_bytes([buf[2], buf[3]]))) <= buf.len()
+}
+```
 
 ---
 
-### 3.2. Layout Byte-Level Của Gói STUN Binding (`crates/mesh-proto::stun` — RFC 5389)
+### 3.2. Layout Byte-Level & Vector Kiểm Thử Của Gói STUN Binding (`crates/mesh-proto::stun` — RFC 5389, `Codex #1`)
 
 ```text
  0                   1                   2                   3
@@ -333,43 +400,90 @@ Khi `MagicSocket::recv_from(&mut buf[0..2048])` nhận được một gói UDP c
 |  Attributes: XOR-MAPPED-ADDRESS (0x0020) + FINGERPRINT (0x8028)|
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
-- **STUN Binding Request (`0x0001`)**: độ dài `28` bytes (Header `20` bytes + Attribute `FINGERPRINT` `8` bytes: `CRC32(bytes) ^ 0x5354554e`).
-- **STUN Binding Response (`0x0101`)**: độ dài `40` bytes (IPv4) hoặc `52` bytes (IPv6), gồm `XOR-MAPPED-ADDRESS` (`0x0020`, cổng XOR với `0x2112`, IP XOR với `0x2112A442` + `tx_id`) và `FINGERPRINT` (`0x8028`). Phản hồi luôn nhỏ hơn hoặc bằng giới hạn an toàn, giới hạn tốc độ **100 pkt/s/IP** trên VPS để chống khuếch đại UDP (`US-019 AC4`).
+- **STUN Binding Request (`0x0001`)**: độ dài `28` bytes (Header `20` bytes + Attribute `FINGERPRINT` `8` bytes: `CRC32(bytes[0..20]) ^ 0x5354554e`).
+- **STUN Binding Success Response (`0x0101`)**: độ dài `40` bytes (IPv4) hoặc `52` bytes (IPv6), gồm `XOR-MAPPED-ADDRESS` (`0x0020`, 12B cho IPv4: cổng XOR với `0x2112`, IPv4 XOR với `0x2112A442`) và `FINGERPRINT` (`0x8028`, 8B). Giới hạn tốc độ **100 pkt/s/IP** trên VPS để chống khuếch đại UDP (`US-019 AC4`).
+
+#### Vector Kiểm Thử Byte Cụ Thể Bắt Buộc Trong Unit Test Của Demuxer & `stun.rs` (`Codex #1`)
+1. **Vector 1 — STUN Binding Request (`msg_type = 0x0001`, `msg_len = 0x0008`, tổng `28` bytes)**:
+   - `buf[0..4] = [0x00, 0x01, 0x00, 0x08]` (lưu ý `buf[1] == 0x01` có bit 0 bằng `1`, trong khi `buf[3] == 0x08` có 2 bit thấp bằng `00`).
+   - `buf[4..8] = [0x21, 0x12, 0xA4, 0x42]` (Magic Cookie).
+   - `buf[8..20] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C]` (`tx_id`).
+   - `buf[20..28] = [0x80, 0x28, 0x00, 0x04, ...]` (`FINGERPRINT` attribute).
+   - **Kỳ vọng**: `is_stun_rfc5389(&req_vec) == true` và `demux_packet(&req_vec)` trả về `DemuxPacket::Stun`.
+2. **Vector 2 — STUN Binding Success Response (`msg_type = 0x0101`, `msg_len = 0x0014` (`20` bytes), tổng `40` bytes, phản xạ `198.51.100.77:51829`)**:
+   - `buf[0..4] = [0x01, 0x01, 0x00, 0x14]` (`buf[1] == 0x01`, `buf[3] == 0x14` có `0x14 & 0b11 == 0`).
+   - `buf[4..8] = [0x21, 0x12, 0xA4, 0x42]`.
+   - `buf[8..20] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C]`.
+   - `buf[20..32]` (`XOR-MAPPED-ADDRESS`): `[0x00, 0x20, 0x00, 0x08, 0x00, 0x01, 0xEB, 0x67, 0xE7, 0x21, 0xC0, 0x0F]`.
+   - `buf[32..40]` (`FINGERPRINT`): `[0x80, 0x28, 0x00, 0x04, ...]`.
+   - **Kỳ vọng**: `is_stun_rfc5389(&resp_vec) == true` và giải mã ra đúng `SocketAddr::from(([198, 51, 100, 77], 51829))`.
 
 ---
 
-### 3.3. Layout Byte-Level Của Gói Authenticated Disco (`crates/mesh-proto::disco` — `US-021`)
+### 3.3. Layout Byte-Level Của Gói Authenticated Disco Chống Phản Xạ & Tách `IngressSource` (`crates/mesh-proto::disco` — `US-021`, `Codex #2`, `HR-G2-04`, `IMP-G2-01`)
 
-Mọi gói Disco đi trên UDP (`MagicSocket`) hoặc đi qua Blind Relay đều có cùng định dạng nhị phân đã xác thực mật mã bằng `crypto_box::SalsaBox(sender_disco_secret, recipient_disco_pubkey)`:
+Vì `crypto_box::SalsaBox(A_priv, B_pub)` và `SalsaBox(B_priv, A_pub)` cùng dẫn xuất ra một khóa chia sẻ đối xứng X25519–XSalsa20–Poly1305, nếu bên trong bản rõ đã mã hóa không ràng buộc tường minh danh tính người gửi và người nhận, kẻ tấn công trên mạng có thể sửa `outer_sender_disco_pubkey` trong header ngoài thành `B_pub` rồi dội ngược (reflect) gói của A về chính A! Để **triệt tiêu 100% tấn công phản xạ hai chiều (`Codex #2`) và tấn công đầu độc đường đi qua Relay (`HR-G2-04`)**, định dạng gói Disco được khóa cứng như sau:
 
+#### (a) Outer Header Không Mã Hóa (`63 bytes` cố định) + `SalsaBox` Ciphertext (`>= 109 bytes`)
 ```text
-+-------------------+--------------+-------------------------+-------------------+------------------------------+
-| Bytes 0..6 (6B)   | Byte 6 (1B)  | Bytes 7..39 (32B)       | Bytes 39..63 (24B)| Bytes 63..N (>= 37B)         |
-| Magic: b"MESHDS"  | Version=0x01 | sender_disco_pubkey     | box_nonce (OsRng) | SalsaBox Ciphertext + Poly1305|
-+-------------------+--------------+-------------------------+-------------------+------------------------------+
++-------------------+--------------+-------------------------------+-------------------+----------------------------------+
+| Bytes 0..6 (6B)   | Byte 6 (1B)  | Bytes 7..39 (32B)             | Bytes 39..63 (24B)| Bytes 63..N (>= 93B + 16B MAC)   |
+| Magic: b"MESHDS"  | Version=0x01 | outer_sender_disco_pubkey     | box_nonce (OsRng) | SalsaBox Ciphertext + Poly1305   |
++-------------------+--------------+-------------------------------+-------------------+----------------------------------+
+```
+- **Hằng số `MIN_DISCO_PACKET_LEN = 172` (`IMP-G2-01`)**:
+  $$\text{MIN\_DISCO\_PACKET\_LEN} = 63\text{ B (Outer Header)} + 93\text{ B (Inner DiscoPayload Header)} + 16\text{ B (Poly1305 Tag)} = 172\text{ bytes}$$
+  (Đúng bằng kích thước một gói `DiscoPing` hoàn chỉnh vì body của `DiscoPing` là `0 B`).
+
+#### (b) Inner Encrypted `DiscoPayload` Header (`93 bytes` cố định + Body theo `msg_type`)
+Sau khi mở hộp `SalsaBox` và xác thực Poly1305 tag 16-byte:
+```text
++--------------------+---------------+-------------------+----------------------+----------------------------+-------------------------------+-------------+
+| Bytes 0..8 (8B)    | Byte 8 (1B)   | Bytes 9..21 (12B) | Bytes 21..29 (8B BE) | Bytes 29..61 (32B)         | Bytes 61..93 (32B)            | Bytes 93..M |
+| magic_ctx="MESHDSv1"| msg_type (u8) | tx_id ([u8; 12])  | sent_at_ms (u64 UTC) | inner_sender_disco_pubkey  | inner_recipient_disco_pubkey  | Body        |
++--------------------+---------------+-------------------+----------------------+----------------------------+-------------------------------+-------------+
 ```
 
-#### Cấu trúc Plaintext Bên Trong `SalsaBox Ciphertext` (Sau khi giải mã & xác thực Poly1305 MAC 16-byte)
+#### (c) Quy Tắc Kiểm Chứng Chống Phản Xạ Bắt Buộc Trước Khi Xử Lý (`Codex #2`)
+Khi node `Self` (có khóa `self_disco_pubkey`) nhận được một khung `b"MESHDS"` (`buf.len() >= 172`):
+1. **Kiểm tra trước giải mã**:
+   - Kiểm tra `buf[0..6] == *b"MESHDS"` và `buf[6] == 0x01`.
+   - Đọc `outer_sender_disco_pubkey = buf[7..39]`. **Bắt buộc `outer_sender_disco_pubkey != self_disco_pubkey`** (loại bỏ ngay gói tự phản xạ trước khi tốn CPU giải mã).
+   - Tra `outer_sender_disco_pubkey` trong `PeerMap`: phải thuộc một peer đang `Active`.
+2. **Kiểm tra sau khi mở `SalsaBox` (`plaintext.len() >= 93`)**:
+   - Kiểm tra `plaintext[0..8] == *b"MESHDSv1"`.
+   - Kiểm tra **`bool::from(plaintext[29..61].ct_eq(&outer_sender_disco_pubkey))`** (`inner_sender == outer_sender`).
+   - Kiểm tra **`bool::from(plaintext[61..93].ct_eq(self_disco_pubkey.as_bytes()))`** (`inner_recipient == self_disco_pubkey`).
+   - Nếu bất kỳ điều kiện nào trên thất bại $\to$ **hủy gói ngay lập tức**, tăng bộ đếm `mesh_agent_disco_invalid_packets_total` và tuyệt đối không phản hồi hay cập nhật trạng thái! (Bắt buộc có unit test chứng minh gói `Ping`/`Pong` của A bị kẻ tấn công sửa `outer_sender_disco_pubkey = B_pub` rồi dội ngược về A bị từ chối 100%).
 
-```text
-+-------------------+------------------------+--------------------------+---------------------------------------+
-| Byte 0 (1B)       | Bytes 1..13 (12B)      | Bytes 13..21 (8B BE)     | Bytes 21..M                           |
-| msg_type (u8)     | tx_id ([u8; 12] OsRng) | sent_at_ms (u64 UTC)     | Body theo msg_type                    |
-+-------------------+------------------------+--------------------------+---------------------------------------+
+#### (d) Tách Biệt `IngressSource` Chống Đầu Độc Đường Đi Qua Blind Relay (`HR-G2-04`)
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressSource {
+    /// Arrived directly on MagicSocket UDP from `remote_addr`.
+    DirectUdp(SocketAddr),
+    /// Arrived via Blind Relay WebSocket frame `0x02` with `src_node_pubkey` authenticated by mesh-server.
+    Relay { verified_src_node_pubkey: PublicKey },
+}
 ```
 
-| `msg_type` | Tên Bản Tin | Nội dung `Body` (Bytes `21..M`) | Quy tắc Chống Phát Lại & Chống Đầu Độc Đường Đi (`US-021 AC2/AC5`) |
+| `msg_type` | Tên Bản Tin | Nội dung `Body` (Bytes `93..M`) | Quy tắc Xử lý theo `IngressSource` (`Codex #2`, `HR-G2-04`, `US-021 AC2/AC5`) |
 |---:|---|---|---|
-| **`0x01`** | `DiscoPing` | `[protocol_version: u16 BE (2B)][padding: 0B]` | Bên nhận chỉ giải mã nếu `sender_disco_pubkey` thuộc một peer `Active` trong Netmap hiện hành. Nếu giải mã thành công, phản hồi `DiscoPong` mang **đúng `tx_id` vừa nhận** kèm `observed_addr` (IP:port nguồn thực tế mà socket nhận được). |
-| **`0x02`** | `DiscoPong` | `[addr_family: 1B (0x04=IPv4, 0x06=IPv6)][observed_port: u16 BE][observed_ip: 4B hoặc 16B]` | Bên nhận tra `tx_id` trong bảng `pending_pings` (TTL **10 giây**, xóa ngay sau khi khớp 1 lần). **Nếu `tx_id` không tồn tại trong `pending_pings`, đã quá 10 s, hoặc sai `sender_disco_pubkey` $\to$ BỎ QUA IM LẶNG 100%**, tuyệt đối không cập nhật endpoint của peer (triệt tiêu hoàn toàn tấn công Endpoint Poisoning giả `RTT = 1 ms` trên Wi-Fi công cộng!). |
-| **`0x03`** | `DiscoCallMeMaybe` | `[endpoint_count: u8 (<= 16)]` theo sau bởi danh sách `[family: 1B][port: u16 BE][ip: 4B/16B]` | Nhận qua Control/Relay; kích hoạt bắn `DiscoPing` đồng thời tới các `endpoints` hợp lệ của peer (có giới hạn tốc độ ≤ 10 đợt/phút/peer). |
+| **`0x01`** | `DiscoPing` | *(Rỗng — `0 bytes`; tổng gói = đúng `172 bytes`)* | - Nếu `IngressSource::Relay { verified_src_node_pubkey }`: kiểm tra thêm `peer.node_pubkey == verified_src_node_pubkey` (chống peer C mạo danh khóa disco qua Relay); phản hồi `DiscoPong` qua Relay với `observed_addr = 0.0.0.0:0`.<br/>- Nếu `IngressSource::DirectUdp(remote_addr)`: phản hồi `DiscoPong` trực tiếp qua UDP tới `remote_addr` mang đúng `tx_id` vừa nhận và `observed_addr = remote_addr` (có giới hạn tốc độ chống bão). |
+| **`0x02`** | `DiscoPong` | `[addr_family: 1B (0x04=IPv4, 0x06=IPv6)][observed_ip: 4B hoặc 16B][observed_port: u16 BE (2B)]`<br/>*(`7 bytes` cho IPv4 $\to$ tổng gói `179 B`; `19 bytes` cho IPv6 $\to$ tổng gói `191 B`)* | Tra `tx_id` trong bảng `pending_pings` (TTL **10 giây**, xóa ngay sau khi khớp 1 lần) và kiểm tra `pending.peer_disco_pubkey == inner_sender_disco_pubkey`.<br/>- **Nếu đến từ `IngressSource::Relay { verified_src_node_pubkey }`**: kiểm tra `peer.node_pubkey == verified_src_node_pubkey` rồi **CHỈ ghi nhận mẫu RTT `via: "relay"` cho lệnh `mesh ping` (`US-040 AC1`); TUYỆT ĐỐI CẤM cập nhật `PeerSession::direct_addr` hoặc nâng cấp `ActivePath` sang `Direct`!**<br/>- **Chỉ khi đến từ `IngressSource::DirectUdp(remote_addr)`** (và `remote_addr` hợp lệ qua `is_valid_candidate_endpoint`): mới được phép cập nhật `PeerSession::direct_addr = Some(remote_addr)` và nâng cấp `ActivePath` sang `Direct(remote_addr)`! |
+| **`0x03`** | `DiscoCallMeMaybe` | `[endpoint_count: u8 (1..=16)]` theo sau bởi danh sách `[addr_family: 1B][ip: 4B/16B][port_be: 2B]` | Nhận qua `ServerControlFrame::CallMeMaybeRelay` (hoặc Relay); sau khi vượt qua kiểm tra chống phản xạ (mục c), lọc các `endpoints` qua `is_valid_candidate_endpoint()` và kích hoạt bắn `DiscoPing` đồng thời trên `MagicSocket` UDP tới các ứng viên của peer (giới hạn ≤ 10 đợt/phút/peer). |
 
 ---
 
-## 4. Server Local Admin IPC API (`SEC-14`, `ADR-006`, `US-012`)
+## 4. Server Local Admin IPC API (`SEC-14`, `ADR-006`, `US-012`, `BLK-G2-03`)
 
-- **Kênh truyền tải duy nhất**: HTTP/1.1 JSON qua **Unix Domain Socket `/run/mesh/admin.sock`** (quyền thư mục `/run/mesh` là `0750 mesh:mesh-admin`, quyền socket `0660`).
-- **Kiểm chứng đặc quyền OS bắt buộc**: Middleware đầu tiên của `admin_service.rs` đọc `UnixStream::peer_cred()` (`SO_PEERCRED` trên Linux) lấy `(uid, gid, pid)`. Chỉ cho phép `uid == 0` (`root`), `uid == mesh_uid`, hoặc `gid == mesh_admin_gid`; mọi tiến trình khác (vd. `www-data`, container, user thường) bị từ chối ngay với `403 Forbidden` (`ErrorKind::PermissionDenied`) và ghi vào `audit_events` (`SEC-14(1)`).
+- **Kênh truyền tải duy nhất**: HTTP/1.1 JSON qua **Unix Domain Socket `/run/mesh/admin.sock`** (quyền thư mục `/run/mesh` là `0750 mesh:mesh-admin`, quyền socket `0660 mesh:mesh-admin`).
+- **Kiểm chứng đặc quyền OS bắt buộc (Bao gồm cả Supplementary Groups — `BLK-G2-03`, `US-012 AC4`, `SEC-14 AC(c)`)**:
+  - Middleware đầu tiên của `admin_service.rs` gọi `crates/mesh-sys::ipc_linux::verify_admin_peer_cred(stream, mesh_uid, mesh_admin_gid)`:
+    1. Đọc `(pid, uid, primary_gid)` từ `getsockopt(fd, SOL_SOCKET, SO_PEERCRED)`.
+    2. Nếu `uid == 0` (`root`), `uid == mesh_uid`, hoặc `primary_gid == mesh_admin_gid` $\to$ **Chấp nhận ngay**.
+    3. Ngược lại, truy vấn tên user từ `uid` bằng `libc::getpwuid_r` (buffer `4096 B` trên stack/vec) rồi gọi **`libc::getgrouplist`** để lấy toàn bộ danh sách **nhóm phụ (supplementary groups)** của `uid`: nếu danh sách nhóm phụ chứa `mesh_admin_gid` $\to$ **Chấp nhận** (đảm bảo tài khoản admin chạy SSH thuộc nhóm phụ `mesh-admin` với primary group `uid == 1000` không bao giờ bị từ chối nhầm!).
+    4. Mọi tiến trình khác (vd. `www-data`, container, user thường không thuộc `mesh-admin`) bị từ chối ngay với `403 Forbidden` (`ErrorKind::PermissionDenied`) và ghi vào `audit_events` (`SEC-14(1)`).
 - **Tuyệt đối cấm** gắn router này vào bất kỳ TCP listener nào (`127.0.0.1`, IP overlay hay IP public).
 
 ### 4.1. Bảng Toàn Bộ Các Endpoint Quản Trị Trên `/run/mesh/admin.sock`
@@ -378,11 +492,11 @@ Mọi gói Disco đi trên UDP (`MagicSocket`) hoặc đi qua Blind Relay đều
 |---|---|---|---|
 | `POST /v1/admin/preauth-keys` | `US-002`, `US-006`, `US-031` | `mesh preauthkey create [--ttl 1h] [--reusable --max-uses N] [--ephemeral] [--for <node>]` | Sinh key 256-bit từ `OsRng`, chỉ lưu `sha256` vào `redb`, trả `raw_key` **đúng 1 lần** kèm chuỗi `join_command` đầy đủ (`IP:port` + `active_pin`). Ghi audit `preauthkey_created`. |
 | `GET /v1/admin/preauth-keys` | `US-002 AC2` | `mesh preauthkey list` | Liệt kê danh sách metadata của các key (`key_id`, `status`, `expires_at_ms`, `target_node_id`, `used_count`/`max_uses`); **không bao giờ trả key rõ**. |
-| `POST /v1/admin/preauth-keys/{key_id}/revoke` | `US-002 AC4`, `US-013 AC4` | `mesh preauthkey revoke <key_id>` | Đưa `key_id` vào `RevokedSet` RAM ngay lập tức (< 100 ms) rồi cập nhật `redb` + ghi audit `preauthkey_revoked` (vẫn có hiệu lực trong RAM kể cả khi đĩa đầy `ENOSPC`). |
+| `POST /v1/admin/preauth-keys/{key_id}/revoke` | `US-002 AC4`, `US-013 AC4` | `mesh preauthkey revoke <key_id>` | Đưa `key_id` vào `RevokedSet` RAM ngay lập tức (< 100 ms) rồi cập nhật `redb` + ghi audit `preauthkey_revoked` (nếu đầy đĩa `ENOSPC` thì ghi đè tại chỗ vào `emergency-revocations.bin`). |
 | `GET /v1/admin/nodes` | `US-012 AC1`, `US-050 AC1` | `mesh node list` | Liệt kê toàn bộ node kèm `overlay_ip`, `status`, `online`, `last_seen_at_ms`, `key_expires_at_ms`, `os`/`arch`, `agent_version` (≤ 1 s). |
 | `GET /v1/admin/nodes/{node_ref}` | `US-012 AC1` | `mesh node inspect <id\|name>` | Xem chi tiết 1 node theo `NodeId` hoặc `name_normalized`. |
-| `POST /v1/admin/nodes/{node_ref}/rename` | `US-012 AC2` | `mesh node rename <id\|name> <new_name>` | Kiểm tra `NodeName` hợp lệ + không thuộc danh sách cấm/trùng lặp (`US-004 AC3`), cập nhật `idx_nodes_name`, tăng `netmap_version`, đẩy Netmap mới (P95 ≤ 5 s) và ghi audit `node_renamed`. |
-| `POST /v1/admin/nodes/{node_ref}/revoke` | `US-029`, `US-013 AC4` | `mesh node revoke <id\|name>` | **Khẩn cấp**: Đưa vào `RevokedSet` RAM + ngắt Relay/Control (< 100 ms) + đẩy Netmap xóa peer tới toàn mạng + cách ly IP 24h (`US-029 AC5`) + ghi audit `node_revoked` (fallback `stderr`/`journald` nếu đầy đĩa). |
+| `POST /v1/admin/nodes/{node_ref}/rename` | `US-012 AC2` | `mesh node rename <id\|name> <new_name>` | Kiểm tra `NodeName` hợp lệ + không thuộc danh sách cấm/trùng lặp (`US-004 AC3`), cập nhật `idx_nodes_name`, cấp `netmap_version` mới qua `MonotonicNetmapVersion`, đẩy Netmap mới (P95 ≤ 5 s) và ghi audit `node_renamed`. |
+| `POST /v1/admin/nodes/{node_ref}/revoke` | `US-029`, `US-013 AC4`, `HR-G2-03` | `mesh node revoke <id\|name>` | **Khẩn cấp**: Đưa vào `RevokedSet` RAM + ngắt Relay/Control (< 100 ms) + đẩy Netmap xóa peer tới toàn mạng + cách ly IP 24h (`US-029 AC5`) + ghi `redb` (hoặc ghi đè tại chỗ vào `/var/lib/mesh/emergency-revocations.bin` `64 KiB` + `journald` nếu đầy đĩa `ENOSPC`). |
 | `POST /v1/admin/nodes/{node_ref}/expire` | `US-012 AC3`, `US-031 AC1/AC2` | `mesh node expire <id\|name> [--never]` | Hết hạn khóa node ngay lập tức (buộc đăng ký lại bằng key `--for <node>`) hoặc đặt `key_expires_at_ms = None` (`--never` cho server tin cậy); ghi audit `node_expiry_updated`. |
 | `GET /v1/admin/server/status` | `US-012 AC6`, `US-074 AC7` | `mesh server status` (hoặc `mesh server info`) | Trả về cổng TCP/UDP hiện hành, `tls_mode`, `active_pin`, `next_pin`, hạn chứng chỉ TLS, trạng thái `ListenerSet` và **danh sách các node chưa xác nhận `endpoint_version` mới** khi đang chuyển tiếp cổng. |
 | `POST /v1/admin/server/backup` | `US-045 AC1` | `mesh server backup` | Thực thi Hot Atomic Snapshot Backup ngay lập tức (kèm `server_identity` và `.sha256`, giữ 7 bản); ghi audit `server_backup_created`. |
@@ -421,22 +535,24 @@ Response (`201 Created`):
 
 ---
 
-## 5. Client Local CLI ↔ Daemon IPC API (`ADR-006`, `PLAT-01`, `PLAT-06`, `US-039..041`, `US-052`, `US-073`, `US-074`)
+## 5. Client Local CLI ↔ Daemon IPC API (`ADR-006`, `BLK-G2-03`, `Codex #11`, `US-039..041`, `US-052`, `US-073`, `US-074`)
 
-### 5.1. Cơ Chế Phân Quyền Ở Tầng Hệ Điều Hành Giữa Nhóm Lệnh Chỉ-Đọc và Nhóm Lệnh Đặc Quyền
+### 5.1. Kiến Trúc Tách 2 Điểm Cuối IPC Theo Mức Đặc Quyền (`meshd-ro` vs `meshd-admin` — `BLK-G2-03`, `Codex #11`, `US-039 AC5`)
 
-| Hệ điều hành | Đường dẫn IPC | Kiểm chứng cho Nhóm Chỉ-Đọc (`status`, `ping`, `netcheck`, `bugreport`) | Kiểm chứng cho Nhóm Đặc Quyền (`up`, `down`, `cleanup`, `set`, `rotate-key`) |
-|---|---|---|---|
-| **macOS 13+** (`US-073 AC3/AC4`) | `/var/run/mesh/meshd.sock` | Cho phép user cục bộ gọi; phản hồi **0 secret** (`SEC-01`, `US-039 AC5`). | Kiểm tra `LOCAL_PEERCRED`: **bắt buộc `uid == 0` (`root`) hoặc thuộc nhóm `admin` (`gid == 80`)**. User thường bị từ chối với `403 PermissionDenied`! |
-| **Windows 10/11** (`US-052 AC3`) | 2 Named Pipes tách biệt:<br/>- `\\.\pipe\mesh-agent-ro`<br/>- `\\.\pipe\mesh-agent-admin` | Đi qua `\\.\pipe\mesh-agent-ro` (chỉ gắn 4 route chỉ-đọc, 0 secret). | Đi qua `\\.\pipe\mesh-agent-admin` được tạo với SDDL DACL **`D:P(A;;GA;;;SY)(A;;GA;;;BA)`** (chỉ `LocalSystem` và `Administrators` mở được pipe). |
-| **Linux (Node/Lab)** (`US-056`) | `/run/mesh/meshd.sock` | Cho phép đọc trạng thái không nhạy cảm (0 secret). | Kiểm tra `SO_PEERCRED`: **bắt buộc `uid == 0` (`root`)** hoặc nhóm `mesh-admin`. |
+Để đảm bảo tài khoản người dùng thường (non-admin / không `sudo`) luôn chạy được `mesh status`, `mesh peers`, `mesh ping`, `mesh netcheck` (`US-039 AC5`) trong khi mọi thao tác thay đổi cấu hình/mạng hoặc xuất bundle chẩn đoán (`up`, `down`, `cleanup`, `set`, `rotate-key`, `bugreport`) đều bị khóa cứng ở cả tầng quyền tệp OS lẫn tầng xác thực credential của kernel, `meshd` trên cả 3 hệ điều hành đều mở **2 listener IPC tách biệt với 2 `axum::Router` hoàn toàn độc lập**:
+
+| Hệ điều hành | **Kênh 1: Read-Only IPC (`meshd-ro`)**<br/>Chỉ gắn 4 route đọc: `GET /v1/agent/status`, `GET /v1/agent/peers`, `POST /v1/agent/ping`, `POST /v1/agent/netcheck` (`DefaultBodyLimit::max(4096)`, **0 secret**) | **Kênh 2: Privileged Admin IPC (`meshd-admin`)**<br/>Gắn toàn bộ route đặc quyền (`up`, `down`, `cleanup`, `set`, `rotate-key`, `bugreport`) + các route đọc |
+|---|---|---|
+| **macOS 13+** (`US-073 AC3/AC4`, `BLK-G2-03`, `Codex #11`) | **`/var/run/mesh/meshd-ro.sock`**<br/>- Thư mục `/var/run/mesh` (`0755 root:wheel`)<br/>- Socket mode **`0666 root:wheel`**<br/>- Cho phép mọi user cục bộ gọi `mesh status` / `mesh ping` / `mesh netcheck` không cần `sudo`. | **`/var/run/mesh/meshd-admin.sock`**<br/>- Socket mode **`0660 root:admin`** (`gid = 80`)<br/>- Kiểm tra trong `crates/mesh-sys::ipc_macos`: lấy `euid` qua `libc::getpeereid(fd)` và đọc đầy đủ `libc::xucred` qua `getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, ...)`. Chỉ chấp nhận nếu **`euid == 0` (`root`) HOẶC mảng `xucred.cr_groups[..xucred.cr_ngroups as usize]` chứa `80` (`admin`)** (kèm fallback `getpwuid_r` + `getgrouplist` khi `cr_ngroups == XU_NGROUPS` = 16). |
+| **Windows 10/11** (`US-052 AC3`, `BLK-G2-03`) | **`\\.\pipe\mesh-agent-ro`**<br/>- Tạo với `FILE_FLAG_FIRST_PIPE_INSTANCE` + SDDL DACL **`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)`** (cho phép `Authenticated Users` mở pipe chỉ-đọc). | **`\\.\pipe\mesh-agent-admin`**<br/>- Tạo với `FILE_FLAG_FIRST_PIPE_INSTANCE` + SDDL DACL **`D:P(A;;GA;;;SY)(A;;GA;;;BA)`** (chỉ `LocalSystem` và `Administrators` mở được pipe). |
+| **Linux (Node/Lab)** (`US-056`, `BLK-G2-03`) | **`/var/run/mesh/meshd-ro.sock`** *(symlink/alias `/run/mesh/meshd-ro.sock`)*<br/>- Thư mục `0755 root:root`<br/>- Socket mode **`0666 root:root`**. | **`/var/run/mesh/meshd-admin.sock`** *(symlink/alias `/run/mesh/meshd-admin.sock`)*<br/>- Socket mode **`0660 root:mesh-admin`**<br/>- Kiểm tra `SO_PEERCRED` (`uid == 0` hoặc `primary_gid == mesh_admin_gid`) + `getpwuid_r` & `getgrouplist` kiểm tra nhóm phụ `mesh-admin`. |
 
 ---
 
 ### 5.2. Đặc Tả Các Endpoint Trên Local Agent IPC
 
-#### (1) `GET /v1/agent/status` — Trạng Thái Toàn Diện Của Agent & Peer (`US-039 AC1..AC7`)
-Response (`200 OK` — hoàn tất ≤ 1 s, hỗ trợ `mesh status` và `mesh status --json`):
+#### (1) `GET /v1/agent/status` & `GET /v1/agent/peers` — Trạng Thái Toàn Diện Của Agent & Peer (`US-039 AC1..AC7`, trên cả `meshd-ro` & `meshd-admin`)
+Response (`200 OK` — hoàn tất ≤ 1 s, hỗ trợ `mesh status`, `mesh status --json`, `mesh peers`):
 ```json
 {
   "daemon_state": "connected",
@@ -492,7 +608,7 @@ Response (`200 OK` — hoàn tất ≤ 1 s, hỗ trợ `mesh status` và `mesh s
 }
 ```
 
-#### (2) `POST /v1/agent/ping` — Ping Tầng Disco/Overlay Quan Sát Nâng Cấp Relay $\to$ Direct (`US-040`)
+#### (2) `POST /v1/agent/ping` — Ping Tầng Disco/Overlay Quan Sát Nâng Cấp Relay $\to$ Direct (`US-040`, trên cả `meshd-ro` & `meshd-admin`)
 Request:
 ```json
 {
@@ -522,7 +638,7 @@ Response (`200 OK`):
 }
 ```
 
-#### (3) `POST /v1/agent/netcheck` — Chẩn Đoán NAT, UDP, STUN & Cổng TCP Tùy Chỉnh (`US-023`, `REL-06`)
+#### (3) `POST /v1/agent/netcheck` — Chẩn Đoán NAT, UDP, STUN & Cổng TCP Tùy Chỉnh (`US-023`, `REL-06`, trên cả `meshd-ro` & `meshd-admin`)
 Response (`200 OK`):
 ```json
 {
@@ -541,10 +657,10 @@ Response (`200 OK`):
 ```
 *(Nếu `control_tcp_reachable == false` khi dùng cổng khác `443` như `8443`, `diagnostic_hint` trả rõ: `"cannot reach Control/Relay at 203.0.113.10:8443 — current network may only allow outbound TCP 80/443; consider hosting or proxying on port 443"` theo `US-023 AC4`, `US-024 AC7`).*
 
-#### (4) `POST /v1/agent/bugreport` — Tạo Bundle Chẩn Đoán Đã Lọc Sạch Secret (`US-041`)
+#### (4) `POST /v1/agent/bugreport` — Tạo Bundle Chẩn Đoán Đã Lọc Sạch Secret (`US-041`, CHỈ trên `meshd-admin`)
 Response (`200 OK`): trả về đường dẫn tệp nén `.tar.gz`/`.zip` (≤ 20 MB) chứa log đã lọc, `status --json`, bảng route và cấu hình đã che `"[REDACTED]"` (`0` byte private key / pre-auth key).
 
-#### (5) Nhóm Lệnh Đặc Quyền (`POST /v1/agent/up`, `down`, `cleanup`, `set`, `rotate-key`)
+#### (5) Nhóm Lệnh Đặc Quyền (`POST /v1/agent/up`, `down`, `cleanup`, `set`, `rotate-key` — CHỈ trên `meshd-admin`)
 - **`POST /v1/agent/up`** (`US-004`):
   ```json
   {
@@ -567,7 +683,7 @@ Response (`200 OK`): trả về đường dẫn tệp nén `.tar.gz`/`.zip` (≤
     "preauth_key": "mpk_..."
   }
   ```
-- **`POST /v1/agent/down`** & **`POST /v1/agent/cleanup`** (`US-055 AC3`): Thực thi `ResourceLedger::cleanup_all()` idempotent, gỡ route, xóa khối `# BEGIN mesh … # END mesh` trong `hosts`, đóng `utunN`/Wintun và trả máy về trạng thái sạch.
+- **`POST /v1/agent/down`** & **`POST /v1/agent/cleanup`** (`US-055 AC3`): Thực thi `ResourceLedger::cleanup_all()` idempotent, gỡ route (và `ip rule`/bảng `51820` trên Linux), xóa khối `# BEGIN mesh … # END mesh` trong `hosts`, đóng `utunN`/Wintun và trả máy về trạng thái sạch.
 
 ---
 
@@ -610,6 +726,7 @@ Chạy trên một listener riêng biệt (mặc định `127.0.0.1:9091` trên 
 | `mesh_relay_throttled_bytes_total` | `counter` | `scope="per_node\|global"` | Số byte bị điều tiết bởi Token Bucket 20 Mbps (`US-027 AC2/AC4`). |
 | `mesh_stun_requests_total` | `counter` | `outcome="ok\|rate_limited\|malformed"` | Số gói STUN Binding xử lý trên cổng UDP cấu hình (`US-019`). |
 | `mesh_agent_peers_by_path` | `gauge` | `path="direct\|relay\|none"` | Số lượng peer của agent theo đường đi hiện tại (`US-048 AC1`). |
+| `mesh_agent_disco_invalid_packets_total` | `counter` | `reason="self_reflection\|recipient_mismatch\|sender_mismatch\|bad_mac\|tx_miss"` | Số gói Disco bị hủy do phản xạ hai chiều, sai khóa người nhận/người gửi hoặc sai MAC (`Codex #2`, `HR-G2-04`). |
 | `mesh_agent_spoofed_packets_dropped_total` | `counter` | — | Số gói bị chặn do vi phạm `AllowedIPs = /32` hoặc ngoài dải overlay (`SEC-11`, `US-014 AC4`, `US-018 AC1`). |
 | `mesh_process_resident_memory_bytes` | `gauge` | — | Dung lượng RAM RSS hiện tại của tiến trình (`PERF-01`, `PERF-09`). |
 
