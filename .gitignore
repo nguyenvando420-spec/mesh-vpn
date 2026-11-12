@@ -1,0 +1,39 @@
+# OS & Editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Build & Test artifacts
+/bin/
+/dist/
+/out/
+/target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+
+# Runtime state, databases & local secrets (SEC-01)
+*.key
+*.pem
+*.crt
+*.csr
+*.pfx
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.env
+.env.*
+
+# Codex CLI JSONL execution logs
+*.log.jsonl

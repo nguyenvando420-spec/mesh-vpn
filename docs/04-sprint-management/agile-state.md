@@ -1,0 +1,46 @@
+﻿# Agile State — Trạng Thái Điều Phối Dự Án
+
+> Main Agent (Scrum Master) cập nhật file này sau mỗi bước quan trọng và đọc lại đầu mỗi phiên / sau khi server restart.
+
+## Giai đoạn hiện tại
+
+- **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
+- **Giai đoạn**: `2 - Tech Stack, Coding Standards, System Design & Sprint Planning`
+- **Sprint hiện tại**: `Sprint 0 (Design)`
+- **Bước tiếp theo**: `Đồng bộ điều chỉnh phạm vi của người dùng tại Gate 1 (macOS + Windows trước, kết nối IP + custom port) vào tài liệu Giai đoạn 1 (v1.2), sau đó chạy ngay Bước 2.1 (agile-tech-lead)`
+
+## Trạng thái Gate
+
+| Gate | Trạng thái | Ngày duyệt | Ghi chú của người dùng |
+|---|---|---|---|
+| Gate 1 — Nghiên cứu & Backlog | ✅ Đã duyệt | 2026-11-12 | (1) Ưu tiên làm Client cho **macOS và Windows trước** (Server chạy trên Ubuntu Linux VPS + hỗ trợ Linux TUN cho VPS làm node & phòng lab NAT); (2) Tạm thời **kết nối trực tiếp bằng IP VPS** (chế độ Pin chứng chỉ/khóa `SEC-04c`) và **hỗ trợ đổi port TCP/UDP tùy ý** (không khóa cứng 443/3478); (3) Giữ các mặc định: chia **2 đợt bàn giao** (Milestone 1 → Milestone 2), tự định nghĩa giao thức, tên CLI **`mesh`** (`.mesh.internal`), quản trị CLI/SSH cục bộ. |
+| Gate 2 — Stack/Model, Code Format, Thiết kế & Sprint | ⏳ Đang thực hiện | | |
+| Gate 3 — Sprint Review, QA/AI Eval & Release | ⏳ Chưa trình | | |
+
+## Các Vai trò trong Team (14 Vai trò: Scrum Master + 12 Subagents + Codex)
+
+| Vai trò | Model | conversationId / tên worker | Nhiệm vụ gần nhất | Trạng thái |
+|---|---|---|---|---|
+| agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Ghi nhận duyệt Gate 1 & điều phối Giai đoạn 2 | 🟢 Active |
+| agile-researcher | claude-opus-5-5-high (đã qua mốc reset ~19:05) | | Đồng bộ v1.2 `production-readiness-requirements.md` theo chốt Gate 1 (macOS + Windows, IP + custom port) | 🟡 Running |
+| agile-po-ba | claude-sonnet-5-5-high (đã qua mốc reset ~19:05) | | Đồng bộ v1.2 `vision`, `charter`, `personas`, `product-backlog.md` theo chốt Gate 1 | 🟡 Running |
+| agile-tech-lead | claude-sonnet-5-5-high | | Chờ đồng bộ v1.2 để chốt Tech Stack, ADRs & Coding Standards | ⚪ Pending |
+| agile-architect | claude-opus-5-5-high | | Chờ Tech Lead chốt Stack để thiết kế C4, DB, Wire/API Contracts | ⚪ Pending |
+| agile-critic | gemini-4-carbon-high | abbcf2d4-c88b-4653-a079-79223667caa1 | Hoàn tất Gate 1 Vòng 2 (`[APPROVED FOR GATE]`); chờ phản biện Gate 2 | ⚪ Ready |
+| agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
+| agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
+| agile-ai-engineer | — (Chưa kích hoạt) | | | ⚪ Inactive |
+| agile-developer | claude-sonnet-5-5-high | | | ⚪ Pending |
+| agile-qa | gemini-4-argon-high | | | ⚪ Pending |
+| agile-mlops-eval | — (Chưa kích hoạt) | | | ⚪ Inactive |
+| agile-devops | gemini-3.8-flash-high | | | ⚪ Pending |
+| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol | (gọi qua codex_task.py) | Chờ phản biện thiết kế song song trước Gate 2 (`review-design`) | ⚪ Pending |
+
+## Kết luận Critic gần nhất
+
+- `Gate 1 Vòng 2 (2026-11-12): [APPROVED FOR GATE] — Người dùng đã duyệt Gate 1 lúc 19:48 ngày 2026-11-12 kèm điều chỉnh ưu tiên macOS + Windows trước và kết nối bằng IP + custom port.`
+
+## Việc còn dở / Vấn đề mở
+
+- Đồng bộ v1.2 các tài liệu Giai đoạn 1 theo quyết định Gate 1 của người dùng (đưa macOS `US-060` + `PLAT-*` vào `Must` MVP cùng Windows; đưa bộ cài desktop Linux sang `Should`/thứ cấp trong khi vẫn giữ Linux VPS Server + Linux TUN cho VPS-node/NAT-lab; ghi rõ cổng TCP/UDP cấu hình được + IP Pinning mặc định).
+- Thực thi liền mạch Giai đoạn 2: `agile-tech-lead` → `agile-architect` → `sprint-backlog.md` → `agile-critic` + `agile-codex` (`review-design` song song) → Trình Gate 2.
