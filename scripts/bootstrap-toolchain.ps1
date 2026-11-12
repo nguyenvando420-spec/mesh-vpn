@@ -13,7 +13,9 @@
            (c) cargo-deny 0.20.2 prebuilt binary
            (d) cargo-zigbuild v0.24.1 prebuilt binary
            (e) apple-codesign (rcodesign.exe) 0.29.0 prebuilt binary for Mach-O arm64 ad-hoc signing (ADR-011)
-      2. Msvc: Installs Visual Studio 2022 C++ Build Tools (VCTools workload) via winget for native -msvc builds.
+      2. Msvc: Installs Visual Studio 2022 C++ Build Tools (VCTools workload) via winget for native -msvc builds,
+         adds required rustup targets, and downloads + verifies SHA-256 (fail-closed) for the 4 common prebuilt tools
+         (Zig 0.13.0, cargo-deny 0.20.2, cargo-zigbuild v0.24.1, apple-codesign rcodesign 0.29.0).
 #>
 [CmdletBinding()]
 param(
@@ -99,6 +101,99 @@ function Assert-FileSha256 {
     Write-Host "    [SHA-256 OK] $actual" -ForegroundColor Green
 }
 
+function Invoke-CheckedVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $out = (& $Exe @Arguments 2>&1) | Select-Object -First 1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "Tool execution verification failed for '$Exe $($Arguments -join ' ')' (exit code $LASTEXITCODE)."
+    }
+    return $out.Trim()
+}
+
+function Install-CommonPrebuiltTools {
+    param(
+        [Parameter(Mandatory = $true)][array]$CommonArtifacts
+    )
+    New-Item -ItemType Directory -Force -Path $SdkRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+    # 1. Zig 0.13.0 (.zip)
+    $zigArt = $CommonArtifacts[0]
+    if (-not (Test-Path $zigArt.Check)) {
+        $archivePath = Join-Path $SdkRoot $zigArt.File
+        Write-Step "Downloading $($zigArt.Name)..."
+        Invoke-WebRequest -Uri $zigArt.Url -OutFile $archivePath -UseBasicParsing
+        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $zigArt.Sha256
+        Expand-Archive -Path $archivePath -DestinationPath $SdkRoot -Force
+        if (Test-Path $ZigDir) {
+            Remove-Item -Recurse -Force $ZigDir
+        }
+        Rename-Item -Path (Join-Path $SdkRoot "zig-windows-x86_64-0.13.0") -NewName "zig"
+        Remove-Item -Force $archivePath
+    }
+
+    # 2. cargo-deny 0.20.2 (.tar.gz)
+    $denyArt = $CommonArtifacts[1]
+    if (-not (Test-Path $denyArt.Check)) {
+        $archivePath = Join-Path $SdkRoot $denyArt.File
+        $extractTmp = Join-Path $SdkRoot "tmp-cargo-deny"
+        Write-Step "Downloading $($denyArt.Name)..."
+        Invoke-WebRequest -Uri $denyArt.Url -OutFile $archivePath -UseBasicParsing
+        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $denyArt.Sha256
+        New-Item -ItemType Directory -Force -Path $extractTmp | Out-Null
+        & "$env:SystemRoot\System32\tar.exe" -xzf $archivePath -C $extractTmp
+        if ($LASTEXITCODE -ne 0) {
+            throw "tar.exe failed to extract $archivePath"
+        }
+        $denyExe = Get-ChildItem -Path $extractTmp -Recurse -Filter "cargo-deny.exe" | Select-Object -First 1
+        if (-not $denyExe) {
+            throw "cargo-deny.exe not found inside archive"
+        }
+        Copy-Item -Force $denyExe.FullName $denyArt.Check
+        Remove-Item -Recurse -Force $extractTmp
+        Remove-Item -Force $archivePath
+    }
+
+    # 3. cargo-zigbuild v0.24.1 (.zip)
+    $zigbuildArt = $CommonArtifacts[2]
+    if (-not (Test-Path $zigbuildArt.Check)) {
+        $archivePath = Join-Path $SdkRoot $zigbuildArt.File
+        $extractTmp = Join-Path $SdkRoot "tmp-cargo-zigbuild"
+        Write-Step "Downloading $($zigbuildArt.Name)..."
+        Invoke-WebRequest -Uri $zigbuildArt.Url -OutFile $archivePath -UseBasicParsing
+        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $zigbuildArt.Sha256
+        Expand-Archive -Path $archivePath -DestinationPath $extractTmp -Force
+        $zigbuildExe = Get-ChildItem -Path $extractTmp -Recurse -Filter "cargo-zigbuild.exe" | Select-Object -First 1
+        if (-not $zigbuildExe) {
+            throw "cargo-zigbuild.exe not found inside archive"
+        }
+        Copy-Item -Force $zigbuildExe.FullName $zigbuildArt.Check
+        Remove-Item -Recurse -Force $extractTmp
+        Remove-Item -Force $archivePath
+    }
+
+    # 4. apple-codesign (rcodesign.exe) 0.29.0 (.zip)
+    $rcodesignArt = $CommonArtifacts[3]
+    if (-not (Test-Path $rcodesignArt.Check)) {
+        $archivePath = Join-Path $SdkRoot $rcodesignArt.File
+        $extractTmp = Join-Path $SdkRoot "tmp-rcodesign"
+        Write-Step "Downloading $($rcodesignArt.Name)..."
+        Invoke-WebRequest -Uri $rcodesignArt.Url -OutFile $archivePath -UseBasicParsing
+        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $rcodesignArt.Sha256
+        Expand-Archive -Path $archivePath -DestinationPath $extractTmp -Force
+        $rcodesignExe = Get-ChildItem -Path $extractTmp -Recurse -Filter "rcodesign.exe" | Select-Object -First 1
+        if (-not $rcodesignExe) {
+            throw "rcodesign.exe not found inside archive"
+        }
+        Copy-Item -Force $rcodesignExe.FullName $rcodesignArt.Check
+        Remove-Item -Recurse -Force $extractTmp
+        Remove-Item -Force $archivePath
+    }
+}
+
 Write-Step "Verifying Rust 1.94.1 toolchain..."
 $rustcVer = (& rustc --version 2>&1) | Out-String
 $rustcVer = $rustcVer.Trim()
@@ -140,9 +235,12 @@ if ($Mode -eq "PortableZig") {
             throw "Failed to add target $target to toolchain 1.94.1-x86_64-pc-windows-gnu."
         }
         & rustup target add $target
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to add target $target to active toolchain."
+        }
     }
 
-    # 1. MinGW-w64 GCC UCRT
+    # 1. MinGW-w64 GCC UCRT (PortableZig-specific host C/ASM compiler & linker)
     $mingwArt = $Artifacts[0]
     if (-not (Test-Path $mingwArt.Check)) {
         $archivePath = Join-Path $SdkRoot $mingwArt.File
@@ -153,97 +251,53 @@ if ($Mode -eq "PortableZig") {
         Remove-Item -Force $archivePath
     }
 
-    # 2. Zig 0.13.0
-    $zigArt = $Artifacts[1]
-    if (-not (Test-Path $zigArt.Check)) {
-        $archivePath = Join-Path $SdkRoot $zigArt.File
-        Write-Step "Downloading $($zigArt.Name)..."
-        Invoke-WebRequest -Uri $zigArt.Url -OutFile $archivePath -UseBasicParsing
-        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $zigArt.Sha256
-        Expand-Archive -Path $archivePath -DestinationPath $SdkRoot -Force
-        if (Test-Path $ZigDir) {
-            Remove-Item -Recurse -Force $ZigDir
-        }
-        Rename-Item -Path (Join-Path $SdkRoot "zig-windows-x86_64-0.13.0") -NewName "zig"
-        Remove-Item -Force $archivePath
-    }
-
-    # 3. cargo-deny 0.20.2 (.tar.gz)
-    $denyArt = $Artifacts[2]
-    if (-not (Test-Path $denyArt.Check)) {
-        $archivePath = Join-Path $SdkRoot $denyArt.File
-        $extractTmp = Join-Path $SdkRoot "tmp-cargo-deny"
-        Write-Step "Downloading $($denyArt.Name)..."
-        Invoke-WebRequest -Uri $denyArt.Url -OutFile $archivePath -UseBasicParsing
-        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $denyArt.Sha256
-        New-Item -ItemType Directory -Force -Path $extractTmp | Out-Null
-        & "$env:SystemRoot\System32\tar.exe" -xzf $archivePath -C $extractTmp
-        if ($LASTEXITCODE -ne 0) {
-            throw "tar.exe failed to extract $archivePath"
-        }
-        $denyExe = Get-ChildItem -Path $extractTmp -Recurse -Filter "cargo-deny.exe" | Select-Object -First 1
-        if (-not $denyExe) {
-            throw "cargo-deny.exe not found inside archive"
-        }
-        Copy-Item -Force $denyExe.FullName $denyArt.Check
-        Remove-Item -Recurse -Force $extractTmp
-        Remove-Item -Force $archivePath
-    }
-
-    # 4. cargo-zigbuild v0.24.1 (.zip)
-    $zigbuildArt = $Artifacts[3]
-    if (-not (Test-Path $zigbuildArt.Check)) {
-        $archivePath = Join-Path $SdkRoot $zigbuildArt.File
-        $extractTmp = Join-Path $SdkRoot "tmp-cargo-zigbuild"
-        Write-Step "Downloading $($zigbuildArt.Name)..."
-        Invoke-WebRequest -Uri $zigbuildArt.Url -OutFile $archivePath -UseBasicParsing
-        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $zigbuildArt.Sha256
-        Expand-Archive -Path $archivePath -DestinationPath $extractTmp -Force
-        $zigbuildExe = Get-ChildItem -Path $extractTmp -Recurse -Filter "cargo-zigbuild.exe" | Select-Object -First 1
-        if (-not $zigbuildExe) {
-            throw "cargo-zigbuild.exe not found inside archive"
-        }
-        Copy-Item -Force $zigbuildExe.FullName $zigbuildArt.Check
-        Remove-Item -Recurse -Force $extractTmp
-        Remove-Item -Force $archivePath
-    }
-
-    # 5. apple-codesign (rcodesign.exe) 0.29.0 (.zip)
-    $rcodesignArt = $Artifacts[4]
-    if (-not (Test-Path $rcodesignArt.Check)) {
-        $archivePath = Join-Path $SdkRoot $rcodesignArt.File
-        $extractTmp = Join-Path $SdkRoot "tmp-rcodesign"
-        Write-Step "Downloading $($rcodesignArt.Name)..."
-        Invoke-WebRequest -Uri $rcodesignArt.Url -OutFile $archivePath -UseBasicParsing
-        Assert-FileSha256 -Path $archivePath -ExpectedSha256 $rcodesignArt.Sha256
-        Expand-Archive -Path $archivePath -DestinationPath $extractTmp -Force
-        $rcodesignExe = Get-ChildItem -Path $extractTmp -Recurse -Filter "rcodesign.exe" | Select-Object -First 1
-        if (-not $rcodesignExe) {
-            throw "rcodesign.exe not found inside archive"
-        }
-        Copy-Item -Force $rcodesignExe.FullName $rcodesignArt.Check
-        Remove-Item -Recurse -Force $extractTmp
-        Remove-Item -Force $archivePath
-    }
+    # 2..5. Common prebuilt cross-compilation & security auditing tools (Zig, cargo-deny, cargo-zigbuild, rcodesign)
+    Install-CommonPrebuiltTools -CommonArtifacts $Artifacts[1..4]
 
     $env:PATH = "$MingwDir\bin;$ZigDir;$BinDir;$env:PATH"
-    Write-Host "    gcc           : $((& x86_64-w64-mingw32-gcc --version | Select-Object -First 1))"
-    Write-Host "    zig           : $(& zig version)"
-    Write-Host "    cargo-deny    : $(& cargo-deny --version)"
-    Write-Host "    cargo-zigbuild: $(& cargo-zigbuild --version)"
-    Write-Host "    rcodesign     : $(& rcodesign --version)"
+    Write-Host "    gcc           : $(Invoke-CheckedVersion -Exe 'x86_64-w64-mingw32-gcc' -Arguments @('--version'))"
+    Write-Host "    zig           : $(Invoke-CheckedVersion -Exe 'zig' -Arguments @('version'))"
+    Write-Host "    cargo-deny    : $(Invoke-CheckedVersion -Exe 'cargo-deny' -Arguments @('--version'))"
+    Write-Host "    cargo-zigbuild: $(Invoke-CheckedVersion -Exe 'cargo-zigbuild' -Arguments @('--version'))"
+    Write-Host "    rcodesign     : $(Invoke-CheckedVersion -Exe 'rcodesign' -Arguments @('--version'))"
 }
 elseif ($Mode -eq "Msvc") {
-    Write-Step "Mode: Msvc (Visual Studio 2022 C++ Build Tools)"
+    Write-Step "Mode: Msvc (Visual Studio 2022 C++ Build Tools + Zig + cargo-deny + cargo-zigbuild + rcodesign)"
     if ($DryRun) {
-        Write-Host "    [DryRun] Would run winget install Microsoft.VisualStudio.2022.BuildTools with VCTools workload"
-        Write-Host "    [DryRun] Would download prebuilt cargo-deny, cargo-zigbuild, rcodesign and verify SHA-256"
+        Write-Host "    [DryRun] Would run: winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override `"--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`""
+        Write-Host "    [DryRun] Would run: rustup target add $($RequiredTargets -join ' ')"
+        foreach ($art in $Artifacts[1..4]) {
+            Write-Host "    [DryRun] Would download $($art.Name):"
+            Write-Host "             URL    : $($art.Url)"
+            Write-Host "             SHA256 : $($art.Sha256)"
+            Write-Host "             Target : $($art.Check)"
+        }
         exit 0
     }
+
     & winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+    $wingetExit = $LASTEXITCODE
+    $vsWherePath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    $hasMsvc = ($null -ne (Get-Command link.exe -ErrorAction SilentlyContinue)) -or (Test-Path $vsWherePath)
+    # 0x8A15002B (-1978335189) = UPDATE_NOT_APPLICABLE / already installed in winget
+    if ($wingetExit -ne 0 -and -not ($wingetExit -eq -1978335189 -and $hasMsvc)) {
+        throw "winget install Microsoft.VisualStudio.2022.BuildTools failed with exit code $wingetExit."
+    }
+
     foreach ($target in $RequiredTargets) {
         & rustup target add $target
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to add target $target to active toolchain."
+        }
     }
+
+    Install-CommonPrebuiltTools -CommonArtifacts $Artifacts[1..4]
+
+    $env:PATH = "$ZigDir;$BinDir;$env:PATH"
+    Write-Host "    zig           : $(Invoke-CheckedVersion -Exe 'zig' -Arguments @('version'))"
+    Write-Host "    cargo-deny    : $(Invoke-CheckedVersion -Exe 'cargo-deny' -Arguments @('--version'))"
+    Write-Host "    cargo-zigbuild: $(Invoke-CheckedVersion -Exe 'cargo-zigbuild' -Arguments @('--version'))"
+    Write-Host "    rcodesign     : $(Invoke-CheckedVersion -Exe 'rcodesign' -Arguments @('--version'))"
 }
 
 Write-Step "Bootstrap complete!"

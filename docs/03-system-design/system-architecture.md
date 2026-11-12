@@ -4,10 +4,10 @@
 |---|---|
 | Tác giả | `agile-architect` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **2.1** — Gate 2 Round 1 Revision: Kiến trúc **Rust `1.94.1` (`edition = "2024"`, `resolver = "3"`)** (Khắc phục toàn bộ phát hiện từ `agile-critic` & `agile-codex`) |
-| Trạng thái | **Proposed-for-Gate-2 (Revised)** |
+| Phiên bản | **2.2** — Gate 2 Round 2 Revision: Kiến trúc **Rust `1.94.1` (`edition = "2024"`, `resolver = "3"`)** (Đóng toàn bộ phát hiện từ `agile-critic` & `agile-codex` Round 2) |
+| Trạng thái | **Proposed-for-Gate-2 (Revised Round 2)** |
 | Thành phần AI/SLM | **Không có** (Dự án thuần phần mềm hệ thống & hạ tầng mạng Mesh VPN → không áp dụng mục Kiến trúc AI) |
-| Đầu vào | [production-readiness-requirements.md](../01-discovery/production-readiness-requirements.md) (v1.2) · [product-backlog.md](../02-product-planning/product-backlog.md) (v1.2) · [tech-stack-decision.md](./tech-stack-decision.md) (v2.0) · [architecture-decision-record.md](./architecture-decision-record.md) (v2.0) · [coding-standards.md](./coding-standards.md) (v2.0) |
+| Đầu vào | [production-readiness-requirements.md](../01-discovery/production-readiness-requirements.md) (v1.2) · [product-backlog.md](../02-product-planning/product-backlog.md) (v1.2) · [tech-stack-decision.md](./tech-stack-decision.md) (v2.0) · [architecture-decision-record.md](./architecture-decision-record.md) (v2.2) · [coding-standards.md](./coding-standards.md) (v2.2) |
 | Tài liệu đi kèm | [database-design.md](./database-design.md) · [api-design.md](./api-design.md) |
 
 ---
@@ -26,16 +26,16 @@ Hệ thống **Mesh VPN** là mạng phủ cá nhân (Personal Overlay Network) 
    - Ngay từ Milestone 1, client kết nối trực tiếp tới `IP:port` của VPS kèm mã ghim khóa công khai `sha256:<64_hex>` (băm SHA-256 trên `subjectPublicKeyInfo` DER của server). `SpkiPinVerifier` dùng `x509-cert` (`RustCrypto`) để kiểm tra khung thời gian hiệu lực (`not_before <= now <= not_after`, phân loại `ErrorKind::ClockSkew` theo `US-003 AC5`) + trích xuất chính xác lát cắt `subjectPublicKeyInfo` DER (hỗ trợ cả ECDSA P-256 và RSA theo `US-003 AC7`), đối chiếu `ConstantTimeEq` với `PinSet`, và ủy quyền kiểm tra chữ ký bắt tay TLS (`verify_tls12_signature` / `verify_tls13_signature`) cho `rustls::crypto::ring::default_provider().signature_verification_algorithms`. Chế độ Domain + Public CA (`SEC-04(a)`) dùng `rustls-webpki` + `rustls-native-certs`. **Cấm tuyệt đối TOFU (Trust-On-First-Use)** và **không tồn tại cờ tắt kiểm tra chứng chỉ/pin** trong bản phát hành. Tái phát hành chứng chỉ X.509 giữ nguyên khóa định danh ECDSA P-256 của server giúp client không bao giờ phải pin lại.
 4. **Cổng & Địa chỉ Cấu hình Tùy chỉnh, Di chuyển Không Mất Danh tính (`GNFR-11`, `SEC-15`, `ADR-009`, `US-074`)**:
    - Không mã hóa cứng cổng `443` hay `3478` ngoài `mesh_core::defaults`. Cổng Relay và STUN được phân phối động qua trường `relay_map` trong `NetmapSnapshot`. Khi đổi cổng/IP/chế độ TLS, `mesh-server` mở `ListenerSet` lắng nghe song song cổng cũ và cổng mới trong cửa sổ `transition_window`, giữ nguyên `NodeId`, khóa node, tên và `OverlayIp`.
-5. **Cô lập Kênh Quản trị theo Đặc quyền OS & Tách 2 Socket IPC trên Client (`SEC-14`, `ADR-006`, `US-012`, `US-039 AC5`, `US-052`, `US-073`)**:
+5. **Cô lập Kênh Quản trị theo Đặc quyền OS & Tách Riêng Thư Mục Runtime IPC Giữa `mesh-server` và `meshd` (`SEC-14`, `ADR-006`, `US-012`, `US-039 AC5`, `US-052`, `US-056`, `US-073`, `Codex R2 #3`)**:
    - **Tuyệt đối cấm** mở Admin API trên IP public, IP overlay hay TCP loopback `127.0.0.1` trần.
-   - Trên **VPS Linux (`mesh-server`)**: CLI `mesh` giao tiếp qua Unix Domain Socket `/run/mesh/admin.sock` (`0660 mesh:mesh-admin` trong thư mục `/run/mesh` `0750 mesh:mesh-admin`). `crates/mesh-sys::ipc_linux` đọc `(pid, uid, primary_gid)` từ `SO_PEERCRED` và nếu chưa khớp thì truy vấn danh sách **nhóm phụ (supplementary groups)** của `uid` qua `getpwuid_r` + `getgrouplist` để cho phép tài khoản admin thuộc nhóm `mesh-admin` (`US-012 AC4`).
-   - Trên **Client (`meshd` ở macOS, Linux, Windows)**: tách đồng nhất thành **2 điểm cuối IPC theo mức đặc quyền**:
+   - Trên **VPS Linux (`mesh-server`)**: CLI `mesh` giao tiếp qua Unix Domain Socket **`/run/mesh-server/admin.sock`** (`0660 mesh:mesh-admin` trong thư mục **`/run/mesh-server`** qua `RuntimeDirectory=mesh-server`, mode **`0750 mesh:mesh-admin`**; thư mục trạng thái `/var/lib/mesh/` `0700 mesh:mesh`, log `/var/log/mesh/mesh-server.log`). `crates/mesh-sys::ipc_linux` đọc `(pid, uid, primary_gid)` từ `SO_PEERCRED` và nếu chưa khớp thì truy vấn danh sách **nhóm phụ (supplementary groups)** của `uid` qua `getpwuid_r` + `getgrouplist` để cho phép tài khoản admin thuộc nhóm `mesh-admin` (`US-012 AC4`).
+   - Trên **Client (`meshd` ở macOS, Linux, Windows)**: dùng thư mục runtime **`/var/run/meshd`** (trên Linux tương ứng `/run/meshd` qua `RuntimeDirectory=meshd`, mode **`0755`**, owner `root:wheel` trên macOS / `root:root` trên Linux; thư mục trạng thái Linux tách riêng tại **`/var/lib/meshd/`** `0700 root:root` và log **`/var/log/meshd/meshd.log`** `0750 root:root` để không bao giờ ghi đè quyền với `mesh-server` trên cùng VPS `US-056`) và tách đồng nhất thành **2 điểm cuối IPC theo mức đặc quyền**:
      1. **Kênh Admin (Mutating + Read — `up`, `down`, `set`, `rotate-key`, `cleanup`, `bugreport`)**:
-        - macOS: `/var/run/mesh/meshd-admin.sock` (`0660 root:admin`). Kiểm tra `getpeereid` (`uid == 0`) hoặc đọc đầy đủ `libc::xucred` qua `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` kiểm tra `xucred.cr_groups[..cr_ngroups]` chứa `gid == 80` (`admin`), kèm fallback `getpwuid_r` + `getgrouplist` khi `cr_ngroups == XU_NGROUPS` (`16`).
-        - Linux: `/run/mesh/meshd-admin.sock` (hoặc `/var/run/mesh/meshd-admin.sock`, `0660 root:mesh-admin`), kiểm tra `uid == 0` hoặc supplementary group `mesh-admin`.
+        - macOS: **`/var/run/meshd/meshd-admin.sock`** (`0660 root:admin` `gid=80`). Kiểm tra `getpeereid` (`uid == 0`) hoặc đọc đầy đủ `libc::xucred` qua `getsockopt(SOL_LOCAL, LOCAL_PEERCRED)` kiểm tra `xucred.cr_groups[..cr_ngroups]` chứa `gid == 80` (`admin`), kèm fallback `getpwuid_r` + `getgrouplist` khi `cr_ngroups == XU_NGROUPS` (`16`).
+        - Linux: **`/var/run/meshd/meshd-admin.sock`** (`0660 root:mesh-admin` hoặc `0600 root:root` nếu nhóm `mesh-admin` chưa tồn tại trên máy lẻ), kiểm tra `SO_PEERCRED` (`uid == 0` hoặc supplementary group `mesh-admin` qua `getgrouplist`).
         - Windows: Named Pipe `\\.\pipe\mesh-agent-admin` (SDDL DACL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` chỉ `LocalSystem` + `Administrators` + `FILE_FLAG_FIRST_PIPE_INSTANCE`).
      2. **Kênh Read-Only (`meshd-ro` — cho phép user thường gọi `mesh status`, `mesh peers`, `mesh ping`, `mesh netcheck` không cần `sudo`/Admin theo `US-039 AC5`)**:
-        - macOS & Linux: `/var/run/mesh/meshd-ro.sock` (`0666` trong thư mục `/var/run/mesh` `0755`), gắn `axum::Router` chỉ-đọc riêng biệt (chỉ có 4 route đọc, `DefaultBodyLimit::max(4096)`, 0 secret).
+        - macOS & Linux: **`/var/run/meshd/meshd-ro.sock`** (`0666` trong thư mục **`/var/run/meshd`** `0755`), gắn `axum::Router` chỉ-đọc riêng biệt (chỉ có 4 route đọc, `DefaultBodyLimit::max(4096)`, 0 secret).
         - Windows: Named Pipe `\\.\pipe\mesh-agent-ro` (SDDL DACL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)` + `FILE_FLAG_FIRST_PIPE_INSTANCE`), gắn cùng router chỉ-đọc.
    - Listener Quan sát (`/healthz`, `/readyz`, `/metrics`) nằm trên một `axum::Router` và socket chỉ-đọc hoàn toàn tách biệt.
 6. **Không Bao Giờ Làm Hỏng Mạng Máy Thật (`G4`, `REL-08`, `REL-09`, `ADR-007`, `US-016`, `US-055`, `US-060`)**:
@@ -73,7 +73,7 @@ flowchart TD
     AcmeCA["Let's Encrypt / ACME CA (Tùy chọn)<br/>(TLS-ALPN-01 hoặc DNS-01)"]
     AlertSink["Kênh Cảnh Báo Cá Nhân (Should)<br/>(Webhook / Telegram / Email)"]
 
-    Admin -->|"SSH + CLI cục bộ qua Unix Socket<br/>(/run/mesh/admin.sock - SEC-14)"| MeshSystem
+    Admin -->|"SSH + CLI cục bộ qua Unix Socket<br/>(/run/mesh-server/admin.sock - SEC-14)"| MeshSystem
     MobileUser -->|"CLI mesh status / ping / up / set<br/>(Local IPC có kiểm chứng quyền OS)"| MacNode
     MobileUser -->|"CLI mesh status / ping / up / set<br/>(Named Pipe SDDL)"| WinNode
 
@@ -103,13 +103,13 @@ flowchart TB
             ControlApi["Control REST & Netmap WS (/v1/...)<br/>(axum + tokio-rustls + RateLimiter)"]
             BlindRelay["Blind Relay Router (/v1/relay)<br/>(mpsc::channel(256) + try_send + TokenBucket)"]
             StunServer["STUN UDP Server (UDP cấu hình, mặc định 3478)<br/>(RFC 5389 Binding + RateLimit 100 pkt/s/IP)"]
-            AdminIpcSrv["Admin IPC Server (/run/mesh/admin.sock)<br/>(0660 mesh:mesh-admin + SO_PEERCRED + getgrouplist)"]
+            AdminIpcSrv["Admin IPC Server (/run/mesh-server/admin.sock)<br/>(0660 mesh:mesh-admin + SO_PEERCRED + getgrouplist)"]
             ObsSrv["Read-Only Observability Server<br/>(127.0.0.1:9091 -> /healthz, /readyz, /metrics)"]
             RedbStore["mesh-store (redb 2.4 ACID MVCC)<br/>(/var/lib/mesh/control.redb 0600 + emergency-revocations.bin 64 KiB)"]
         end
 
         subgraph VpsNodeProc["Tiến trình meshd trên VPS (Tùy chọn US-056 - vps.mesh.internal, User: root/CAP_NET_ADMIN)"]
-            VpsAgent["meshd Agent (Linux)<br/>(/dev/net/tun mesh0 + SO_MARK 0x5d56 + ip rule table 51820)"]
+            VpsAgent["meshd Agent (Linux: /var/lib/meshd & /var/run/meshd)<br/>(/dev/net/tun mesh0 + SO_MARK 0x5d56 + ip rule table 51820)"]
         end
 
         VpsCli["mesh CLI (Admin / Node)<br/>Chạy qua SSH"]
@@ -117,7 +117,7 @@ flowchart TB
 
     subgraph ClientOS["Máy Client: macOS 13+ (arm64/x86_64) hoặc Windows 10/11 x64"]
         subgraph DaemonProc["Tiến trình meshd (macOS: root:wheel LaunchDaemon | Windows: LocalSystem Service)"]
-            AgentIpc["Local Agent IPC (Tách 2 kênh Admin & Read-Only)<br/>macOS/Linux: meshd-admin.sock (0660) & meshd-ro.sock (0666)<br/>Win: \\.\pipe\mesh-agent-admin (SDDL SY+BA) & mesh-agent-ro"]
+            AgentIpc["Local Agent IPC (Tách 2 kênh Admin & Read-Only)<br/>macOS/Linux: /var/run/meshd/meshd-admin.sock (0660) & meshd-ro.sock (0666)<br/>Win: \\.\pipe\mesh-agent-admin (SDDL SY+BA) & mesh-agent-ro"]
             ControlClient["Control & Relay WS Client<br/>(SpkiPinVerifier x509-cert + ExponentialBackoff)"]
             MagicSock["MagicSocket (1 tokio::net::UdpSocket)<br/>(Ràng IP_BOUND_IF / IP_UNICAST_IF / SO_MARK)"]
             WgEngine["WireGuard Sans-I/O Engine<br/>(defguard_boringtun::noise::Tunn + PeerMap Diff)"]
@@ -236,7 +236,7 @@ flowchart TD
 | `mesh-crypto` | `mesh-core` | **Duy nhất** import `crypto_box`, `x25519-dalek`, `chacha20poly1305`, `sha2`, `subtle`, `x509-cert`, `rustls-webpki`, `rustls-native-certs`, `rcgen` |
 | `mesh-proto` | `mesh-core`, `mesh-crypto` | `unsafe_code = "forbid"`, `clippy::indexing_slicing = "deny"`, bắt buộc có `proptest!` |
 | `mesh-net` | `mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-sys` | Định nghĩa Trait + In-Memory Fake; tách file `*_linux.rs`, `*_macos.rs`, `*_windows.rs` |
-| `mesh-store` | `mesh-core`, `mesh-crypto`, `mesh-proto` | **Duy nhất** import `redb`; có `emergency-revocations.bin` (64 KiB A/B slots) + `AtomicU64` `netmap_version`; cấm xóa/sửa bảng `audit_events` |
+| `mesh-store` | `mesh-core`, `mesh-crypto`, `mesh-proto` | **Duy nhất** import `redb`; có `emergency-revocations.bin` (64 KiB A/B slots, compaction & fail-closed boot) + `MonotonicNetmapVersion` (`VERSION_LEASE_STEP = 1_024`); cấm xóa/sửa bảng `audit_events` |
 | `mesh-datapath` | `mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-net` | **Duy nhất** import `defguard_boringtun`; tái sử dụng buffer tĩnh `[u8; 2048]` |
 | `mesh-server` | `mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-store`, `mesh-net` | Chạy quyền user `mesh` không đặc quyền trên VPS Linux |
 | `meshd` | `mesh-core`, `mesh-crypto`, `mesh-proto`, `mesh-datapath`, `mesh-net` | Giới hạn `tokio` `worker_threads(2)`, `thread_stack_size(512 * 1024)` |
@@ -253,7 +253,7 @@ sequenceDiagram
     autonumber
     actor Admin as "Chủ mạng (Admin)"
     participant SrvCli as "mesh CLI (trên VPS)"
-    participant AdminSock as "mesh-server Admin IPC<br/>(/run/mesh/admin.sock)"
+    participant AdminSock as "mesh-server Admin IPC<br/>(/run/mesh-server/admin.sock)"
     participant Store as "mesh-store (redb)"
     participant ClientCli as "mesh CLI (Client)"
     participant Daemon as "meshd Daemon (Client)"
@@ -267,7 +267,7 @@ sequenceDiagram
     SrvCli-->>Admin: "In lệnh: mesh up --server IP:port --server-pin sha256:... --authkey-file ..."
 
     Admin->>ClientCli: "Chạy mesh up --server IP:port --server-pin sha256:... --authkey-file key.txt --name macbook"
-    ClientCli->>Daemon: "POST /v1/agent/up (qua meshd-admin.sock 0660 LOCAL_PEERCRED / Named Pipe SDDL)"
+    ClientCli->>Daemon: "POST /v1/agent/up (qua /var/run/meshd/meshd-admin.sock 0660 LOCAL_PEERCRED / Named Pipe SDDL)"
     Daemon->>Daemon: "1. Tải hoặc sinh cặp khóa X25519 (node_key, disco_key) lưu 0600 (US-001)"
     Daemon->>Ctrl: "2. Bắt tay TLS 1.3 (rustls)"
     Daemon->>Daemon: "SpkiPinVerifier dùng x509-cert kiểm tra NotBefore..NotAfter + trích xuất SPKI DER,<br/>so sánh ConstantTimeEq với PinSet + kiểm tra chữ ký TLS bằng ring (SEC-04c, BLK-G2-04)"
@@ -281,7 +281,7 @@ sequenceDiagram
         Daemon->>Ctrl: "4. POST /v1/nodes/register kèm 4 headers:<br/>X-Mesh-Challenge-Id, X-Mesh-Node-Pubkey, X-Mesh-Box-Nonce, X-Mesh-Auth-Proof"
         Ctrl->>Ctrl: "Xóa nguyên tử challenge_id (chống replay 100%) + Mở SalsaBox kiểm tra method/path/body_sha256/timestamp<br/>Standalone: đối chiếu ConstantTimeEq(tls_exporter_binding) | ReverseProxy(trusted_proxies): bỏ qua bước so sánh exporter"
         Ctrl->>Ctrl: "Băm sha256(preauth_key) + so sánh ConstantTimeEq"
-        Ctrl->>Store: "5. 1 WriteTransaction ACID duy nhất (US-004, US-005, US-007):<br/>- Kiểm tra Idempotency theo idx_nodes_pubkey (Từ chối 401 nếu NodeStatus::Expired)<br/>- Kiểm tra NodeName hợp lệ & không trùng idx_nodes_name<br/>- Cấp OverlayIp từ dải 100.115.0.0/16 (dọn idx_nodes_overlay_ip nếu tái cấp IP hết quarantine)<br/>- Đánh dấu preauth_key = used + Cấp netmap_version = max(prev+1, now_ms) + append_audit"
+        Ctrl->>Store: "5. 1 WriteTransaction ACID duy nhất (US-004, US-005, US-007, Codex R2 #1):<br/>- Kiểm tra Idempotency theo idx_nodes_pubkey (Từ chối 401 nếu NodeStatus::Expired)<br/>- Kiểm tra NodeName hợp lệ & không trùng idx_nodes_name<br/>- Cấp OverlayIp từ dải 100.115.0.0/16 (dọn idx_nodes_overlay_ip nếu tái cấp IP hết quarantine)<br/>- Đánh dấu preauth_key = used + Cấp netmap_version = current + 1 & netmap_version_watermark + append_audit"
         Store-->>Ctrl: "NodeRecord { node_id, overlay_ip, netmap_version }"
         Ctrl-->>Daemon: "200 OK { node_id, overlay_ip, netmap_snapshot, relay_map }"
         Daemon->>Daemon: "Ghi bền bootstrap config (chỉ lưu server + pin, không lưu cứng cổng STUN/Relay - US-004 AC7)"
@@ -333,15 +333,15 @@ sequenceDiagram
     end
 ```
 
-### 3.3. Luồng 3: Thu Hồi Khẩn Cấp Thiết Bị Bị Mất (`mesh node revoke`) — Ưu Tiên Cắt Trong RAM + Ghi Tệp Cấp Cứu Định Sẵn `emergency-revocations.bin` Khi Đĩa Đầy `ENOSPC` (`US-013 AC4`, `US-029`, `US-030`, `HR-G2-03`, `Codex #5, #6`)
+### 3.3. Luồng 3: Thu Hồi Khẩn Cấp Thiết Bị Bị Mất (`mesh node revoke`) — Ưu Tiên Cắt Trong RAM + 3 Mức Bền Vững `persistence_tier` (`redb` / `emergency_slot` / `ram_only`) (`US-013 AC4`, `US-029`, `US-030`, `HR-G2-03`, `Codex #5, #6`, `Codex R2 #1, #2, #3`)
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Admin as "Chủ mạng (Admin qua SSH)"
     participant Cli as "mesh CLI"
-    participant AdminIpc as "mesh-server Admin IPC<br/>(/run/mesh/admin.sock)"
-    participant RamState as "In-Memory State<br/>(RevokedSet + AtomicU64 netmap_version)"
+    participant AdminIpc as "mesh-server Admin IPC<br/>(/run/mesh-server/admin.sock)"
+    participant RamState as "In-Memory State<br/>(RevokedSet + MonotonicNetmapVersion)"
     participant Store as "mesh-store (redb +<br/>emergency-revocations.bin 64 KiB)"
     participant RelayHub as "Blind Relay & Netmap Stream Hub"
     participant LostLaptop as "Laptop Bị Mất (Node L)"
@@ -351,8 +351,8 @@ sequenceDiagram
     Cli->>AdminIpc: "POST /v1/admin/nodes/{id}/revoke (UDS + SO_PEERCRED / getgrouplist)"
     AdminIpc->>AdminIpc: "Kiểm chứng SO_PEERCRED + supplementary group mesh-admin"
 
-    Note over AdminIpc,RamState: "BƯỚC 1: Thực thi phòng vệ trong RAM TRƯỚC TIÊN (< 100 ms - US-013 AC4)"
-    AdminIpc->>RamState: "1. Chèn (NodeId(L), pubkey_L) vào RevokedSet trong RAM<br/>2. Cấp netmap_version mới đơn điệu = max(prev + 1, now_unix_ms)<br/>3. Kích hoạt cancel_token.cancel() của phiên Node L"
+    Note over AdminIpc,RamState: "BƯỚC 1: Thực thi phòng vệ trong RAM TRƯỚC TIÊN (< 100 ms, ram_enforced = true - US-013 AC4)"
+    AdminIpc->>RamState: "1. Chèn (NodeId(L), pubkey_L) vào RevokedSet trong RAM<br/>2. Cấp netmap_version mới đơn điệu (next = current + 1 <= persisted_watermark)<br/>3. Kích hoạt cancel_token.cancel() của phiên Node L"
     RamState->>RelayHub: "Ngắt tức thì kết nối WebSocket Relay & Control của Node L"
     RelayHub-->>LostLaptop: "Gửi Control Event { code: 'node_revoked' } + Đóng WebSocket (< 100 ms)"
     LostLaptop->>LostLaptop: "Nhận 'node_revoked' qua kênh TLS hợp lệ -> Dừng retry tự động (US-034 AC5)"
@@ -360,19 +360,27 @@ sequenceDiagram
     RelayHub-->>PeerA: "Đẩy NetmapSnapshot/Delta mới (đã loại Node L) tới mọi peer online (P95 <= 5s)"
     PeerA->>PeerA: "PeerMap::apply_diff() -> Xóa Tunn của Node L khỏi RAM ngay lập tức (<= 2s - US-030)<br/>Mọi phiên SSH/TCP từ L bị cắt đứt tức thì"
 
-    Note over AdminIpc,Store: "BƯỚC 2: Ghi bền xuống redb + Ghi đè tại chỗ vào tệp cấp cứu 64 KiB khi đĩa đầy (ENOSPC)"
-    AdminIpc->>Store: "WriteTx: cập nhật status = Revoked, quarantine IP 24h, lưu netmap_version, append_audit"
-    alt "Đĩa hoạt động bình thường"
+    Note over AdminIpc,Store: "BƯỚC 2: Ghi bền theo 3 mức persistence_tier ('redb' | 'emergency_slot' | 'ram_only' - Codex R2 #2)"
+    AdminIpc->>Store: "WriteTx: cập nhật status = Revoked, quarantine IP 24h, lưu netmap_version & watermark, append_audit"
+    alt "Tier 1: Đĩa hoạt động bình thường (persistence_tier = 'redb')"
         Store-->>AdminIpc: "Commit OK"
         AdminIpc->>AdminIpc: "Ghi log INFO event='node_revoked' ra journald/stderr"
-        AdminIpc-->>Cli: "200 OK { status: 'revoked', persisted: true, netmap_version }"
-    else "Đĩa đầy (ENOSPC) hoặc lỗi I/O trên redb"
-        Store->>Store: "Ghi đè tại chỗ (pwrite + fsync, 0 cấp phát block mới) vào Slot A/B (32 KiB)<br/>của tệp định sẵn /var/lib/mesh/emergency-revocations.bin (kèm min_netmap_version & CRC32)"
-        Store-->>AdminIpc: "EmergencySlotPersisted (disk_degraded = true)"
-        AdminIpc->>AdminIpc: "GIỮ NGUYÊN trạng thái đã cắt trong RevokedSet RAM & tệp cấp cứu!<br/>(Khởi động lại khi đĩa đầy vẫn nạp emergency-revocations.bin -> KHÔNG BAO GIỜ hồi sinh node đã thu hồi)<br/>Đặt /readyz = 503 + Xuất bản ghi Audit mức CRITICAL ra stderr/journald (US-013 AC4)"
-        AdminIpc-->>Cli: "200 OK { status: 'revoked_emergency_slot', persisted: true, disk_degraded: true }"
+        AdminIpc-->>Cli: "200 OK { revoked: true, ram_enforced: true, persisted: true, persistence_tier: 'redb' }"
+    else "Tier 2: redb bị ENOSPC nhưng pwrite + sync_data vào Slot A/B (64 KiB) thành công"
+        Store->>Store: "Loại bỏ mục đã commit trong redb; nếu chưa vượt trần (500 nodes / 250 keys),<br/>pwrite + sync_data (0 xin block mới) vào Slot A/B của /var/lib/mesh/emergency-revocations.bin"
+        Store-->>AdminIpc: "EmergencySlotPersisted (disk_degraded = true, /readyz = 503)"
+        AdminIpc->>AdminIpc: "Ghi log CRITICAL event='emergency_revoke_persisted_to_emergency_slot'<br/>Tự động compaction về redb ngay khi đĩa có chỗ trống lại"
+        AdminIpc-->>Cli: "200 OK { revoked: true, ram_enforced: true, persisted: true, persistence_tier: 'emergency_slot' }"
+    else "Tier 3: Lỗi phần cứng EIO/EROFS trên cả 2 tầng hoặc tràn 500 mục chưa hợp nhất"
+        Store-->>AdminIpc: "RamOnlyEnforced (disk_degraded = true, /readyz = 503, giữ nguyên mục cũ trên đĩa)"
+        AdminIpc->>AdminIpc: "Giữ chặn trong RevokedSet RAM + Ghi log CRITICAL event='emergency_revoke_ram_only_unpersisted'"
+        AdminIpc-->>Cli: "200 OK { revoked: true, ram_enforced: true, persisted: false, persistence_tier: 'ram_only' }<br/>(CLI in cảnh báo khẩn cấp ra stderr yêu cầu sửa đĩa trước khi restart mesh-server)"
     end
 ```
+
+> **Bảo toàn tính đơn điệu & Chống hồi sinh sau khi khởi động lại (`Codex R2 #1, #2`)**:
+> 1. **High-Watermark Lease (`VERSION_LEASE_STEP = 1_024`)**: Lúc khởi động lại (kể cả khi đồng hồ NTP bị kéo lùi + crash), `mesh-server` tính `boot_base = db_netmap_version.max(db_watermark).max(emergency_slot.min_netmap_version)` (độc lập với `now_unix_ms`) và ghi bền ngay `initial_watermark = boot_base + 1_024` trước khi mở cổng mạng.
+> 2. **Fail-Closed Boot**: Nếu `control.redb` đã tồn tại mà `/var/lib/mesh/emergency-revocations.bin` bị mất/ngắn hơn `65_536 B` hoặc **cả `Slot A` lẫn `Slot B` đều hỏng `magic`/`crc32`**, `mesh-server` dừng khởi động ngay (`exit != 0`), tuyệt đối không mở cổng mạng.
 
 ### 3.4. Luồng 4: Phục Hồi Sau Đổi Mạng (`Roaming`), `Sleep/Wake` & Lỗi TLS Tạm Thời trên macOS & Windows (`US-034 AC4/AC5`, `US-035`, `US-036`)
 
@@ -429,7 +437,7 @@ sequenceDiagram
     actor LocalAdmin as "Admin Cục Bộ Máy Client<br/>(root/admin macOS | Admin Win)"
 
     Admin->>SrvCli: "mesh server migrate-endpoint --tcp-port 8443 --stun-port 3479 --transition-window 24h"
-    SrvCli->>Srv: "POST /v1/admin/server/migrate-endpoint (qua /run/mesh/admin.sock)"
+    SrvCli->>Srv: "POST /v1/admin/server/migrate-endpoint (qua /run/mesh-server/admin.sock)"
     Srv->>Srv: "1. Thử bind trước TCP :8443 và UDP :3479 (US-046 AC5)<br/>Nếu cổng đang bị chiếm -> Từ chối ngay, giữ nguyên cổng cũ 443/3478!"
     Srv->>Srv: "2. Mở thêm listener :8443 trong ListenerSet (nghe song song :443 và :8443)<br/>3. Ghi cấu hình mới + PinSet (active_pin, next_pin) vào redb + append_audit<br/>4. Tăng netmap_version"
 
@@ -446,7 +454,7 @@ sequenceDiagram
 
     Note over OfflineAgent,LocalAdmin: "Khôi phục máy Offline sau khi cổng cũ đã đóng (US-074 AC5)"
     LocalAdmin->>OfflineAgent: "Chạy: mesh set --server <IP:8443> --server-pin sha256:..."
-    OfflineAgent->>OfflineAgent: "Kiểm tra quyền IPC trên meshd-admin.sock (LOCAL_PEERCRED uid=0/cr_groups gid=80)<br/>hoặc Named Pipe mesh-agent-admin SDDL SY+BA (Nếu gọi qua meshd-ro.sock -> 404/PermissionDenied ngay!)"
+    OfflineAgent->>OfflineAgent: "Kiểm tra quyền IPC trên /var/run/meshd/meshd-admin.sock (LOCAL_PEERCRED uid=0/cr_groups gid=80)<br/>hoặc Named Pipe mesh-agent-admin SDDL SY+BA (Nếu gọi qua meshd-ro.sock -> 404/PermissionDenied ngay!)"
     OfflineAgent->>OfflineAgent: "Cập nhật bootstrap config, giữ nguyên node.key & OverlayIp cũ"
     OfflineAgent->>Srv: "Kết nối tới :8443 bằng đúng node_key cũ (Không cần pre-auth key mới!)"
 ```
@@ -527,7 +535,7 @@ Mọi socket đi ra Internet của `meshd` (bao gồm `MagicSocket` UDP và mọ
    - Chọn mặc định **`100.115.0.0/16`** (nằm trong dải RFC 6598 `100.64.0.0/10` nhưng tách biệt khỏi dải `100.64.0.0/24` thường dùng của ISP CGNAT và tránh hoàn toàn `192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12` của LAN/Docker).
    - Trước khi cài route (lúc khởi động hoặc khi roaming sang mạng 4G CGNAT), `meshd` kiểm tra toàn bộ địa chỉ/subnet của các card mạng vật lý đang hoạt động: nếu phát hiện một interface vật lý có IP/subnet chồng lấn với `overlay_cidr`, `meshd` **từ chối cài route chồng chéo**, giữ mạng máy thật an toàn, ghi cảnh báo `WARN` (`event = "overlay_subnet_conflict"`) và hiển thị trạng thái `"overlay_conflict"` trong `mesh status` (`US-037 AC1`).
 
-### 4.3. Lớp 3 — Bộ Lọc Card Mạng Ảo & Endpoint Ứng Viên (`US-011 AC4`, `US-016 AC2`, `US-020 AC2/AC4`, `US-056`, `Codex #8`)
+### 4.3. Lớp 3 — Bộ Lọc Card Mạng Ảo & Endpoint Ứng Viên Phân Biệt Rõ UDP vs TCP (`US-011 AC4`, `US-016 AC2`, `US-020 AC2/AC4`, `US-056`, `Codex #8`, `Codex R2 #4`)
 
 Khi thu thập `endpoints[]` cục bộ hoặc khi nhận danh sách `endpoints[]` của peer từ Netmap/Disco, hàm `mesh_net::endpoint_filter::is_valid_candidate_endpoint()` tự động loại bỏ:
 1. Bất kỳ địa chỉ IP nào nằm trong `overlay_cidr` (vd. `100.115.0.0/16`), loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), multicast, broadcast hoặc unspecified (`0.0.0.0`, `::`).
@@ -535,9 +543,9 @@ Khi thu thập `endpoints[]` cục bộ hoặc khi nhận danh sách `endpoints[
    - **macOS**: `utun*` (bao gồm cả `utun` của iCloud Private Relay và VPN khác), `awdl0`, `llw0`, `bridge*`, `anpi*`, `gif*`, `stf*`, `ap1`, `vmnet*`, `vboxnet*`, `lo*`.
    - **Windows**: adapter Wintun `MeshVPN`, các vEthernet của WSL / Hyper-V / Docker Desktop, Loopback Pseudo-Interface, Teredo/ISATAP.
    - **Linux**: `mesh*`, `lo`, `docker*`, `br-*`, `veth*`, `virbr*`, `cni*`, `flannel*`, `cali*`, `wg*`, `tailscale*`.
-3. **Loại bỏ chính xác cặp `SocketAddr` (`IP:port`) trùng với `control_tcp_endpoint` hoặc `stun_udp_endpoint` của `mesh-server` (nhưng CHO PHÉP IP public của VPS ở cổng UDP khác cho `vps.mesh.internal` — `US-056`, `Codex #8`)**:
-   - Bộ lọc chỉ chặn đúng cặp `<vps_public_ip>:<control_port>` và `<vps_public_ip>:<stun_port>` để ngăn dò đường Disco bắn nhầm vào cổng Control/STUN.
-   - Khi VPS đồng thời chạy `meshd` làm node `vps.mesh.internal` (`US-056`) trên cổng UDP của `MagicSocket` (vd. `<vps_public_ip>:51820`), endpoint `<vps_public_ip>:51820` **được giữ nguyên 100%** để các client thiết lập đường hầm Direct P2P UDP trực tiếp tới VPS.
+3. **Chỉ từ chối khi trùng cặp `SocketAddr` UDP của `stun_udp_endpoint` (`<vps_ip>:<stun_udp_port>`), KHÔNG từ chối khi trùng số cổng với `control_tcp_endpoint` (`US-020 AC2/AC4`, `US-056`, `Codex R2 #4`)**:
+   - Vì `CandidateEndpoint` mang giao thức tầng 4 **UDP** (dùng cho `MagicSocket` WireGuard/Disco/STUN), trong khi `control_tcp_endpoint` chạy trên giao thức tầng 4 **TCP**, hàm `is_valid_candidate_endpoint()` chỉ từ chối ứng viên trùng cặp `SocketAddr` UDP của `stun_udp_endpoint` (`<vps_ip>:<stun_udp_port>`).
+   - **Vector kiểm thử bắt buộc (`Codex R2 #4`)**: Với `control_tcp_endpoint = 203.0.113.10:51820 (TCP)` và `stun_udp_endpoint = 203.0.113.10:3478 (UDP)` $\to$ ứng viên UDP `203.0.113.10:51820` được **CHẤP NHẬN (`true`)** cho Direct P2P của `vps.mesh.internal` (`US-056`), còn ứng viên UDP `203.0.113.10:3478` bị **TỪ CHỐI (`false`)**!
 
 ### 4.4. Lớp 4 — Chống Vòng Lặp DNS trong Khối `hosts` (`PLAT-04`, `US-004 AC3`, `US-038 AC5`, `US-056 AC2`)
 
@@ -631,24 +639,24 @@ mesh-vpn/
     │       ├── lib.rs
     │       ├── control.rs              # DTOs cho /v1/auth/challenge (challenge_id), /v1/nodes/register, /v1/endpoints, /v1/disco/call-me-maybe
     │       ├── netmap.rs               # NetmapSnapshot, PeerDescriptor, RelayMap, PinSet, ClientControlFrame, ServerControlFrame
-    │       ├── stun.rs                 # Codec STUN RFC 5389/8489 ((buf[3]&3)==0, 0x2112A442, XOR-MAPPED-ADDRESS, FINGERPRINT)
+    │       ├── stun.rs                 # Codec STUN RFC 5389/8489 ((len_lo&3)==0, 0x2112A442, XOR-MAPPED-ADDRESS, FINGERPRINT)
     │       ├── disco.rs                # Định dạng nhị phân b"MESHDS" (MIN_DISCO_PACKET_LEN = 172) + DiscoPayload + IngressSource
     │       ├── relay.rs                # Định dạng frame nhị phân Blind Relay (0x01 Client->Peer, 0x02 Relay->Client, 0x03 KeepAlive)
-    │       ├── admin_ipc.rs            # DTOs cho Server Local Admin IPC (/run/mesh/admin.sock)
-    │       └── agent_ipc.rs            # DTOs cho Client CLI <-> Daemon IPC (meshd-admin.sock & meshd-ro.sock / Named Pipes)
+    │       ├── admin_ipc.rs            # DTOs cho Server Local Admin IPC (/run/mesh-server/admin.sock, gồm persistence_tier)
+    │       └── agent_ipc.rs            # DTOs cho Client CLI <-> Daemon IPC (/var/run/meshd/meshd-admin.sock & meshd-ro.sock / Named Pipes)
     │
     ├── mesh-store/                     # [Lib - Tầng 2] Lưu trữ ACID thuần Rust trên redb 2.4
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs
     │       ├── schema.rs               # Định nghĩa 9 TableDefinition của redb & phiên bản migration
-    │       ├── store.rs                # ControlStore: mở DB, check_integrity(), AtomicU64 netmap_version = max(prev+1, now_ms)
+    │       ├── store.rs                # ControlStore: mở DB, check_integrity(), MonotonicNetmapVersion (VERSION_LEASE_STEP = 1_024)
     │       ├── nodes_repo.rs           # Đăng ký Idempotent (chặn Expired, dọn idx_nodes_overlay_ip khi tái cấp IP hết quarantine)
     │       ├── keys_repo.rs            # Tạo/liệt kê/thu hồi Pre-Auth Key, hỗ trợ --for <node> & reusable/ephemeral
     │       ├── identity_repo.rs        # ServerIdentity (Secret<Vec<u8>>) tách khỏi StoredServerIdentityDto (không Debug)
     │       ├── audit_repo.rs           # Bảng audit_events chỉ append (cấm xóa/sửa) + fallback stderr/journald
-    │       ├── revoked_ram.rs          # RevokedSet RAM + pre-allocated 64 KiB emergency-revocations.bin (Slot A/B 32 KiB)
-    │       └── backup.rs               # Hot Atomic Snapshot Backup + SHA-256 + giữ 7 bản + Restore (US-045)
+    │       ├── revoked_ram.rs          # RevokedSet RAM + 64 KiB emergency-revocations.bin (Slot A/B 32 KiB, compaction, fail-closed boot)
+    │       └── backup.rs               # Hot Atomic Snapshot Backup + SHA-256 + giữ 7 bản + Restore (US-045, nhảy watermark +1_000_000)
     │
     ├── mesh-net/                       # [Lib - Tầng 2] Trừu tượng hóa mạng/OS bằng Trait + Fake trong bộ nhớ
     │   ├── Cargo.toml
@@ -656,8 +664,8 @@ mesh-vpn/
     │       ├── lib.rs
     │       ├── sysexec.rs              # Thực thi lệnh hệ thống bằng đường dẫn tuyệt đối cố định (0 shell)
     │       ├── ledger.rs               # ResourceLedger nguyên tử (ledger.json 0600, gồm cả linux_routing_table & linux_ip_rules)
-    │       ├── keystore.rs             # Đọc/ghi khóa 0600 (root:wheel macOS, root Linux, SYSTEM+Admins Windows)
-    │       ├── endpoint_filter.rs      # Lọc card mạng ảo + chặn đúng SocketAddr Control/STUN (giữ IP VPS cho vps.mesh.internal)
+    │       ├── keystore.rs             # Đọc/ghi khóa 0600 (/var/db/mesh macOS, /var/lib/meshd Linux, ProgramData\Mesh Windows)
+    │       ├── endpoint_filter.rs      # Lọc card mạng ảo + chặn đúng SocketAddr UDP của STUN (không chặn trùng cổng TCP Control)
     │       ├── tun.rs                  # Trait TunDevice + FakeTunDevice
     │       ├── tun_linux.rs            # AsyncTunDevice cho Linux (/dev/net/tun)
     │       ├── tun_macos.rs            # AsyncTunDevice cho macOS (utun[0-9]+, xử lý 4-byte AF_INET header)
@@ -675,8 +683,8 @@ mesh-vpn/
     │       ├── netmon_macos.rs         # Theo dõi PF_ROUTE
     │       ├── netmon_windows.rs       # Theo dõi NotifyIpInterfaceChange + Windows PowerEvent
     │       ├── ipc.rs                  # Trait PrivilegeIpc & phân loại CallerPrivilege (Admin vs ReadOnly)
-    │       ├── ipc_linux.rs            # Dual UDS (meshd-admin.sock 0660 & meshd-ro.sock 0666) + SO_PEERCRED + getgrouplist
-    │       ├── ipc_macos.rs            # Dual UDS (meshd-admin.sock 0660 & meshd-ro.sock 0666) + LOCAL_PEERCRED xucred.cr_groups
+    │       ├── ipc_linux.rs            # Dual UDS (/var/run/meshd/meshd-admin.sock 0660 & meshd-ro.sock 0666) + SO_PEERCRED + getgrouplist
+    │       ├── ipc_macos.rs            # Dual UDS (/var/run/meshd/meshd-admin.sock 0660 & meshd-ro.sock 0666) + LOCAL_PEERCRED xucred.cr_groups
     │       ├── ipc_windows.rs          # Dual Named Pipes (mesh-agent-admin SDDL SY+BA & mesh-agent-ro SDDL SY+BA+AU)
     │       ├── firewall_linux.rs       # Firewall opt-in có dry-run + auto-rollback 90s, giữ SSH (US-046)
     │       ├── firewall_macos.rs       # Kiểm tra socketfilterfw opt-in & anchor pf riêng (US-073 AC6)
@@ -687,6 +695,8 @@ mesh-vpn/
     │   └── src/
     │       ├── lib.rs
     │       ├── magic_socket.rs         # 1 tokio::net::UdpSocket demuxer trên static buffer [u8; 2048]
+    │       ├── rebind.rs               # Ràng lại socket vào NIC vật lý mới (IP_BOUND_IF / IP_UNICAST_IF / SO_MARK) & rebind local_udp_port
+    │       ├── stun_client.rs          # Gửi STUN Binding Request trên MagicSocket, đo Reflexive Endpoint & phân loại NAT 1-IP/2-IP
     │       ├── peer_map.rs             # Bảng Peer & defguard_boringtun::noise::Tunn, áp Netmap theo diff (US-010)
     │       ├── cryptokey.rs            # Kiểm chứng chặt AllowedIPs = /32 & tùy chọn packet filter (SEC-11, US-018)
     │       ├── disco_engine.rs         # Bảng pending_pings, đục lỗ đồng thời, tách IngressSource::{DirectUdp, Relay}
@@ -705,7 +715,7 @@ mesh-vpn/
     │       ├── netmap_hub.rs           # Quản lý WebSocket /v1/netmap/stream (hỗ trợ cả ClientControlFrame::EndpointUpdate/CallMeMaybe)
     │       ├── relay_hub.rs            # Blind Relay /v1/relay: mpsc::channel(256) + try_send() + TokenBucket 20 Mbps
     │       ├── stun_service.rs         # Dịch vụ UDP STUN RFC 5389 trên cổng cấu hình (giới hạn 100 pkt/s/IP)
-    │       ├── admin_service.rs        # Router quản trị trên /run/mesh/admin.sock (SO_PEERCRED + getgrouplist mesh-admin)
+    │       ├── admin_service.rs        # Router quản trị trên /run/mesh-server/admin.sock (SO_PEERCRED + getgrouplist mesh-admin)
     │       ├── obs_service.rs          # Listener chỉ-đọc tách biệt (/healthz, /readyz, /metrics)
     │       └── alert_worker.rs         # Cảnh báo cá nhân tối giản (chứng chỉ, đĩa, relay, key expiry - US-049)
     │
@@ -713,11 +723,12 @@ mesh-vpn/
     │   ├── Cargo.toml
     │   └── src/
     │       ├── main.rs                 # Khởi tạo tokio (2 worker threads, stack 512 KiB), chạy daemon hoặc Windows Service
-    │       ├── config.rs               # Bootstrap config (chỉ lưu server_endpoint + PinSet) & netmap-cache.json
+    │       ├── config.rs               # Bootstrap config (chỉ lưu server_endpoint + PinSet, 0600)
+    │       ├── netmap_cache.rs         # Lưu/nạp netmap-cache.json (local_udp_port + SHA-256 checksum, US-019 AC1, US-033 AC2/AC3)
     │       ├── supervisor.rs           # Quản lý CancellationToken + TaskTracker, đảm bảo Graceful Shutdown <= 5s
     │       ├── control_loop.rs         # Kết nối Control, đồng bộ Netmap, xử lý chuyển tiếp cổng (US-074)
     │       ├── roaming_loop.rs         # Xử lý sự kiện từ NetMonitor & ClockJumpDetector (US-035, US-036)
-    │       ├── ipc_service.rs          # Phục vụ 2 Router độc lập trên meshd-admin.sock & meshd-ro.sock (hoặc 2 Named Pipes)
+    │       ├── ipc_service.rs          # Phục vụ 2 Router độc lập trên /var/run/meshd/meshd-admin.sock & meshd-ro.sock (hoặc 2 Named Pipes)
     │       ├── ping_probe.rs           # Thực thi lệnh mesh ping <peer> và mesh netcheck
     │       └── service_windows.rs      # Tích hợp Windows Service Control Manager & PowerEvent (cfg(windows))
     │
@@ -727,7 +738,7 @@ mesh-vpn/
             ├── main.rs                 # runtime current_thread, phân tích lệnh clap
             ├── cli.rs                  # Định nghĩa toàn bộ cấu trúc lệnh mesh <noun> <verb>
             ├── client_cmds.rs          # status/peers/ping/netcheck (-> meshd-ro) & up/down/set/rotate-key/cleanup/bugreport (-> meshd-admin)
-            ├── admin_cmds.rs           # preauthkey, node, server, backup, restore, hardening-check (-> /run/mesh/admin.sock)
+            ├── admin_cmds.rs           # preauthkey, node, server, backup, restore, hardening-check (-> /run/mesh-server/admin.sock)
             └── output.rs               # Định dạng bảng dễ đọc cho người dùng & --json ổn định cho script
 ```
 
@@ -797,7 +808,7 @@ flowchart LR
 - **Quy tắc Khởi động Tự Dọn Dẹp (Startup Crash Recovery)**:
   - Ngay bước đầu tiên khi `meshd` khởi động (trước khi tạo bất kỳ tài nguyên mới nào), nó đọc `ledger.json`. Nếu phát hiện còn tài nguyên của phiên trước chưa được đánh dấu `cleaned = true`, `meshd` dọn sạch đúng danh sách tài nguyên đó (gỡ đúng route CIDR, gỡ đúng `ip rule` & bảng route `51820` trên Linux, xóa khối `# BEGIN mesh … # END mesh`, gỡ anchor `pf` `com.internal.mesh`, xóa adapter Wintun `MeshVPN` bị kẹt), hoàn toàn không đụng tới bất kỳ `utunK` hay quy tắc tường lửa nào khác của máy!
 
-### 6.5. Tách Biệt Tuyệt Đối Listener Quan Sát và Kênh Admin (`SEC-14`, `OPS-05`, `OPS-06`, `BLK-G2-03`)
+### 6.5. Tách Biệt Tuyệt Đối Listener Quan Sát và Kênh Admin (`SEC-14`, `OPS-05`, `OPS-06`, `BLK-G2-03`, `Codex R2 #3`)
 
 ```mermaid
 flowchart TB
@@ -810,10 +821,10 @@ flowchart TB
         ObsRouter["axum::Router Độc lập (Read-Only)<br/>CHỈ có: GET /healthz, GET /readyz, GET /metrics<br/>0 route thay đổi trạng thái, 0 secret"]
     end
 
-    subgraph PrivilegedLocal["Kênh Quản trị Cục bộ (Kiểm chứng Đặc quyền OS)"]
-        AdminUds["Server: /run/mesh/admin.sock (0660 mesh:mesh-admin)<br/>Kiểm tra SO_PEERCRED + getgrouplist (uid==0 | mesh | mesh-admin)<br/>Client Admin: meshd-admin.sock (0660) / mesh-agent-admin<br/>Client Read-Only: meshd-ro.sock (0666) / mesh-agent-ro"]
+    subgraph PrivilegedLocal["Kênh Quản trị Cục bộ (Kiểm chứng Đặc quyền OS & Tách Thư mục Runtime)"]
+        AdminUds["Server: /run/mesh-server/admin.sock (0660 mesh:mesh-admin trong /run/mesh-server 0750)<br/>Kiểm tra SO_PEERCRED + getgrouplist (uid==0 | mesh | mesh-admin)<br/>Client Admin: /var/run/meshd/meshd-admin.sock (0660) / mesh-agent-admin<br/>Client Read-Only: /var/run/meshd/meshd-ro.sock (0666) / mesh-agent-ro"]
     end
 ```
 
 - Các nhóm giao tiếp trên sử dụng **các `axum::Router` và listener hoàn toàn riêng biệt**, không dùng chung middleware hay route table.
-- Lệnh `mesh server hardening-check` (`US-046 AC4`) tự động kiểm tra: tiến trình `mesh-server` không chạy dưới `root`, quyền `/run/mesh/admin.sock` không lỏng hơn `0660`, tệp `/var/lib/mesh/emergency-revocations.bin` (`64 KiB`, `0600`) đã được cấp phát sẵn trên đĩa, không có listener Admin trên TCP, và cảnh báo nếu bật Reverse Proxy mà chưa cấu hình `trusted_proxies`.
+- Lệnh `mesh server hardening-check` (`US-046 AC4`) tự động kiểm tra: tiến trình `mesh-server` không chạy dưới `root`, quyền thư mục `/run/mesh-server` là `0750 mesh:mesh-admin` và `/run/mesh-server/admin.sock` không lỏng hơn `0660`, tệp `/var/lib/mesh/emergency-revocations.bin` (`64 KiB`, `0600`, có ít nhất 1 slot A/B hợp lệ CRC32) đã được cấp phát sẵn trên đĩa, không có listener Admin trên TCP, và cảnh báo nếu bật Reverse Proxy mà chưa cấu hình `trusted_proxies`.

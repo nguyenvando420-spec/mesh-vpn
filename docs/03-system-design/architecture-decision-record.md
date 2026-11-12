@@ -4,7 +4,7 @@
 |---|---|
 | Tác giả | `agile-tech-lead` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **2.1 (Gate 2 Round 1 Revision)** — Cập nhật đồng bộ 100% sang **Rust `1.94.1` Stack** theo quyết định của Người dùng (2026-11-12 21:01) và phản biện độc lập `agile-critic` + `agile-codex` |
+| Phiên bản | **2.2 (Gate 2 Round 2 Revision)** — Cập nhật đồng bộ 100% sang **Rust `1.94.1` Stack** theo quyết định của Người dùng (2026-11-12 21:01) và đóng dứt điểm toàn bộ phát hiện phản biện độc lập Vòng 1 & Vòng 2 của `agile-critic` + `agile-codex` |
 | Trạng thái chung | **Accepted-by-User (ADR-001) / Proposed-for-Gate-2 (ADR-002..011)** |
 | Phạm vi | Quyết định công nghệ và ranh giới an toàn hệ thống. Giao thức chi tiết (schema bản tin, DB tables, C4) do `agile-architect` thiết kế dựa trên các ràng buộc bất biến trong tài liệu này |
 | Liên kết | [tech-stack-decision.md](./tech-stack-decision.md) · [coding-standards.md](./coding-standards.md) · [`.agents/rules/coding-standards.md`](../../.agents/rules/coding-standards.md) |
@@ -60,7 +60,7 @@
    - Chỉ riêng **`crates/mesh-sys/Cargo.toml` KHÔNG đặt `[lints] workspace = true`**, mà tự khai báo `[lints.rust]` (`unsafe_code = "allow"`, `unsafe_op_in_unsafe_fn = "deny"`) và `[lints.clippy]` (`undocumented_unsafe_blocks = "deny"`, `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`, `indexing_slicing = "deny"`, v.v.) kèm chú thích `// SAFETY:` bắt buộc trên mọi khối `unsafe`.
 3. **Chiến lược Pure-Rust / Zero-C**: cấm các crate bọc thư viện C lớn (`openssl-sys`, `libsqlite3-sys`/`rusqlite`, `libsodium-sys`); bắt buộc đặt `default-features = false` và chọn rõ feature `ring` trên toàn bộ các crate TLS (`rustls`, `tokio-rustls`, `rcgen`, `instant-acme`, `reqwest`) để chặn hoàn toàn `aws-lc-rs` (vốn đòi CMake + NASM trên Windows).
 4. **Cấu hình Release Profile nhỏ nhẹ**: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, `panic = "abort"`.
-5. **Toolchain & Cross-compile (`scripts/bootstrap-toolchain.ps1`)**: cưỡng chế `rustc 1.94.1` và kiểm tra SHA-256 ở chế độ **fail-closed** (`Assert-FileSha256`). Hỗ trợ cả chế độ gọn nhẹ `-Mode PortableZig` (cài host toolchain `1.94.1-x86_64-pc-windows-gnu` và tải 5 gói prebuilt chính thức: `winlibs MinGW-w64 GCC 16.2.0 UCRT`, `Zig 0.13.0`, `cargo-deny 0.20.2`, `cargo-zigbuild v0.24.1`, `apple-codesign / rcodesign 0.29.0` để biên dịch cả `proc-macro`/`build.rs` như `ring` lẫn binary trên Windows không có `link.exe`, đồng thời cross-compile ra Linux `musl` và macOS `arm64`/`x86_64`) lẫn chế độ `-Mode Msvc`, kết hợp GitHub Actions matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`).
+5. **Toolchain & Cross-compile (`scripts/bootstrap-toolchain.ps1`)**: cưỡng chế `rustc 1.94.1` và kiểm tra SHA-256 ở chế độ **fail-closed** (`Assert-FileSha256`) kết hợp hàm dùng chung `Install-CommonPrebuiltTools` và kiểm tra thực thi (`Invoke-CheckedVersion`) cho cả 2 chế độ: (a) `-Mode PortableZig` (cài host toolchain `1.94.1-x86_64-pc-windows-gnu`, tải `winlibs MinGW-w64 GCC 16.2.0 UCRT` kèm 4 gói prebuilt dùng chung `Zig 0.13.0`, `cargo-deny 0.20.2`, `cargo-zigbuild v0.24.1`, `apple-codesign / rcodesign 0.29.0` để biên dịch cả `proc-macro`/`build.rs` như `ring` lẫn binary trên Windows không có `link.exe`, đồng thời cross-compile ra Linux `musl` và macOS `arm64`/`x86_64`) và (b) `-Mode Msvc` (cài VS 2022 C++ Build Tools qua `winget`, thêm `rustup` targets và cài cùng bộ 4 gói prebuilt có kiểm SHA-256), kết hợp GitHub Actions matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`).
 
 ### Consequences
 - **(+) Tích cực**: Đạt đúng mục tiêu của người dùng về hiệu năng, không GC, RAM ~4–18 MB, binary ~3–6 MB, xóa khóa tức thì bằng `ZeroizeOnDrop`, và loại trừ hoàn toàn lỗi bộ nhớ trong toàn bộ tầng giao thức.
@@ -209,25 +209,29 @@
 
 ### Decision
 1. Dùng **`redb` `2.4`** duy nhất trong `crates/mesh-store` với các bảng định kiểu (`TableDefinition`):
-   - `schema_meta`: phiên bản schema hiện hành và lịch sử migration.
+   - `schema_meta`: phiên bản schema hiện hành, lịch sử migration, `netmap_version` hiện tại và `netmap_version_watermark` (`u64` High-Watermark Lease).
    - `server_identity`: khóa định danh server (đã bọc bảo vệ, quyền tệp DB `0600`), tập pin (`active_pin`, `next_pin`), cấu hình cổng/chế độ hiện hành.
    - `nodes`: `NodeId -> NodeRecord` (tên, `overlay_ip`, `node_pubkey`, `disco_pubkey`, `key_expiry`, `status`, `created_at`…).
    - `idx_nodes_pubkey`: `[u8; 32] -> NodeId` và `idx_nodes_overlay_ip`: `u32 -> NodeId` — kiểm tra và ghi cùng trong 1 `WriteTransaction` để cưỡng chế tính duy nhất tuyệt đối (`UNIQUE(public_key)`, `UNIQUE(overlay_ip)` — `REL-02`, `US-005`).
    - `preauth_keys`: `KeyId -> PreAuthKeyRecord` và `idx_preauth_hash`: `[u8; 32] -> KeyId`.
    - `audit_events`: `u64 (seq) -> AuditRecord` — tầng store chỉ cung cấp hàm `append_audit`, **không tồn tại bất kỳ hàm sửa/xóa bản ghi nào** (`US-013 AC2`).
-2. **Kiểm tra toàn vẹn khi khởi động (`US-007 AC3`)**: Gọi `db.check_integrity()` khi mở DB; nếu phát hiện lỗi, dừng khởi động kèm thông báo hướng dẫn chạy `mesh-server restore`.
-3. **Cơ chế Thu hồi Khẩn cấp trong RAM + Tệp Cấp phát Sẵn khi Đầy Đĩa (`US-013 AC4`, `HR-G2-03`)**:
+2. **Kiểm tra toàn vẹn, Fail-Closed lúc Boot & Khôi phục High-Watermark Lease (`US-007 AC3`, `Codex R2 #1, #2`)**:
+   - Gọi `db.check_integrity()` khi mở `control.redb`; nếu phát hiện lỗi, dừng khởi động kèm thông báo hướng dẫn chạy `mesh-server restore`.
+   - Nếu `control.redb` đã tồn tại mà thiếu tệp `/var/lib/mesh/emergency-revocations.bin` hoặc **cả 2 Slot A và B đều hỏng `magic`/`crc32`**, `mesh-server` **fail-closed dừng khởi động** (hướng dẫn kiểm tra đĩa / `restore`), tuyệt đối không mở cổng mạng để tránh hồi sinh node đã thu hồi (`Codex R2 #2`).
+   - Khi khởi động, lấy `boot_base = max(db_netmap_version, db_watermark, emergency_slot.min_netmap_version)` (không phụ thuộc đồng hồ hệ thống bị lùi!), lập tức ghi bền `new_watermark = boot_base + 1_024` vào `redb` (hoặc `emergency-revocations.bin` nếu `ENOSPC`; nếu cả hai lỗi I/O lúc boot thì **fail-closed** từ chối mở cổng) rồi mới phục vụ (`Codex R2 #1`).
+3. **`MonotonicNetmapVersion` (High-Watermark Lease `VERSION_LEASE_STEP = 1_024`) & Ngữ nghĩa Trung thực của `emergency-revocations.bin` (`US-013 AC4`, `HR-G2-03`, `Codex R2 #1, #2`)**:
    - `mesh-server` duy trì tập `RevokedSet` (`RwLock<HashSet<NodeId>>` và `HashSet<KeyId>`) trong bộ nhớ làm nguồn chặn tức thì trước mọi quyết định Control/Relay.
-   - `netmap_version` được cấp theo công thức đơn điệu có sàn thời gian thực: `next_version = max(current_version + 1, now_unix_ms)` để đảm bảo kể cả khi `redb` không ghi được rồi tiến trình khởi động lại, `netmap_version` mới không bao giờ lùi thấp hơn bản mà client đã cache.
-   - Ngay khi khởi tạo DB lần đầu, `mesh-store` tạo sẵn tệp cố định `/var/lib/mesh/emergency-revocations.bin` dung lượng **64 KiB** (đã `fallocate` / ghi đầy byte `0` trước trên đĩa, quyền `0600`, có header + CRC32).
+   - **High-Watermark Lease cho `netmap_version` chống lùi version khi đồng hồ hệ thống bị kéo lùi + crash**: không phụ thuộc `now_unix_ms` trong hàm cấp phát runtime (`next = current + 1`), nhờ đó việc đồng hồ NTP nhảy tiến rồi lùi không làm phình hay tụt bộ đếm. Bảo toàn bất biến **`next <= persisted_watermark`** trước khi phát bất kỳ `netmap_version` nào ra mạng (kể cả cập nhật `online/offline` trong RAM): `schema_meta["netmap_version_watermark"]` (và trường `min_netmap_version` trong `emergency-revocations.bin`) luôn đi trước `current` một khoảng `VERSION_LEASE_STEP = 1_024`.
+   - Ngay khi khởi tạo DB lần đầu, `mesh-store` tạo sẵn tệp cố định `/var/lib/mesh/emergency-revocations.bin` dung lượng **64 KiB** (`posix_fallocate` / ghi đầy byte `0` trước trên đĩa, quyền `0600`, gồm 2 slot A/B 32 KiB có `magic`, `seq`, `min_netmap_version` và `crc32`).
    - Với thao tác thông thường (`register`, `create key`, `rename`): nếu `write_tx.commit()` thất bại (vd. `ENOSPC`), thao tác bị từ chối (*fail-closed*) và `/readyz` chuyển sang `503` (`US-007 AC5`).
-   - Với thao tác phòng vệ khẩn cấp (`node revoke`, `preauthkey revoke`, `node expire`): cập nhật `RevokedSet` trong RAM, tăng `netmap_version` trong RAM, đẩy Netmap mới và ngắt kết nối Relay/Control của kẻ xâm nhập **ngay lập tức**; sau đó cố gắng ghi `redb`. Nếu `redb` trả về lỗi `ENOSPC`, `mesh-store` ghi đè vào vùng 64 KiB đã cấp phát sẵn của `emergency-revocations.bin` (`pwrite` + `fsync`, không cần xin thêm block đĩa mới) và xuất bản ghi audit mức `CRITICAL` ra `stderr`/`journald`. Khi `mesh-server` khởi động lại, nó luôn nạp hợp nhất cả `redb` lẫn `emergency-revocations.bin` trước khi mở cổng mạng!
-4. **Sao lưu nóng nguyên tử (`US-045`)**:
+   - Với thao tác phòng vệ khẩn cấp (`node revoke`, `preauthkey revoke`, `node expire`): cập nhật `RevokedSet` trong RAM, tăng `netmap_version` trong RAM, đẩy Netmap mới và ngắt kết nối Relay/Control của kẻ xâm nhập **ngay lập tức** (`ram_enforced: true`); sau đó cố gắng ghi `redb`. Nếu `redb` thất bại (vd. `ENOSPC`), trước khi ghi slot cấp cứu, `mesh-store` **tự động thu gọn (loại bỏ)** các mục thu hồi đã có mặt bền vững trong `control.redb`, rồi ghi đè tại chỗ vào vùng 64 KiB đã cấp phát sẵn của `emergency-revocations.bin` (`pwrite` + `sync_data`, **0 cấp phát block mới khi `ENOSPC`**).
+   - **Ngữ nghĩa trung thực khi lỗi phần cứng đĩa hoặc tràn slot (`Codex R2 #2`)**: không tuyên bố `pwrite`/`sync_data` luôn thành công vô điều kiện — nếu phần cứng đĩa lỗi `EIO`/`EROFS` khiến cả `redb` lẫn `emergency-revocations.bin` đều thất bại, hoặc nếu sau khi thu gọn mà số mục chưa hợp nhất vẫn chạm trần cứng (`500` node / `250` key, `slot_full`), thao tác thu hồi vẫn cắt kết nối và giữ chặn trong `RevokedSet` RAM (`ram_enforced: true`), đặt `disk_degraded = true` (`/readyz = 503`), ghi log `CRITICAL` ra `stderr`/`journald`, nhưng **trả trung thực `persisted: false`** (không âm thầm ghi đè mất mục chưa lưu) để CLI cảnh báo rõ trên `stderr`.
+4. **Sao lưu nóng nguyên tử & Khôi phục Nhảy Watermark (`US-045`, `Codex R2 #1`)**:
    - Mở `ReadTransaction` trên DB đang chạy (không chặn ghi), sao chép toàn bộ các bảng (bao gồm `server_identity`) sang tệp `redb` tạm trong thư mục backup (`0700`), gọi `commit()` + `sync_all()`, mở lại tệp tạm kiểm tra `check_integrity()`, tính băm SHA-256 ghi ra `<backup>.db.sha256`, đổi tên nguyên tử (`rename`) với quyền `0600`, và xoay vòng giữ 7 bản gần nhất.
-   - Lệnh `restore <file>` kiểm tra khớp `.sha256`, kiểm tra `check_integrity()` và xác nhận có `server_identity` hợp lệ trước khi khôi phục (`US-045 AC4/AC6`).
+   - Lệnh `restore <backup.db>` kiểm tra khớp `.sha256`, kiểm tra `check_integrity()`, xác nhận có `server_identity` hợp lệ, và nhảy `restored_base = max(backup_wm, existing_local_wm, now_unix_ms) + 1_000_000` (kèm cờ tùy chọn `--min-netmap-version`) trước khi khôi phục (`US-045 AC4/AC6`).
 
 ### Consequences
-- **(+) Tích cực**: 100% Pure Rust, không phụ thuộc C compiler, tốc độ đọc từ MVCC cực nhanh, sao lưu nóng an toàn không chặn luồng đăng ký.
+- **(+) Tích cực**: 100% Pure Rust, không phụ thuộc C compiler, tốc độ đọc từ MVCC cực nhanh, sao lưu nóng an toàn không chặn luồng đăng ký, và bảo toàn tính đơn điệu `netmap_version` kể cả khi đồng hồ NTP bị kéo lùi.
 - **(−) Chi phí / Giảm thiểu**: Các bảng chỉ mục phụ (`idx_nodes_pubkey`, `idx_nodes_overlay_ip`) được duy trì tường minh trong hàm giao dịch của `mesh-store` → bắt buộc có unit test và property test kiểm tra bất biến chỉ mục sau 100 lần crash/rollback mô phỏng (`US-007 AC2`).
 
 ---
@@ -249,23 +253,25 @@
    - Bị cấm trực tiếp bởi `SEC-14(2)(b)`.
 
 ### Decision
-1. **Kênh Admin của `mesh-server` trên VPS Linux (`US-012`, `US-046`, `BLK-G2-03`)**:
-   - Chỉ lắng nghe trên Unix Domain Socket `/run/mesh/admin.sock` (thư mục `/run/mesh` quyền `0750` thuộc `mesh:mesh-admin`, socket quyền `0660` thuộc `mesh:mesh-admin`).
+1. **Kênh Admin của `mesh-server` trên Ubuntu Linux VPS (`US-012`, `US-046`, `BLK-G2-03`, `Codex R2 #3`)**:
+   - Sử dụng thư mục runtime riêng biệt **`/run/mesh-server`** (`RuntimeDirectory=mesh-server`, mode **`0750`**, owner **`mesh:mesh-admin`**) để không bao giờ xung đột quyền/owner với thư mục runtime của `meshd` khi VPS kiêm node (`US-056`).
+   - Chỉ lắng nghe trên Unix Domain Socket **`/run/mesh-server/admin.sock`** (mode **`0660`**, owner **`mesh:mesh-admin`**).
    - Ngay khi nhận kết nối `tokio::net::UnixStream`, gọi `stream.peer_cred()` (sử dụng `SO_PEERCRED` của kernel Linux) lấy `(uid, gid, pid)`: vì `SO_PEERCRED` chỉ trả về `gid` chính (primary group) của người gọi, `mesh-sys::ipc_linux` kiểm tra: cho phép nếu `uid == 0` (`root`), `uid == service_uid`, `gid == admin_gid`, **hoặc** `uid` thuộc nhóm phụ (supplementary group) `mesh-admin` thông qua `getpwuid_r` + `getgrouplist`. Ghi `uid` và `pid` vào bản ghi Audit (`SEC-09`).
-2. **Tách 2 Kênh IPC của `meshd` trên Client (macOS, Linux, Windows — `US-039 AC5`, `US-052 AC3`, `US-073 AC3/AC4`, `BLK-G2-03`, Codex `#11`)**:
-   - Để đáp ứng đồng thời hai yêu cầu: (a) tài khoản quản trị viên máy (`admin` trên macOS, `Administrators` trên Windows, `root` trên Linux) chạy được lệnh thay đổi trạng thái mà không bị kẹt quyền tệp socket, và (b) tài khoản user thường chạy được `mesh status` / `mesh ping` / `mesh netcheck` chỉ-đọc với 0 khóa bí mật, `meshd` mở **2 kênh IPC tách biệt hoàn toàn**:
+2. **Tách 2 Kênh IPC của `meshd` trong Thư mục Runtime Riêng `/var/run/meshd` (macOS 13+, Linux Node/Lab, Windows — `US-039 AC5`, `US-052 AC3`, `US-073 AC3/AC4`, `US-056`, `BLK-G2-03`, `Codex R2 #3`)**:
+   - Trên macOS và Linux, `meshd` sử dụng thư mục runtime riêng **`/var/run/meshd`** (trên Linux tương ứng `/run/meshd` qua `RuntimeDirectory=meshd`, mode **`0755`**, owner `root:wheel` trên macOS / `root:root` trên Linux; kiểm tra chống symlink trên các thành phần đường dẫn cha).
+   - Để đáp ứng đồng thời hai yêu cầu: (a) tài khoản quản trị viên máy (`admin` trên macOS, `Administrators` trên Windows, `root`/`mesh-admin` trên Linux) chạy được lệnh thay đổi trạng thái mà không bị kẹt quyền tệp socket, và (b) tài khoản user thường chạy được `mesh status` / `mesh ping` / `mesh netcheck` chỉ-đọc với 0 khóa bí mật, `meshd` mở **2 kênh IPC tách biệt hoàn toàn**:
      - **Kênh Admin (Read/Write — `up`, `down`, `cleanup`, `set`, `rotate-key`, `bugreport`)**:
-       - **macOS**: `/var/run/mesh/meshd-admin.sock` có mode `0660` thuộc `root:admin` (`gid = 80`). Khi nhận kết nối, `mesh-sys::ipc_macos` đọc `LOCAL_PEERCRED` (`struct xucred`): cho phép nếu `cr_uid == 0` hoặc mảng nhóm `cr_groups` chứa `80` (`admin`) (nếu `cr_ngroups == 16` bị cắt ngọn thì fallback kiểm tra bằng `getpwuid_r` + `getgrouplist`).
-       - **Linux Client**: `/var/run/mesh/meshd-admin.sock` có mode `0660` thuộc `root:root` (hoặc `root:mesh-admin` nếu nhóm tồn tại), kiểm tra `SO_PEERCRED` + `getgrouplist`.
-       - **Windows**: Named Pipe `\\.\pipe\mesh-agent-admin` tạo bằng `CreateNamedPipeW` với SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (`LocalSystem` + `Administrators`) và cờ `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+       - **macOS**: **`/var/run/meshd/meshd-admin.sock`** có mode **`0660`** thuộc **`root:admin`** (`gid = 80`). Khi nhận kết nối, `mesh-sys::ipc_macos` kiểm tra `getpeereid` (`uid == 0`) hoặc đọc `LOCAL_PEERCRED` (`struct xucred`): cho phép nếu `cr_uid == 0` hoặc mảng nhóm `cr_groups` chứa `80` (`admin`) (nếu `cr_ngroups == 16` bị cắt ngọn thì fallback kiểm tra bằng `getpwuid_r` + `getgrouplist`).
+       - **Linux Node/Lab**: **`/var/run/meshd/meshd-admin.sock`** có mode **`0660`** thuộc **`root:mesh-admin`** (hoặc **`0600 root:root`** nếu nhóm `mesh-admin` chưa tạo trên máy lẻ), kiểm tra `SO_PEERCRED` + `getgrouplist`.
+       - **Windows**: Named Pipe **`\\.\pipe\mesh-agent-admin`** tạo bằng `CreateNamedPipeW` với SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` (`LocalSystem` + `Administrators`) và cờ `FILE_FLAG_FIRST_PIPE_INSTANCE`.
      - **Kênh Chỉ-Đọc Chẩn Đoán (Read-Only — chỉ gắn 4 route `GET /v1/agent/status`, `GET /v1/agent/peers`, `POST /v1/agent/ping`, `POST /v1/agent/netcheck`, giới hạn body ≤ 4 KiB, 0 trường bí mật)**:
-       - **macOS & Linux**: `/var/run/mesh/meshd-ro.sock` có mode `0666` thuộc `root:wheel` / `root:root` (nằm trong thư mục `/var/run/mesh` quyền `0755` thuộc `root`, kiểm tra chống symlink trên toàn bộ đường dẫn cha).
-       - **Windows**: Named Pipe `\\.\pipe\mesh-agent-ro` với SDDL chỉ cấp quyền đọc/ghi thông điệp trên pipe này cho `Authenticated Users` (`AU`), tách biệt hoàn toàn khỏi router Admin.
+       - **macOS & Linux**: **`/var/run/meshd/meshd-ro.sock`** có mode **`0666`**, owner `root:wheel` / `root:root` (nằm trong `/var/run/meshd` mode `0755`).
+       - **Windows**: Named Pipe **`\\.\pipe\mesh-agent-ro`** với SDDL chỉ cấp quyền đọc/ghi thông điệp trên pipe này cho `Authenticated Users` (`AU`), tách biệt hoàn toàn khỏi router Admin.
 3. **Listener Quan sát Chỉ-Đọc riêng biệt (`OPS-05`, `OPS-06`, `US-044`, `US-048`)**:
    - Một instance `axum::Router` hoàn toàn độc lập, mặc định chỉ bind `127.0.0.1:<obs_port>` (hoặc IP overlay nếu bật tường minh), **chỉ đăng ký đúng 3 route `GET /healthz`, `GET /readyz`, `GET /metrics`**, không chia sẻ router hay middleware với kênh Admin.
 
 ### Consequences
-- **(+) Tích cực**: Loại bỏ 100% nguy cơ leo thang đặc quyền từ mạng overlay, từ SSRF trên VPS dùng chung, hoặc từ user không có quyền quản trị trên máy macOS/Windows.
+- **(+) Tích cực**: Loại bỏ 100% nguy cơ leo thang đặc quyền từ mạng overlay, từ SSRF trên VPS dùng chung, hoặc từ user không có quyền quản trị trên máy macOS/Windows; đồng thời loại bỏ hoàn toàn xung đột thư mục `/run` khi chạy đồng thời `mesh-server` và `meshd` trên cùng Ubuntu VPS (`US-056`).
 - **(−) Chi phí / Giảm thiểu**: Tách mã IPC theo OS trong `crates/mesh-net` + `crates/mesh-sys` và có bộ kiểm thử phân quyền trên cả 3 OS.
 
 ---
@@ -281,17 +287,17 @@
 - Trên macOS (`PLAT-06`, `US-060`, `US-073`), không dùng chứng chỉ Apple Developer $99/năm (không dùng NetworkExtension), kernel tự cấp số `utunN` động, `/etc/hosts` là symlink tới `/private/etc/hosts`, và Application Firewall có thể chặn UDP inbound im lặng.
 
 ### Options & Decision
-1. **Sổ cái Tài nguyên Nguyên tử (`ResourceLedger` — `REL-08`, `US-055`)**:
-   - Trước khi `meshd` tạo hoặc sửa bất kỳ tài nguyên hệ thống nào (tên `utunN` thực tế trên macOS, GUID/tên adapter Wintun trên Windows, tên `mesh0` trên Linux, danh sách route CIDR đã thêm, anchor `pf`, rule firewall, khối hosts), nó **ghi nguyên tử mục đó vào tệp `/var/db/mesh/ledger.json` (macOS) / `/var/lib/mesh/ledger.json` (Linux) / `C:\ProgramData\Mesh\ledger.json` (Windows)** với quyền `0600`.
+1. **Sổ cái Tài nguyên Nguyên tử (`ResourceLedger` — `REL-08`, `US-055`, `US-056`)**:
+   - Trước khi `meshd` tạo hoặc sửa bất kỳ tài nguyên hệ thống nào (tên `utunN` thực tế trên macOS, GUID/tên adapter Wintun trên Windows, tên `mesh0` trên Linux, danh sách route CIDR đã thêm, anchor `pf`, rule firewall, khối hosts), nó **ghi nguyên tử mục đó vào tệp `/var/db/mesh/ledger.json` (macOS) / `/var/lib/meshd/ledger.json` (Linux, quyền `0600 root:root`, tách biệt hoàn toàn khỏi `/var/lib/mesh/` `0700 mesh:mesh` của `mesh-server` trên VPS kiêm node `US-056`) / `C:\ProgramData\Mesh\ledger.json` (Windows)** với quyền `0600`.
    - Khi tắt dịch vụ (`SIGTERM`, `launchctl bootout`, Windows Service Stop — ngân sách **≤ 5 s**) hoặc khi vừa khởi động lại sau crash (`kill -9`), `meshd` đọc `ledger.json` và **chỉ dọn đúng các tài nguyên được liệt kê trong sổ cái**. Tuyệt đối cấm quét xóa theo mẫu `utun*` (bảo vệ 100% iCloud Private Relay và các VPN khác theo `US-060 AC3`, `US-055 AC6`).
-2. **Chống Routing Loop ở Tầng Socket (`REL-09`, `US-016`)**:
+2. **Chống Routing Loop ở Tầng Socket (`REL-09`, `US-016`, `NOTE-G2-R2-03`)**:
    - Mọi socket ngoại biên của `meshd` (`MagicSocket` UDP, kết nối TCP tới Control/Relay) bắt buộc được ràng cứng vào interface vật lý mặc định thông qua `mesh-sys` / `socket2` **trước khi gửi gói** và ràng lại mỗi khi sự kiện mạng báo đổi interface mặc định (`US-035 AC7`):
      - **macOS**: `setsockopt(..., IPPROTO_IP, IP_BOUND_IF, if_index)` và `IPV6_BOUND_IF`.
      - **Windows**: `setsockopt(..., IPPROTO_IP, IP_UNICAST_IF, if_index_be)` và `IPV6_UNICAST_IF`.
      - **Linux (VPS-node & Lab — `HR-G2-01`)**: `setsockopt(..., SOL_SOCKET, SO_MARK, 0x5d56)` kết hợp bảng định tuyến chính sách riêng `table 51820` và cặp quy tắc `ip rule` được ghi trước vào `ResourceLedger` (`ledger.json`):
        - `ip route replace <overlay_cidr> dev mesh0 table 51820`
-       - `ip rule add not fwmark 0x5d56 table 51820 priority 5182`
-       - `ip rule add table main suppress_prefixlength 0 priority 5181`
+       - `ip rule add priority 51820 not fwmark 0x5d56 table 51820`
+       - `ip rule add priority 51810 table main suppress_prefixlength 0`
        (Đảm bảo 100% gói UDP ngoại biên của `meshd` mang nhãn `0x5d56` luôn đi qua bảng `main` ra NIC vật lý, không bao giờ bị hút ngược vào `mesh0`).
    - Chỉ cài route cho đúng dải CIDR overlay (không cài default route `0.0.0.0/0` ở MVP); lọc bỏ mọi endpoint ứng viên nằm trong dải overlay hoặc thuộc các card ảo (`utun*`, `awdl0`, `llw0`, `bridge*`, `docker0`, `veth*`, WSL/Hyper-V — `US-020 AC2`).
 3. **Quản lý Khối `hosts` & Xả Cache DNS (`PLAT-04`, `US-038`)**:

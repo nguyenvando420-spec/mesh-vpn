@@ -4,10 +4,10 @@
 |---|---|
 | Tác giả | `agile-architect` |
 | Ngày | 2026-11-12 |
-| Phiên bản | **2.1** — Gate 2 Round 1 Revision: Thiết kế lưu trữ **`redb` `2.4` (100% Pure-Rust ACID MVCC)**, `emergency-revocations.bin` & tệp trạng thái đa nền tảng |
-| Trạng thái | **Proposed-for-Gate-2 (Revised)** |
+| Phiên bản | **2.2** — Gate 2 Round 2 Revision: Thiết kế lưu trữ **`redb` `2.4` (100% Pure-Rust ACID MVCC)**, `MonotonicNetmapVersion` High-Watermark Lease (`VERSION_LEASE_STEP = 1_024`), `emergency-revocations.bin` (Compaction & Fail-Closed Boot) & tách riêng thư mục trạng thái/IPC Linux giữa `mesh-server` và `meshd` |
+| Trạng thái | **Proposed-for-Gate-2 (Revised Round 2)** |
 | Thành phần AI/Vector DB | **Không có** (Dự án không có RAG/Vector Index) |
-| Đầu vào | [production-readiness-requirements.md](../01-discovery/production-readiness-requirements.md) (v1.2) · [product-backlog.md](../02-product-planning/product-backlog.md) (v1.2) · [tech-stack-decision.md](./tech-stack-decision.md) (v2.0) · [architecture-decision-record.md](./architecture-decision-record.md) (v2.0 `ADR-005`, `ADR-007`) · [coding-standards.md](./coding-standards.md) (v2.0) |
+| Đầu vào | [production-readiness-requirements.md](../01-discovery/production-readiness-requirements.md) (v1.2) · [product-backlog.md](../02-product-planning/product-backlog.md) (v1.2) · [tech-stack-decision.md](./tech-stack-decision.md) (v2.0) · [architecture-decision-record.md](./architecture-decision-record.md) (v2.2 `ADR-005`, `ADR-006`, `ADR-007`) · [coding-standards.md](./coding-standards.md) (v2.2) |
 | Crate thực thi | `crates/mesh-store` (trên VPS) và `crates/mesh-net::{keystore, ledger}` + `crates/meshd::config` (trên Client/Node) |
 
 ---
@@ -20,10 +20,10 @@ Theo quyết định tại **`ADR-001`** và **`ADR-005`**, hệ thống loại 
    - `redb::Database::begin_write()` cung cấp một `WriteTransaction` tuần tự hóa duy nhất tại một thời điểm, đảm bảo mọi thao tác cập nhật bảng chính (`nodes`, `preauth_keys`, `audit_events`, `schema_meta`) và các bảng chỉ mục duy nhất (`idx_nodes_pubkey`, `idx_nodes_overlay_ip`, `idx_nodes_name`, `idx_preauth_hash`) thành công cùng nhau hoặc tự động rollback hoàn toàn nếu tiến trình bị `kill -9` hay mất điện.
 2. **Đọc Không Chặn Ghi bằng MVCC (`ReadTransaction`)**:
    - `redb::Database::begin_read()` tạo snapshot cô lập dựa trên cây B-tree Copy-on-Write, không bao giờ chặn luồng `WriteTransaction` và cho phép tạo **Hot Atomic Snapshot Backup** (`US-045`) ngay khi server đang phục vụ lưu lượng.
-3. **Tách Biệt Trạng Thái Cấu Trúc Bền Vững (`redb`), Tệp Cấp Cứu Định Sẵn (`emergency-revocations.bin`) và Trạng Thái Runtime Trong RAM (`HR-03`, `HR-G2-03`, `Codex #5, #6`, `US-009 AC1`, `US-013 AC4`)**:
+3. **Tách Biệt Trạng Thái Cấu Trúc Bền Vững (`redb`), Tệp Cấp Cứu Định Sẵn (`emergency-revocations.bin`) và Trạng Thái Runtime Trong RAM (`HR-03`, `HR-G2-03`, `Codex #5, #6`, `Codex R2 #1, #2`, `US-009 AC1`, `US-013 AC4`)**:
    - Các nhịp heartbeat `last_seen_at_ms` chỉ cập nhật trong bộ nhớ RAM (`NodeRuntimePresence`), **không ghi đĩa liên tục và không bao giờ làm tăng `netmap_version`**.
-   - Bộ sinh `netmap_version` là **một biến nguyên tử `AtomicU64` duy nhất** trên `ControlState`, tăng đơn điệu tuyệt đối theo công thức `next = max(prev + 1, now_unix_ms)` qua mọi thao tác cấu trúc, cập nhật endpoint/presence lẫn khi khởi động lại.
-   - Tập thu hồi khẩn cấp `RevokedSet` trong RAM luôn được ưu tiên kiểm tra và cập nhật trước tiên (< 100 ms); khi đĩa đầy (`ENOSPC`) làm `redb` không thể cấp phát trang mới, `mesh-server` ghi đè tại chỗ (`pwrite` + `fsync`, **0 cấp phát block đĩa mới**) vào tệp cấp cứu đã cấp phát sẵn **`/var/lib/mesh/emergency-revocations.bin` (`64 KiB` chia 2 slot A/B `32 KiB`)**, đảm bảo ngay cả khi mất điện hay khởi động lại lúc đĩa vẫn đầy, thiết bị đã thu hồi **không bao giờ bị hồi sinh**.
+   - Bộ sinh `netmap_version` (`MonotonicNetmapVersion`) sử dụng **bộ đếm logic thuần túy kết hợp High-Watermark Lease bền vững (`VERSION_LEASE_STEP = 1_024`)** lưu tại `schema_meta["netmap_version_watermark"]` (và trường `min_netmap_version` trong `emergency-revocations.bin` làm bản gương khi `ENOSPC`). Trong runtime, phiên bản tăng đơn điệu thuần túy `next = current.checked_add(1)?` (**không gọi `max(..., now_unix_ms)`** trong runtime) và đảm bảo bất biến cứng `next <= persisted_watermark` trước khi phát sóng — giúp **1.023 / 1.024 lần chuyển trạng thái `online/offline` tốn 0 lượt ghi đĩa (`O(1)`)** mà vẫn chống tuyệt đối lỗi lùi version khi đồng hồ hệ thống bị NTP kéo lùi kèm crash/restart (`Codex R2 #1`).
+   - Tập thu hồi khẩn cấp `RevokedSet` trong RAM luôn được ưu tiên kiểm tra và cập nhật trước tiên (< 100 ms); khi đĩa đầy (`ENOSPC`) làm `redb` không thể cấp phát trang mới, `mesh-server` ghi đè tại chỗ (`pwrite` + `sync_data`, **0 xin thêm block filesystem mới khi đầy đĩa `ENOSPC`**) vào tệp cấp cứu đã cấp phát sẵn **`/var/lib/mesh/emergency-revocations.bin` (`64 KiB` chia 2 slot A/B `32 KiB`)**, trả rõ trạng thái bền vững qua `persistence_tier: "redb" | "emergency_slot" | "ram_only"`, tự động thu gọn (compaction) khi `redb` ghi lại được, và khởi động **fail-closed** nếu tệp cấp cứu bị mất hoặc hỏng cả 2 slot (`Codex R2 #2`).
 
 ---
 
@@ -32,8 +32,8 @@ Theo quyết định tại **`ADR-001`** và **`ADR-005`**, hệ thống loại 
 ```mermaid
 erDiagram
     SCHEMA_META {
-        string meta_key PK "current_version | netmap_version | overlay_cidr | audit_seq"
-        bytes value_json "Giá trị cấu hình/bộ đếm tuần tự hóa"
+        string meta_key PK "schema_version | netmap_version | netmap_version_watermark | overlay_cidr | audit_seq | last_alloc_ip"
+        bytes value_json "Giá trị cấu hình/bộ đếm/watermark tuần tự hóa"
     }
 
     SERVER_IDENTITY {
@@ -192,7 +192,8 @@ pub const TABLE_AUDIT_EVENTS: TableDefinition<u64, &[u8]> =
 | Khóa (`&str`) | Kiểu dữ liệu Rust | Ràng buộc & Ý nghĩa |
 |---|---|---|
 | `"schema_version"` | `u32` (hiện tại = `1`) | Phiên bản schema DB hiện hành (`US-007 AC4`). |
-| `"netmap_version"` | `u64` | Giá trị bền vững của bộ đếm `netmap_version` **tăng đơn điệu tuyệt đối** (`REL-03`, `US-009 AC1`, `HR-G2-03`, `Codex #5`). Tại runtime được quản lý bởi duy nhất 1 `AtomicU64` trên `ControlState`, khởi tạo lúc boot (và sau `restore`) bằng `max(db_schema_meta["netmap_version"], emergency_slot.min_netmap_version, now_unix_ms)` và cấp số mới qua vòng lặp CAS `next = max(prev + 1, now_unix_ms)`. |
+| `"netmap_version"` | `u64` | Phiên bản `netmap_version` mới nhất đã được ghi nhận trong một `WriteTransaction` của `redb` (`REL-03`, `US-009 AC1`). |
+| `"netmap_version_watermark"` | `u64` | Mức trần **High-Watermark Lease (`VERSION_LEASE_STEP = 1_024`)** đã được ghi bền trên đĩa (`Codex R2 #1`). Mọi giá trị `next` trước khi phát ra mạng (cả giao dịch `redb` lẫn sự kiện `online/offline` chỉ-trong-RAM) đều bắt buộc thỏa **`next <= persisted_watermark`**. Lúc khởi động lại sau crash/lùi đồng hồ, `boot_base = db_netmap_version.max(db_watermark).max(emergency_slot.min_netmap_version)` (hoàn toàn độc lập với đồng hồ tường `now_unix_ms`) và server ghi bền ngay `initial_watermark = boot_base + VERSION_LEASE_STEP` trước khi mở cổng mạng. |
 | `"audit_seq"` | `u64` (khởi đầu = `0`) | Bộ đếm thứ tự bản ghi `audit_events` tăng đơn điệu (`US-013`). |
 | `"overlay_cidr"` | `OverlayCidr` (mặc định `"100.115.0.0/16"`) | Dải CIDR đã khóa khi khởi tạo; từ chối tự ý đổi dải khi đã có node (`US-008 AC3`). |
 | `"last_alloc_ip"` | `u32` | Con trỏ cấp phát IP vòng tròn (Round-Robin) trong dải `overlay_cidr`. |
@@ -367,89 +368,108 @@ Mọi yêu cầu `POST /v1/nodes/register` (sau khi đã vượt qua bước ch�
        - Nếu `ip` trỏ tới một bản ghi `old_node` đã `Revoked` và `now_ms > old_node.quarantine_until_at_ms.unwrap_or(u64::MAX)` (đã hết 24h cách ly theo `US-029 AC5`) $\to$ ngay trong cùng `WriteTransaction`, **xóa mục `idx_nodes_overlay_ip.remove(ip)` của `old_node`**, cập nhật `old_node.ip_released = true` & `old_node.quarantine_until_at_ms = None` vào `TABLE_NODES`, rồi cấp `ip` đó cho node mới.
        - Nếu cả dải CIDR đã kín $\to$ abort transaction, trả `ErrorKind::Conflict` (`"overlay subnet address pool exhausted"`, `US-004 AC5`).
      - Ghi `NodeRecord` mới (`ip_released = false`) vào `nodes`, ghi đồng thời vào `idx_nodes_pubkey`, `idx_nodes_overlay_ip`, `idx_nodes_name`.
-4. **Bước 4 — Cập nhật Pre-Auth Key, Cấp `netmap_version` Đơn điệu & Ghi Audit (`HR-G2-03`, `Codex #5`)**:
+4. **Bước 4 — Cập nhật Pre-Auth Key, Cấp `netmap_version` Kèm High-Watermark Lease & Ghi Audit (`HR-G2-03`, `Codex #5`, `Codex R2 #1`)**:
    - Tăng `key.used_count += 1`; nếu `!key.reusable || key.used_count >= key.max_uses` thì đặt `key.status = PreAuthKeyStatus::Used`.
-   - Gọi bộ sinh đơn điệu duy nhất `let next_ver = control_state.next_netmap_version(now_ms)` (`max(prev + 1, now_unix_ms)`) và ghi `next_ver` vào `schema_meta["netmap_version"]`.
+   - Gọi bộ sinh đơn điệu `let (next_ver, new_watermark) = control_state.allocate_version_for_db_tx()?` (trong đó `next_ver = current.checked_add(1)?` không phụ thuộc `now_unix_ms`, và `new_watermark = persisted_watermark.max(next_ver.checked_add(VERSION_LEASE_STEP)?)`) rồi ghi đồng thời `schema_meta["netmap_version"] = next_ver` và `schema_meta["netmap_version_watermark"] = new_watermark` ngay trong cùng `WriteTransaction`.
    - Tăng `audit_seq += 1` và chèn bản ghi `AuditRecord` vào `audit_events`.
    - Gọi `write_tx.commit()?`: đảm bảo cả 4 bước thành công nguyên tử 100%!
 
-### 4.2. Cơ Chế `RevokedSet` Trong RAM Kết Hợp Tệp Cấp Cứu Định Sẵn `emergency-revocations.bin` (`64 KiB` A/B Slots) Khi Đầy Đĩa `ENOSPC` (`US-013 AC4`, `US-029`, `HR-G2-03`, `Codex #5, #6`)
+### 4.2. Cơ Chế `RevokedSet` Trong RAM Kết Hợp Tệp Cấp Cứu Định Sẵn `emergency-revocations.bin` (`64 KiB` A/B Slots) Khi Đầy Đĩa `ENOSPC` (`US-013 AC4`, `US-029`, `HR-G2-03`, `Codex #5, #6`, `Codex R2 #2`)
 
-Vì `redb` là cơ sở dữ liệu Copy-on-Write nên một `WriteTransaction` mới có thể thất bại khi ổ đĩa của VPS đầy 100% (`ENOSPC`). Nếu chỉ lưu trạng thái thu hồi trong RAM mà VPS bị mất điện/restart ngay lúc đĩa vẫn đầy, node bị thu hồi sẽ sống lại từ `control.redb` cũ. Để **triệt tiêu 100% nguy cơ hồi sinh node đã thu hồi**, `crates/mesh-store::revoked_ram` kết hợp `RevokedSet` trong RAM với một **tệp nhị phân kích thước cố định đã cấp phát sẵn từ lúc khởi tạo DB**:
+Vì `redb` là cơ sở dữ liệu Copy-on-Write nên một `WriteTransaction` mới có thể thất bại khi ổ đĩa của VPS đầy 100% (`ENOSPC`). Nếu chỉ lưu trạng thái thu hồi trong RAM mà VPS bị mất điện/restart ngay lúc đĩa vẫn đầy, node bị thu hồi sẽ sống lại từ `control.redb` cũ. Để **triệt tiêu nguy cơ hồi sinh node đã thu hồi khi đầy đĩa `ENOSPC`** đồng thời phản ánh trung thực trạng thái phần cứng lưu trữ, `crates/mesh-store::revoked_ram` kết hợp `RevokedSet` trong RAM với tệp nhị phân kích thước cố định đã cấp phát sẵn từ lúc khởi tạo DB:
 
-#### (a) Đặc tả Tệp Cấp Cứu Định Sẵn `/var/lib/mesh/emergency-revocations.bin` (`64 KiB`, mode `0600 mesh:mesh`)
+#### (a) Đặc tả & Ngữ nghĩa Trung thực của `/var/lib/mesh/emergency-revocations.bin` (`64 KiB`, mode `0600 mesh:mesh`, `Codex R2 #2`)
 - **Cấp phát trước 100% block vật lý lúc khởi tạo (`init`)**:
   - Ngay khi tạo `/var/lib/mesh/control.redb`, `mesh-store` tạo tệp `/var/lib/mesh/emergency-revocations.bin` và ghi đủ **`65_536 bytes` (`64 KiB`, non-sparse, dùng `libc::posix_fallocate` trên Linux + ghi 2 slot khởi tạo hợp lệ có `seq_no = 0` + `file.sync_all()`)**.
-  - Vì mọi block vật lý trên đĩa đã được cấp phát trước, thao tác ghi đè tại chỗ (`pwrite` / `seek` + `write_all` + `sync_data`) lúc xảy ra `ENOSPC` **không xin thêm bất kỳ block filesystem mới nào** và luôn thành công!
+  - **Ngữ nghĩa bền vững trung thực (`Codex R2 #2`)**: Việc cấp phát trước `64 KiB` đảm bảo thao tác ghi đè tại chỗ (`pwrite` + `sync_data`) **0 xin thêm bất kỳ block filesystem mới nào khi đầy đĩa `ENOSPC`**, nhưng lỗi I/O vật lý của ổ đĩa (`EIO`) hoặc filesystem bị remount read-only (`EROFS`) vẫn có thể xảy ra. Do đó, hệ thống **không tuyên bố ghi đè slot "luôn thành công vô điều kiện"**, mà trả tường minh trạng thái bền vững qua trường `persistence_tier` (`"redb" | "emergency_slot" | "ram_only"`) và `persisted: bool` trong response JSON của các API thu hồi trên `/run/mesh-server/admin.sock` (xem mục (b) dưới đây).
 - **Cấu trúc 2 Slot Luân Phiên A/B (Mỗi Slot = `32_768 bytes` = `32 KiB`)**:
   - `Slot A`: byte offset `0..32_768`
   - `Slot B`: byte offset `32_768..65_536`
   - Layout nhị phân chính xác của mỗi Slot `32 KiB` (Big-Endian):
     - `[0..8]`: `magic: [u8; 8] = *b"MESHERV1"` (`8 B`)
-    - `[8..16]`: `seq_no: u64` (`8 B`, tăng `+1` mỗi lần ghi cấp cứu; slot hợp lệ có `seq_no` lớn hơn là bản mới nhất)
-    - `[16..24]`: `min_netmap_version: u64` (`8 B`, phiên bản `netmap_version` tối thiểu tại thời điểm thu hồi)
-    - `[24..26]`: `node_entry_count: u16` (`2 B`, tối đa `500` node — vượt xa quy mô 20 node của hệ thống)
-    - `[26..28]`: `key_entry_count: u16` (`2 B`, tối đa `250` pre-auth key)
+    - `[8..16]`: `seq_no: u64` (`8 B`, tăng `+1` mỗi lần ghi cấp cứu hoặc gia hạn watermark/compaction; slot hợp lệ có `seq_no` lớn hơn là bản mới nhất)
+    - `[16..24]`: `min_netmap_version: u64` (`8 B`, giữ bản gương của `persisted_watermark` hoặc `netmap_version` tối thiểu tại thời điểm thu hồi/gia hạn lease khi `ENOSPC` — `Codex R2 #1`)
+    - `[24..26]`: `node_entry_count: u16` (`2 B`, tối đa `500` node chưa hợp nhất — gấp 25 lần quy mô 20 node của hệ thống)
+    - `[26..28]`: `key_entry_count: u16` (`2 B`, tối đa `250` pre-auth key chưa hợp nhất)
     - `[28..28 + 500 * 56]`: Mảng 500 phần tử `EmergencyNodeRevokeEntry` (`56 B/phần tử` = `node_id: u128 (16B)` + `node_pubkey: [u8; 32] (32B)` + `revoked_at_ms: u64 (8B)`) = `28_000 B`
     - `[28_028..28_028 + 250 * 16]`: Mảng 250 phần tử `key_id: u128 (16B)` = `4_000 B`
     - `[32_028..32_764]`: `reserved_zero: [u8; 736]` (`736 B`)
     - `[32_764..32_768]`: `crc32: u32` (`4 B`, tính bằng `crc32fast::hash(&slot[0..32_764])`)
 
-#### (b) Quy trình Thực thi Thu hồi & Khởi động Phục hồi Chống Hồi Sinh (`Codex #5, #6`)
-1. **Khi thực thi lệnh phòng vệ khẩn cấp (`node revoke`, `node expire`, `preauthkey revoke`)**:
-   - **Bước 1 (Trong RAM, `< 100 ms`)**: Chèn ngay `(NodeId, PublicKey)` hoặc `KeyId` vào `EmergencyRevocationState`, cấp `next_ver = control_state.next_netmap_version(now_ms)` (`max(prev + 1, now_unix_ms)`), hủy `CancellationToken` của phiên Relay/Control tương ứng và đẩy `NetmapSnapshot`/`NetmapDelta` mới cho toàn bộ peer online (< 100 ms).
-   - **Bước 2 (Ghi bền xuống `redb`)**: Mở `WriteTransaction` để cập nhật `nodes`/`preauth_keys`, `schema_meta["netmap_version"] = next_ver` và `audit_events`.
-   - **Bước 3 (Khi `redb` gặp lỗi `ENOSPC` / I/O)**:
-     - Đặt `disk_degraded = true` (khiến `/readyz` trả `503 Service Unavailable` theo `US-007 AC5`, `US-044 AC2`).
-     - Ghi đè tại chỗ (`pwrite` + `sync_data`) toàn bộ danh sách `EmergencyRevocationState` kèm `min_netmap_version = next_ver` và `seq_no = prev_seq + 1` vào Slot không hoạt động (`Slot A` hoặc `Slot B`) của `/var/lib/mesh/emergency-revocations.bin`.
-     - Xuất bản ghi Audit kèm cảnh báo mức `CRITICAL` (`event = "emergency_revoke_persisted_to_emergency_slot"`) ra `stderr` / `journald` (`US-013 AC4`).
-2. **Khi khởi động `mesh-server` (Trước khi mở bất kỳ listener TCP/UDP/IPC nào)**:
-   - Đọc cả `Slot A` và `Slot B` của `/var/lib/mesh/emergency-revocations.bin`, kiểm tra `magic == *b"MESHERV1"` và `crc32`, chọn slot hợp lệ có `seq_no` cao nhất.
-   - Nạp toàn bộ `NodeId`/`PublicKey`/`KeyId` từ cả `control.redb` **LẪN** slot cấp cứu vào `EmergencyRevocationState` trong RAM.
-   - Khởi tạo bộ đếm đơn điệu `netmap_version` bằng **`max(db_schema_meta["netmap_version"], emergency_slot.min_netmap_version, now_unix_ms)`**.
-   - Nếu trong slot cấp cứu có mục thu hồi chưa được ghi vào `control.redb`: thử mở `WriteTransaction` hợp nhất chúng vào `control.redb`; nếu đĩa vẫn đang đầy (`ENOSPC`), giữ `disk_degraded = true` và tiếp tục cưỡng chế chặn 100% các node/key đó từ `EmergencyRevocationState` trong RAM!
-3. **Với mọi thao tác tạo mới/thay đổi thông thường (`register`, `preauthkey create`, `node rename`)**:
-   - Nếu ghi `audit_events` hoặc `commit()` vào `redb` thất bại, hệ thống **bắt buộc từ chối thao tác (fail-closed)** và trả lỗi `503 Unavailable`.
+#### (b) Quy trình Thực thi Thu hồi Theo 3 Mức `persistence_tier` (`"redb" | "emergency_slot" | "ram_only"`)
+Khi thực thi lệnh phòng vệ khẩn cấp (`node revoke`, `node expire`, `preauthkey revoke`):
+1. **Bước 1 — Cưỡng chế Trong RAM Trước Tiên (`< 100 ms`, `ram_enforced = true`)**:
+   - Chèn ngay `(NodeId, PublicKey)` hoặc `KeyId` vào `EmergencyRevocationState` (`RevokedSet` RAM), hủy `CancellationToken` của phiên Relay/Control tương ứng và đẩy `NetmapSnapshot`/`NetmapDelta` mới cho toàn bộ peer online (< 100 ms).
+2. **Bước 2 — Phân Nhánh Ghi Bền Theo 3 Mức `persistence_tier` (`Codex R2 #2`)**:
+   - **Mức 1 — `persistence_tier: "redb"` (`persisted: true`)**:
+     - Mở `WriteTransaction` cập nhật `nodes`/`preauth_keys`, `schema_meta["netmap_version"] = next_ver`, `schema_meta["netmap_version_watermark"] = new_watermark` và `audit_events`. Nếu `commit()` thành công $\to$ trả `{"revoked": true, "ram_enforced": true, "persisted": true, "persistence_tier": "redb"}`.
+   - **Mức 2 — `persistence_tier: "emergency_slot"` (`persisted: true`)**:
+     - Khi `redb` gặp lỗi `ENOSPC`: lọc bỏ mọi mục đã được commit bền vững trong `control.redb` (khử trùng lặp theo `NodeId`/`KeyId`). Nếu số mục **chưa hợp nhất** sau khi thêm mục mới vẫn `<= 500` nodes và `<= 250` keys, thực hiện `pwrite` + `sync_data` vào Slot không hoạt động (`Slot A` hoặc `Slot B`) của `/var/lib/mesh/emergency-revocations.bin` với `min_netmap_version = persisted_watermark.max(next_ver + VERSION_LEASE_STEP)` và `seq_no = prev_seq + 1`.
+     - Nếu `pwrite` + `sync_data` thành công: đặt `disk_degraded = true` (`/readyz = 503`), ghi log `CRITICAL` (`event = "emergency_revoke_persisted_to_emergency_slot"`), và trả `{"revoked": true, "ram_enforced": true, "persisted": true, "persistence_tier": "emergency_slot"}`.
+   - **Mức 3 — `persistence_tier: "ram_only"` (`persisted: false`)**:
+     - Khi cả `redb` lẫn `pwrite`+`sync_data` trên slot cấp cứu đều lỗi phần cứng (`EIO`/`EROFS`), HOẶC số mục **chưa hợp nhất** trong `emergency-revocations.bin` đã chạm trần cứng (`500` nodes hoặc `250` keys):
+     - **Tuyệt đối không ghi đè làm mất mục thu hồi cũ trên đĩa**; giữ chặn mục mới trong `RevokedSet` RAM (`ram_enforced = true`), đặt `disk_degraded = true` (`/readyz = 503`), ghi log `CRITICAL` (`event = "emergency_revoke_ram_only_unpersisted"`) ra `stderr`/`journald`, trả `{"revoked": true, "ram_enforced": true, "persisted": false, "persistence_tier": "ram_only"}`, và CLI `mesh` in cảnh báo khẩn cấp ra `stderr` yêu cầu quản trị viên sửa/giải phóng ổ đĩa trước khi khởi động lại `mesh-server`.
+
+#### (c) Chính sách Thu Gọn Tự Động (Compaction) & Khởi Động Fail-Closed (`Codex R2 #2`)
+1. **Compaction tự động khi `redb` ghi lại được**:
+   - Mỗi khi một `WriteTransaction` trên `control.redb` thành công trong lúc `emergency-revocations.bin` đang giữ mục chưa hợp nhất (`node_entry_count > 0 || key_entry_count > 0`), `mesh-store` hợp nhất toàn bộ các mục đó vào `control.redb` ngay trong giao dịch đó, rồi ghi đè một slot sạch (`node_entry_count = 0, key_entry_count = 0, min_netmap_version = persisted_watermark, seq_no = prev_seq + 1`) xuống `emergency-revocations.bin` và xóa cờ `disk_degraded`.
+2. **Khởi động Fail-Closed Khi Mất Hoặc Hỏng Tệp Cấp Cứu**:
+   - Lúc `mesh-server` khởi động (trước khi mở bất kỳ listener TCP/UDP/IPC nào):
+     - Nếu `control.redb` đã tồn tại mà tệp `/var/lib/mesh/emergency-revocations.bin` bị mất, ngắn hơn `65_536 B`, HOẶC **cả `Slot A` lẫn `Slot B` đều sai `magic == *b"MESHERV1"` / sai `crc32` / lỗi đọc I/O**: `mesh-server` **BẮT BUỘC fail-closed dừng khởi động ngay lập tức** (`exit != 0`, ghi log `CRITICAL` và hướng dẫn kiểm tra ổ đĩa hoặc chạy `mesh-server restore` theo `US-007 AC3`), tuyệt đối không mở cổng mạng để ngăn chặn 100% nguy cơ hồi sinh node đã thu hồi!
+     - Nếu 1 trong 2 slot hợp lệ và slot kia bị ghi dở do mất điện: chọn slot hợp lệ có `seq_no` cao nhất, nạp vào `EmergencyRevocationState` RAM, và tự sửa lại slot hỏng (`pwrite` + `sync_data`) trước khi mở cổng mạng.
+3. **Danh sách 4 Fault-Injection Unit Tests Bắt Buộc Trong `crates/mesh-store/src/revoked_ram.rs`**:
+   - `test_emergency_revoke_enospc_persists_to_slot_and_survives_restart`
+   - `test_emergency_slot_compaction_clears_entries_after_redb_recovery`
+   - `test_emergency_slot_overflow_never_evicts_older_unmerged_revocations`
+   - `test_boot_fails_closed_when_emergency_file_missing_or_both_slots_corrupted`
 
 ---
 
-## 5. Bộ Sinh `netmap_version` Đơn Điệu Duy Nhất & Quy Tắc Tách Biệt Trạng Thái Runtime (`HR-03`, `HR-G2-03`, `Codex #5`, `US-009 AC1`)
+## 5. Bộ Sinh `netmap_version` Đơn Điệu Dựa Trên High-Watermark Lease (`VERSION_LEASE_STEP = 1_024`) & Tách Biệt Trạng Thái Runtime (`HR-03`, `HR-G2-03`, `Codex #5`, `Codex R2 #1`, `US-009 AC1`)
 
-### 5.1. Thuật toán Cấp phát `netmap_version` Đơn điệu Tuyệt đối (`MonotonicNetmapVersion`)
-Để loại bỏ hoàn toàn nguy cơ `netmap_version` bị tụt lùi hoặc trùng lặp giữa các thay đổi chỉ-trong-RAM (`endpoints`, `online/offline`) và các thay đổi ghi `redb` (`register`, `revoke`, `rename`) hoặc sau khi `mesh-server` khởi động lại (`Codex #5`, `HR-G2-03`):
+### 5.1. Thuật toán `MonotonicNetmapVersion` Chống Lùi Version Khi Đồng Hồ Hệ Thống Bị Kéo Lùi + Crash (`Codex R2 #1`)
+
+Nếu sự kiện `online/offline` tăng `netmap_version` trong RAM không ghi đĩa, còn lúc khởi động lại lấy `max(db_version, slot_version, now_unix_ms)`, thì khi đồng hồ hệ thống từng ở `T + 60s` lúc phát presence rồi bị NTP kéo lùi về `T + 30s` kèm crash/restart, server sẽ phát version nhỏ hơn version mà client đang giữ trong RAM, khiến các client online bỏ qua bản cập nhật mới (kể cả bản thu hồi node) theo `US-009 AC3`.
+
+Để **triệt tiêu 100% lỗi lùi version do đồng hồ hệ thống nhảy lùi + crash** mà vẫn giữ **0 lượt ghi đĩa cho 1.023 / 1.024 sự kiện `online/offline`**, `crates/mesh-store::store` thiết kế `MonotonicNetmapVersion` theo cơ chế **Bộ đếm Logic Thuần túy + High-Watermark Lease Bền vững (`VERSION_LEASE_STEP = 1_024`)**:
 
 ```rust
+pub const VERSION_LEASE_STEP: u64 = 1_024;
+
 pub struct MonotonicNetmapVersion {
+    /// Current logical version emitted so far.
     current: AtomicU64,
-}
-
-impl MonotonicNetmapVersion {
-    /// Initialized at boot (and after backup restore) from:
-    /// `max(db_netmap_version, emergency_slot_min_version, clock.now_ms())`
-    pub fn new(db_version: u64, emergency_slot_version: u64, now_unix_ms: u64) -> Self {
-        let init = db_version.max(emergency_slot_version).max(now_unix_ms);
-        Self { current: AtomicU64::new(init) }
-    }
-
-    /// Strictly monotonic allocation across RAM-only and DB-persisted mutations.
-    pub fn allocate_next(&self, now_unix_ms: u64) -> u64 {
-        let mut prev = self.current.load(Ordering::Acquire);
-        loop {
-            let next = prev.saturating_add(1).max(now_unix_ms);
-            match self.current.compare_exchange_weak(
-                prev,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return next,
-                Err(actual) => prev = actual,
-            }
-        }
-    }
+    /// Highest version durably leased in `schema_meta["netmap_version_watermark"]`
+    /// (or mirrored in `emergency-revocations.bin` `min_netmap_version` during ENOSPC).
+    persisted_watermark: AtomicU64,
 }
 ```
-- **Bất biến**: Vì mọi thao tác làm thay đổi bản đồ mạng (cả trong RAM lẫn trong `WriteTransaction` của `redb`) đều lấy phiên bản từ cùng một `MonotonicNetmapVersion::allocate_next(now_ms)` và mọi `WriteTransaction` đều lưu giá trị đó vào `schema_meta["netmap_version"]`, đồng thời lúc khởi động luôn lấy `max(db_version, emergency_slot_version, now_unix_ms)`, nên `netmap_version` **tăng nghiêm ngặt (`v_next > v_prev`) trong mọi kịch bản** (kể cả khi `presence/endpoint update -> crash -> restart` hoặc `ENOSPC revoke -> restart`).
+
+1. **Khởi tạo DB Lần Đầu (`init_db`)**:
+   - Gán `current = now_unix_ms` và ghi bền `persisted_watermark = current.checked_add(VERSION_LEASE_STEP)?` vào `schema_meta["netmap_version_watermark"]` (kèm `schema_meta["netmap_version"] = current`).
+2. **Cấp Phát Trong Runtime (Độc lập 100% với Đồng hồ Tường `now_unix_ms`)**:
+   - Trong runtime, hàm cấp phát phiên bản **KHÔNG gọi `max(..., now_unix_ms)`** mà chỉ tăng đơn điệu thuần túy:
+     $$\text{next} = \text{current.checked\_add}(1)?$$
+   - Nhờ không phụ thuộc `now_unix_ms` trong runtime, đồng hồ NTP nhảy tiến hay kéo lùi đều không bao giờ làm phình hay làm tụt `netmap_version`!
+   - **Bất biến cứng trước khi phát sóng (`next <= persisted_watermark`)**:
+     - **Với sự kiện `online/offline` chỉ-trong-RAM**:
+       - Trong **1.023 / 1.024 lần**, `next <= persisted_watermark` đúng sẵn $\to$ **0 lượt ghi đĩa**, trả về `O(1)` ngay lập tức.
+       - Khi `next > persisted_watermark` (cạn cửa sổ lease `1_024` bước): trước khi phát `next`, `mesh-store` gia hạn trước `new_watermark = next.checked_add(VERSION_LEASE_STEP)?` bằng một giao dịch nhỏ ghi `schema_meta["netmap_version_watermark"] = new_watermark` vào `redb` (hoặc ghi đè vào `emergency-revocations.bin` trường `min_netmap_version` nếu `redb` đang bị `ENOSPC`), cập nhật `persisted_watermark = new_watermark`, rồi mới phát `next`.
+       - Nếu cả `redb` lẫn `emergency-revocations.bin` đều gặp lỗi phần cứng `EIO` đúng lúc cạn lease (`current == persisted_watermark`): đặt `disk_degraded = true` (`/readyz = 503`) và **tạm dừng phát version mới cho sự kiện presence không thiết yếu** để bảo toàn tuyệt đối tính đơn điệu sau khi khởi động lại.
+     - **Với các giao dịch `WriteTransaction` thông thường trên `redb` (`register`, `revoke`, `rename`, `migrate-endpoint`)**:
+       - Luôn tiện tay ghi kèm cả `schema_meta["netmap_version"] = next` và `schema_meta["netmap_version_watermark"] = persisted_watermark.max(next.checked_add(VERSION_LEASE_STEP)?)` trong cùng giao dịch `redb` (0 tốn thêm fsync phụ).
+3. **Khi `mesh-server` Khởi Động Lại (Sau Crash / Mất Điện / Đồng Hồ Bị Kéo Lùi)**:
+   - Tính điểm tựa khởi động hoàn toàn độc lập với `now_unix_ms` bị lùi:
+     $$\text{boot\_base} = \max\big(\text{db\_netmap\_version},\ \text{db\_watermark},\ \text{emergency\_slot.min\_netmap\_version}\big)$$
+   - Ghi bền ngay `initial_watermark = boot_base.checked_add(VERSION_LEASE_STEP)?` vào `schema_meta["netmap_version_watermark"]` của `redb` (hoặc vào `emergency-revocations.bin` `min_netmap_version` nếu `redb` đang `ENOSPC`; nếu cả hai đều lỗi I/O lúc boot thì **fail-closed**, không mở cổng mạng).
+   - Đặt `current = boot_base` và `persisted_watermark = initial_watermark`. Phiên bản đầu tiên phát ra sau restart là `boot_base + 1`, **lớn hơn nghiêm ngặt 100% mọi phiên bản đã từng phát trước crash dù đồng hồ hệ thống bị kéo lùi bao xa**!
+4. **Khi Chạy `mesh-server restore <backup.db> [--min-netmap-version <u64>]` (`US-045`)**:
+   - Vì bản sao lưu có thể được tạo trước khi server phát thêm nhiều version cho các client đang online, lệnh `restore` tính:
+     $$\text{restored\_base} = \max\big(\text{backup\_db\_watermark},\ \text{existing\_local\_db\_watermark\_if\_readable},\ \text{existing\_local\_emergency\_slot\_version\_if\_readable},\ \text{now\_unix\_ms},\ \text{cli\_min\_netmap\_version.unwrap\_or}(0)\big).\text{saturating\_add}(1\_000\_000)$$
+   - Ghi bền `netmap_version = restored_base` và `netmap_version_watermark = restored_base + VERSION_LEASE_STEP` vào DB khôi phục trước khi mở lại dịch vụ.
+5. **2 Unit Tests Bắt Buộc Trong `crates/mesh-store/src/store.rs`**:
+   - `test_netmap_version_clock_rollback_and_crash_never_regresses`: Khởi tạo ở `T + 60s`, phát 2.500 sự kiện presence trong RAM (vượt qua 2 lần gia hạn lease), kéo lùi `FakeClock` về `T - 3600s` rồi mô phỏng crash & khởi động lại `ControlStore` $\to$ phiên bản phát ra sau restart lớn hơn nghiêm ngặt phiên bản cuối cùng trước crash.
+   - `test_restore_advances_netmap_version_watermark`: Khôi phục từ bản backup cũ hơn trạng thái hiện tại $\to$ `netmap_version` sau restore nhảy vọt tối thiểu `+1_000_000` trên mức watermark cao nhất.
 
 ### 5.2. Bảng Tách Biệt Trạng Thái Cấu Trúc và Trạng Thái Runtime
 Để giữ CPU của VPS lúc rảnh **< 2%** (`GNFR-06`) và băng thông nền mỗi node **≤ 1 KB/s** (`GNFR-07`), `mesh-server` tách bạch 2 nhóm trạng thái:
@@ -458,27 +478,29 @@ impl MonotonicNetmapVersion {
 |---|---|---|
 | **Các trường dữ liệu** | `node_id`, `name_normalized`, `overlay_ip`, `node_pubkey`, `disco_pubkey`, `status` (`Active`/`Expired`/`Revoked`), `endpoints[]`, `key_expires_at_ms`, `relay_map`, `pin_set` | `last_seen_at_ms: u64`, `online: bool`, `disconnect_debounce_until_ms: Option<u64>`, `ws_stream_tx`, `relay_session_tx`, bộ đếm `rx_bytes`/`tx_bytes` |
 | **Khi nhận nhịp Heartbeat (mỗi 30 s)** | **KHÔNG chạm vào `redb`**, **KHÔNG tăng `netmap_version`**, **KHÔNG phát lại `NetmapSnapshot`** | Chỉ cập nhật `runtime.last_seen_at_ms = now_ms` trong RAM (`O(1)`) |
-| **Khi Peer chuyển `online ↔ offline`** | Không cần ghi đĩa mỗi lần rớt mạng ngắn | Khi mở stream: nếu `online == false` $\to$ chuyển `online = true`, gọi `allocate_next(now_ms)` và đẩy thông báo. Khi đóng stream: chờ **debounce 10 giây** (tránh nhấp nháy khi roaming Wi-Fi $\to$ 4G); nếu sau 10 s chưa kết nối lại mới chuyển `online = false` và gọi `allocate_next(now_ms)`. |
+| **Khi Peer chuyển `online ↔ offline`** | Chỉ gia hạn `netmap_version_watermark` mỗi `1_024` lần chuyển trạng thái (`VERSION_LEASE_STEP = 1_024`) | Khi mở stream: nếu `online == false` $\to$ chuyển `online = true`, cấp `next <= persisted_watermark` (`0` ghi đĩa trong 1.023/1.024 lần) và đẩy thông báo. Khi đóng stream: chờ **debounce 10 giây** (tránh nhấp nháy khi roaming Wi-Fi $\to$ 4G); nếu sau 10 s chưa kết nối lại mới chuyển `online = false` và cấp `next <= persisted_watermark`. |
 
 ---
 
 ## 6. Cấu Trúc Tệp Trạng Thái, Khóa (`0600`), `ResourceLedger` & `netmap-cache.json` Trên 3 Hệ Điều Hành
 
-### 6.1. Bảng Đường Dẫn & Phân Quyền Hệ Điều Hành Chuẩn Hóa (`SEC-01`, `PLAT-01..06`, `US-033 AC6`, `US-073 AC2`, `BLK-G2-03`, `Codex #11`)
+### 6.1. Bảng Đường Dẫn & Phân Quyền Hệ Điều Hành Chuẩn Hóa (`SEC-01`, `PLAT-01..06`, `US-033 AC6`, `US-056`, `US-073 AC2`, `BLK-G2-03`, `Codex #11`, `Codex R2 #3`)
 
-| Thành phần | **macOS 13+ (`arm64` & `x86_64`)** | **Windows 10/11 x64** | **Ubuntu Linux LTS (VPS & Node/Lab)** |
+| Thành phần | **macOS 13+ (`arm64` & `x86_64`)** | **Windows 10/11 x64** | **Ubuntu Linux LTS (VPS & Node/Lab — Tách biệt `mesh-server` và `meshd`)** |
 |---|---|---|---|
 | **Binary thực thi** | `/usr/local/libexec/mesh/meshd`<br/>`/usr/local/bin/mesh`<br/>*(Owner `root:wheel`, mode `0755`, kiểm tra `mode & 0o022 == 0`)* | `C:\Program Files\Mesh\meshd.exe`<br/>`C:\Program Files\Mesh\mesh.exe`<br/>`C:\Program Files\Mesh\wintun.dll`<br/>*(ACL: `SYSTEM` + `Administrators` ghi; kiểm SHA-256 `wintun.dll`)* | `/usr/bin/mesh-server`<br/>`/usr/bin/meshd`<br/>`/usr/bin/mesh`<br/>*(Owner `root:root`, mode `0755`)* |
-| **Unit / Service file** | `/Library/LaunchDaemons/internal.mesh.meshd.plist`<br/>*(Owner `root:wheel`, mode `0644`)* | Windows Service `MeshVpnAgent`<br/>*(Chạy dưới `NT AUTHORITY\LocalSystem`)* | `/lib/systemd/system/mesh-server.service` *(User=`mesh`)*<br/>`/lib/systemd/system/meshd.service` *(CAP_NET_ADMIN)* |
-| **Thư mục trạng thái bảo mật** | `/var/db/mesh/`<br/>*(Owner `root:wheel`, mode **`0700`**)* | `C:\ProgramData\Mesh\`<br/>*(SDDL DACL: **chỉ `SYSTEM` và `Administrators`**, tắt kế thừa `D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)`)* | Server: `/var/lib/mesh/` *(`0700` `mesh:mesh`)*<br/>Agent: `/var/lib/mesh-agent/` *(hoặc `/var/lib/mesh/` khi chạy riêng, `0700` `root:root`)* |
+| **Unit / Service file** | `/Library/LaunchDaemons/internal.mesh.meshd.plist`<br/>*(Owner `root:wheel`, mode `0644`)* | Windows Service `MeshVpnAgent`<br/>*(Chạy dưới `NT AUTHORITY\LocalSystem`)* | `/lib/systemd/system/mesh-server.service` *(User=`mesh`, `RuntimeDirectory=mesh-server`)*<br/>`/lib/systemd/system/meshd.service` *(`CAP_NET_ADMIN`, `RuntimeDirectory=meshd`)* |
+| **Thư mục trạng thái bảo mật** | `/var/db/mesh/`<br/>*(Owner `root:wheel`, mode **`0700`**)* | `C:\ProgramData\Mesh\`<br/>*(SDDL DACL: **chỉ `SYSTEM` và `Administrators`**, tắt kế thừa `D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)`)* | Server (`mesh-server`): **`/var/lib/mesh/`** *(`0700` `mesh:mesh`: `control.redb`, `emergency-revocations.bin`, `backups/`)*<br/>Agent (`meshd`): **`/var/lib/meshd/`** *(`0700` `root:root` — tách biệt hoàn toàn khỏi `/var/lib/mesh/` theo bất kỳ thứ tự khởi động nào!)* |
 | **Cơ sở dữ liệu & Tệp cấp cứu Server (`US-007`, `US-013 AC4`)** | *(Không áp dụng)* | *(Không áp dụng)* | `/var/lib/mesh/control.redb` *(`0600 mesh:mesh`)*<br/>`/var/lib/mesh/emergency-revocations.bin` *(`64 KiB` pre-allocated, `0600 mesh:mesh`)* |
-| **Tệp khóa Node & Disco (`SEC-01`)** | `/var/db/mesh/keys.json`<br/>*(Owner `root:wheel`, mode **`0600`**)* | `C:\ProgramData\Mesh\keys.json`<br/>*(ACL: chỉ `SYSTEM` + `Administrators`)* | `/var/lib/mesh/keys.json`<br/>*(Owner `root:root`, mode **`0600`**)* |
-| **Cấu hình Bootstrap (`US-004 AC7`)** | `/var/db/mesh/bootstrap.toml` *(`0600`)* | `C:\ProgramData\Mesh\bootstrap.toml` | `/var/lib/mesh/bootstrap.toml` *(`0600`)* |
-| **Cache Netmap & Cổng UDP (`US-019`, `US-033`)** | `/var/db/mesh/netmap-cache.json` *(`0600`)* | `C:\ProgramData\Mesh\netmap-cache.json` | `/var/lib/mesh/netmap-cache.json` *(`0600`)* |
-| **Sổ cái Tài nguyên (`ResourceLedger` `US-055`)** | `/var/db/mesh/ledger.json` *(`0600`)* | `C:\ProgramData\Mesh\ledger.json` | `/var/lib/mesh/ledger.json` *(`0600`)* |
-| **Kênh Local IPC — Admin (`SEC-14`, `BLK-G2-03`)** | `/var/run/mesh/meshd-admin.sock`<br/>*(Thư mục `/var/run/mesh` `0755 root:wheel`; socket `0660 root:admin` + kiểm tra `getpeereid` `uid==0` hoặc `LOCAL_PEERCRED` `xucred.cr_groups` chứa `gid==80` / fallback `getgrouplist`)* | `\\.\pipe\mesh-agent-admin`<br/>*(SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` + `FILE_FLAG_FIRST_PIPE_INSTANCE`)* | Server Admin: `/run/mesh/admin.sock` *(thư mục `/run/mesh` `0750 mesh:mesh-admin`; socket `0660 mesh:mesh-admin` + `SO_PEERCRED` + `getgrouplist` kiểm tra nhóm phụ `mesh-admin`)*<br/>Agent Admin: `/var/run/mesh/meshd-admin.sock` *(`0660 root:mesh-admin` + `SO_PEERCRED` + `getgrouplist`)* |
-| **Kênh Local IPC — Read-Only (`US-039 AC5`, `BLK-G2-03`)** | `/var/run/mesh/meshd-ro.sock`<br/>*(Mode `0666 root:wheel`, chỉ gắn Router chỉ-đọc `status`/`peers`/`ping`/`netcheck`, 0 secret)* | `\\.\pipe\mesh-agent-ro`<br/>*(SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)` + `FILE_FLAG_FIRST_PIPE_INSTANCE`, chỉ gắn Router chỉ-đọc)* | Agent Read-Only: `/var/run/mesh/meshd-ro.sock`<br/>*(Mode `0666 root:root`, chỉ gắn Router chỉ-đọc `status`/`peers`/`ping`/`netcheck`, 0 secret)* |
-| **Thư mục Log xoay vòng (`US-043`)** | `/var/log/mesh/meshd.log` *(≤ 100 MB)* | `C:\ProgramData\Mesh\logs\meshd.log` *(≤ 100 MB)* | `/var/log/mesh/mesh-server.log` & `meshd.log` *(≤ 100 MB)* |
+| **Tệp khóa Node & Disco (`SEC-01`)** | `/var/db/mesh/keys.json`<br/>*(Owner `root:wheel`, mode **`0600`**)* | `C:\ProgramData\Mesh\keys.json`<br/>*(ACL: chỉ `SYSTEM` + `Administrators`)* | `/var/lib/meshd/keys.json`<br/>*(Owner `root:root`, mode **`0600`**)* |
+| **Cấu hình Bootstrap (`US-004 AC7`)** | `/var/db/mesh/bootstrap.toml` *(`0600`)* | `C:\ProgramData\Mesh\bootstrap.toml` | `/var/lib/meshd/bootstrap.toml` *(`0600 root:root`)* |
+| **Cache Netmap & Cổng UDP (`US-019`, `US-033`)** | `/var/db/mesh/netmap-cache.json` *(`0600`)* | `C:\ProgramData\Mesh\netmap-cache.json` | `/var/lib/meshd/netmap-cache.json` *(`0600 root:root`)* |
+| **Sổ cái Tài nguyên (`ResourceLedger` `US-055`)** | `/var/db/mesh/ledger.json` *(`0600`)* | `C:\ProgramData\Mesh\ledger.json` | `/var/lib/meshd/ledger.json` *(`0600 root:root`)* |
+| **Kênh Local IPC — Admin (`SEC-14`, `BLK-G2-03`, `Codex R2 #3`)** | **`/var/run/meshd/meshd-admin.sock`**<br/>*(Thư mục `/var/run/meshd` `0755 root:wheel`, kiểm tra chống symlink trên các thành phần cha; socket `0660 root:admin` `gid=80` + kiểm tra `getpeereid` `uid==0` hoặc `LOCAL_PEERCRED` `xucred.cr_groups` chứa `gid==80` / fallback `getgrouplist`)* | `\\.\pipe\mesh-agent-admin`<br/>*(SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)` + `FILE_FLAG_FIRST_PIPE_INSTANCE`)* | Server Admin (`mesh-server`): **`/run/mesh-server/admin.sock`** *(thư mục `/run/mesh-server` `0750 mesh:mesh-admin`; socket `0660 mesh:mesh-admin` + `SO_PEERCRED` + `getpwuid_r` & `getgrouplist` kiểm tra nhóm phụ `mesh-admin`)*<br/>Agent Admin (`meshd`): **`/var/run/meshd/meshd-admin.sock`** *(tương ứng `/run/meshd/meshd-admin.sock`, thư mục `0755 root:root`; socket `0660 root:mesh-admin` hoặc `0600 root:root` nếu nhóm `mesh-admin` chưa tồn tại trên máy lẻ + `SO_PEERCRED` + `getgrouplist`)* |
+| **Kênh Local IPC — Read-Only (`US-039 AC5`, `BLK-G2-03`, `Codex R2 #3`)** | **`/var/run/meshd/meshd-ro.sock`**<br/>*(Thư mục `/var/run/meshd` `0755 root:wheel`; socket mode `0666 root:wheel`, chỉ gắn Router chỉ-đọc `status`/`peers`/`ping`/`netcheck`, ≤ 4 KiB, 0 secret)* | `\\.\pipe\mesh-agent-ro`<br/>*(SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)` + `FILE_FLAG_FIRST_PIPE_INSTANCE`, chỉ gắn Router chỉ-đọc)* | Agent Read-Only (`meshd`): **`/var/run/meshd/meshd-ro.sock`** *(tương ứng `/run/meshd/meshd-ro.sock`, thư mục `0755 root:root`; socket mode `0666 root:root`, chỉ gắn Router chỉ-đọc `status`/`peers`/`ping`/`netcheck`, ≤ 4 KiB, 0 secret)* |
+| **Thư mục Log xoay vòng (`US-043`, `Codex R2 #3`)** | `/var/log/mesh/meshd.log` *(≤ 100 MB)* | `C:\ProgramData\Mesh\logs\meshd.log` *(≤ 100 MB)* | Server: `/var/log/mesh/mesh-server.log` *(`0750 mesh:mesh`, ≤ 100 MB)*<br/>Agent: **`/var/log/meshd/meshd.log`** *(`0750 root:root`, ≤ 100 MB)* |
+
+> **Kiểm thử Co-Residency bắt buộc cho `US-056` (`Codex R2 #3`)**: Trên Ubuntu Linux, `/var/run` là symlink tới `/run`. Nhờ tách hẳn `/run/mesh-server` (`0750 mesh:mesh-admin`) và `/var/run/meshd` (`/run/meshd` `0755 root:root`) cùng `/var/lib/mesh/` và `/var/lib/meshd/`, kịch bản kiểm thử tự động bắt buộc xác minh khởi động `mesh-server` trước `meshd` **VÀ** `meshd` trước `mesh-server` trên cùng Ubuntu Linux host đều giữ nguyên quyền của cả 3 socket (`/run/mesh-server/admin.sock`, `/var/run/meshd/meshd-admin.sock`, `/var/run/meshd/meshd-ro.sock`).
 
 ### 6.2. Schema JSON/TOML của Các Tệp Trạng Thái Phía Client (`meshd`)
 
@@ -570,13 +592,18 @@ acked_endpoint_version = 2
 
 ## 7. Kiểm Tra Toàn Vẹn Khi Khởi Động, Migration Schema & Hot Atomic Snapshot Backup (`US-007`, `US-045`)
 
-### 7.1. Kiểm tra Toàn vẹn Lúc Khởi Động (`db.check_integrity()` & `emergency-revocations.bin` — `US-007 AC3`, `HR-G2-03`)
+### 7.1. Kiểm tra Toàn vẹn Lúc Khởi Động (`db.check_integrity()` & `emergency-revocations.bin` — `US-007 AC3`, `HR-G2-03`, `Codex R2 #1, #2`)
 
 Ngay khi `mesh-server` mở thư mục `/var/lib/mesh/` (`0700 mesh:mesh`):
-1. Kiểm tra quyền tệp `/var/lib/mesh/control.redb` và `/var/lib/mesh/emergency-revocations.bin` trên đĩa phải là `0600` (nếu lỏng hơn thì tự siết về `0600` hoặc từ chối chạy nếu thuộc sở hữu user khác). Nếu `emergency-revocations.bin` chưa tồn tại (DB mới khởi tạo), cấp phát trước đủ `65_536 bytes` (`64 KiB` non-sparse) trên đĩa.
+1. Kiểm tra quyền tệp `/var/lib/mesh/control.redb` và `/var/lib/mesh/emergency-revocations.bin` trên đĩa phải là `0600` (nếu lỏng hơn thì tự siết về `0600` hoặc từ chối chạy nếu thuộc sở hữu user khác).
+   - Chỉ khi **cả** `control.redb` lẫn `emergency-revocations.bin` đều chưa tồn tại (DB khởi tạo lần đầu), `mesh-store` mới tạo và cấp phát trước đủ `65_536 bytes` (`64 KiB` non-sparse, `posix_fallocate`) cho `emergency-revocations.bin`.
+   - Nếu `control.redb` **đã tồn tại** mà tệp `/var/lib/mesh/emergency-revocations.bin` bị mất hoặc ngắn hơn `65_536 B`, HOẶC **cả `Slot A` lẫn `Slot B` đều sai `magic == *b"MESHERV1"` / sai `crc32` / lỗi đọc I/O**: `mesh-server` **BẮT BUỘC fail-closed dừng khởi động ngay lập tức** (`exit != 0`, hướng dẫn kiểm tra ổ đĩa hoặc chạy `mesh-server restore` theo `US-007 AC3`), tuyệt đối không mở cổng mạng để ngăn chặn 100% nguy cơ hồi sinh node đã thu hồi (`Codex R2 #2`)!
 2. Gọi `db.check_integrity()` của `redb` để kiểm tra toàn bộ cây B-tree và checksum các trang dữ liệu.
-3. Đọc Slot A/B hợp lệ mới nhất từ `/var/lib/mesh/emergency-revocations.bin` (kiểm tra `magic == *b"MESHERV1"` + `crc32`), nạp `EmergencyRevocationState` trong RAM và khởi tạo `MonotonicNetmapVersion` = `max(db_version, slot.min_netmap_version, now_unix_ms)`.
-4. Nếu `check_integrity()` trả về lỗi hỏng dữ liệu: `mesh-server` **dừng khởi động ngay lập tức (fail-closed)**, ghi log `ERROR` (`event = "db_integrity_check_failed"`) và in hướng dẫn khôi phục từ bản sao lưu gần nhất bằng lệnh `mesh server restore <backup_file>`.
+3. Đọc Slot A/B hợp lệ có `seq_no` cao nhất từ `/var/lib/mesh/emergency-revocations.bin` (nếu 1 trong 2 slot bị ghi dở do mất điện thì tự sửa lại slot hỏng từ slot hợp lệ), nạp `EmergencyRevocationState` trong RAM.
+4. Khởi tạo `MonotonicNetmapVersion` theo cơ chế High-Watermark Lease (`Codex R2 #1`):
+   - Tính `boot_base = db_netmap_version.max(db_watermark).max(emergency_slot.min_netmap_version)` (hoàn toàn độc lập với đồng hồ tường `now_unix_ms`).
+   - Ghi bền ngay `initial_watermark = boot_base.checked_add(VERSION_LEASE_STEP)?` (`+ 1_024`) vào `schema_meta["netmap_version_watermark"]` của `redb` (hoặc vào `emergency-revocations.bin` nếu `redb` đang `ENOSPC`; nếu cả hai đều lỗi I/O lúc boot thì **fail-closed**).
+5. Nếu `check_integrity()` trả về lỗi hỏng dữ liệu: `mesh-server` **dừng khởi động ngay lập tức (fail-closed)**, ghi log `ERROR` (`event = "db_integrity_check_failed"`) và in hướng dẫn khôi phục từ bản sao lưu gần nhất bằng lệnh `mesh server restore <backup_file>`.
 
 ### 7.2. Chiến lược Migration Schema An Toàn (`US-007 AC4`)
 
@@ -609,9 +636,13 @@ sequenceDiagram
     BackupMgr-->>TimerOrAdmin: "Hoàn tất (Thời gian giữ khóa ghi trên LiveDb = 0 ms!)"
 ```
 
-#### Quy trình Khôi phục (`mesh server restore <backup_file>` — `US-045 AC2/AC4/AC6`)
+#### Quy trình Khôi phục (`mesh server restore <backup_file> [--min-netmap-version <u64>]` — `US-045 AC2/AC4/AC6`, `Codex R2 #1`)
 1. Kiểm tra sự tồn tại của tệp `<backup_file>.sha256`, tính lại mã băm SHA-256 của `<backup_file>` và so sánh `ConstantTimeEq`. Nếu sai mã băm hoặc tệp bị cắt cụt $\to$ **từ chối khôi phục ngay lập tức** (`US-045 AC4`), không đụng tới DB hiện tại.
 2. Mở `<backup_file>` bằng `redb::Database::open`, chạy `check_integrity()`, và kiểm tra bảng `server_identity` có chứa bản ghi `"primary"` hợp lệ hay không:
    - Nếu thiếu `server_identity` hoặc `active_pin` khác với pin đang cấu hình mà không có cờ `--force-repin`: từ chối và cảnh báo rõ `"mọi client sẽ phải pin lại thủ công"` (`US-045 AC6`).
-3. Sao lưu tệp `control.redb` hiện tại (nếu có) sang `control.redb.before-restore`, chép `<backup_file>` vào `control.redb.tmp` (`0600`), gọi `sync_all()` và `rename` nguyên tử thành `control.redb`.
-4. Khi `mesh-server` khởi động lại trên DB vừa khôi phục: khóa định danh ECDSA P-256 (`active_pin`), danh sách `nodes` và `OverlayIp` được giữ nguyên 100%, và `MonotonicNetmapVersion` được khởi tạo bằng `max(restored_db_version, emergency_slot_version, now_unix_ms)` $\to$ **toàn bộ máy client macOS/Windows/Linux tự động kết nối lại trong ≤ 5 phút (RTO) mà không cần đăng ký lại và không cần pin lại** (`US-045 AC2`).
+3. **Nâng `netmap_version` & `netmap_version_watermark` chống tụt lùi sau Restore (`Codex R2 #1`)**:
+   - Vì bản sao lưu có thể cũ hơn trạng thái các client đang giữ trong RAM, lệnh `restore` tính:
+     $$\text{restored\_base} = \max\big(\text{backup\_db\_watermark},\ \text{existing\_local\_db\_watermark\_if\_readable},\ \text{existing\_local\_emergency\_slot\_version\_if\_readable},\ \text{now\_unix\_ms},\ \text{cli\_min\_netmap\_version.unwrap\_or}(0)\big).\text{saturating\_add}(1\_000\_000)$$
+   - Mở `WriteTransaction` trên bản khôi phục tạm `control.redb.tmp` (`0600`), cập nhật `schema_meta["netmap_version"] = restored_base` và `schema_meta["netmap_version_watermark"] = restored_base + VERSION_LEASE_STEP`, đồng thời ghi một slot sạch có `min_netmap_version = restored_base + VERSION_LEASE_STEP` vào `emergency-revocations.bin`.
+4. Sao lưu tệp `control.redb` hiện tại (nếu có) sang `control.redb.before-restore`, gọi `sync_all()` và `rename` nguyên tử `control.redb.tmp` thành `control.redb`.
+5. Khi `mesh-server` khởi động lại trên DB vừa khôi phục: khóa định danh ECDSA P-256 (`active_pin`), danh sách `nodes` và `OverlayIp` được giữ nguyên 100%, và `MonotonicNetmapVersion` phát các phiên bản `> restored_base` $\to$ **toàn bộ máy client macOS/Windows/Linux tự động kết nối lại và nhận Netmap mới trong ≤ 5 phút (RTO) mà không cần đăng ký lại và không cần pin lại** (`US-045 AC2`).
