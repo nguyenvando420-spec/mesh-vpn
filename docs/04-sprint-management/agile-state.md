@@ -7,7 +7,7 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `3 - Sprint Execution & Parallel Implementation`
 - **Sprint hiện tại**: `Sprint 1 (Milestone 1 — 38 Must / 174 SP)`
-- **Bước tiếp theo**: `Wave 1.0: Bootstrap toolchain (PortableZig SHA-256 fail-closed) -> Chạy WP-S1-00 (Foundation: Cargo workspace 10 crates, mesh-core, mesh-crypto, mesh-proto, OS traits & fakes)`
+- **Bước tiếp theo**: `Wave 1.0 (WP-S1-00) đã PASS Critic R2 (11/11 CLOSED, 63 tests) & Commit/Push -> Đang chạy song song 4 workers Wave 1.1 (WP-S1-01 Server/Store, WP-S1-02 Datapath, WP-S1-03 macOS/Linux, WP-S1-04 Windows)`
 
 ## Trạng thái Gate
 
@@ -26,15 +26,15 @@
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
 | agile-tech-lead | gemini-4-argon-high (dự phòng tiếp theo: `gemini-4-hydrogen-xhigh` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41) | 111ccb61-76da-4415-aa05-654afdb784c6 | Hoàn tất Vòng sửa 2 Gate 2 (`bootstrap-toolchain.ps1` Msvc parity, tách `/run/mesh-server` vs `/var/run/meshd`, `ADR-005..007` & `coding-standards` v2.2, rule 9,887 B) | ✅ Done (Rust v2.2) |
 | agile-architect | gemini-4-argon-high (dự phòng tiếp theo: `gemini-4-hydrogen-xhigh` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41) | 991a5bee-a698-49a3-b364-1ee99581e4f1 | Hoàn tất Vòng sửa 2 Gate 2 (`system-architecture.md`, `database-design.md`, `api-design.md` v2.2: High-Watermark Lease `1_024`, `persistence_tier`, tách IPC/state dir, UDP filter) | ✅ Done (Rust v2.2) |
-| agile-critic | gemini-4-carbon-high | 05cc28db-eaaa-4f04-b9b0-28fc69d2fd89 | Hoàn tất Thẩm định cuối Gate 2 Vòng 3: `[APPROVED FOR GATE]` (0B / 0H / 0 Notes) | ✅ Done (G2 R3) |
+| agile-critic | gemini-4-carbon-high | 0b42ff44-f6f8-46d8-b066-4b942a7ec8fe | Tái thẩm định `WP-S1-00` Vòng 2: `[APPROVED FOR GATE]` (`11/11 CLOSED`, `0B/0H`) | ✅ Done (`WP-S1-00 R2`) |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-ai-engineer | — (Chưa kích hoạt) | | | ⚪ Inactive |
-| agile-developer | gemini-4-hydrogen-xhigh (dự phòng cho `claude-sonnet-5-5-high` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41; tách biệt biến thể với QA `argon` & Critic `carbon`) | | Chuẩn bị thực thi `WP-S1-00` (Foundation 10 crates + `mesh-core`, `mesh-crypto`, `mesh-proto`, OS traits/fakes) | 🟡 Starting (`WP-S1-00`) |
+| agile-developer | gemini-4-hydrogen-xhigh (dự phòng cho `claude-sonnet-5-5-high` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41; tách biệt biến thể với QA `argon` & Critic `carbon`) | 4 parallel workers (`WP-S1-01..04`) | Đã hoàn tất `WP-S1-00`; đang chạy song song 4 gói Wave 1.1 (`WP-S1-01..04`, 0% file overlap) | 🟢 Active (`Wave 1.1 x4`) |
 | agile-qa | gemini-4-argon-high | | | ⚪ Pending |
 | agile-mlops-eval | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-devops | gemini-4-hydrogen-high (nâng cấp từ `gemini-3.8-flash-high` ngày 2026-11-13) | | | ⚪ Pending |
-| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol (`high`; mở rộng `gpt-6-astra` cho lõi Crypto/FFI/Gate 3, `gpt-6.1-terra` cho WP lớn, `gpt-6-luna` cho WP nhỏ) | (gọi qua codex_task.py) | Hoàn tất Thẩm định cuối Gate 2 Vòng 3: `0 Blocker` + 2 lưu ý nhánh lỗi `EIO` kép (trình minh bạch tại Gate 2 theo trần 2 vòng sửa) | ✅ Done (G2 R3) |
+| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol / gpt-6-astra (tạm chạm trần quota ChatGPT tới `2026-11-13 09:20+07:00` — áp dụng mục 1 `model-routing.md`: tạm thay bằng `agile-critic` `gemini-4-carbon-high` tới 09:20) | (gọi qua codex_task.py) | Chạm hạn mức cửa sổ ChatGPT lúc 06:50 (`resets at 09:20 AM`); tự động kích hoạt lại sau 09:20 | ⏸️ Quota Wait (`09:20`) |
 
 ## Kết luận Critic gần nhất
 

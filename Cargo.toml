@@ -1,0 +1,112 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+let_underscore_must_use = "deny"
+await_holding_lock = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+
+[workspace.dependencies]
+# Internal workspace crates
+mesh-core = { path = "crates/mesh-core", version = "0.1.0" }
+mesh-sys = { path = "crates/mesh-sys", version = "0.1.0" }
+mesh-crypto = { path = "crates/mesh-crypto", version = "0.1.0" }
+mesh-proto = { path = "crates/mesh-proto", version = "0.1.0" }
+mesh-net = { path = "crates/mesh-net", version = "0.1.0" }
+mesh-store = { path = "crates/mesh-store", version = "0.1.0" }
+mesh-datapath = { path = "crates/mesh-datapath", version = "0.1.0" }
+
+# Async runtime & utilities
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = { version = "0.7", features = ["full"] }
+
+# WireGuard userspace sans-I/O
+defguard_boringtun = "0.6"
+
+# TLS & PKI (Pure-Rust / ring only - aws-lc-rs blocked)
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1.11"
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+ring = "0.17"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+instant-acme = { version = "0.7", default-features = false, features = ["ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots-no-provider", "json"] }
+
+# HTTP & WebSocket
+axum = { version = "0.8" }
+hyper = { version = "1.6", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
+
+# Cryptography & secret memory protection
+crypto_box = "0.9"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+subtle = "2.6"
+zeroize = { version = "1.8", features = ["derive"] }
+rand = "0.8"
+getrandom = "0.2"
+
+# Embedded ACID storage
+redb = "2.4"
+
+# Serialization, config, CLI & errors
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+thiserror = "2.0"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+
+# Networking & encodings
+bytes = "1.10"
+crc32fast = "1.4"
+base64 = "0.22"
+data-encoding = "2.8"
+socket2 = "0.5"
+
+# OS FFI & service bindings
+libc = "0.2"
+windows-sys = "0.59"
+windows-service = "0.7"
+
+# Dev / test dependencies
+proptest = "1.6"
+tempfile = "3.17"
