@@ -63,6 +63,8 @@ pub struct RestoreOptions {
     pub verify_sha256: bool,
     /// Monotonic floor from live DB + emergency slot + current clock (`database-design.md` §3.3).
     pub min_netmap_version: u64,
+    /// Optional operator-requested minimum snapshot version (`--min-netmap-version`, `US-045`).
+    pub min_required_snapshot_version: Option<u64>,
 }
 
 /// Outcome returned by [`BackupManager::restore_from_snapshot`].
@@ -448,6 +450,13 @@ fn validate_and_bump_staged_db(
             Some(g) => decode_u64_be(g.value())?,
             None => 0,
         };
+        if let Some(required_ver) = options.min_required_snapshot_version
+            && current < required_ver
+        {
+            return Err(AppError::invalid_argument(format!(
+                "snapshot netmap_version watermark {current} is below --min-netmap-version {required_ver}"
+            )));
+        }
         let jumped = current
             .max(options.min_netmap_version)
             .saturating_add(RESTORE_WATERMARK_JUMP);
@@ -891,6 +900,7 @@ mod tests {
             allow_pin_change: false,
             verify_sha256: true,
             min_netmap_version: 0,
+            min_required_snapshot_version: None,
         });
         assert!(restore_res.is_err());
     }
@@ -963,6 +973,7 @@ mod tests {
             allow_pin_change: false,
             verify_sha256: true,
             min_netmap_version: 1_731_480_001_000,
+            min_required_snapshot_version: None,
         });
 
         // Assert: `<target_db_path>.before-restore` MUST be retained cleanly with 0600 mode.

@@ -16,12 +16,14 @@ use mesh_core::defaults::{DEFAULT_CONTROL_TCP_PORT, MAX_HTTP_BODY_BYTES};
 use mesh_core::defaults::{UNIX_AGENT_ADMIN_SOCKET, UNIX_AGENT_RO_SOCKET};
 #[cfg(windows)]
 use mesh_core::defaults::{WINDOWS_AGENT_ADMIN_PIPE, WINDOWS_AGENT_RO_PIPE};
-use mesh_core::{AppError, AppResult, NodeName, Port, SpkiPin};
+use mesh_core::{AppError, AppResult, ErrorKind, NodeName, Port, SpkiPin};
 use mesh_crypto::PreAuthToken;
 use mesh_net::ipc::send_ipc_json_request;
+use mesh_net::ledger::{LedgerCleanupOps, ResourceLedger};
 use mesh_proto::agent_ipc::{
     AgentActionResponse, AgentRotateKeyRequest, AgentSetRequest, AgentStatusResponse,
-    AgentUpRequest, BugreportResponse, NetcheckResponse, PingRequest, PingResponse, PingVia,
+    AgentUpRequest, BugreportResponse, DaemonState, NetcheckResponse, PingRequest, PingResponse,
+    PingVia,
 };
 
 use crate::output::{
@@ -173,9 +175,7 @@ pub(crate) async fn handle_client_command(
             emit_formatted(&resp, cfg.json, format_agent_action)
         }
         ClientCommand::Cleanup => {
-            let resp: AgentActionResponse =
-                send_admin_request(cfg, hyper::Method::POST, "/v1/agent/cleanup", Some(&()))
-                    .await?;
+            let resp = execute_cleanup_with_offline_fallback(cfg).await?;
             emit_formatted(&resp, cfg.json, format_agent_action)
         }
         ClientCommand::Set(args) => handle_set(args, cfg).await,
@@ -187,6 +187,73 @@ pub(crate) async fn handle_client_command(
             emit_formatted(&resp, cfg.json, format_bugreport)
         }
     }
+}
+
+async fn execute_cleanup_with_offline_fallback(
+    cfg: &ClientDispatchConfig,
+) -> AppResult<AgentActionResponse> {
+    match send_admin_request::<(), AgentActionResponse>(
+        cfg,
+        hyper::Method::POST,
+        "/v1/agent/cleanup",
+        Some(&()),
+    )
+    .await
+    {
+        Ok(resp) => Ok(resp),
+        Err(err) if err.kind() == ErrorKind::Unavailable && cfg.admin_ipc_override.is_none() => {
+            let ledger_path = ResourceLedger::default_ledger_path();
+            cleanup_offline_ledger_with_platform_ops(&ledger_path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn cleanup_offline_ledger_with_platform_ops(ledger_path: &Path) -> AppResult<AgentActionResponse> {
+    #[cfg(target_os = "linux")]
+    {
+        let ops = mesh_net::route_linux::LinuxCleanupOps::new();
+        cleanup_offline_ledger_if_present(ledger_path, &ops)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ops = mesh_net::route_macos::MacOsCleanupOps::new();
+        cleanup_offline_ledger_if_present(ledger_path, &ops)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let ops = mesh_net::route_windows::WindowsCleanupOps::new();
+        cleanup_offline_ledger_if_present(ledger_path, &ops)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let ops = mesh_net::ledger::FakeLedgerCleanupOps::new();
+        cleanup_offline_ledger_if_present(ledger_path, &ops)
+    }
+}
+
+fn cleanup_offline_ledger_if_present(
+    ledger_path: &Path,
+    ops: &dyn LedgerCleanupOps,
+) -> AppResult<AgentActionResponse> {
+    if !ledger_path.exists() {
+        return Ok(AgentActionResponse {
+            state: DaemonState::Stopped,
+            message: "daemon offline and no ledger present; skipping cleanup".to_owned(),
+        });
+    }
+    let mut ledger = ResourceLedger::load_or_init(ledger_path.to_path_buf())?;
+    if !ledger.needs_stale_recovery() {
+        return Ok(AgentActionResponse {
+            state: DaemonState::Stopped,
+            message: "daemon offline and ledger already clean".to_owned(),
+        });
+    }
+    ledger.cleanup_all(ops)?;
+    Ok(AgentActionResponse {
+        state: DaemonState::Stopped,
+        message: "offline ledger cleanup completed idempotently".to_owned(),
+    })
 }
 
 async fn handle_ping(args: &PingArgs, cfg: &ClientDispatchConfig) -> AppResult<()> {
@@ -750,5 +817,152 @@ mod tests {
         assert!(req_text.starts_with("GET /v1/agent/status HTTP/1.1"));
         assert_eq!(got.daemon_state, DaemonState::Stopped);
         assert_eq!(got.tun_mtu, 1380);
+    }
+
+    #[tokio::test]
+    async fn test_set_and_rotate_key_wire_contracts_and_error_safety() {
+        use mesh_proto::agent_ipc::{
+            AgentActionResponse, AgentRotateKeyRequest, AgentSetRequest, DaemonState,
+        };
+        use tempfile::tempdir;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+
+        // Arrange: US-074 AC5 Zero-TOFU validation for IP vs pin
+        assert!(validate_server_and_policy("203.0.113.10:8443", None, None, false).is_err());
+        assert!(validate_server_and_policy("203.0.113.10:8443", None, None, true).is_err());
+        let valid_pin = format!("sha256:{}", "ab".repeat(32));
+        let (ep, _port, parsed_pin) =
+            validate_server_and_policy("203.0.113.10:8443", None, Some(&valid_pin), false)
+                .expect("pinned IP accepted");
+        assert_eq!(ep, "203.0.113.10:8443");
+        assert!(parsed_pin.is_some());
+
+        // Act 1: POST /v1/agent/set over mock duplex admin IPC
+        let (client_set, mut server_set) = duplex(16 * 1024);
+        let set_req = AgentSetRequest {
+            server_endpoint: ep.clone(),
+            server_pin: parsed_pin,
+        };
+        let action_ok = AgentActionResponse {
+            state: DaemonState::Connecting,
+            message: "Control endpoint updated; reconnecting".to_owned(),
+        };
+        let ok_bytes = serde_json::to_vec(&action_ok).expect("serialize action");
+        let set_client_fut = call_agent_stream::<_, AgentSetRequest, AgentActionResponse>(
+            client_set,
+            hyper::Method::POST,
+            "/v1/agent/set",
+            Some(&set_req),
+        );
+        let set_server_fut = async move {
+            let mut buf = [0_u8; 4096];
+            let n = server_set.read(&mut buf).await.expect("read set req");
+            let req_text = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).into_owned();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                ok_bytes.len()
+            );
+            server_set.write_all(reply.as_bytes()).await.expect("hdr");
+            server_set.write_all(&ok_bytes).await.expect("body");
+            server_set.flush().await.expect("flush");
+            req_text
+        };
+        let (set_res, set_wire) = tokio::join!(set_client_fut, set_server_fut);
+        assert!(set_wire.starts_with("POST /v1/agent/set HTTP/1.1"));
+        assert!(set_wire.contains("203.0.113.10:8443"));
+        assert_eq!(set_res.expect("set ok").state, DaemonState::Connecting);
+
+        // Act 2: US-032 authkey file load + failed /v1/agent/rotate-key error preserves secrecy
+        let dir = tempdir().expect("tempdir");
+        let auth_file = dir.path().join("rotate.key");
+        let canary_tok = PreAuthToken::generate();
+        let canary_key = canary_tok.as_secret().expose_secret().clone();
+        std::fs::write(&auth_file, format!("{canary_key}\n")).expect("write key");
+        let loaded = load_preauth_token(Some(&auth_file), None, false, true)
+            .expect("load token ok")
+            .expect("token present");
+        let (client_rot, mut server_rot) = duplex(16 * 1024);
+        let rot_req = AgentRotateKeyRequest {
+            preauth_key: loaded.as_secret().expose_secret().clone(),
+        };
+        let err_json = br#"{"error":{"kind":"unavailable","message":"Control unreachable; existing identity preserved"}}"#;
+        let rot_client_fut = call_agent_stream::<_, AgentRotateKeyRequest, AgentActionResponse>(
+            client_rot,
+            hyper::Method::POST,
+            "/v1/agent/rotate-key",
+            Some(&rot_req),
+        );
+        let rot_server_fut = async move {
+            let mut buf = [0_u8; 4096];
+            let _n = server_rot.read(&mut buf).await.expect("read rot req");
+            let reply = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                err_json.len()
+            );
+            server_rot.write_all(reply.as_bytes()).await.expect("hdr");
+            server_rot.write_all(err_json).await.expect("body");
+            server_rot.flush().await.expect("flush");
+        };
+        let (rot_res, ()) = tokio::join!(rot_client_fut, rot_server_fut);
+
+        // Assert: error propagates cleanly without leaking preauth canary key
+        let rot_err = rot_res.expect_err("offline rotate-key fails safely");
+        assert!(!rot_err.to_string().contains(&canary_key));
+    }
+
+    #[test]
+    fn test_cleanup_offline_ledger_if_present_skips_when_missing_and_cleans_only_recorded() {
+        // Arrange (`HR-W21-09`)
+        let Ok(dir) = tempfile::tempdir() else {
+            return;
+        };
+        let missing_ledger = dir.path().join("missing-ledger.json");
+        let fake_ops_missing = mesh_net::ledger::FakeLedgerCleanupOps::new();
+
+        // Act 1: missing ledger does nothing
+        let res_missing =
+            super::cleanup_offline_ledger_if_present(&missing_ledger, &fake_ops_missing);
+
+        // Assert 1
+        assert!(res_missing.is_ok());
+        assert!(
+            fake_ops_missing
+                .recorded_steps()
+                .ok()
+                .is_some_and(|steps| steps.is_empty())
+        );
+
+        // Arrange 2: dirty ledger with recorded resources
+        let active_ledger = dir.path().join("ledger.json");
+        let Ok(mut ledger) = mesh_net::ledger::ResourceLedger::load_or_init(active_ledger.clone())
+        else {
+            return;
+        };
+        assert!(
+            ledger
+                .record_tun_before_create("mesh0".to_owned(), None, 999, 1_700_000_000_000)
+                .is_ok()
+        );
+        assert!(
+            ledger
+                .record_route_before_add(mesh_net::ledger::LedgerRouteEntry {
+                    destination_cidr: "100.115.0.0/16".to_owned(),
+                    interface_name: "mesh0".to_owned(),
+                    table: Some(51820),
+                })
+                .is_ok()
+        );
+        let fake_ops_active = mesh_net::ledger::FakeLedgerCleanupOps::new();
+
+        // Act 2: cleanup reads ledger and removes only recorded items
+        let res_active = super::cleanup_offline_ledger_if_present(&active_ledger, &fake_ops_active);
+
+        // Assert 2
+        assert!(res_active.is_ok());
+        let Ok(steps) = fake_ops_active.recorded_steps() else {
+            return;
+        };
+        assert!(steps.iter().any(|s| s.contains("mesh0")));
+        assert!(steps.iter().any(|s| s.contains("100.115.0.0/16")));
     }
 }

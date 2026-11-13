@@ -8,8 +8,33 @@ use mesh_core::{AppError, AppResult};
 use mesh_sys::netmon_macos::RawNetEventKind;
 use tokio::net::unix::pipe;
 
-use crate::netmon::NetEvent;
+use crate::endpoint_filter::InterfaceSubnetSnapshot;
+use crate::netmon::{NetEvent, PhysicalInterface};
 use crate::tun::BoxFuture;
+
+/// Queries the current primary macOS physical interface `(if_index, name)` via `PF_ROUTE`/`getifaddrs`.
+pub fn query_primary_physical_interface() -> AppResult<PhysicalInterface> {
+    let (if_index, name) =
+        mesh_sys::netmon_macos::query_primary_physical_interface().map_err(AppError::from)?;
+    Ok(PhysicalInterface { if_index, name })
+}
+
+/// Lists all current macOS interface unicast addresses and CIDR prefixes (`US-035`, `US-037`).
+pub fn list_interface_subnets() -> AppResult<Vec<InterfaceSubnetSnapshot>> {
+    let items = mesh_sys::netmon_macos::list_interface_addresses().map_err(AppError::from)?;
+    Ok(items
+        .into_iter()
+        .map(|item| InterfaceSubnetSnapshot {
+            if_index: item.if_index,
+            interface_name: item.name,
+            ip: item.ip,
+            prefix_len: item.prefix_len,
+            is_up: item.is_up,
+            is_virtual: item.is_virtual,
+            has_gateway: false,
+        })
+        .collect())
+}
 
 /// macOS asynchronous network monitor backed by a non-blocking `PF_ROUTE` routing socket.
 #[derive(Debug)]
@@ -44,7 +69,7 @@ impl MacOsNetMonitor {
     /// Eagerly opens the `PF_ROUTE` monitor socket right away.
     pub fn start() -> AppResult<Self> {
         let monitor = Self::new();
-        let _ = monitor.ensure_fd()?;
+        monitor.ensure_fd().map(|_| ())?;
         Ok(monitor)
     }
 
@@ -83,11 +108,14 @@ impl MacOsNetMonitor {
         Ok(async_rx)
     }
 
-    fn enqueue_batch_and_take_first(
+    fn enqueue_batch_for_iface_and_take_first(
         &self,
         batch: Vec<RawNetEventKind>,
+        iface_name: Option<&str>,
     ) -> AppResult<Option<NetEvent>> {
-        let mut iter = batch.into_iter().map(map_raw_event);
+        let mut iter = batch
+            .into_iter()
+            .map(|kind| map_raw_event_with_iface(kind, iface_name));
         let Some(first) = iter.next() else {
             return Ok(None);
         };
@@ -98,22 +126,37 @@ impl MacOsNetMonitor {
         guard.pending.extend(iter);
         Ok(Some(first))
     }
+
+    #[cfg(test)]
+    fn enqueue_batch_and_take_first(
+        &self,
+        batch: Vec<RawNetEventKind>,
+    ) -> AppResult<Option<NetEvent>> {
+        self.enqueue_batch_for_iface_and_take_first(batch, None)
+    }
+}
+
+/// Translates a raw macOS `PF_ROUTE` notification kind into an OS-agnostic [`NetEvent`], attaching
+/// a resolved physical interface name when available.
+#[must_use]
+pub fn map_raw_event_with_iface(kind: RawNetEventKind, iface_name: Option<&str>) -> NetEvent {
+    let iface = iface_name
+        .filter(|s| !s.is_empty())
+        .unwrap_or("underlay")
+        .to_owned();
+    match kind {
+        RawNetEventKind::InterfaceUpChanged => NetEvent::InterfaceUp { interface: iface },
+        RawNetEventKind::AddressChanged => NetEvent::AddressChanged { interface: iface },
+        RawNetEventKind::DefaultRouteChanged | RawNetEventKind::PhysicalInterfaceChanged => {
+            NetEvent::RouteChanged
+        }
+    }
 }
 
 /// Translates a raw macOS `PF_ROUTE` notification kind into an OS-agnostic [`NetEvent`].
 #[must_use]
 pub fn map_raw_event(kind: RawNetEventKind) -> NetEvent {
-    match kind {
-        RawNetEventKind::InterfaceUpChanged => NetEvent::InterfaceUp {
-            interface: "underlay".to_owned(),
-        },
-        RawNetEventKind::AddressChanged => NetEvent::AddressChanged {
-            interface: "underlay".to_owned(),
-        },
-        RawNetEventKind::DefaultRouteChanged | RawNetEventKind::PhysicalInterfaceChanged => {
-            NetEvent::RouteChanged
-        }
-    }
+    map_raw_event_with_iface(kind, None)
 }
 
 impl crate::netmon::NetMonitor for MacOsNetMonitor {
@@ -130,7 +173,11 @@ impl crate::netmon::NetMonitor for MacOsNetMonitor {
                 })?;
                 match rx.try_io(|| mesh_sys::netmon_macos::read_route_events(rx.as_ref())) {
                     Ok(batch) => {
-                        if let Some(first) = self.enqueue_batch_and_take_first(batch)? {
+                        let active_iface = query_primary_physical_interface().ok().map(|p| p.name);
+                        if let Some(first) = self.enqueue_batch_for_iface_and_take_first(
+                            batch,
+                            active_iface.as_deref(),
+                        )? {
                             return Ok(first);
                         }
                     }
@@ -138,6 +185,11 @@ impl crate::netmon::NetMonitor for MacOsNetMonitor {
                         if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
                     {
                         continue;
+                    }
+                    Err(err)
+                        if err.raw_os_error() == Some(mesh_sys::netmon_macos::ENOBUFS_ERRNO) =>
+                    {
+                        return Ok(NetEvent::RouteChanged);
                     }
                     Err(err) => {
                         return Err(AppError::unavailable(format!(

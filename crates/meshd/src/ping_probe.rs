@@ -6,13 +6,15 @@ use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
 use tracing::debug;
 
+use mesh_core::clock::SystemClock;
 use mesh_core::defaults::{CONNECT_TIMEOUT_MS, DEFAULT_CONTROL_TCP_PORT};
 use mesh_core::{AppError, AppResult, NodeId, NodeName, OverlayIp};
 use mesh_datapath::{
-    DatapathCommand, DatapathHandle, PingProbePath, connect_bound_tcp_with_timeout,
+    DatapathCommand, DatapathHandle, MagicSocket, MagicSocketConfig, PingProbePath, StunClient,
+    StunClientConfig, StunProbeReport, connect_bound_tcp_with_timeout,
 };
 use mesh_proto::agent_ipc::{NetcheckResponse, PingRequest, PingResponse, PingSample, PingVia};
-use mesh_proto::netmap::NatMappingKind;
+use mesh_proto::netmap::{NatMappingKind, RelayMap};
 
 use crate::config::split_host_port;
 use crate::control_loop::DaemonRuntimeState;
@@ -23,6 +25,7 @@ const MIN_PING_TIMEOUT_MS: u64 = 200;
 const MAX_PING_TIMEOUT_MS: u64 = 15_000;
 const STUN_REFRESH_WAIT: Duration = Duration::from_millis(600);
 const NETCHECK_TCP_TOTAL_BUDGET: Duration = Duration::from_millis(2_500);
+const NETCHECK_OVERALL_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Executes live datapath ping probes and STUN/TCP diagnostics for `meshd-ro` IPC routes.
 #[derive(Debug)]
@@ -73,62 +76,122 @@ impl PingProbe {
         Ok(summarize_ping_samples(peer_name, peer_ip, samples))
     }
 
-    /// Evaluates STUN UDP reachability, NAT mapping behavior, and Control TCP egress (`US-023`).
+    /// Evaluates STUN UDP reachability, NAT mapping behavior, and Control/Relay TCP egress (`US-023`).
     pub(crate) async fn execute_netcheck(
         state: &DaemonRuntimeState,
     ) -> AppResult<NetcheckResponse> {
         let (
             datapath_opt,
             control_endpoint,
+            relay_endpoint,
             cached_relay_rtt,
-            stun_list,
+            mut stun_list,
             underlay_if_index,
             linux_fwmark,
+            local_has_ipv6,
         ) = {
             let g = state.inner.read().await;
             let ctrl = g.bootstrap.server_endpoint.clone();
+            let relay_ep = g
+                .latest_netmap
+                .as_ref()
+                .map(|n| n.relay_map.relay_tcp_endpoint.clone());
             let stuns = g
                 .latest_netmap
                 .as_ref()
                 .map_or_else(Vec::new, |n| n.relay_map.stun_udp_endpoints.clone());
+            let has_v6 = g.local_candidates.iter().any(|c| c.addr.is_ipv6());
             (
                 g.datapath_handle.clone(),
                 ctrl,
+                relay_ep,
                 g.relay_rtt_ms,
                 stuns,
                 g.underlay_if_index,
                 g.linux_fwmark,
+                has_v6,
             )
         };
 
-        let dp_snapshot = match datapath_opt {
-            Some(ref handle) => refresh_stun_snapshot(handle).await,
-            None => None,
+        if stun_list.is_empty()
+            && let Ok(env_stuns) = std::env::var("MESH_STUN_ENDPOINTS")
+        {
+            stun_list = env_stuns
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+
+        let stun_list_for_task = stun_list.clone();
+        let control_ep_for_task = control_endpoint.clone();
+        let control_ep_for_relay_cmp = control_endpoint.clone();
+        let relay_ep_for_task = relay_endpoint.clone();
+
+        let stun_fut = async move {
+            let dp_snap = match datapath_opt {
+                Some(ref handle) => refresh_stun_snapshot(handle).await,
+                None => None,
+            };
+            let standalone = if dp_snap
+                .as_ref()
+                .and_then(|s| s.last_stun_report.as_ref())
+                .is_none()
+                && !stun_list_for_task.is_empty()
+            {
+                run_ephemeral_stun_probe(&stun_list_for_task, underlay_if_index, linux_fwmark).await
+            } else {
+                None
+            };
+            (dp_snap, standalone)
+        };
+        let control_tcp_fut = async move {
+            match control_ep_for_task.as_deref() {
+                Some(ep) => probe_tcp_reachability(ep, underlay_if_index, linux_fwmark).await,
+                None => (false, None),
+            }
+        };
+        let relay_tcp_fut = async move {
+            match relay_ep_for_task.as_deref() {
+                Some(rep) if Some(rep) != control_ep_for_relay_cmp.as_deref() => {
+                    probe_tcp_reachability(rep, underlay_if_index, linux_fwmark)
+                        .await
+                        .1
+                }
+                _ => None,
+            }
         };
 
-        let tcp_probe = match control_endpoint.as_deref() {
-            Some(ep) => Some(probe_tcp_reachability(ep, underlay_if_index, linux_fwmark).await),
-            None => None,
-        };
+        let (
+            (dp_snapshot, standalone_stun_report),
+            (control_tcp_reachable, tcp_rtt_ms),
+            relay_tcp_rtt_ms,
+        ) = tokio::time::timeout(NETCHECK_OVERALL_DEADLINE, async {
+            tokio::join!(stun_fut, control_tcp_fut, relay_tcp_fut)
+        })
+        .await
+        .unwrap_or(((None, None), (false, None), None));
 
-        let (control_tcp_reachable, tcp_rtt_ms) = match tcp_probe {
-            Some((ok, rtt)) => (ok, rtt),
-            None => (false, None),
-        };
+        let relay_rtt_ms = cached_relay_rtt
+            .map(|v| v as f64)
+            .or(relay_tcp_rtt_ms)
+            .or(tcp_rtt_ms);
 
-        let relay_rtt_ms = cached_relay_rtt.map(|v| v as f64).or(tcp_rtt_ms);
-
-        let report = dp_snapshot.and_then(|s| s.last_stun_report);
+        let report = dp_snapshot
+            .and_then(|s| s.last_stun_report)
+            .or(standalone_stun_report);
         let (
             udp_egress_ok,
             stun_reachable,
             stun_tested,
             reflexive_ipv4,
-            ipv6_available,
+            stun_ipv6,
             nat_mapping,
             nat_note,
         ) = extract_stun_fields(report.as_ref(), &stun_list);
 
+        let ipv6_available = stun_ipv6 || local_has_ipv6;
         let diagnostic_hint = build_netcheck_hint(
             control_endpoint.as_deref(),
             control_tcp_reachable,
@@ -149,6 +212,31 @@ impl PingProbe {
             diagnostic_hint,
         })
     }
+}
+
+async fn run_ephemeral_stun_probe(
+    stun_endpoints: &[String],
+    underlay_if_index: Option<u32>,
+    linux_fwmark: Option<u32>,
+) -> Option<StunProbeReport> {
+    let sock_cfg = MagicSocketConfig {
+        underlay_if_index,
+        linux_fwmark,
+        ..MagicSocketConfig::default()
+    };
+    let Ok(sock) = MagicSocket::bind(sock_cfg).await else {
+        return None;
+    };
+    let mut stun = StunClient::new(StunClientConfig::with_timeout(Duration::from_millis(1_500)));
+    let rmap = RelayMap {
+        endpoint_version: 0,
+        control_tcp_endpoint: String::new(),
+        relay_tcp_endpoint: String::new(),
+        stun_udp_endpoints: stun_endpoints.to_vec(),
+    };
+    stun.probe_blocking(&sock, &rmap, &SystemClock::new())
+        .await
+        .ok()
 }
 
 async fn refresh_stun_snapshot(
@@ -368,9 +456,13 @@ fn build_netcheck_hint(
             && port.get() != DEFAULT_CONTROL_TCP_PORT
         {
             let suffix = if host.parse::<IpAddr>().is_ok() {
-                "consider terminating Control TLS behind a domain/HTTPS proxy on the standard TLS port"
+                format!(
+                    "captive/hotel firewalls often permit only ports 80 and {DEFAULT_CONTROL_TCP_PORT}; consider migrating server port to {DEFAULT_CONTROL_TCP_PORT}"
+                )
             } else {
-                "verify outbound corporate firewall rules allow this custom Control TCP port"
+                format!(
+                    "restrictive networks may allow only ports 80 and {DEFAULT_CONTROL_TCP_PORT}; consider port {DEFAULT_CONTROL_TCP_PORT}"
+                )
             };
             return Some(format!(
                 "Control TCP endpoint {ep} is unreachable on non-standard port {}; {suffix}",
@@ -384,7 +476,7 @@ fn build_netcheck_hint(
     }
     if !udp_egress_ok {
         return Some(
-            "Outbound UDP STUN appears blocked; Blind Relay over TLS/WebSocket will carry traffic"
+            "UDP blocked, relay-only: outbound UDP STUN timed out so encrypted traffic falls back to Blind Relay over TLS/WebSocket"
                 .to_owned(),
         );
     }
@@ -579,5 +671,157 @@ mod tests {
         assert!(!reachable);
         assert_eq!(rtt, None);
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    // Traces: US-023
+    #[tokio::test]
+    async fn test_netcheck_runs_standalone_stun_when_stopped_and_gives_port_and_udp_hints() {
+        // Arrange: start local mock UDP STUN responder + closed non-443 Control port (8443 style)
+        use mesh_core::OverlayCidr;
+        use mesh_crypto::DiscoKeypair;
+        use mesh_crypto::NodeKeypair;
+        use mesh_proto::netmap::{NetmapSnapshot, PinSetDto};
+        use tokio::net::TcpListener;
+        use tokio::net::UdpSocket;
+
+        let stun_sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind stun");
+        let stun_addr = stun_sock.local_addr().expect("stun addr");
+        let stun_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if let Ok((n, peer)) = stun_sock.recv_from(&mut buf).await
+                && let Ok(parsed) = mesh_proto::stun::parse_stun_packet(buf.get(..n).unwrap_or(&[]))
+            {
+                let resp = mesh_proto::stun::encode_binding_success_response(parsed.tx_id, peer);
+                let _ignored = stun_sock.send_to(&resp, peer).await;
+            }
+        });
+
+        let dead_tcp = TcpListener::bind("127.0.0.1:0").await.expect("bind dead");
+        let dead_addr = dead_tcp.local_addr().expect("dead addr");
+        drop(dead_tcp);
+
+        let dir = tempdir().expect("tempdir");
+        let cfg = BootstrapConfig {
+            server_endpoint: Some(format!("127.0.0.1:{}", dead_addr.port())),
+            tls_auth_mode: mesh_proto::agent_ipc::TlsAuthMode::SpkiPin,
+            active_pin: Some(SpkiPin::from_sha256_bytes([1u8; 32])),
+            ..BootstrapConfig::default()
+        };
+        let state = DaemonRuntimeState::new(
+            cfg,
+            BootstrapStore::new(dir.path().join("bootstrap.toml")),
+            NetmapCacheStore::new(dir.path().join("netmap-cache.json")),
+            None,
+            1280,
+        );
+        let cidr: OverlayCidr = "100.115.0.0/16".parse().expect("cidr");
+        let _kp = NodeKeypair::generate();
+        let _dk = DiscoKeypair::generate();
+        let snap = NetmapSnapshot {
+            netmap_version: 1,
+            generated_at_ms: 1_700_000_000_000,
+            overlay_cidr: cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: RelayMap {
+                endpoint_version: 1,
+                control_tcp_endpoint: format!("127.0.0.1:{}", dead_addr.port()),
+                relay_tcp_endpoint: format!("127.0.0.1:{}", dead_addr.port()),
+                stun_udp_endpoints: vec![stun_addr.to_string()],
+            },
+            pin_set: PinSetDto {
+                active_pin: SpkiPin::from_sha256_bytes([1u8; 32]),
+                next_pin: None,
+            },
+            peers: vec![],
+        };
+        {
+            let mut g = state.inner.write().await;
+            g.latest_netmap = Some(snap);
+        }
+
+        // Act: tunnel stopped (datapath_handle = None), STUN probe STILL succeeds standalone!
+        let res = PingProbe::execute_netcheck(&state)
+            .await
+            .expect("netcheck succeeds");
+        stun_task.abort();
+
+        // Assert
+        assert!(res.udp_egress_ok);
+        assert!(res.stun_reachable);
+        assert!(!res.control_tcp_reachable);
+        use mesh_core::defaults::DEFAULT_CONTROL_TCP_PORT;
+        let hint = res.diagnostic_hint.expect("port hint present");
+        assert!(hint.contains(&dead_addr.port().to_string()));
+        assert!(hint.contains(&DEFAULT_CONTROL_TCP_PORT.to_string()));
+
+        // Also check UDP blocked + TCP reachable -> explicit "UDP blocked, relay-only"
+        let udp_block_hint = super::build_netcheck_hint(Some("203.0.113.10:8443"), true, false)
+            .expect("udp block hint");
+        assert!(udp_block_hint.contains("UDP blocked, relay-only"));
+    }
+
+    // Traces: IMP-W21-02 (`US-023 AC4`)
+    #[tokio::test]
+    async fn test_netcheck_completes_under_5s_deadline_when_blackholed() {
+        // Arrange: silent UDP STUN sink + two distinct RFC 5737 TEST-NET blackhole TCP endpoints
+        use mesh_core::OverlayCidr;
+        use mesh_proto::netmap::{NetmapSnapshot, PinSetDto};
+        use tokio::net::UdpSocket;
+
+        let silent_udp = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent udp");
+        let silent_addr = silent_udp.local_addr().expect("silent addr");
+
+        let dir = tempdir().expect("tempdir");
+        let cfg = BootstrapConfig {
+            server_endpoint: Some("192.0.2.1:8443".to_owned()),
+            tls_auth_mode: mesh_proto::agent_ipc::TlsAuthMode::SpkiPin,
+            active_pin: Some(SpkiPin::from_sha256_bytes([2u8; 32])),
+            ..BootstrapConfig::default()
+        };
+        let state = DaemonRuntimeState::new(
+            cfg,
+            BootstrapStore::new(dir.path().join("bootstrap.toml")),
+            NetmapCacheStore::new(dir.path().join("netmap-cache.json")),
+            None,
+            1280,
+        );
+        let cidr: OverlayCidr = "100.115.0.0/16".parse().expect("cidr");
+        let snap = NetmapSnapshot {
+            netmap_version: 1,
+            generated_at_ms: 1_700_000_000_000,
+            overlay_cidr: cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: RelayMap {
+                endpoint_version: 1,
+                control_tcp_endpoint: "192.0.2.1:8443".to_owned(),
+                relay_tcp_endpoint: "198.51.100.1:8443".to_owned(),
+                stun_udp_endpoints: vec![silent_addr.to_string()],
+            },
+            pin_set: PinSetDto {
+                active_pin: SpkiPin::from_sha256_bytes([2u8; 32]),
+                next_pin: None,
+            },
+            peers: vec![],
+        };
+        {
+            let mut g = state.inner.write().await;
+            g.latest_netmap = Some(snap);
+        }
+
+        // Act
+        let started = Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(5), PingProbe::execute_netcheck(&state))
+            .await
+            .expect("execute_netcheck MUST stay within <= 5 s overall SLO")
+            .expect("execute_netcheck succeeds cleanly");
+        let elapsed = started.elapsed();
+
+        // Assert
+        assert!(elapsed <= Duration::from_secs(5), "elapsed={elapsed:?}");
+        assert!(!res.udp_egress_ok);
+        assert!(!res.stun_reachable);
+        assert!(!res.control_tcp_reachable);
     }
 }

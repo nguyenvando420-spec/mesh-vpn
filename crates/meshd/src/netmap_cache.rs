@@ -19,6 +19,20 @@ pub(crate) const NETMAP_CACHE_SCHEMA_VERSION: u16 = 1;
 /// Default offline P2P survivability grace window in hours (`US-033 AC2`).
 pub(crate) const DEFAULT_OFFLINE_GRACE_HOURS: u64 = 168;
 
+/// Default offline grace period (hours) before expired WireGuard keys stop offline forwarding (`US-031 AC4`).
+pub(crate) const DEFAULT_KEY_EXPIRY_GRACE_HOURS: u64 = 24;
+
+/// Configurable override env var for offline netmap survivability grace hours (`US-033`).
+const ENV_OFFLINE_GRACE_HOURS: &str = "MESH_OFFLINE_GRACE_HOURS";
+
+fn configured_offline_grace_hours() -> u64 {
+    std::env::var(ENV_OFFLINE_GRACE_HOURS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&h| h > 0)
+        .unwrap_or(DEFAULT_OFFLINE_GRACE_HOURS)
+}
+
 /// Offline cache payload written atomically with a canonical SHA-256 checksum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +45,9 @@ pub(crate) struct NetmapCacheFile {
     pub(crate) cached_at_ms: u64,
     /// Configured offline survivability grace window in hours.
     pub(crate) offline_grace_hours: u64,
+    /// Optional local node identity key expiry timestamp in UTC milliseconds (`US-031 AC4`).
+    #[serde(default)]
+    pub(crate) local_key_expires_at_ms: Option<u64>,
     /// Lowercase SHA-256 hex digest over canonical serialized snapshot metadata.
     pub(crate) payload_sha256: String,
     /// Last validated network map received over verified Control TLS.
@@ -53,6 +70,7 @@ impl NetmapCacheFile {
             self.local_udp_port,
             self.cached_at_ms,
             self.offline_grace_hours,
+            self.local_key_expires_at_ms,
             &self.netmap,
         )?;
         let actual_lower = self.payload_sha256.trim().to_ascii_lowercase();
@@ -71,6 +89,42 @@ impl NetmapCacheFile {
         let grace_ms = self.offline_grace_hours.saturating_mul(3_600_000);
         self.cached_at_ms.saturating_add(grace_ms) >= now_unix_ms
     }
+
+    /// Returns `true` if `key_expires_at_ms` has not elapsed beyond `key_grace_hours` (`US-031 AC4`).
+    #[must_use]
+    pub(crate) fn is_key_usable_offline(
+        key_expires_at_ms: Option<u64>,
+        now_unix_ms: u64,
+        key_grace_hours: u64,
+    ) -> bool {
+        let Some(exp_ms) = key_expires_at_ms else {
+            return true;
+        };
+        let grace_ms = key_grace_hours.saturating_mul(3_600_000);
+        exp_ms.saturating_add(grace_ms) >= now_unix_ms
+    }
+
+    /// Extracts an offline-recoverable snapshot enforcing both snapshot grace (`168 h`) and peer
+    /// key-expiry grace (`24 h` per `US-031 AC4`), returning `None` if cache grace expired.
+    #[must_use]
+    pub(crate) fn snapshot_for_offline_recovery(
+        &self,
+        now_unix_ms: u64,
+        local_key_expires_at_ms: Option<u64>,
+        key_grace_hours: u64,
+    ) -> Option<NetmapSnapshot> {
+        if !self.is_within_offline_grace(now_unix_ms) {
+            return None;
+        }
+        if !Self::is_key_usable_offline(local_key_expires_at_ms, now_unix_ms, key_grace_hours) {
+            return None;
+        }
+        let mut filtered = self.netmap.clone();
+        filtered.peers.retain(|p| {
+            Self::is_key_usable_offline(p.key_expires_at_ms, now_unix_ms, key_grace_hours)
+        });
+        Some(filtered)
+    }
 }
 
 #[derive(Serialize)]
@@ -79,6 +133,7 @@ struct CanonicalCacheDigestView<'a> {
     local_udp_port: u16,
     cached_at_ms: u64,
     offline_grace_hours: u64,
+    local_key_expires_at_ms: Option<u64>,
     netmap: &'a NetmapSnapshot,
 }
 
@@ -86,6 +141,7 @@ fn compute_payload_sha256(
     local_udp_port: u16,
     cached_at_ms: u64,
     offline_grace_hours: u64,
+    local_key_expires_at_ms: Option<u64>,
     netmap: &NetmapSnapshot,
 ) -> AppResult<String> {
     let view = CanonicalCacheDigestView {
@@ -93,6 +149,7 @@ fn compute_payload_sha256(
         local_udp_port,
         cached_at_ms,
         offline_grace_hours,
+        local_key_expires_at_ms,
         netmap,
     };
     let canonical = serde_json::to_vec(&view).map_err(|err| {
@@ -148,21 +205,49 @@ impl NetmapCacheStore {
         }
     }
 
-    /// Computes canonical SHA-256 and atomically persists `netmap-cache.json` (`0600`).
+    /// Safely reads and verifies `netmap-cache.json`, logging a `WARN` and returning `None` on
+    /// corruption/truncation instead of crashing daemon boot (`US-033 AC3`).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn load_verified_safe(&self) -> Option<NetmapCacheFile> {
+        match self.load_verified() {
+            Ok(opt) => opt,
+            Err(err) => {
+                tracing::warn!(
+                    component = "meshd.netmap_cache",
+                    event = "netmap_cache_rejected",
+                    path = %self.path.display(),
+                    error = %err,
+                    "ignoring corrupted or tampered netmap-cache.json; daemon will enter waiting_for_control state"
+                );
+                None
+            }
+        }
+    }
+
+    /// Computes canonical SHA-256 including `local_key_expires_at_ms` and persists atomically (`0600`).
     pub(crate) fn save_atomic(
         &self,
         local_udp_port: Port,
         netmap: &NetmapSnapshot,
         cached_at_ms: u64,
+        local_key_expires_at_ms: Option<u64>,
     ) -> AppResult<NetmapCacheFile> {
+        let grace_hours = configured_offline_grace_hours();
         let port_u16 = local_udp_port.get();
-        let digest =
-            compute_payload_sha256(port_u16, cached_at_ms, DEFAULT_OFFLINE_GRACE_HOURS, netmap)?;
+        let digest = compute_payload_sha256(
+            port_u16,
+            cached_at_ms,
+            grace_hours,
+            local_key_expires_at_ms,
+            netmap,
+        )?;
         let record = NetmapCacheFile {
             schema_version: NETMAP_CACHE_SCHEMA_VERSION,
             local_udp_port: port_u16,
             cached_at_ms,
-            offline_grace_hours: DEFAULT_OFFLINE_GRACE_HOURS,
+            offline_grace_hours: grace_hours,
+            local_key_expires_at_ms,
             payload_sha256: digest,
             netmap: netmap.clone(),
         };
@@ -170,6 +255,27 @@ impl NetmapCacheStore {
             .map_err(|err| AppError::internal(format!("failed serializing netmap cache: {err}")))?;
         write_private_file_atomic(&self.path, &encoded)?;
         Ok(record)
+    }
+
+    /// Re-persists the cached netmap atomically with an updated `local_udp_port` (`US-019`, `US-033`).
+    pub(crate) fn update_udp_port(
+        &self,
+        new_port: Port,
+        updated_at_ms: u64,
+    ) -> AppResult<Option<NetmapCacheFile>> {
+        let Some(existing) = self.load_verified()? else {
+            return Ok(None);
+        };
+        if existing.local_udp_port == new_port.get() {
+            return Ok(Some(existing));
+        }
+        let updated = self.save_atomic(
+            new_port,
+            &existing.netmap,
+            updated_at_ms,
+            existing.local_key_expires_at_ms,
+        )?;
+        Ok(Some(updated))
     }
 }
 
@@ -212,7 +318,7 @@ mod tests {
 
         // Act
         let saved = store
-            .save_atomic(port, &snap, 1_700_000_100_000)
+            .save_atomic(port, &snap, 1_700_000_100_000, None)
             .expect("save cache");
         let loaded = store
             .load_verified()
@@ -234,5 +340,93 @@ mod tests {
             tamper_err,
             Err(err) if err.kind() == ErrorKind::InvalidArgument
         ));
+    }
+
+    // Traces: US-033 AC2/AC3, US-031 AC4
+    #[test]
+    fn test_netmap_cache_truncated_fails_safely_and_key_expiry_24h_grace_enforced() {
+        // Arrange
+        let dir = tempdir().expect("tempdir");
+        let store = NetmapCacheStore::new(dir.path().join("netmap-cache.json"));
+        let port = Port::from_u16(51820).expect("port");
+        let mut snap = sample_snapshot(7);
+        let kp_valid = mesh_crypto::NodeKeypair::generate();
+        let kp_expired = mesh_crypto::NodeKeypair::generate();
+        let dk = mesh_crypto::DiscoKeypair::generate();
+        let cached_at = 1_700_000_000_000u64;
+        let peer_exp_at = cached_at + 10_000;
+
+        snap.peers.push(mesh_proto::netmap::PeerEntry {
+            node_id: NodeId::from_bytes([1u8; 16]),
+            name: mesh_core::NodeName::parse("valid-peer").expect("name"),
+            fqdn: "valid-peer.mesh.internal".to_owned(),
+            overlay_ip: mesh_core::OverlayIp::from_ipv4(std::net::Ipv4Addr::new(100, 115, 0, 2))
+                .expect("ip1"),
+            node_pubkey: kp_valid.public_key(),
+            disco_pubkey: dk.public_key(),
+            endpoints: vec![],
+            relay_home: "203.0.113.10:8443".to_owned(),
+            key_expires_at_ms: Some(cached_at + 72 * 3_600_000),
+            online: true,
+        });
+        snap.peers.push(mesh_proto::netmap::PeerEntry {
+            node_id: NodeId::from_bytes([2u8; 16]),
+            name: mesh_core::NodeName::parse("expired-peer").expect("name"),
+            fqdn: "expired-peer.mesh.internal".to_owned(),
+            overlay_ip: mesh_core::OverlayIp::from_ipv4(std::net::Ipv4Addr::new(100, 115, 0, 3))
+                .expect("ip2"),
+            node_pubkey: kp_expired.public_key(),
+            disco_pubkey: dk.public_key(),
+            endpoints: vec![],
+            relay_home: "203.0.113.10:8443".to_owned(),
+            key_expires_at_ms: Some(peer_exp_at),
+            online: true,
+        });
+
+        let saved = store
+            .save_atomic(port, &snap, cached_at, Some(peer_exp_at))
+            .expect("save");
+        let new_port = Port::from_u16(51821).expect("new port");
+        let rebound = store
+            .update_udp_port(new_port, cached_at + 1_000)
+            .expect("update port")
+            .expect("cache exists");
+        assert_eq!(rebound.local_udp_port, 51821);
+        assert_eq!(rebound.local_key_expires_at_ms, Some(peer_exp_at));
+
+        // Inside 24h after peer_exp_at -> both peers recoverable offline!
+        let within_24h = peer_exp_at + super::DEFAULT_KEY_EXPIRY_GRACE_HOURS * 3_600_000 - 1;
+        let recovered_ok = saved
+            .snapshot_for_offline_recovery(within_24h, None, super::DEFAULT_KEY_EXPIRY_GRACE_HOURS)
+            .expect("within grace");
+        assert_eq!(recovered_ok.peers.len(), 2);
+
+        // Past 24h after peer_exp_at -> expired peer filtered out; valid peer preserved!
+        let past_24h = peer_exp_at + super::DEFAULT_KEY_EXPIRY_GRACE_HOURS * 3_600_000 + 1;
+        let recovered_pruned = saved
+            .snapshot_for_offline_recovery(past_24h, None, super::DEFAULT_KEY_EXPIRY_GRACE_HOURS)
+            .expect("within netmap grace");
+        assert_eq!(recovered_pruned.peers.len(), 1);
+        assert_eq!(
+            recovered_pruned.peers.first().map(|p| p.name.as_str()),
+            Some("valid-peer")
+        );
+
+        // Local node expired >24h ago while offline -> stop offline forwarding completely!
+        assert!(
+            saved
+                .snapshot_for_offline_recovery(
+                    past_24h,
+                    Some(peer_exp_at),
+                    super::DEFAULT_KEY_EXPIRY_GRACE_HOURS,
+                )
+                .is_none()
+        );
+
+        // Truncated file returns None safely without panicking
+        let raw = std::fs::read_to_string(store.path()).expect("raw");
+        let truncated = raw.get(..raw.len() / 2).unwrap_or("{");
+        std::fs::write(store.path(), truncated).expect("write truncated");
+        assert!(store.load_verified_safe().is_none());
     }
 }

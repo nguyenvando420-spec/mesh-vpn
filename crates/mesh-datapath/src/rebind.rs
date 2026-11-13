@@ -112,13 +112,17 @@ impl SocketRebinder {
         if_index: Option<u32>,
         linux_fwmark: Option<u32>,
     ) -> AppResult<RebindOutcome> {
-        if magic_socket.rebind_underlay(if_index, linux_fwmark).is_ok() {
+        let normalized_if_index = if_index.filter(|&id| id != 0);
+        if magic_socket
+            .rebind_underlay(normalized_if_index, linux_fwmark)
+            .is_ok()
+        {
             let local_addr = magic_socket.local_addr()?;
             tracing::info!(
                 component = "datapath.rebind",
                 event = "underlay_rebound_in_place",
                 interface = %interface_name,
-                if_index = ?if_index,
+                if_index = ?normalized_if_index,
                 local_addr = %local_addr,
                 "rebound MagicSocket underlay interface in place"
             );
@@ -129,12 +133,12 @@ impl SocketRebinder {
             });
         }
 
-        let report = magic_socket.recreate_socket(if_index, linux_fwmark)?;
+        let report = magic_socket.recreate_socket(normalized_if_index, linux_fwmark)?;
         tracing::info!(
             component = "datapath.rebind",
             event = "underlay_socket_recreated",
             interface = %interface_name,
-            if_index = ?if_index,
+            if_index = ?normalized_if_index,
             local_addr = %report.local_addr,
             used_fallback_port = report.used_fallback_port,
             "recreated MagicSocket on new physical underlay interface"
@@ -212,5 +216,54 @@ mod tests {
         );
         assert_eq!(refresh_res, RebindOutcome::RefreshCandidatesRequested);
         assert_eq!(wake_res, RebindOutcome::WakeRelayRequested);
+    }
+
+    #[tokio::test]
+    async fn test_socket_rebinder_recreate_preserves_local_udp_port() {
+        // Traces: US-035 AC2
+        // Arrange
+        let bound = MagicSocket::bind(
+            MagicSocketConfig::default().with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        assert!(bound.is_ok());
+        let Ok(mut sock) = bound else {
+            return;
+        };
+        let Ok(original_addr) = sock.local_addr() else {
+            assert!(sock.local_addr().is_ok());
+            return;
+        };
+        let original_port = original_addr.port();
+
+        // Act: force socket recreation without explicit physical interface index (0 normalized out)
+        let outcome = SocketRebinder::apply_command(
+            &mut sock,
+            &RebindCommand::RebindInterface {
+                interface_name: "en0".to_owned(),
+                if_index: Some(0),
+                is_ipv6: false,
+            },
+            None,
+        );
+        assert!(outcome.is_ok());
+        let Ok(outcome) = outcome else {
+            return;
+        };
+        let Ok(after_addr) = sock.local_addr() else {
+            assert!(sock.local_addr().is_ok());
+            return;
+        };
+        let after_port = after_addr.port();
+
+        // Assert
+        assert_eq!(after_port, original_port);
+        assert!(matches!(
+            outcome,
+            RebindOutcome::Rebound {
+                used_fallback_port: false,
+                ..
+            }
+        ));
     }
 }

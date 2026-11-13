@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use defguard_boringtun::noise::{Tunn, TunnResult};
 use defguard_boringtun::x25519::{PublicKey as WgPublicKey, StaticSecret as WgStaticSecret};
@@ -59,6 +59,10 @@ pub struct ApplyDiffReport {
     pub preserved_tunnels: usize,
     /// Number of peers removed immediately due to absence/revocation.
     pub removed: usize,
+    /// Removed peer UUIDs so caller engines can immediately purge Disco & Relay state (`US-030`).
+    pub removed_peer_ids: Vec<NodeId>,
+    /// Removed peer WireGuard public keys so Relay queues purge immediately (`US-030`).
+    pub removed_node_pubkeys: Vec<PublicKey>,
     /// Peers skipped because of invalid/conflicting configuration (`US-010 AC4`).
     pub skipped_peers: Vec<(NodeId, String)>,
 }
@@ -268,7 +272,10 @@ impl PeerMap {
         let valid_entries = self.filter_valid_entries(snapshot, &mut report);
         let desired_ids: HashSet<NodeId> =
             valid_entries.iter().map(|entry| entry.node_id).collect();
-        report.removed = self.remove_absent_peers(&desired_ids);
+        let (removed_ids, removed_pubkeys) = self.remove_absent_peers(&desired_ids);
+        report.removed = removed_ids.len();
+        report.removed_peer_ids = removed_ids;
+        report.removed_node_pubkeys = removed_pubkeys;
 
         for entry in valid_entries {
             self.upsert_peer(entry, &mut report);
@@ -559,18 +566,29 @@ impl PeerMap {
         valid
     }
 
-    fn remove_absent_peers(&mut self, desired_ids: &HashSet<NodeId>) -> usize {
-        let before = self.peers.len();
+    fn remove_absent_peers(
+        &mut self,
+        desired_ids: &HashSet<NodeId>,
+    ) -> (Vec<NodeId>, Vec<PublicKey>) {
+        let mut removed_ids = Vec::new();
+        let mut removed_pubkeys = Vec::new();
+        for (&id, session) in &self.peers {
+            if !desired_ids.contains(&id) {
+                removed_ids.push(id);
+                removed_pubkeys.push(session.node_pubkey);
+            }
+        }
         self.peers.retain(|id, _| desired_ids.contains(id));
-        before.saturating_sub(self.peers.len())
+        (removed_ids, removed_pubkeys)
     }
 
     fn upsert_peer(&mut self, entry: &PeerEntry, report: &mut ApplyDiffReport) {
+        let sanitized_endpoints = sanitize_peer_endpoints(self.overlay_cidr, &entry.endpoints);
         if let Some(existing) = self.peers.get_mut(&entry.node_id)
             && existing.node_pubkey == entry.node_pubkey
             && existing.overlay_ip == entry.overlay_ip
         {
-            let endpoints_or_disco_changed = existing.endpoints != entry.endpoints
+            let endpoints_or_disco_changed = existing.endpoints != sanitized_endpoints
                 || existing.disco_pubkey != entry.disco_pubkey
                 || existing.name != entry.name
                 || existing.fqdn != entry.fqdn
@@ -581,7 +599,7 @@ impl PeerMap {
             existing.name.clone_from(&entry.name);
             existing.fqdn.clone_from(&entry.fqdn);
             existing.disco_pubkey = entry.disco_pubkey;
-            existing.endpoints.clone_from(&entry.endpoints);
+            existing.endpoints = sanitized_endpoints;
             existing.relay_home.clone_from(&entry.relay_home);
             existing.key_expires_at_ms = entry.key_expires_at_ms;
             existing.online = entry.online;
@@ -598,7 +616,10 @@ impl PeerMap {
         let tunn = build_wireguard_tunn(&self.local_keypair, entry.node_pubkey, wg_idx);
         let replaced = self
             .peers
-            .insert(entry.node_id, build_peer_session(entry, tunn))
+            .insert(
+                entry.node_id,
+                build_peer_session(entry, sanitized_endpoints, tunn),
+            )
             .is_some();
         if replaced {
             report.updated = report.updated.saturating_add(1);
@@ -643,7 +664,40 @@ fn build_wireguard_tunn(
     ))
 }
 
-fn build_peer_session(entry: &PeerEntry, tunn: WireGuardTunn) -> PeerSession {
+fn sanitize_peer_endpoints(
+    overlay_cidr: Option<OverlayCidr>,
+    endpoints: &[CandidateEndpoint],
+) -> Vec<CandidateEndpoint> {
+    endpoints
+        .iter()
+        .filter(|ep| {
+            let addr = ep.addr;
+            if addr.port() == 0 || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+                return false;
+            }
+            if let Some(cidr) = overlay_cidr
+                && let IpAddr::V4(v4) = addr.ip()
+            {
+                let mask = if cidr.prefix_len() == 0 {
+                    0
+                } else {
+                    !0u32 << 32u32.saturating_sub(u32::from(cidr.prefix_len()))
+                };
+                if (u32::from(v4) & mask) == (u32::from(cidr.network()) & mask) {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+fn build_peer_session(
+    entry: &PeerEntry,
+    endpoints: Vec<CandidateEndpoint>,
+    tunn: WireGuardTunn,
+) -> PeerSession {
     PeerSession {
         node_id: entry.node_id,
         name: entry.name.clone(),
@@ -651,7 +705,7 @@ fn build_peer_session(entry: &PeerEntry, tunn: WireGuardTunn) -> PeerSession {
         overlay_ip: entry.overlay_ip,
         node_pubkey: entry.node_pubkey,
         disco_pubkey: entry.disco_pubkey,
-        endpoints: entry.endpoints.clone(),
+        endpoints,
         relay_home: entry.relay_home.clone(),
         key_expires_at_ms: entry.key_expires_at_ms,
         online: entry.online,
@@ -882,5 +936,119 @@ mod tests {
                 .expect("b session")
                 .has_established_handshake()
         );
+    }
+
+    // Traces: US-030, US-011 AC4
+    #[test]
+    fn test_peer_map_removal_immediately_drops_tunn_indexes_and_rejects_old_packets() {
+        // Arrange
+        let kp_a = NodeKeypair::generate();
+        let kp_b = NodeKeypair::generate();
+        let dk_a = DiscoKeypair::generate();
+        let dk_b = DiscoKeypair::generate();
+        let id_a = NodeId::from_bytes([0x1a; 16]);
+        let id_b = NodeId::from_bytes([0x2b; 16]);
+        let ip_a = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 2)).expect("ip a");
+        let ip_b = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 3)).expect("ip b");
+        let udp_ep: SocketAddr = "198.51.100.77:51820".parse().expect("udp ep");
+        let bad_overlay_ep: SocketAddr = "10.100.0.99:51820".parse().expect("overlay ep");
+
+        let entry_b = PeerEntry {
+            node_id: id_b,
+            name: NodeName::parse("peer-b").expect("name"),
+            fqdn: "peer-b.mesh.internal".to_owned(),
+            overlay_ip: ip_b,
+            node_pubkey: kp_b.public_key(),
+            disco_pubkey: dk_b.public_key(),
+            endpoints: vec![
+                CandidateEndpoint {
+                    addr: bad_overlay_ep,
+                    source: CandidateSource::Lan,
+                },
+                CandidateEndpoint {
+                    addr: udp_ep,
+                    source: CandidateSource::Reflexive,
+                },
+            ],
+            relay_home: "127.0.0.1:14430".to_owned(),
+            key_expires_at_ms: None,
+            online: true,
+        };
+        let entry_a = PeerEntry {
+            node_id: id_a,
+            name: NodeName::parse("peer-a").expect("name"),
+            fqdn: "peer-a.mesh.internal".to_owned(),
+            overlay_ip: ip_a,
+            node_pubkey: kp_a.public_key(),
+            disco_pubkey: dk_a.public_key(),
+            endpoints: vec![],
+            relay_home: "127.0.0.1:14430".to_owned(),
+            key_expires_at_ms: None,
+            online: true,
+        };
+
+        let mut map_a = PeerMap::new(id_a, kp_a.clone_keypair());
+        let mut map_b = PeerMap::new(id_b, kp_b.clone_keypair());
+        map_a.apply_diff(&mk_snapshot(1, vec![entry_b]));
+        map_b.apply_diff(&mk_snapshot(1, vec![entry_a]));
+
+        assert_eq!(
+            map_a.get(&id_b).expect("b present").endpoints.len(),
+            1,
+            "endpoint inside overlay CIDR must be stripped"
+        );
+
+        // Establish live handshake and verify B -> A works before cut
+        let mut wg_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
+        let mut tun_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
+        let ping_msg = build_sample_ipv4_packet(ip_b.as_ipv4(), ip_a.as_ipv4(), b"live-before-cut");
+        let (_, _, init_len) = map_b
+            .encapsulate_to_overlay_ip(ip_a, &ping_msg, &mut wg_buf, 100)
+            .expect("ok")
+            .expect("init");
+        let dec_a1 = map_a
+            .decapsulate_from_udp(
+                udp_ep,
+                wg_buf.get(..init_len).expect("slice"),
+                &mut tun_buf,
+                101,
+            )
+            .expect("A accepts handshake");
+        let dec_b1 = map_b
+            .decapsulate_from_relay(
+                kp_a.public_key(),
+                dec_a1.outbound_network_packets.first().expect("reply"),
+                &mut tun_buf,
+                102,
+            )
+            .expect("B accepts reply");
+        assert!(!dec_b1.outbound_network_packets.is_empty());
+
+        // Act: remove B in netmap diff v2
+        let cut_report = map_a.apply_diff(&mk_snapshot(2, vec![]));
+
+        // Assert: removed_peer_ids + removed_node_pubkeys populated, and both UDP & Relay from B dropped
+        assert_eq!(cut_report.removed, 1);
+        assert_eq!(cut_report.removed_peer_ids, vec![id_b]);
+        assert_eq!(cut_report.removed_node_pubkeys, vec![kp_b.public_key()]);
+        assert!(map_a.get(&id_b).is_none());
+        assert!(map_a.get_by_overlay_ip(ip_b).is_none());
+        assert!(map_a.get_by_node_pubkey(&kp_b.public_key()).is_none());
+        assert!(map_a.get_by_disco_pubkey(&dk_b.public_key()).is_none());
+
+        for wg_pkt in &dec_b1.outbound_network_packets {
+            assert!(
+                map_a
+                    .decapsulate_from_udp(udp_ep, wg_pkt, &mut tun_buf, 103)
+                    .is_none(),
+                "post-cut UDP packet from revoked peer MUST be rejected"
+            );
+            assert!(
+                map_a
+                    .decapsulate_from_relay(kp_b.public_key(), wg_pkt, &mut tun_buf, 104)
+                    .is_none(),
+                "post-cut Relay packet from revoked peer MUST be rejected"
+            );
+        }
     }
 }

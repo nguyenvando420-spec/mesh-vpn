@@ -128,16 +128,28 @@ pub(crate) fn handle_control_event(
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::PowerEvent(param) => {
-            if let Some(power_ev) = map_power_event(param)
-                && let Some(tx) = power_tx
-                && let Err(err) = tx.try_send(power_ev)
-            {
-                warn!(
-                    component = "meshd.service_windows",
-                    event = "scm_power_event_dropped",
-                    error = %err,
-                    "failed forwarding Windows PowerEvent to monitor channel"
-                );
+            if let Some(power_ev) = map_power_event(param) {
+                if matches!(
+                    power_ev,
+                    WindowsPowerEvent::ResumeAutomatic | WindowsPowerEvent::ResumeSuspend
+                ) {
+                    info!(
+                        component = "meshd.service_windows",
+                        event = "scm_power_resume_received",
+                        power_event = ?power_ev,
+                        "Windows SCM reported system resume from sleep/hibernate"
+                    );
+                }
+                if let Some(tx) = power_tx
+                    && let Err(err) = tx.try_send(power_ev)
+                {
+                    warn!(
+                        component = "meshd.service_windows",
+                        event = "scm_power_event_dropped",
+                        error = %err,
+                        "failed forwarding Windows PowerEvent to monitor channel"
+                    );
+                }
             }
             ServiceControlHandlerResult::NoError
         }

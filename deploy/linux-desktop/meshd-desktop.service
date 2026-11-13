@@ -1,0 +1,37 @@
+[Unit]
+Description=Mesh VPN Desktop Agent Daemon
+Documentation=https://mesh.internal/docs/deployment
+After=network-online.target NetworkManager.service systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/meshd
+User=root
+Group=root
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+RuntimeDirectory=meshd
+RuntimeDirectoryMode=0755
+StateDirectory=meshd
+StateDirectoryMode=0700
+LogsDirectory=meshd
+LogsDirectoryMode=0750
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=/dev/net/tun rw
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Keep /etc/resolv.conf read-only so NetworkManager and systemd-resolved are never overwritten.
+ReadWritePaths=/etc/hosts /var/lib/meshd /run/meshd /var/log/meshd /dev/net/tun
+Environment=MESH_STATE_DIR=/var/lib/meshd
+
+[Install]
+WantedBy=multi-user.target

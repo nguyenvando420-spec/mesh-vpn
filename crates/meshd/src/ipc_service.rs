@@ -17,12 +17,14 @@ use tokio_util::task::TaskTracker;
 use tracing::debug;
 use tracing::{info, warn};
 
+use mesh_core::clock::{Clock as _, SystemClock};
 use mesh_core::defaults::{MAX_ADMIN_IPC_BODY_BYTES, MAX_RO_IPC_BODY_BYTES};
 use mesh_core::error::{ErrorEnvelope, ErrorKind, ErrorResponse};
 use mesh_core::{AppError, AppResult};
 use mesh_net::ipc::IpcChannelKind;
 use mesh_proto::agent_ipc::{AgentRotateKeyRequest, AgentSetRequest, AgentUpRequest, PingRequest};
 
+use crate::config::create_bugreport_tar_bundle;
 use crate::control_loop::DaemonRuntimeState;
 use crate::ping_probe::PingProbe;
 use crate::supervisor::SupervisorCommand;
@@ -159,10 +161,41 @@ async fn handle_rotate_key(
 }
 
 async fn handle_bugreport(State(state): State<IpcRouterState>) -> Response {
-    dispatch_cmd(&state.cmd_tx, |reply| SupervisorCommand::Bugreport {
-        reply,
+    let (bootstrap, state_dir_opt) = {
+        let g = state.runtime.inner.read().await;
+        let dir = g
+            .bootstrap_store
+            .path()
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        (g.bootstrap.clone(), dir)
+    };
+    let status = state.runtime.build_status_response().await;
+    let netcheck_res = PingProbe::execute_netcheck(&state.runtime).await;
+    let now_unix_ms = SystemClock::new().now_unix_ms();
+    let Some(state_dir) = state_dir_opt else {
+        return dispatch_cmd(&state.cmd_tx, |reply| SupervisorCommand::Bugreport {
+            reply,
+        })
+        .await;
+    };
+
+    let bundle_join = tokio::task::spawn_blocking(move || {
+        let nc_ref = match netcheck_res.as_ref() {
+            Ok(ok) => Ok(ok),
+            Err(err) => Err(err.public_message()),
+        };
+        create_bugreport_tar_bundle(&state_dir, &bootstrap, &status, nc_ref, now_unix_ms)
     })
-    .await
+    .await;
+
+    match bundle_join {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        Ok(Err(err)) => app_error_response(&err),
+        Err(join_err) => app_error_response(&AppError::internal(format!(
+            "bugreport worker task failed: {join_err}"
+        ))),
+    }
 }
 
 async fn dispatch_cmd<Resp, F>(tx: &mpsc::Sender<SupervisorCommand>, make_cmd: F) -> Response
@@ -541,5 +574,84 @@ mod tests {
             denied_down,
             Err(err) if err.kind() == ErrorKind::NotFound || err.kind() == ErrorKind::PermissionDenied
         ));
+    }
+
+    #[tokio::test]
+    async fn test_ipc_admin_bugreport_creates_tar_scrubs_secrets_and_ro_blocks_it() {
+        use crate::config::MAX_BUGREPORT_ARCHIVE_BYTES;
+        use mesh_core::defaults::MAX_ADMIN_IPC_BODY_BYTES;
+        use mesh_proto::agent_ipc::BugreportResponse;
+
+        // Arrange: stage rotated log containing canary tokens inside daemon state_dir
+        let dir = tempdir().expect("tempdir");
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("mkdir logs");
+        let canary_mpk = "mpk_IPC_CANARY_TOKEN_11223344";
+        let canary_bearer = "eyJhbGciOiJIUzI1NiJ9.IPC_CANARY_BEARER_5566";
+        let canary_secret = "IPC_NODE_SECRET_CANARY_9988";
+        std::fs::write(
+            log_dir.join("meshd.log.1"),
+            format!(
+                "WARN connect preauth_key=\"{canary_mpk}\" Authorization: Bearer {canary_bearer} node_secret=\"{canary_secret}\"\n"
+            ),
+        )
+        .expect("write canary log");
+
+        let runtime = Arc::new(DaemonRuntimeState::new(
+            BootstrapConfig::default(),
+            BootstrapStore::new(dir.path().join("bootstrap.toml")),
+            NetmapCacheStore::new(dir.path().join("netmap-cache.json")),
+            None,
+            1280,
+        ));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+        let router_state = IpcRouterState { runtime, cmd_tx };
+        let ro_router = IpcService::build_ro_router(router_state.clone());
+        let admin_router = IpcService::build_admin_router(router_state);
+
+        // Act 1: verify RO socket rejects /v1/agent/bugreport (`US-041` / `SEC-14`)
+        let (ro_client, ro_server) = duplex(16 * 1024);
+        let ro_task = tokio::spawn(serve_ipc_http_connection(ro_server, ro_router));
+        let ro_res: Result<BugreportResponse, _> = send_ipc_json_request(
+            ro_client,
+            Method::POST,
+            "/v1/agent/bugreport",
+            Some(&()),
+            MAX_RO_IPC_BODY_BYTES,
+        )
+        .await;
+        ro_task.await.expect("ro join").expect("ro clean");
+        assert!(matches!(
+            ro_res,
+            Err(err) if err.kind() == ErrorKind::NotFound || err.kind() == ErrorKind::PermissionDenied
+        ));
+
+        // Act 2: invoke /v1/agent/bugreport over privileged admin router
+        let (ad_client, ad_server) = duplex(16 * 1024);
+        let ad_task = tokio::spawn(serve_ipc_http_connection(ad_server, admin_router));
+        let resp: BugreportResponse = send_ipc_json_request(
+            ad_client,
+            Method::POST,
+            "/v1/agent/bugreport",
+            Some(&()),
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("admin bugreport succeeds");
+        ad_task.await.expect("admin join").expect("admin clean");
+
+        // Assert
+        let tar_bytes = std::fs::read(&resp.bundle_path).expect("read bugreport tar");
+        assert!(resp.bundle_path.ends_with(".tar"));
+        assert!(tar_bytes.len() <= MAX_BUGREPORT_ARCHIVE_BYTES);
+        assert!(resp.scrubbed_items >= 3);
+        let text = String::from_utf8_lossy(&tar_bytes);
+        assert!(!text.contains(canary_mpk));
+        assert!(!text.contains(canary_bearer));
+        assert!(!text.contains(canary_secret));
+        assert!(text.contains("ustar"));
+        assert!(text.contains("status.json"));
+        assert!(text.contains("netcheck.json"));
+        assert!(text.contains("routes.txt"));
     }
 }

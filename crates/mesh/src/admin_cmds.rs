@@ -3,6 +3,7 @@
 
 #[cfg(unix)]
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -33,6 +34,7 @@ use crate::output::{
 
 #[cfg(unix)]
 const SERVER_IPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const KEY_EXPIRY_WARNING_MS: u64 = 7 * 86_400 * 1_000;
 
 /// Global routing/formatting options passed to Server Admin handlers.
 #[derive(Debug, Clone)]
@@ -277,14 +279,27 @@ async fn handle_node(args: &NodeArgs, cfg: &AdminDispatchConfig) -> AppResult<()
         NodeSubcommand::List => {
             let resp: Vec<AdminNodeSummary> =
                 send_server_admin(cfg, hyper::Method::GET, "/v1/admin/nodes", None::<&()>).await?;
-            emit_admin(&resp, cfg.json, |items| format_node_list(items))
+            emit_admin(&resp, cfg.json, |items| format_node_list(items))?;
+            if !cfg.json
+                && let Some(warn) = format_expiring_nodes_warning(&resp, current_unix_ms())
+            {
+                write_stderr(&warn)?;
+            }
+            Ok(())
         }
         NodeSubcommand::Inspect { node } => {
             let clean = validate_path_segment(node)?;
             let path = format!("/v1/admin/nodes/{clean}");
             let resp: AdminNodeSummary =
                 send_server_admin(cfg, hyper::Method::GET, &path, None::<&()>).await?;
-            emit_admin(&resp, cfg.json, format_node_inspect)
+            emit_admin(&resp, cfg.json, format_node_inspect)?;
+            if !cfg.json
+                && let Some(warn) =
+                    format_expiring_nodes_warning(std::slice::from_ref(&resp), current_unix_ms())
+            {
+                write_stderr(&warn)?;
+            }
+            Ok(())
         }
         NodeSubcommand::Rename { node, new_name } => {
             let clean = validate_path_segment(node)?;
@@ -348,13 +363,14 @@ async fn handle_server(args: &ServerArgs, cfg: &AdminDispatchConfig) -> AppResul
             emit_admin(&resp, cfg.json, format_backup_created)
         }
         ServerSubcommand::Restore(restore) => {
-            let path = build_restore_path(restore.force_repin);
+            let path =
+                build_restore_path_with_options(restore.force_repin, restore.min_netmap_version);
             let req = RestoreBackupRequest {
                 snapshot_path: restore.file.clone(),
                 verify_sha256: !restore.skip_sha256,
             };
             let resp: RestoreBackupResponse =
-                send_server_admin(cfg, hyper::Method::POST, path, Some(&req)).await?;
+                send_server_admin(cfg, hyper::Method::POST, &path, Some(&req)).await?;
             emit_admin(&resp, cfg.json, format_restore_backup)?;
             validate_min_netmap_version(restore.min_netmap_version, resp.netmap_version)
         }
@@ -411,12 +427,64 @@ async fn handle_audit(args: &AuditArgs, cfg: &AdminDispatchConfig) -> AppResult<
 }
 
 /// Builds the REST path for `POST /v1/admin/restore`, adding `?allow_pin_change=true` on `--force-repin`.
+#[cfg(test)]
 #[must_use]
 pub(crate) const fn build_restore_path(force_repin: bool) -> &'static str {
     if force_repin {
         "/v1/admin/restore?allow_pin_change=true"
     } else {
         "/v1/admin/restore"
+    }
+}
+
+/// Builds the REST path for `POST /v1/admin/restore` including optional server-side
+/// `min_netmap_version` anti-rollback query enforcement (`US-045`).
+#[must_use]
+pub(crate) fn build_restore_path_with_options(
+    force_repin: bool,
+    min_netmap_version: Option<u64>,
+) -> String {
+    match (force_repin, min_netmap_version) {
+        (false, None) => "/v1/admin/restore".to_owned(),
+        (true, None) => "/v1/admin/restore?allow_pin_change=true".to_owned(),
+        (false, Some(min_ver)) => format!("/v1/admin/restore?min_netmap_version={min_ver}"),
+        (true, Some(min_ver)) => {
+            format!("/v1/admin/restore?allow_pin_change=true&min_netmap_version={min_ver}")
+        }
+    }
+}
+
+fn current_unix_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn format_expiring_nodes_warning(
+    nodes: &[AdminNodeSummary],
+    now_ms: u64,
+) -> Option<String> {
+    let mut soon = Vec::new();
+    for node in nodes {
+        if node.status != "active" {
+            continue;
+        }
+        if let Some(exp_ms) = node.key_expires_at_ms {
+            let remaining_ms = exp_ms.saturating_sub(now_ms);
+            if remaining_ms <= KEY_EXPIRY_WARNING_MS {
+                let hours = remaining_ms.div_ceil(3_600 * 1_000);
+                soon.push(format!("{} ({hours}h remaining)", node.name));
+            }
+        }
+    }
+    if soon.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "WARN: node key(s) expiring within 7 days: {}; renew with a preauth key (--for <node>) or run `mesh node expire <node> --never`.\n",
+            soon.join(", ")
+        ))
     }
 }
 
@@ -622,13 +690,13 @@ where
 mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    use mesh_core::ErrorKind;
-    use mesh_proto::admin_ipc::RestoreBackupResponse;
+    use mesh_core::{ErrorKind, NodeName};
+    use mesh_proto::admin_ipc::{AdminNodeSummary, RestoreBackupResponse};
 
     use super::{
         PreauthkeyCreateArgs, build_create_preauth_request, build_restore_path,
-        call_server_admin_stream, parse_ttl_secs, validate_min_netmap_version,
-        validate_path_segment,
+        build_restore_path_with_options, call_server_admin_stream, format_expiring_nodes_warning,
+        parse_ttl_secs, validate_min_netmap_version, validate_path_segment,
     };
 
     #[test]
@@ -728,5 +796,69 @@ mod tests {
         assert!(req_text.starts_with("POST /v1/admin/restore?allow_pin_change=true HTTP/1.1"));
         assert!(got.restored);
         assert_eq!(got.netmap_version, 22);
+    }
+
+    #[test]
+    fn test_restore_path_with_min_netmap_version_and_expiring_node_warning() {
+        // Arrange
+        assert_eq!(
+            build_restore_path_with_options(false, Some(42)),
+            "/v1/admin/restore?min_netmap_version=42"
+        );
+        assert_eq!(
+            build_restore_path_with_options(true, Some(99)),
+            "/v1/admin/restore?allow_pin_change=true&min_netmap_version=99"
+        );
+
+        let now_ms = 1_762_958_151_000_u64;
+        let nodes = vec![
+            AdminNodeSummary {
+                node_id: mesh_core::NodeId::new_v7(now_ms),
+                name: NodeName::parse("safe-node").expect("name"),
+                overlay_ip: "10.100.0.2".parse().expect("ip"),
+                status: "active".to_owned(),
+                online: true,
+                last_seen_at_ms: now_ms,
+                key_expires_at_ms: Some(now_ms + 30 * 86_400 * 1_000),
+                os: "linux".to_owned(),
+                arch: "amd64".to_owned(),
+                agent_version: "0.1.0".to_owned(),
+                acked_endpoint_version: 0,
+            },
+            AdminNodeSummary {
+                node_id: mesh_core::NodeId::new_v7(now_ms + 1),
+                name: NodeName::parse("never-node").expect("name"),
+                overlay_ip: "10.100.0.3".parse().expect("ip"),
+                status: "active".to_owned(),
+                online: true,
+                last_seen_at_ms: now_ms,
+                key_expires_at_ms: None,
+                os: "linux".to_owned(),
+                arch: "amd64".to_owned(),
+                agent_version: "0.1.0".to_owned(),
+                acked_endpoint_version: 0,
+            },
+            AdminNodeSummary {
+                node_id: mesh_core::NodeId::new_v7(now_ms + 2),
+                name: NodeName::parse("soon-node").expect("name"),
+                overlay_ip: "10.100.0.4".parse().expect("ip"),
+                status: "active".to_owned(),
+                online: false,
+                last_seen_at_ms: now_ms,
+                key_expires_at_ms: Some(now_ms + 2 * 86_400 * 1_000),
+                os: "linux".to_owned(),
+                arch: "amd64".to_owned(),
+                agent_version: "0.1.0".to_owned(),
+                acked_endpoint_version: 0,
+            },
+        ];
+
+        // Act
+        let warn = format_expiring_nodes_warning(&nodes, now_ms).expect("warning expected");
+
+        // Assert
+        assert!(warn.contains("soon-node"));
+        assert!(!warn.contains("safe-node"));
+        assert!(!warn.contains("never-node"));
     }
 }

@@ -1,7 +1,7 @@
 //! Verified TLS 1.3 Control-plane client, challenge proof signer, Netmap stream consumer,
 //! and hosts synchronization loop (`US-003`, `US-004`, `US-033`, `US-034`, `US-074`).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, ErrorKind as IoErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::path::PathBuf;
@@ -61,8 +61,11 @@ use mesh_proto::control::{
 };
 use mesh_proto::netmap::{CandidateEndpoint, CandidateSource, NatMappingKind, NetmapSnapshot};
 
-use crate::config::{BootstrapConfig, BootstrapStore, split_host_port, validate_tls_trust_policy};
-use crate::netmap_cache::NetmapCacheStore;
+use crate::config::{
+    BootstrapConfig, BootstrapStore, load_inbound_filter_spec, split_host_port,
+    validate_tls_trust_policy,
+};
+use crate::netmap_cache::{DEFAULT_KEY_EXPIRY_GRACE_HOURS, NetmapCacheStore};
 
 const CONTROL_PROTOCOL_VERSION: u16 = 1;
 const STABLE_SESSION_RESET_THRESHOLD: Duration = Duration::from_secs(60);
@@ -71,6 +74,8 @@ const MAX_CONTROL_WS_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+const ENV_NETMAP_CHURN_WARN_PERCENT: &str = "MESH_NETMAP_CHURN_WARN_PERCENT";
+const DEFAULT_NETMAP_CHURN_WARN_PERCENT: u8 = 50;
 
 /// Signal sent by `supervisor` when endpoint config changes or daemon initiates shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +126,8 @@ pub(crate) struct DaemonRuntimeState {
 }
 
 impl DaemonRuntimeState {
-    /// Creates an initialized [`DaemonRuntimeState`] from loaded persistent config and cache.
+    /// Creates an initialized [`DaemonRuntimeState`] using the current wall clock.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(
         bootstrap: BootstrapConfig,
@@ -130,8 +136,46 @@ impl DaemonRuntimeState {
         cached: Option<&crate::netmap_cache::NetmapCacheFile>,
         tun_mtu: u16,
     ) -> Self {
+        Self::new_with_now(
+            bootstrap,
+            bootstrap_store,
+            netmap_cache,
+            cached,
+            tun_mtu,
+            mesh_core::clock::SystemClock::new().now_unix_ms(),
+        )
+    }
+
+    /// Creates an initialized [`DaemonRuntimeState`] evaluating offline grace at `now_unix_ms` (`HR-W21-13`).
+    #[must_use]
+    pub(crate) fn new_with_now(
+        bootstrap: BootstrapConfig,
+        bootstrap_store: BootstrapStore,
+        netmap_cache: NetmapCacheStore,
+        cached: Option<&crate::netmap_cache::NetmapCacheFile>,
+        tun_mtu: u16,
+        now_unix_ms: u64,
+    ) -> Self {
         let (ws_close_tx, _) = watch::channel(false);
-        let initial_netmap = cached.map(|c| c.netmap.clone());
+        let cache_self_exp = cached.and_then(|c| {
+            c.local_key_expires_at_ms.or_else(|| {
+                bootstrap.node_id.and_then(|nid| {
+                    c.netmap
+                        .peers
+                        .iter()
+                        .find(|p| p.node_id == nid)
+                        .and_then(|p| p.key_expires_at_ms)
+                })
+            })
+        });
+        let local_key_expires_at_ms = bootstrap.key_expires_at_ms.or(cache_self_exp);
+        let initial_netmap = cached.and_then(|c| {
+            c.snapshot_for_offline_recovery(
+                now_unix_ms,
+                local_key_expires_at_ms,
+                DEFAULT_KEY_EXPIRY_GRACE_HOURS,
+            )
+        });
         let initial_udp_port = cached.map_or(0, |c| c.local_udp_port);
         let overlay_cidr = initial_netmap.as_ref().map(|n| n.overlay_cidr);
         let node_id = bootstrap.node_id;
@@ -159,7 +203,7 @@ impl DaemonRuntimeState {
                 fqdn,
                 overlay_ip,
                 overlay_cidr,
-                key_expires_at_ms: None,
+                key_expires_at_ms: local_key_expires_at_ms,
                 latest_netmap: initial_netmap,
                 control_connected: false,
                 relay_rtt_ms: None,
@@ -504,6 +548,16 @@ impl ControlLoop {
             if ctx.shutdown.is_cancelled() {
                 break;
             }
+            if let Some(msg) =
+                check_offline_key_grace_expired(&ctx.state, ctx.clock.now_unix_ms()).await
+            {
+                handle_terminal_revocation(&ctx.state, TerminationReason::NodeKeyExpired, &msg)
+                    .await;
+                if let Some(ref tx) = ctx.termination_tx {
+                    let _ignored = tx.send((TerminationReason::NodeKeyExpired, msg)).await;
+                }
+                break;
+            }
             let outcome = run_single_control_session(&mut ctx).await;
             {
                 let mut g = ctx.state.inner.write().await;
@@ -531,11 +585,38 @@ impl ControlLoop {
                     tls_backoff.reset();
                 }
                 ControlSessionExit::Retry { err, tls_capped } => {
+                    if let Some(msg) =
+                        check_offline_key_grace_expired(&ctx.state, ctx.clock.now_unix_ms()).await
+                    {
+                        handle_terminal_revocation(
+                            &ctx.state,
+                            TerminationReason::NodeKeyExpired,
+                            &msg,
+                        )
+                        .await;
+                        if let Some(ref tx) = ctx.termination_tx {
+                            let _ignored = tx.send((TerminationReason::NodeKeyExpired, msg)).await;
+                        }
+                        break;
+                    }
                     let delay =
                         advance_retry_backoff(&mut net_backoff, &mut tls_backoff, tls_capped, &err);
                     set_degraded_or_connecting(&ctx.state, &err.to_string()).await;
                     match wait_backoff_or_wake(&mut ctx, delay).await {
                         BackoffWaitOutcome::Shutdown => break,
+                        BackoffWaitOutcome::KeyGraceExpired(msg) => {
+                            handle_terminal_revocation(
+                                &ctx.state,
+                                TerminationReason::NodeKeyExpired,
+                                &msg,
+                            )
+                            .await;
+                            if let Some(ref tx) = ctx.termination_tx {
+                                let _ignored =
+                                    tx.send((TerminationReason::NodeKeyExpired, msg)).await;
+                            }
+                            break;
+                        }
                         BackoffWaitOutcome::WakeSignal => {
                             net_backoff.reset();
                             tls_backoff.reset();
@@ -561,7 +642,16 @@ fn advance_retry_backoff(
     err: &AppError,
 ) -> Duration {
     if tls_capped || is_tls_or_pin_error(err) {
-        tls_backoff.next_delay()
+        let delay = tls_backoff.next_delay();
+        warn!(
+            component = "meshd.control_loop",
+            event = "control_tls_or_portal_retry_backoff",
+            error_kind = ?err.kind(),
+            retry_delay_ms = delay.as_millis(),
+            error = %err,
+            "Control TLS/Pin/ClockSkew/Captive-Portal failure; continuing retry with 5m cap without sending secrets"
+        );
+        delay
     } else {
         net_backoff.next_delay()
     }
@@ -1166,9 +1256,197 @@ struct NetmapRuntimeUpdate {
     cache_store: NetmapCacheStore,
     udp_port: Option<Port>,
     self_overlay_ip: Option<OverlayIp>,
+    key_expires_at_ms: Option<u64>,
 }
 
-async fn apply_netmap_update(ctx: &ControlLoopContext, snapshot: NetmapSnapshot) -> bool {
+#[must_use]
+fn configured_churn_warn_percent() -> u8 {
+    std::env::var(ENV_NETMAP_CHURN_WARN_PERCENT)
+        .ok()
+        .and_then(|v| v.trim().parse::<u8>().ok())
+        .filter(|&p| (1..=100).contains(&p))
+        .unwrap_or(DEFAULT_NETMAP_CHURN_WARN_PERCENT)
+}
+
+fn is_valid_peer_candidate_addr(
+    addr: SocketAddr,
+    overlay_cidr: OverlayCidr,
+    control_sock: Option<SocketAddr>,
+    relay_sock: Option<SocketAddr>,
+) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    let ip = addr.ip();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    if let IpAddr::V4(v4) = ip
+        && overlay_cidr.contains_subnet_ip(v4)
+    {
+        return false;
+    }
+    if control_sock == Some(addr) || relay_sock == Some(addr) {
+        return false;
+    }
+    true
+}
+
+/// Validates and sanitizes an incoming `NetmapSnapshot` before any daemon state mutation (`US-011`).
+///
+/// Returns `Ok(true)` when accepted, `Ok(false)` when stale/non-increasing version should be ignored,
+/// and `Err(reason)` when the entire snapshot must be rejected safely.
+pub(crate) fn validate_and_sanitize_netmap_snapshot(
+    snapshot: &mut NetmapSnapshot,
+    prev_version: Option<u64>,
+    prev_peer_ids: &HashSet<NodeId>,
+    self_node_id: Option<NodeId>,
+    self_pubkey: PublicKey,
+    self_overlay_ip: Option<OverlayIp>,
+) -> Result<bool, String> {
+    if let Some(prev) = prev_version
+        && snapshot.netmap_version <= prev
+    {
+        return Ok(false);
+    }
+
+    let mut seen_ids = HashSet::with_capacity(snapshot.peers.len());
+    let mut seen_ips = HashSet::with_capacity(snapshot.peers.len());
+    let mut seen_pubkeys = HashSet::with_capacity(snapshot.peers.len());
+
+    let control_sock = snapshot
+        .relay_map
+        .control_tcp_endpoint
+        .parse::<SocketAddr>()
+        .ok();
+    let relay_sock = snapshot
+        .relay_map
+        .relay_tcp_endpoint
+        .parse::<SocketAddr>()
+        .ok();
+    let mut stripped_endpoints = 0usize;
+
+    for peer in &mut snapshot.peers {
+        if !snapshot.overlay_cidr.contains_usable_host(peer.overlay_ip) {
+            return Err(format!(
+                "peer {} overlay_ip {} is outside usable host range of {}",
+                peer.node_id, peer.overlay_ip, snapshot.overlay_cidr
+            ));
+        }
+        if !seen_ids.insert(peer.node_id) {
+            return Err(format!("duplicate peer node_id {}", peer.node_id));
+        }
+        if !seen_ips.insert(peer.overlay_ip) {
+            return Err(format!("duplicate peer overlay_ip {}", peer.overlay_ip));
+        }
+        if !seen_pubkeys.insert(peer.node_pubkey) {
+            return Err(format!("duplicate peer node_pubkey {}", peer.node_pubkey));
+        }
+        if Some(peer.node_id) != self_node_id
+            && (Some(peer.overlay_ip) == self_overlay_ip || peer.node_pubkey == self_pubkey)
+        {
+            return Err(format!(
+                "peer {} collides with local node overlay identity",
+                peer.node_id
+            ));
+        }
+
+        let before = peer.endpoints.len();
+        peer.endpoints.retain(|ep| {
+            is_valid_peer_candidate_addr(ep.addr, snapshot.overlay_cidr, control_sock, relay_sock)
+        });
+        stripped_endpoints =
+            stripped_endpoints.saturating_add(before.saturating_sub(peer.endpoints.len()));
+    }
+
+    if stripped_endpoints > 0 {
+        debug!(
+            component = "meshd.control_loop",
+            event = "netmap_peer_endpoints_sanitized",
+            netmap_version = snapshot.netmap_version,
+            stripped_count = stripped_endpoints,
+            "stripped invalid or overlay/control-colliding peer candidate endpoints"
+        );
+    }
+
+    if !prev_peer_ids.is_empty() {
+        let removed = prev_peer_ids
+            .iter()
+            .filter(|id| !seen_ids.contains(id))
+            .count();
+        let added = seen_ids
+            .iter()
+            .filter(|id| !prev_peer_ids.contains(id))
+            .count();
+        let changed = removed.saturating_add(added);
+        let churn_pct = changed.saturating_mul(100) / prev_peer_ids.len().max(1);
+        let warn_pct = configured_churn_warn_percent();
+        if churn_pct > usize::from(warn_pct) {
+            warn!(
+                component = "meshd.control_loop",
+                event = "netmap_abnormal_churn_warning",
+                netmap_version = snapshot.netmap_version,
+                prev_peers = prev_peer_ids.len(),
+                new_peers = snapshot.peers.len(),
+                changed_peers = changed,
+                churn_percent = churn_pct,
+                threshold_percent = warn_pct,
+                "abnormal Netmap peer churn exceeds configured threshold"
+            );
+        }
+    }
+
+    Ok(true)
+}
+
+async fn apply_netmap_update(ctx: &ControlLoopContext, mut snapshot: NetmapSnapshot) -> bool {
+    let (prev_version, prev_peer_ids, self_node_id, self_overlay_ip, state_dir) = {
+        let g = ctx.state.inner.read().await;
+        let prev_ver = g.latest_netmap.as_ref().map(|n| n.netmap_version);
+        let prev_ids: HashSet<NodeId> = g
+            .latest_netmap
+            .as_ref()
+            .map(|n| n.peers.iter().map(|p| p.node_id).collect())
+            .unwrap_or_default();
+        let dir = g
+            .bootstrap_store
+            .path()
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        (prev_ver, prev_ids, g.node_id, g.overlay_ip, dir)
+    };
+
+    match validate_and_sanitize_netmap_snapshot(
+        &mut snapshot,
+        prev_version,
+        &prev_peer_ids,
+        self_node_id,
+        ctx.node_keypair.public_key(),
+        self_overlay_ip,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                component = "meshd.control_loop",
+                event = "netmap_stale_version_ignored",
+                incoming_version = snapshot.netmap_version,
+                prev_version = prev_version,
+                "ignoring non-increasing NetmapSnapshot version"
+            );
+            return false;
+        }
+        Err(reason) => {
+            warn!(
+                component = "meshd.control_loop",
+                event = "netmap_sanity_rejected",
+                incoming_version = snapshot.netmap_version,
+                reason = %reason,
+                "rejecting malformed NetmapSnapshot; preserving prior valid topology"
+            );
+            return false;
+        }
+    }
+
     let now_ms = ctx.clock.now_unix_ms();
     let update = record_netmap_in_runtime(ctx, &snapshot).await;
 
@@ -1184,7 +1462,10 @@ async fn apply_netmap_update(ctx: &ControlLoopContext, snapshot: NetmapSnapshot)
     }
 
     if let Some(port) = update.udp_port
-        && let Err(err) = update.cache_store.save_atomic(port, &snapshot, now_ms)
+        && let Err(err) =
+            update
+                .cache_store
+                .save_atomic(port, &snapshot, now_ms, update.key_expires_at_ms)
     {
         warn!(
             component = "meshd.control_loop",
@@ -1198,15 +1479,25 @@ async fn apply_netmap_update(ctx: &ControlLoopContext, snapshot: NetmapSnapshot)
         relay_handle.update_config(relay_cfg);
     }
 
-    if let Some(handle) = update.datapath_opt
-        && let Err(err) = handle.apply_netmap(snapshot.clone()).await
-    {
-        warn!(
-            component = "meshd.control_loop",
-            event = "datapath_apply_netmap_failed",
-            error = %err,
-            "failed applying NetmapSnapshot diff to DatapathEngine"
-        );
+    if let Some(handle) = update.datapath_opt {
+        if let Err(err) = handle.apply_netmap(snapshot.clone()).await {
+            warn!(
+                component = "meshd.control_loop",
+                event = "datapath_apply_netmap_failed",
+                error = %err,
+                "failed applying NetmapSnapshot diff to DatapathEngine"
+            );
+        }
+        if let Some(spec) = load_inbound_filter_spec(state_dir.as_deref())
+            && let Err(err) = handle.try_reload_packet_filter_spec(&spec).await
+        {
+            warn!(
+                component = "meshd.control_loop",
+                event = "inbound_filter_reload_failed",
+                error = %err,
+                "invalid inbound packet filter configuration rejected fail-safely; keeping active rules"
+            );
+        }
     }
 
     sync_hosts_entries(ctx, &snapshot, update.self_overlay_ip).await;
@@ -1253,9 +1544,18 @@ async fn record_netmap_in_runtime(
     if let (Some(name), None) = (&g.node_name, &g.fqdn) {
         g.fqdn = Some(format!("{name}.{}", snapshot.domain_suffix));
     }
+    let mut key_exp_changed = false;
+    if let Some(local_nid) = g.node_id
+        && let Some(self_peer) = snapshot.peers.iter().find(|p| p.node_id == local_nid)
+        && g.key_expires_at_ms != self_peer.key_expires_at_ms
+    {
+        g.key_expires_at_ms = self_peer.key_expires_at_ms;
+        g.bootstrap.key_expires_at_ms = self_peer.key_expires_at_ms;
+        key_exp_changed = true;
+    }
     g.latest_netmap = Some(snapshot.clone());
 
-    let bootstrap_save = if pins_changed || acked_changed {
+    let bootstrap_save = if pins_changed || acked_changed || key_exp_changed {
         Some((g.bootstrap_store.clone(), g.bootstrap.clone()))
     } else {
         None
@@ -1285,6 +1585,7 @@ async fn record_netmap_in_runtime(
         cache_store: g.netmap_cache.clone(),
         udp_port: Port::from_u16(g.local_udp_port.max(1)).ok(),
         self_overlay_ip: g.overlay_ip,
+        key_expires_at_ms: g.key_expires_at_ms,
     }
 }
 
@@ -1633,12 +1934,31 @@ where
     let local_candidates =
         discover_filtered_local_candidates(active_udp_port, tun_ifname.as_deref(), &filter_ctx)
             .await;
-    {
+    let cache_store_opt = {
         let mut g = ctx.state.inner.write().await;
         g.local_candidates = local_candidates.clone();
         if active_udp_port > 0 {
             g.local_udp_port = active_udp_port;
+            if active_udp_port != cached_port {
+                Some(g.netmap_cache.clone())
+            } else {
+                None
+            }
+        } else {
+            None
         }
+    };
+    if let Some(cache_store) = cache_store_opt
+        && let Ok(port) = Port::from_u16(active_udp_port)
+        && let Err(err) = cache_store.update_udp_port(port, ctx.clock.now_unix_ms())
+    {
+        debug!(
+            component = "meshd.control_loop",
+            event = "netmap_cache_port_persist_failed",
+            port = active_udp_port,
+            error = %err,
+            "failed updating persisted UDP port in netmap-cache.json"
+        );
     }
 
     let endpoints = merge_local_and_reflexive_candidates(&local_candidates, &reflexive_addrs);
@@ -1887,25 +2207,74 @@ async fn handle_terminal_revocation(
 
 async fn set_degraded_or_connecting(state: &DaemonRuntimeState, err_msg: &str) {
     let mut g = state.inner.write().await;
-    g.daemon_state = if g.latest_netmap.is_some() && g.datapath_handle.is_some() {
-        DaemonState::Degraded
+    if g.latest_netmap.is_some() && g.datapath_handle.is_some() {
+        g.daemon_state = DaemonState::Degraded;
+        g.last_error = Some(err_msg.to_owned());
     } else {
-        DaemonState::Connecting
-    };
-    g.last_error = Some(err_msg.to_owned());
+        g.daemon_state = DaemonState::Connecting;
+        g.last_error = Some(if err_msg.starts_with("waiting_for_control") {
+            err_msg.to_owned()
+        } else {
+            format!("waiting_for_control: {err_msg}")
+        });
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BackoffWaitOutcome {
     TimerExpired,
     WakeSignal,
+    KeyGraceExpired(String),
     Shutdown,
+}
+
+const OFFLINE_KEY_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Checks if an offline node's identity key has exceeded its 24h (`86_400_000 ms`) grace period (`US-031 AC4`).
+pub(crate) async fn check_offline_key_grace_expired(
+    state: &DaemonRuntimeState,
+    now_unix_ms: u64,
+) -> Option<String> {
+    let g = state.inner.read().await;
+    if g.control_connected {
+        return None;
+    }
+    if crate::netmap_cache::NetmapCacheFile::is_key_usable_offline(
+        g.key_expires_at_ms,
+        now_unix_ms,
+        DEFAULT_KEY_EXPIRY_GRACE_HOURS,
+    ) {
+        return None;
+    }
+    Some(
+        "local node identity key exceeded 24h offline grace window; re-authentication required"
+            .to_owned(),
+    )
+}
+
+async fn next_offline_key_check_delay(
+    state: &DaemonRuntimeState,
+    now_unix_ms: u64,
+) -> Option<Duration> {
+    let key_exp = state.inner.read().await.key_expires_at_ms?;
+    let grace_deadline_ms =
+        key_exp.saturating_add(DEFAULT_KEY_EXPIRY_GRACE_HOURS.saturating_mul(3_600_000));
+    let remaining_ms = grace_deadline_ms
+        .saturating_sub(now_unix_ms)
+        .saturating_add(1);
+    Some(Duration::from_millis(remaining_ms).min(OFFLINE_KEY_CHECK_INTERVAL))
 }
 
 async fn wait_backoff_or_wake(ctx: &mut ControlLoopContext, delay: Duration) -> BackoffWaitOutcome {
     let timer = tokio::time::sleep(delay);
     tokio::pin!(timer);
     loop {
+        if let Some(msg) =
+            check_offline_key_grace_expired(&ctx.state, ctx.clock.now_unix_ms()).await
+        {
+            return BackoffWaitOutcome::KeyGraceExpired(msg);
+        }
+        let expiry_poll = next_offline_key_check_delay(&ctx.state, ctx.clock.now_unix_ms()).await;
         tokio::select! {
             () = ctx.shutdown.cancelled() => return BackoffWaitOutcome::Shutdown,
             maybe_wake = ctx.wake_rx.recv() => {
@@ -1919,6 +2288,18 @@ async fn wait_backoff_or_wake(ctx: &mut ControlLoopContext, delay: Duration) -> 
             maybe_roam = recv_shared_roaming(&ctx.roaming_rx) => {
                 if maybe_roam.is_some() {
                     return BackoffWaitOutcome::WakeSignal;
+                }
+            }
+            () = async {
+                match expiry_poll {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if let Some(msg) =
+                    check_offline_key_grace_expired(&ctx.state, ctx.clock.now_unix_ms()).await
+                {
+                    return BackoffWaitOutcome::KeyGraceExpired(msg);
                 }
             }
             () = &mut timer => return BackoffWaitOutcome::TimerExpired,
@@ -1958,10 +2339,16 @@ fn map_ws_handshake_error(ws_err: tokio_tungstenite::tungstenite::Error) -> Cont
 }
 
 fn is_tls_or_pin_error(err: &AppError) -> bool {
-    matches!(
+    if matches!(
         err.kind(),
         ErrorKind::PinMismatch | ErrorKind::ClockSkew | ErrorKind::Unauthenticated
-    )
+    ) {
+        return true;
+    }
+    let msg = err.public_message();
+    msg.starts_with("TLS ")
+        || msg.starts_with("Control TLS ")
+        || msg.starts_with("Control captive portal ")
 }
 
 pub(crate) async fn connect_control_tls(
@@ -2136,6 +2523,11 @@ where
     if !(200..300).contains(&status) {
         return Err(map_http_error_response(status, &resp_body));
     }
+    if looks_like_html_captive_portal(&resp_body) {
+        return Err(AppError::unavailable(
+            "Control captive portal HTML page intercepted HTTPS response",
+        ));
+    }
     serde_json::from_slice(&resp_body).map_err(|err| {
         AppError::internal(format!("malformed Control JSON response for {path}: {err}"))
     })
@@ -2297,9 +2689,24 @@ async fn read_crlf_line<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>)
     }
 }
 
+fn looks_like_html_captive_portal(raw_body: &[u8]) -> bool {
+    let prefix_len = raw_body.len().min(512);
+    let trimmed = String::from_utf8_lossy(raw_body.get(..prefix_len).unwrap_or(&[]))
+        .trim_start()
+        .to_ascii_lowercase();
+    trimmed.starts_with("<!doctype html")
+        || trimmed.starts_with("<html")
+        || (trimmed.starts_with('<') && (trimmed.contains("<html") || trimmed.contains("<title")))
+}
+
 fn map_http_error_response(status: u16, raw_body: &[u8]) -> AppError {
     if let Ok(env) = serde_json::from_slice::<ErrorResponse>(raw_body) {
         return AppError::new(env.error.kind, env.error.message);
+    }
+    if (300..=399).contains(&status) || status == 511 || looks_like_html_captive_portal(raw_body) {
+        return AppError::unavailable(format!(
+            "Control captive portal HTTP {status} detected; keeping secrets local and retrying"
+        ));
     }
     let msg = String::from_utf8_lossy(raw_body);
     match status {
@@ -2780,5 +3187,380 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING> mtu 1500
 
         // Act & Assert
         forward_relayed_disco_frame(&state, node_id, pk, "not-valid-base64!!!").await;
+    }
+
+    #[tokio::test]
+    async fn test_netmap_sanity_rejects_bad_cidr_duplicates_and_local_collision_preserves_valid() {
+        use mesh_core::{NodeName, OverlayCidr, OverlayIp, SpkiPin};
+        use mesh_proto::netmap::{NetmapSnapshot, PeerEntry, PinSetDto, RelayMap};
+        use std::collections::HashSet;
+
+        let cidr = OverlayCidr::parse("100.115.0.0/16").expect("cidr");
+        let self_kp = NodeKeypair::generate();
+        let self_id = NodeId::new_v7(1_700_000_000_001);
+        let self_ip = OverlayIp::from_ipv4("100.115.0.10".parse().expect("v4")).expect("self ip");
+
+        let make_peer =
+            |ts: u64, name: &str, ip_str: &str, eps: Vec<CandidateEndpoint>| PeerEntry {
+                node_id: NodeId::new_v7(ts),
+                name: NodeName::parse(name).expect("name"),
+                fqdn: format!("{name}.mesh.internal"),
+                overlay_ip: OverlayIp::from_ipv4(ip_str.parse().expect("v4")).expect("ip"),
+                node_pubkey: NodeKeypair::generate().public_key(),
+                disco_pubkey: DiscoKeypair::generate().public_key(),
+                endpoints: eps,
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            };
+
+        let make_snap = |ver: u64, peers: Vec<PeerEntry>| NetmapSnapshot {
+            netmap_version: ver,
+            generated_at_ms: 1_700_000_100_000 + ver,
+            overlay_cidr: cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: RelayMap {
+                endpoint_version: 1,
+                control_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                relay_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                stun_udp_endpoints: vec!["203.0.113.10:3478".to_owned()],
+            },
+            pin_set: PinSetDto {
+                active_pin: SpkiPin::from_sha256_bytes([1_u8; 32]),
+                next_pin: None,
+            },
+            peers,
+        };
+
+        // Out-of-CIDR IP rejects entire snapshot (`US-011 AC1`).
+        let mut bad_cidr_snap = make_snap(
+            2,
+            vec![make_peer(
+                1_700_000_000_100,
+                "peer-a",
+                "192.168.1.5",
+                vec![],
+            )],
+        );
+        let err_cidr = super::validate_and_sanitize_netmap_snapshot(
+            &mut bad_cidr_snap,
+            Some(1),
+            &HashSet::new(),
+            Some(self_id),
+            self_kp.public_key(),
+            Some(self_ip),
+        );
+        assert!(err_cidr.is_err());
+
+        // Duplicate overlay IP rejects entire snapshot.
+        let mut dup_ip_snap = make_snap(
+            3,
+            vec![
+                make_peer(1_700_000_000_101, "peer-a", "100.115.0.20", vec![]),
+                make_peer(1_700_000_000_102, "peer-b", "100.115.0.20", vec![]),
+            ],
+        );
+        assert!(
+            super::validate_and_sanitize_netmap_snapshot(
+                &mut dup_ip_snap,
+                Some(1),
+                &HashSet::new(),
+                Some(self_id),
+                self_kp.public_key(),
+                Some(self_ip),
+            )
+            .is_err()
+        );
+
+        // Local self overlay IP collision rejects snapshot.
+        let mut self_col_snap = make_snap(
+            4,
+            vec![make_peer(
+                1_700_000_000_103,
+                "spoof",
+                "100.115.0.10",
+                vec![],
+            )],
+        );
+        assert!(
+            super::validate_and_sanitize_netmap_snapshot(
+                &mut self_col_snap,
+                Some(1),
+                &HashSet::new(),
+                Some(self_id),
+                self_kp.public_key(),
+                Some(self_ip),
+            )
+            .is_err()
+        );
+
+        // Non-increasing version is safely ignored (`Ok(false)`).
+        let mut stale_snap = make_snap(1, vec![]);
+        assert_eq!(
+            super::validate_and_sanitize_netmap_snapshot(
+                &mut stale_snap,
+                Some(5),
+                &HashSet::new(),
+                Some(self_id),
+                self_kp.public_key(),
+                Some(self_ip),
+            ),
+            Ok(false)
+        );
+
+        // Valid snapshot with mixed candidate endpoints strips overlay & Control sockets cleanly.
+        let bad_overlay_ep = CandidateEndpoint {
+            addr: "100.115.0.77:51820".parse().expect("addr"),
+            source: CandidateSource::Lan,
+        };
+        let bad_ctrl_ep = CandidateEndpoint {
+            addr: "203.0.113.10:8443".parse().expect("addr"),
+            source: CandidateSource::Reflexive,
+        };
+        let good_ep = CandidateEndpoint {
+            addr: "198.51.100.42:51820".parse().expect("addr"),
+            source: CandidateSource::Reflexive,
+        };
+        let mut ok_snap = make_snap(
+            6,
+            vec![make_peer(
+                1_700_000_000_200,
+                "peer-ok",
+                "100.115.0.30",
+                vec![bad_overlay_ep, bad_ctrl_ep, good_ep],
+            )],
+        );
+        let prev_ids: HashSet<NodeId> = [NodeId::new_v7(1_700_000_000_999)].into_iter().collect();
+        let accepted = super::validate_and_sanitize_netmap_snapshot(
+            &mut ok_snap,
+            Some(5),
+            &prev_ids,
+            Some(self_id),
+            self_kp.public_key(),
+            Some(self_ip),
+        );
+        assert_eq!(accepted, Ok(true));
+        let first_peer = ok_snap.peers.first().expect("sanitized peer present");
+        assert_eq!(first_peer.endpoints.len(), 1);
+        assert_eq!(
+            first_peer.endpoints.first().expect("kept endpoint").addr,
+            "198.51.100.42:51820"
+                .parse::<std::net::SocketAddr>()
+                .expect("addr")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_captive_portal_and_tls_errors_use_5m_backoff_and_surface_waiting_for_control() {
+        use mesh_core::ErrorKind;
+
+        let portal_redirect = super::map_http_error_response(302, b"Found");
+        let portal_511 = super::map_http_error_response(511, b"Network Authentication Required");
+        let portal_html =
+            super::map_http_error_response(200, b"<!DOCTYPE html><html>Wi-Fi Login</html>");
+        let tls_issuer = AppError::unavailable("TLS certificate signed by unknown issuer");
+        let clock_skew = AppError::new(ErrorKind::ClockSkew, "clock skew");
+
+        for err in [
+            portal_redirect,
+            portal_511,
+            portal_html,
+            tls_issuer,
+            clock_skew,
+        ] {
+            assert!(
+                super::is_tls_or_pin_error(&err),
+                "expected tls_capped=true for {err}"
+            );
+            let exit = map_verified_tls_http_error(err);
+            assert!(matches!(
+                exit,
+                ControlSessionExit::Retry {
+                    tls_capped: true,
+                    ..
+                }
+            ));
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let state = DaemonRuntimeState::new(
+            BootstrapConfig::default(),
+            BootstrapStore::new(dir.path().join("bootstrap.toml")),
+            NetmapCacheStore::new(dir.path().join("netmap-cache.json")),
+            None,
+            1280,
+        );
+        super::set_degraded_or_connecting(&state, "Control TLS handshake failed").await;
+        let g = state.inner.read().await;
+        assert_eq!(g.daemon_state, DaemonState::Connecting);
+        assert!(
+            g.last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("waiting_for_control: "))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rotate_key_network_failure_preserves_existing_identity_and_bootstrap() {
+        // Arrange: persist valid bootstrap & node identity before rotation attempt
+        let dir = tempdir().expect("tempdir");
+        let bootstrap_path = dir.path().join("bootstrap.toml");
+        let store = BootstrapStore::new(bootstrap_path);
+        let old_id = NodeId::new_v7(1_700_000_000_555);
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let dead_ep = dead_listener.local_addr().expect("addr").to_string();
+        drop(dead_listener);
+
+        let bootstrap = BootstrapConfig {
+            node_id: Some(old_id),
+            server_endpoint: Some(dead_ep),
+            tls_auth_mode: TlsAuthMode::SpkiPin,
+            active_pin: Some(mesh_core::SpkiPin::from_sha256_bytes([9_u8; 32])),
+            acked_endpoint_version: 2,
+            ..BootstrapConfig::default()
+        };
+        store.save_atomic(&bootstrap).expect("save old bootstrap");
+
+        let old_kp = NodeKeypair::generate();
+        let new_kp = NodeKeypair::generate();
+        let req = mesh_proto::control::RegisterNodeRequest {
+            node_pubkey: new_kp.public_key(),
+            disco_pubkey: DiscoKeypair::generate().public_key(),
+            preauth_key: "mpk_rotate_test_secret".to_owned(),
+            node_name: mesh_core::NodeName::parse("rotate-test-node").expect("node name"),
+            previous_node_pubkey: Some(old_kp.public_key()),
+        };
+
+        // Act: mid-rotation network connection failure
+        let res = super::ControlLoop::register_node(
+            &bootstrap,
+            &new_kp,
+            &req,
+            "0.1.0-test",
+            (None, None),
+        )
+        .await;
+
+        // Assert: failed safely without touching persisted bootstrap node_id / endpoint
+        assert!(res.is_err());
+        let after = store.load_or_default().expect("load preserved bootstrap");
+        assert_eq!(after.node_id, Some(old_id));
+        assert_eq!(after.acked_endpoint_version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_control_loop_run_tears_down_when_offline_key_grace_exceeds_24h() {
+        // Arrange (`HR-W21-13`)
+        let Ok(dir) = tempdir() else {
+            return;
+        };
+        let t0: u64 = 1_700_000_000_000;
+        let key_expiry_ms = t0 + 5_000;
+        let clock = Arc::new(mesh_core::clock::FakeClock::new(t0));
+
+        let Ok(dead_listener) = TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(dead_addr) = dead_listener.local_addr() else {
+            return;
+        };
+        drop(dead_listener);
+
+        let Ok(node_name) = mesh_core::NodeName::parse("offline-grace-node") else {
+            return;
+        };
+        let Ok(overlay_ip) = "100.115.0.44"
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|_| ())
+            .and_then(|v4| mesh_core::OverlayIp::from_ipv4(v4).map_err(|_| ()))
+        else {
+            return;
+        };
+        let node_id = NodeId::new_v7(t0);
+        let bootstrap = BootstrapConfig {
+            node_id: Some(node_id),
+            node_name: Some(node_name),
+            overlay_ip: Some(overlay_ip),
+            fqdn: Some("offline-grace-node.mesh.internal".to_owned()),
+            server_endpoint: Some(dead_addr.to_string()),
+            tls_auth_mode: TlsAuthMode::SpkiPin,
+            active_pin: Some(mesh_core::SpkiPin::from_sha256_bytes([3_u8; 32])),
+            key_expires_at_ms: Some(key_expiry_ms),
+            ..BootstrapConfig::default()
+        };
+        let store = BootstrapStore::new(dir.path().join("bootstrap.toml"));
+        assert!(store.save_atomic(&bootstrap).is_ok());
+
+        let state = Arc::new(DaemonRuntimeState::new_with_now(
+            bootstrap,
+            store,
+            NetmapCacheStore::new(dir.path().join("netmap-cache.json")),
+            None,
+            1280,
+            t0,
+        ));
+        assert!(
+            super::check_offline_key_grace_expired(&state, t0 + 86_400_000)
+                .await
+                .is_none()
+        );
+
+        let Ok(ledger) =
+            mesh_net::ledger::ResourceLedger::load_or_init(dir.path().join("ledger.json"))
+        else {
+            return;
+        };
+        let ledger = Arc::new(tokio::sync::Mutex::new(ledger));
+        let (_roaming_tx, roaming_rx) = mpsc::channel(4);
+        let (wake_tx, wake_rx) = mpsc::channel(8);
+        let (term_tx, mut term_rx) = mpsc::channel(4);
+        let shutdown = CancellationToken::new();
+
+        let kp = NodeKeypair::generate();
+        let disco = DiscoKeypair::generate();
+        let ctx = super::ControlLoopContext {
+            state: Arc::clone(&state),
+            clock: Arc::clone(&clock) as Arc<dyn mesh_core::clock::Clock>,
+            node_keypair: kp,
+            disco_pubkey: disco.public_key(),
+            agent_version: "0.1.0-test".to_owned(),
+            hosts_override: None,
+            ledger,
+            roaming_rx: Arc::new(tokio::sync::Mutex::new(roaming_rx)),
+            wake_rx,
+            termination_tx: Some(term_tx),
+            shutdown: shutdown.clone(),
+        };
+
+        let loop_handle = tokio::spawn(super::ControlLoop::run(ctx));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(term_rx.try_recv().is_err());
+
+        // Act: advance offline clock past key expiry + 24h and wake loop
+        clock.set_wall_ms(key_expiry_ms + 86_400_000 + 1_000);
+        assert!(
+            wake_tx
+                .send(super::ControlWakeSignal::ConfigUpdated)
+                .await
+                .is_ok()
+        );
+
+        // Assert: ControlLoop terminates session with NodeKeyExpired and ReauthRequired
+        let term = tokio::time::timeout(Duration::from_secs(2), term_rx.recv()).await;
+        assert!(matches!(
+            term,
+            Ok(Some((
+                mesh_proto::control::TerminationReason::NodeKeyExpired,
+                _
+            )))
+        ));
+        let status = state.build_status_response().await;
+        assert_eq!(status.daemon_state, DaemonState::ReauthRequired);
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), loop_handle)
+                .await
+                .is_ok()
+        );
     }
 }

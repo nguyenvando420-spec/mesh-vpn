@@ -1,5 +1,6 @@
 //! Windows `NotifyIpInterfaceChange` + PowerEvent monitor (`US-036`, `WP-S1-04`).
 
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
@@ -8,12 +9,39 @@ use std::time::Duration;
 
 use mesh_core::{AppError, AppResult, ErrorKind};
 use mesh_sys::netmon_windows::{
-    IpChangeSubscription, query_primary_physical_if_index, subscribe_ip_interface_changes,
+    IpChangeSubscription, is_usable_dhcp_ip, list_interface_addresses,
+    query_primary_physical_interface as sys_query_primary_physical_interface,
+    subscribe_ip_interface_changes,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
-use crate::netmon::{NetEvent, NetMonitor, netmon_unavailable};
+use crate::endpoint_filter::InterfaceSubnetSnapshot;
+use crate::netmon::{NetEvent, NetMonitor, PhysicalInterface, netmon_unavailable};
 use crate::tun::BoxFuture;
+
+/// Queries the current primary Windows physical interface `(IfIndex, FriendlyName)` via IP Helper.
+pub fn query_primary_physical_interface() -> AppResult<PhysicalInterface> {
+    let (if_index, name) = sys_query_primary_physical_interface().map_err(AppError::from)?;
+    Ok(PhysicalInterface { if_index, name })
+}
+
+/// Lists all current Windows adapter unicast addresses and on-link CIDR prefixes
+/// (`US-036` DHCP wait, `US-037` CGNAT overlap detection).
+pub fn list_interface_subnets() -> AppResult<Vec<InterfaceSubnetSnapshot>> {
+    let items = list_interface_addresses().map_err(AppError::from)?;
+    Ok(items
+        .into_iter()
+        .map(|item| InterfaceSubnetSnapshot {
+            if_index: item.if_index,
+            interface_name: item.friendly_name,
+            ip: item.ip,
+            prefix_len: item.prefix_len,
+            is_up: item.is_up,
+            is_virtual: item.is_virtual,
+            has_gateway: item.has_gateway,
+        })
+        .collect())
+}
 
 const POLL_TIMEOUT_MS: u64 = 250;
 
@@ -35,6 +63,7 @@ pub struct WindowsNetMonitor {
     power_rx: tokio::sync::Mutex<Receiver<WindowsPowerEvent>>,
     power_tx: Sender<WindowsPowerEvent>,
     stop: Arc<AtomicBool>,
+    power_only: bool,
     _subscription: Option<IpChangeSubscription>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -69,15 +98,35 @@ impl WindowsNetMonitor {
             power_rx: tokio::sync::Mutex::new(power_rx),
             power_tx,
             stop: Arc::new(AtomicBool::new(true)),
+            power_only: false,
             _subscription: None,
             worker: Mutex::new(None),
         }
     }
 
-    /// Starts live monitoring via `NotifyIpInterfaceChange` + physical interface polling.
+    /// Creates a fallback active monitor that delivers SCM [`WindowsPowerEvent`] wakeups even when
+    /// kernel IP Helper notifications are unavailable (`US-036 AC1`).
+    #[must_use]
+    pub fn start_power_monitor_only() -> Self {
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (power_tx, power_rx) = mpsc::channel(16);
+        Self {
+            rx: tokio::sync::Mutex::new(event_rx),
+            power_rx: tokio::sync::Mutex::new(power_rx),
+            power_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            power_only: true,
+            _subscription: None,
+            worker: Mutex::new(None),
+        }
+    }
+
+    /// Starts live monitoring via `NotifyIpInterfaceChange` + `NotifyUnicastIpAddressChange` and
+    /// physical adapter / IP snapshot resolution.
     pub fn start_live() -> AppResult<Self> {
         let (subscription, os_rx) = subscribe_ip_interface_changes().map_err(AppError::from)?;
-        let initial_if = query_primary_physical_if_index().ok();
+        let initial_if = sys_query_primary_physical_interface().ok();
+        let initial_ips = capture_usable_ips(initial_if.as_ref().map(|(idx, _)| *idx));
         let (event_tx, event_rx) = mpsc::channel(32);
         let (power_tx, power_rx) = mpsc::channel::<WindowsPowerEvent>(16);
         let stop = Arc::new(AtomicBool::new(false));
@@ -85,12 +134,27 @@ impl WindowsNetMonitor {
         let stop_flag = Arc::clone(&stop);
         let handle = thread::spawn(move || {
             let mut last_if = initial_if;
+            let mut last_ips = initial_ips;
             while !stop_flag.load(Ordering::Acquire) {
                 match os_rx.recv_timeout(Duration::from_millis(POLL_TIMEOUT_MS)) {
                     Ok(()) => {
-                        let new_if = query_primary_physical_if_index().ok();
-                        let ev = classify_interface_transition(last_if, new_if);
+                        while os_rx.try_recv().is_ok() {}
+                        let new_if = sys_query_primary_physical_interface().ok();
+                        let new_ips = capture_usable_ips(new_if.as_ref().map(|(idx, _)| *idx));
+                        let ev = if new_if != last_if {
+                            classify_interface_transition_named(last_if.as_ref(), new_if.as_ref())
+                        } else if new_ips != last_ips {
+                            match new_if.as_ref() {
+                                Some((_, iface_name)) => NetEvent::AddressChanged {
+                                    interface: iface_name.clone(),
+                                },
+                                None => NetEvent::RouteChanged,
+                            }
+                        } else {
+                            NetEvent::RouteChanged
+                        };
                         last_if = new_if;
+                        last_ips = new_ips;
                         if event_tx.blocking_send(ev).is_err() {
                             break;
                         }
@@ -106,6 +170,7 @@ impl WindowsNetMonitor {
             power_rx: tokio::sync::Mutex::new(power_rx),
             power_tx,
             stop,
+            power_only: false,
             _subscription: Some(subscription),
             worker: Mutex::new(Some(handle)),
         })
@@ -138,20 +203,47 @@ impl Default for WindowsNetMonitor {
     }
 }
 
-fn classify_interface_transition(previous: Option<u32>, current: Option<u32>) -> NetEvent {
+fn capture_usable_ips(if_index: Option<u32>) -> Vec<IpAddr> {
+    let Some(target_idx) = if_index else {
+        return Vec::new();
+    };
+    let Ok(addrs) = list_interface_addresses() else {
+        return Vec::new();
+    };
+    let mut ips: Vec<IpAddr> = addrs
+        .into_iter()
+        .filter(|a| a.if_index == target_idx && a.is_up && !a.is_virtual && is_usable_dhcp_ip(a.ip))
+        .map(|a| a.ip)
+        .collect();
+    ips.sort_unstable();
+    ips.dedup();
+    ips
+}
+
+fn classify_interface_transition_named(
+    previous: Option<&(u32, String)>,
+    current: Option<&(u32, String)>,
+) -> NetEvent {
     match (previous, current) {
-        (Some(old), Some(new)) if old != new => NetEvent::RouteChanged,
-        (None, Some(new_idx)) => NetEvent::InterfaceUp {
-            interface: format!("if-{new_idx}"),
+        (Some((old_idx, _)), Some((new_idx, _))) if old_idx != new_idx => NetEvent::RouteChanged,
+        (None, Some((_, new_name))) => NetEvent::InterfaceUp {
+            interface: new_name.clone(),
         },
-        (Some(old_idx), None) => NetEvent::InterfaceDown {
-            interface: format!("if-{old_idx}"),
+        (Some((_, old_name)), None) => NetEvent::InterfaceDown {
+            interface: old_name.clone(),
         },
-        (Some(idx), Some(_)) => NetEvent::AddressChanged {
-            interface: format!("if-{idx}"),
+        (Some(_), Some((_, cur_name))) => NetEvent::AddressChanged {
+            interface: cur_name.clone(),
         },
         (None, None) => NetEvent::RouteChanged,
     }
+}
+
+#[cfg(test)]
+fn classify_interface_transition(previous: Option<u32>, current: Option<u32>) -> NetEvent {
+    let prev = previous.map(|idx| (idx, format!("if-{idx}")));
+    let cur = current.map(|idx| (idx, format!("if-{idx}")));
+    classify_interface_transition_named(prev.as_ref(), cur.as_ref())
 }
 
 impl NetMonitor for WindowsNetMonitor {
@@ -164,7 +256,7 @@ impl NetMonitor for WindowsNetMonitor {
             let mut pwr_guard = self.power_rx.lock().await;
             loop {
                 tokio::select! {
-                    maybe_os = os_guard.recv() => {
+                    maybe_os = os_guard.recv(), if !self.power_only => {
                         return maybe_os.ok_or_else(|| {
                             AppError::new(ErrorKind::Unavailable, "Windows IP Helper monitor closed")
                         });
@@ -233,5 +325,23 @@ mod tests {
         // Assert
         assert!(matches!(ev, Ok(Ok(_))));
         drop(mon);
+    }
+
+    #[tokio::test]
+    async fn test_netmon_windows_power_only_monitor_delivers_resume_and_ignores_suspend() {
+        // Traces: US-036 AC1
+        // Arrange
+        let mon = WindowsNetMonitor::start_power_monitor_only();
+        assert!(mon.notify_power_event(WindowsPowerEvent::Suspend).is_ok());
+        assert!(
+            mon.notify_power_event(WindowsPowerEvent::ResumeSuspend)
+                .is_ok()
+        );
+
+        // Act
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), mon.next_event()).await;
+
+        // Assert
+        assert!(matches!(ev, Ok(Ok(NetEvent::WakeFromSleep))));
     }
 }

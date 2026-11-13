@@ -66,6 +66,7 @@ pub struct StunServiceState {
     healthy: AtomicBool,
     requests_total: AtomicU64,
     dropped_rate_limited_total: AtomicU64,
+    malformed_total: AtomicU64,
 }
 
 impl Default for StunServiceState {
@@ -82,6 +83,7 @@ impl StunServiceState {
             healthy: AtomicBool::new(false),
             requests_total: AtomicU64::new(0),
             dropped_rate_limited_total: AtomicU64::new(0),
+            malformed_total: AtomicU64::new(0),
         }
     }
 
@@ -113,6 +115,12 @@ impl StunServiceState {
     pub fn dropped_rate_limited_total(&self) -> u64 {
         self.dropped_rate_limited_total.load(Ordering::Relaxed)
     }
+
+    /// Total malformed or non-Binding-Request STUN datagrams ignored (`US-048`).
+    #[must_use]
+    pub fn malformed_total(&self) -> u64 {
+        self.malformed_total.load(Ordering::Relaxed)
+    }
 }
 
 /// Processes a single STUN datagram, returning an RFC 5389 Binding Success Response if valid & allowed.
@@ -125,9 +133,11 @@ pub fn process_stun_datagram(
     metrics: &StunServiceState,
 ) -> Option<Vec<u8>> {
     let Ok(msg) = parse_stun_packet(payload) else {
+        metrics.malformed_total.fetch_add(1, Ordering::Relaxed);
         return None;
     };
     if msg.msg_type != STUN_BINDING_REQUEST {
+        metrics.malformed_total.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if !limiter.allow(peer_addr.ip(), now_ms) {
@@ -239,5 +249,28 @@ mod tests {
         assert!(process_stun_datagram(&req, peer, now_ms, &mut limiter, &state).is_none());
         assert!(process_stun_datagram(&req, other_peer, now_ms, &mut limiter, &state).is_some());
         assert_eq!(state.dropped_rate_limited_total(), 1);
+    }
+
+    #[test]
+    fn test_stun_malformed_or_non_binding_packets_increment_malformed_counter() {
+        // Arrange
+        let mut limiter = StunIpRateLimiter::new(100);
+        let state = StunServiceState::new();
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 40000);
+        let now_ms = 1_762_958_152_000_u64;
+        let garbage = [0xFF_u8; 8];
+        let mut resp = mesh_proto::stun::encode_binding_success_response([0x11_u8; 12], peer);
+        // Flip binding response type byte slightly? Keep malformed + valid non-request distinct:
+        let non_request = resp.as_slice();
+
+        // Act
+        assert!(process_stun_datagram(&garbage, peer, now_ms, &mut limiter, &state).is_none());
+        assert!(process_stun_datagram(non_request, peer, now_ms, &mut limiter, &state).is_none());
+        resp.clear();
+
+        // Assert
+        assert_eq!(state.requests_total(), 0);
+        assert_eq!(state.dropped_rate_limited_total(), 0);
+        assert_eq!(state.malformed_total(), 2);
     }
 }

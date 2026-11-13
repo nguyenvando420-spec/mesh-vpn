@@ -31,7 +31,9 @@ use crate::magic_socket::{MAGIC_SOCKET_BUFFER_SIZE, MagicSocket, MagicSocketConf
 use crate::peer_map::{ApplyDiffReport, PeerActivePath, PeerMap, PeerSendTarget};
 use crate::rebind::{RebindCommand, RebindOutcome, SocketRebinder};
 use crate::relay_client::{RelayClientHandle, RelayConnectionState, RelayEvent};
-use crate::stun_client::{StunClient, StunClientConfig, StunProbeReport};
+use crate::stun_client::{
+    StunClient, StunClientConfig, StunProbeReport, resolve_stun_endpoints_cancellable,
+};
 
 const DEFAULT_WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_DISCO_TICK_INTERVAL: Duration = Duration::from_millis(250);
@@ -127,6 +129,13 @@ pub enum DatapathCommand {
     TriggerStunProbe,
     /// Atomically replaces the active `CryptokeyValidator` packet filter policy (`US-018`).
     SetPacketFilter(PacketFilterPolicy),
+    /// Atomically parses and reloads inbound filter rules, preserving previous policy if invalid (`US-018`).
+    TryReloadPacketFilterSpec {
+        /// Rule specification such as `"3389,tcp:8080"` or `"allow-all"`.
+        spec: String,
+        /// Reply returning validation result.
+        reply: oneshot::Sender<AppResult<()>>,
+    },
     /// Triggers immediate simultaneous NAT hole punching toward a peer (`US-021`, `US-026`).
     InitiateHolePunch(NodeId),
     /// Sends an end-to-end encrypted `DiscoPing` probe (`Direct` or `Relay`) and waits up to
@@ -151,6 +160,19 @@ pub enum DatapathCommand {
         verified_src_pubkey: PublicKey,
         /// Complete `MESHDS` encrypted frame payload.
         packet: Bytes,
+    },
+    /// Marks direct UDP egress blocked while preparing a physical interface rebind (`HR-W21-08`).
+    BeginRebind,
+    /// Synchronously rebinds `MagicSocket` onto a new physical interface before reprobing (`HR-W21-08`).
+    RebindUnderlay {
+        /// Physical interface name for diagnostics.
+        interface_name: String,
+        /// Optional physical interface index (`IP_UNICAST_IF` / `IP_BOUND_IF`).
+        if_index: Option<u32>,
+        /// Whether underlay uses IPv6.
+        is_ipv6: bool,
+        /// Completion reply yielding `Ok(bound_local_port)` or `Err(err)`.
+        reply: oneshot::Sender<AppResult<u16>>,
     },
     /// Queries an immutable snapshot of data-plane metrics and active peer paths.
     QueryStatus(oneshot::Sender<DatapathStatusSnapshot>),
@@ -226,9 +248,49 @@ impl DatapathHandle {
         })
         .await
     }
+
+    /// Atomically parses and applies an inbound packet filter rule specification (`US-018`).
+    ///
+    /// Preserves the previous valid policy intact if `spec` fails validation.
+    pub async fn try_reload_packet_filter_spec(&self, spec: &str) -> AppResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(DatapathCommand::TryReloadPacketFilterSpec {
+            spec: spec.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| AppError::unavailable("packet filter reload canceled during shutdown"))?
+    }
+
+    /// Blocks direct UDP sends while an interface transition rebind is in progress (`HR-W21-08`).
+    pub async fn begin_rebind(&self) -> AppResult<()> {
+        self.send(DatapathCommand::BeginRebind).await
+    }
+
+    /// Synchronously rebinds `MagicSocket` and awaits confirmation with the bound UDP port (`HR-W21-08`).
+    pub async fn rebind_underlay(
+        &self,
+        interface_name: String,
+        if_index: Option<u32>,
+        is_ipv6: bool,
+    ) -> AppResult<u16> {
+        let (tx, rx) = oneshot::channel();
+        self.send(DatapathCommand::RebindUnderlay {
+            interface_name,
+            if_index,
+            is_ipv6,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| {
+            AppError::unavailable("datapath underlay rebind canceled during shutdown")
+        })?
+    }
 }
 
 struct PendingPingWaiter {
+    peer_id: NodeId,
     started_at: tokio::time::Instant,
     expires_at: tokio::time::Instant,
     force_direct: bool,
@@ -260,6 +322,10 @@ pub struct DatapathEngine {
     clock: Arc<dyn Clock>,
     cmd_tx: mpsc::Sender<DatapathCommand>,
     cmd_rx: mpsc::Receiver<DatapathCommand>,
+    direct_udp_blocked: bool,
+    stun_dns_cancel: Option<CancellationToken>,
+    #[cfg(test)]
+    injected_rebind_failures: std::collections::VecDeque<AppError>,
 }
 
 impl std::fmt::Debug for DatapathEngine {
@@ -311,7 +377,16 @@ impl DatapathEngine {
             clock,
             cmd_tx,
             cmd_rx,
+            direct_udp_blocked: false,
+            stun_dns_cancel: None,
+            #[cfg(test)]
+            injected_rebind_failures: std::collections::VecDeque::new(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rebind_failure_for_tests(&mut self, err: AppError) {
+        self.injected_rebind_failures.push_back(err);
     }
 
     /// Returns a clonable handle to issue runtime commands and status queries.
@@ -347,6 +422,7 @@ impl DatapathEngine {
         shutdown: CancellationToken,
     ) -> AppResult<()> {
         let tracker = TaskTracker::new();
+        let (stun_dns_tx, mut stun_dns_rx) = mpsc::channel::<(Vec<String>, Vec<SocketAddr>)>(8);
         let (mut wg_tick, mut disco_tick) = self.build_tick_intervals();
         let mut udp_rx_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
         let mut tun_rx_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
@@ -383,13 +459,20 @@ impl DatapathEngine {
                 }
                 maybe_cmd = self.cmd_rx.recv() => {
                     match maybe_cmd {
-                        Some(cmd) => self.process_command(cmd).await,
+                        Some(cmd) => self.process_command(cmd, &tracker, &shutdown, &stun_dns_tx).await,
                         None => break,
                     }
                 }
                 maybe_rebind = rebind_rx.recv() => {
                     if let Some(cmd) = maybe_rebind {
                         self.process_rebind_command(&cmd).await;
+                    }
+                }
+                maybe_stun_dns = stun_dns_rx.recv() => {
+                    if let Some((raw_endpoints, resolved)) = maybe_stun_dns
+                        && self.stun_client.apply_resolved_endpoints_for_raw(&raw_endpoints, resolved)
+                    {
+                        self.reprobe_tracked_stun_endpoints().await;
                     }
                 }
                 _ = wg_tick.tick() => self.step_wg_timers(&mut wg_tx_buf).await,
@@ -491,6 +574,9 @@ impl DatapathEngine {
     }
 
     async fn shutdown_cleanup(&mut self, tracker: TaskTracker) {
+        if let Some(cancel) = self.stun_dns_cancel.take() {
+            cancel.cancel();
+        }
         self.drain_ping_waiters_as_timeout();
         if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, self.tun.close())
             .await
@@ -632,14 +718,26 @@ impl DatapathEngine {
         }
     }
 
-    async fn process_command(&mut self, cmd: DatapathCommand) {
+    async fn process_command(
+        &mut self,
+        cmd: DatapathCommand,
+        tracker: &TaskTracker,
+        shutdown: &CancellationToken,
+        stun_dns_tx: &mpsc::Sender<(Vec<String>, Vec<SocketAddr>)>,
+    ) {
         match cmd {
             DatapathCommand::ApplyNetmap { snapshot, reply } => {
-                let stun_changed = self
-                    .stun_client
-                    .sync_and_resolve_relay_map(&snapshot.relay_map)
-                    .await;
                 let report = self.peer_map.apply_diff(&snapshot);
+                if !report.removed_peer_ids.is_empty() {
+                    self.disco.remove_peers(&report.removed_peer_ids);
+                    self.fail_ping_waiters_for_peers(&report.removed_peer_ids);
+                }
+                if !report.removed_node_pubkeys.is_empty()
+                    && let Some(relay) = &self.relay_handle
+                {
+                    relay.remove_peer_queues(&report.removed_node_pubkeys);
+                }
+                let stun_changed = self.stun_client.sync_relay_map(&snapshot.relay_map);
                 if let Some(tx) = reply
                     && tx.send(report).is_err()
                 {
@@ -649,7 +747,33 @@ impl DatapathEngine {
                     );
                 }
                 if stun_changed {
-                    self.trigger_stun_probe(&snapshot.relay_map).await;
+                    if !self.stun_client.tracked_endpoints().is_empty() {
+                        self.reprobe_tracked_stun_endpoints().await;
+                    }
+                    if StunClient::has_unresolved_hostnames(&snapshot.relay_map.stun_udp_endpoints)
+                    {
+                        if let Some(prev_cancel) = self.stun_dns_cancel.take() {
+                            prev_cancel.cancel();
+                        }
+                        let dns_cancel = shutdown.child_token();
+                        self.stun_dns_cancel = Some(dns_cancel.clone());
+                        let endpoints = snapshot.relay_map.stun_udp_endpoints.clone();
+                        let dns_tx = stun_dns_tx.clone();
+                        tracker.spawn(async move {
+                            let resolved =
+                                resolve_stun_endpoints_cancellable(&endpoints, &dns_cancel).await;
+                            if !dns_cancel.is_cancelled()
+                                && dns_tx.send((endpoints, resolved)).await.is_err()
+                            {
+                                debug!(
+                                    component = "datapath.engine",
+                                    "background stun dns result receiver closed"
+                                );
+                            }
+                        });
+                    } else if let Some(prev_cancel) = self.stun_dns_cancel.take() {
+                        prev_cancel.cancel();
+                    }
                 }
             }
             DatapathCommand::SetAdvertisedEndpoints(endpoints) => {
@@ -668,6 +792,15 @@ impl DatapathEngine {
             }
             DatapathCommand::SetPacketFilter(policy) => {
                 self.cryptokey.set_policy(policy);
+            }
+            DatapathCommand::TryReloadPacketFilterSpec { spec, reply } => {
+                let res = self.cryptokey.try_reload_policy_spec(&spec);
+                if reply.send(res).is_err() {
+                    debug!(
+                        component = "datapath.engine",
+                        "try_reload_packet_filter_spec reply receiver closed"
+                    );
+                }
             }
             DatapathCommand::InitiateHolePunch(peer_id) => {
                 let now_ms = self.clock.now_unix_ms();
@@ -697,6 +830,47 @@ impl DatapathEngine {
                 self.handle_relayed_disco_cmd(src_node_id, verified_src_pubkey, &packet)
                     .await;
             }
+            DatapathCommand::BeginRebind => {
+                self.direct_udp_blocked = true;
+            }
+            DatapathCommand::RebindUnderlay {
+                interface_name,
+                if_index,
+                is_ipv6,
+                reply,
+            } => {
+                self.direct_udp_blocked = true;
+                let rebind_cmd = RebindCommand::RebindInterface {
+                    interface_name,
+                    if_index,
+                    is_ipv6,
+                };
+                let res = match self.execute_socket_rebind(&rebind_cmd) {
+                    Ok(RebindOutcome::Rebound { local_addr, .. }) => {
+                        self.direct_udp_blocked = false;
+                        Ok(local_addr.port())
+                    }
+                    Ok(_) => {
+                        self.direct_udp_blocked = false;
+                        self.magic_socket.local_addr().map(|addr| addr.port())
+                    }
+                    Err(err) => {
+                        warn!(
+                            component = "datapath.engine",
+                            event = "rebind_underlay_failed",
+                            error = %err,
+                            "underlay socket rebind failed; keeping direct UDP egress blocked until retry succeeds"
+                        );
+                        Err(err)
+                    }
+                };
+                if reply.send(res).is_err() {
+                    debug!(
+                        component = "datapath.engine",
+                        "rebind_underlay reply receiver closed"
+                    );
+                }
+            }
             DatapathCommand::QueryStatus(reply) => {
                 let status = self.build_status_snapshot();
                 if reply.send(status).is_err() {
@@ -710,19 +884,17 @@ impl DatapathEngine {
     }
 
     async fn reprobe_tracked_stun_endpoints(&mut self) {
-        let endpoints: Vec<String> = self
-            .stun_client
-            .tracked_endpoints()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let rmap = mesh_proto::netmap::RelayMap {
-            endpoint_version: 0,
-            control_tcp_endpoint: String::new(),
-            relay_tcp_endpoint: String::new(),
-            stun_udp_endpoints: endpoints,
-        };
-        self.trigger_stun_probe(&rmap).await;
+        if self.direct_udp_blocked {
+            debug!(
+                component = "datapath.engine",
+                event = "stun_probe_blocked_during_rebind",
+                "skipped STUN probe while direct UDP is blocked during interface rebind"
+            );
+            return;
+        }
+        let now_ms = self.clock.now_unix_ms();
+        let requests = self.stun_client.start_probe_round_tracked(now_ms);
+        self.send_stun_probe_requests(requests).await;
     }
 
     async fn handle_disco_bytes(&mut self, disco_bytes: &[u8], ingress: IngressSource) {
@@ -839,6 +1011,7 @@ impl DatapathEngine {
             self.pending_ping_waiters.insert(
                 tx_id,
                 PendingPingWaiter {
+                    peer_id: cmd.peer_id,
                     started_at,
                     expires_at,
                     force_direct: cmd.force_direct,
@@ -908,6 +1081,31 @@ impl DatapathEngine {
         }
     }
 
+    fn fail_ping_waiters_for_peers(&mut self, peer_ids: &[NodeId]) {
+        if peer_ids.is_empty() || self.pending_ping_waiters.is_empty() {
+            return;
+        }
+        let matching: Vec<[u8; 12]> = self
+            .pending_ping_waiters
+            .iter()
+            .filter_map(|(&tx_id, waiter)| peer_ids.contains(&waiter.peer_id).then_some(tx_id))
+            .collect();
+        for tx_id in matching {
+            if let Some(waiter) = self.pending_ping_waiters.remove(&tx_id)
+                && let Ok(mut guard) = waiter.slot.lock()
+                && let Some(tx) = guard.take()
+            {
+                send_ping_reply(
+                    tx,
+                    PingProbeOutcome {
+                        path: PingProbePath::Timeout,
+                        rtt_ms: None,
+                    },
+                );
+            }
+        }
+    }
+
     fn drain_ping_waiters_as_timeout(&mut self) {
         let waiters: Vec<PendingPingWaiter> = self
             .pending_ping_waiters
@@ -929,22 +1127,45 @@ impl DatapathEngine {
         }
     }
 
-    async fn process_rebind_command(&mut self, cmd: &RebindCommand) {
-        match SocketRebinder::apply_command(
+    fn execute_socket_rebind(&mut self, cmd: &RebindCommand) -> AppResult<RebindOutcome> {
+        #[cfg(test)]
+        if matches!(cmd, RebindCommand::RebindInterface { .. })
+            && let Some(err) = self.injected_rebind_failures.pop_front()
+        {
+            return Err(err);
+        }
+        SocketRebinder::apply_command(
             &mut self.magic_socket,
             cmd,
             self.config.socket_config.linux_fwmark,
-        ) {
-            Ok(RebindOutcome::Rebound { .. } | RebindOutcome::RefreshCandidatesRequested) => {
+        )
+    }
+
+    async fn process_rebind_command(&mut self, cmd: &RebindCommand) {
+        if matches!(cmd, RebindCommand::RebindInterface { .. }) {
+            self.direct_udp_blocked = true;
+        }
+        match self.execute_socket_rebind(cmd) {
+            Ok(RebindOutcome::Rebound { .. }) => {
+                self.direct_udp_blocked = false;
                 self.reprobe_tracked_stun_endpoints().await;
             }
-            Ok(RebindOutcome::WakeRelayRequested) => {}
+            Ok(RebindOutcome::RefreshCandidatesRequested) => {
+                if !self.direct_udp_blocked {
+                    self.reprobe_tracked_stun_endpoints().await;
+                }
+            }
+            Ok(RebindOutcome::WakeRelayRequested) => {
+                if let Some(relay) = &self.relay_handle {
+                    relay.wake_reconnect();
+                }
+            }
             Err(err) => {
                 warn!(
                     component = "datapath.engine",
                     event = "rebind_failed",
                     error = %err,
-                    "failed executing RebindCommand against MagicSocket"
+                    "failed executing RebindCommand against MagicSocket; direct UDP stays blocked"
                 );
             }
         }
@@ -987,6 +1208,15 @@ impl DatapathEngine {
         }
         match target {
             PeerSendTarget::Direct(addr) => {
+                if self.direct_udp_blocked {
+                    debug!(
+                        component = "datapath.engine",
+                        event = "direct_udp_blocked_during_rebind",
+                        target = %addr,
+                        "blocked direct UDP datagram over stale NIC while rebinding"
+                    );
+                    return;
+                }
                 if let Err(err) = self.magic_socket.send_to(payload, addr).await {
                     warn!(
                         component = "datapath.engine",
@@ -1031,9 +1261,15 @@ impl DatapathEngine {
         }
     }
 
-    async fn trigger_stun_probe(&mut self, relay_map: &mesh_proto::netmap::RelayMap) {
-        let now_ms = self.clock.now_unix_ms();
-        let requests = self.stun_client.start_probe_round(relay_map, now_ms);
+    async fn send_stun_probe_requests(&mut self, requests: Vec<(SocketAddr, [u8; 28])>) {
+        if self.direct_udp_blocked {
+            debug!(
+                component = "datapath.engine",
+                event = "stun_probe_blocked_during_rebind",
+                "skipped STUN probe transmission while direct UDP is blocked"
+            );
+            return;
+        }
         for (target, pkt) in requests {
             if let Err(err) = self.magic_socket.send_to(&pkt, target).await {
                 debug!(
@@ -1977,18 +2213,18 @@ mod tests {
         let local_disco_pub = local_dk.public_key();
         let peer_dk_responder = DiscoKeypair::from_secret_bytes([0x52; 32]).expect("peer dk resp");
 
+        let shutdown = CancellationToken::new();
+        let peer_shutdown = shutdown.clone();
         let peer_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             let mut saw_ping = false;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            while tokio::time::Instant::now() < deadline {
-                let recv =
-                    tokio::time::timeout(Duration::from_millis(500), peer_sock.recv_from(&mut buf))
-                        .await;
-                let Ok(Ok((len, src_addr))) = recv else {
-                    if saw_ping {
-                        break;
-                    }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::time::Instant::now() < deadline && !peer_shutdown.is_cancelled() {
+                let recv = tokio::select! {
+                    () = peer_shutdown.cancelled() => break,
+                    res = peer_sock.recv_from(&mut buf) => res,
+                };
+                let Ok((len, src_addr)) = recv else {
                     continue;
                 };
                 if let Some(pkt) = buf.get(..len)
@@ -2052,7 +2288,6 @@ mod tests {
         let handle = engine.handle();
         let (_ev_tx, ev_rx) = mpsc::channel(8);
         let (_reb_tx, reb_rx) = mpsc::channel(8);
-        let shutdown = CancellationToken::new();
         let run_shutdown = shutdown.clone();
         let engine_task = tokio::spawn(async move {
             engine.run(ev_rx, reb_rx, run_shutdown).await.expect("run");
@@ -2119,5 +2354,420 @@ mod tests {
             }
         );
         assert!(outcome.rtt_ms.is_some());
+    }
+
+    // Traces: US-030, US-018
+    #[tokio::test]
+    async fn test_engine_live_revoked_peer_cut_within_2_seconds_and_packet_filter_enforced() {
+        // Arrange: spin up A <-> B live WireGuard Direct UDP + Relay tunnel
+        let (kp_a, kp_b, dk_a, dk_b, id_a, id_b, ip_a, ip_b, cidr) = base_test_identity();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let shutdown = CancellationToken::new();
+        let hub_addr =
+            spawn_two_peer_relay_hub(kp_a.public_key(), kp_b.public_key(), shutdown.clone()).await;
+        let disco_cfg = DiscoConfig {
+            keepalive_interval_ms: 150,
+            idle_window_ms: 180_000,
+            probe_timeout_ms: 120,
+        };
+        let node_a = spawn_test_node(TestNodeParams {
+            node_id: id_a,
+            tun_name: "mesh-cut-a",
+            overlay_ip: ip_a,
+            cidr,
+            node_keypair: kp_a.clone_keypair(),
+            disco_keypair: dk_a.clone_keypair(),
+            hub_addr,
+            clock: Arc::clone(&clock),
+            disco_config: disco_cfg.clone(),
+            tick_interval: Duration::from_millis(25),
+            shutdown: shutdown.clone(),
+        })
+        .await;
+        let node_b = spawn_test_node(TestNodeParams {
+            node_id: id_b,
+            tun_name: "mesh-cut-b",
+            overlay_ip: ip_b,
+            cidr,
+            node_keypair: kp_b.clone_keypair(),
+            disco_keypair: dk_b.clone_keypair(),
+            hub_addr,
+            clock,
+            disco_config: disco_cfg,
+            tick_interval: Duration::from_millis(25),
+            shutdown: shutdown.clone(),
+        })
+        .await;
+
+        let mut entry_b = mk_peer_entry(
+            id_b,
+            "peer-b-live",
+            ip_b,
+            kp_b.public_key(),
+            dk_b.public_key(),
+            hub_addr,
+        );
+        entry_b.endpoints = vec![CandidateEndpoint {
+            addr: node_b.udp_addr,
+            source: CandidateSource::Lan,
+        }];
+        let mut entry_a = mk_peer_entry(
+            id_a,
+            "peer-a-live",
+            ip_a,
+            kp_a.public_key(),
+            dk_a.public_key(),
+            hub_addr,
+        );
+        entry_a.endpoints = vec![CandidateEndpoint {
+            addr: node_a.udp_addr,
+            source: CandidateSource::Lan,
+        }];
+
+        node_a
+            .handle
+            .apply_netmap(mk_netmap(1, vec![entry_b], hub_addr))
+            .await
+            .expect("nm1 A");
+        node_b
+            .handle
+            .apply_netmap(mk_netmap(1, vec![entry_a], hub_addr))
+            .await
+            .expect("nm1 B");
+
+        // Promote to live Direct UDP path and prove bidirectional tunnel traffic works
+        node_a
+            .handle
+            .send(DatapathCommand::SetAdvertisedEndpoints(vec![
+                node_a.udp_addr,
+            ]))
+            .await
+            .expect("adv A");
+        node_b
+            .handle
+            .send(DatapathCommand::SetAdvertisedEndpoints(vec![
+                node_b.udp_addr,
+            ]))
+            .await
+            .expect("adv B");
+        node_a
+            .handle
+            .send(DatapathCommand::InitiateHolePunch(id_b))
+            .await
+            .expect("punch");
+        await_peer_path(&node_a.handle, Some(node_b.udp_addr)).await;
+
+        // Exercise US-018 fail-safe filter reload while tunnel is live (block port 3389, allow 5001)
+        node_a
+            .handle
+            .try_reload_packet_filter_spec("tcp:3389,udp:3389")
+            .await
+            .expect("valid blocklist");
+        assert!(
+            node_a
+                .handle
+                .try_reload_packet_filter_spec("bad:syntax:99999")
+                .await
+                .is_err()
+        );
+
+        let blocked_pkt =
+            build_ipv4_udp_msg_with_port(ip_b.as_ipv4(), ip_a.as_ipv4(), 3389, b"blocked-3389");
+        node_b
+            .tun
+            .inject_inbound_packet(blocked_pkt)
+            .await
+            .expect("inject blocked");
+        sleep(Duration::from_millis(80)).await;
+        assert!(node_a.tun.drain_outbound_packets().await.is_empty());
+
+        let allowed_pkt =
+            build_ipv4_udp_msg_with_port(ip_b.as_ipv4(), ip_a.as_ipv4(), 5001, b"live-allowed");
+        node_b
+            .tun
+            .inject_inbound_packet(allowed_pkt.clone())
+            .await
+            .expect("inject allowed");
+        await_tun_packet(&node_a.tun, &allowed_pkt).await;
+
+        // Act (US-030): revoke peer B from node A's netmap while tunnel is active!
+        let cut_started = std::time::Instant::now();
+        let report = node_a
+            .handle
+            .apply_netmap(mk_netmap(2, vec![], hub_addr))
+            .await
+            .expect("apply cut netmap");
+        let cut_elapsed = cut_started.elapsed();
+        assert!(
+            cut_elapsed <= Duration::from_secs(2),
+            "peer cut exceeded 2s budget: {cut_elapsed:?}"
+        );
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.removed_peer_ids, vec![id_b]);
+        assert!(
+            node_a
+                .handle
+                .query_status()
+                .await
+                .expect("status")
+                .peers
+                .is_empty()
+        );
+
+        // B (whose local map was not yet updated) keeps blasting encrypted WireGuard packets -> A MUST drop 100%!
+        let _drain = node_a.tun.drain_outbound_packets().await;
+        for seq in 0..5u8 {
+            let after_cut =
+                build_ipv4_udp_msg_with_port(ip_b.as_ipv4(), ip_a.as_ipv4(), 5001, &[b'x', seq]);
+            node_b
+                .tun
+                .inject_inbound_packet(after_cut)
+                .await
+                .expect("inject after cut");
+        }
+        sleep(Duration::from_millis(180)).await;
+        let leaked = node_a.tun.drain_outbound_packets().await;
+        assert!(
+            leaked.is_empty(),
+            "post-cut packets from revoked peer MUST be dropped 100%, got {} packets",
+            leaked.len()
+        );
+
+        shutdown.cancel();
+        for t in node_a.tasks.into_iter().chain(node_b.tasks) {
+            t.await.expect("node task exited");
+        }
+    }
+
+    fn build_ipv4_udp_msg_with_port(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 28 + payload.len();
+        let mut pkt = Vec::with_capacity(total);
+        pkt.extend_from_slice(&[0x45, 0]);
+        pkt.extend_from_slice(&(u16::try_from(total).unwrap_or(28)).to_be_bytes());
+        pkt.extend_from_slice(&[0; 5]);
+        pkt.push(17);
+        pkt.extend_from_slice(&[0; 2]);
+        pkt.extend_from_slice(&src.octets());
+        pkt.extend_from_slice(&dst.octets());
+        pkt.extend_from_slice(&5000u16.to_be_bytes());
+        pkt.extend_from_slice(&dst_port.to_be_bytes());
+        pkt.extend_from_slice(&((8 + u16::try_from(payload.len()).unwrap_or(0)).to_be_bytes()));
+        pkt.extend_from_slice(&[0; 2]);
+        pkt.extend_from_slice(payload);
+        pkt
+    }
+
+    // Traces: HR-W21-07 (`US-030 AC1`)
+    #[tokio::test]
+    async fn test_apply_netmap_unblocked_by_stun_dns_completes_under_200ms_and_purges_peers() {
+        // Arrange
+        let (kp_a, kp_b, dk_a, dk_b, id_a, id_b, ip_a, ip_b, cidr) = base_test_identity();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let shutdown = CancellationToken::new();
+        let hub_addr: SocketAddr = "127.0.0.1:49999".parse().expect("dummy hub addr");
+        let tun = Arc::new(FakeTunDevice::new(
+            TunConfig::with_default_mtu("mesh-dns-test", ip_a, cidr)
+                .expect("valid test tun config"),
+        ));
+        let cfg = DatapathConfig {
+            local_node_id: id_a,
+            local_overlay_ip: ip_a,
+            overlay_cidr: cidr,
+            node_keypair: kp_a,
+            disco_keypair: dk_a,
+            socket_config: MagicSocketConfig::default()
+                .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            stun_config: StunClientConfig::default(),
+            disco_config: DiscoConfig::default(),
+            control_tcp_endpoint: None,
+            wg_timer_interval: Duration::from_millis(250),
+            disco_tick_interval: Duration::from_millis(250),
+        };
+        let engine = DatapathEngine::bind(cfg, tun, clock, None)
+            .await
+            .expect("bind engine");
+        let handle = engine.handle();
+        let (_relay_tx, relay_rx) = mpsc::channel(8);
+        let (_rebind_handle, rebind_rx) = RebindHandle::channel();
+        let engine_task = tokio::spawn(engine.run(relay_rx, rebind_rx, shutdown.clone()));
+
+        let mut peer_b = mk_peer_entry(
+            id_b,
+            "peer-b",
+            ip_b,
+            kp_b.public_key(),
+            dk_b.public_key(),
+            hub_addr,
+        );
+        peer_b.endpoints.push(CandidateEndpoint {
+            addr: "127.0.0.1:51822".parse().expect("valid cand addr"),
+            source: CandidateSource::Lan,
+        });
+        let snap_v1 = mk_netmap(1, vec![peer_b], hub_addr);
+        let rep_v1 = handle.apply_netmap(snap_v1).await.expect("apply v1");
+        assert_eq!(rep_v1.added, 1);
+
+        // Act: revoke peer_b AND include an unresolved/invalid STUN hostname in v2
+        let mut snap_v2 = mk_netmap(2, vec![], hub_addr);
+        snap_v2.relay_map.stun_udp_endpoints = vec![
+            "stun-hang-1.invalid.mesh.test.:3479".to_owned(),
+            "stun-hang-2.invalid.mesh.test.:3480".to_owned(),
+        ];
+        let started = tokio::time::Instant::now();
+        let rep_v2 = tokio::time::timeout(Duration::from_millis(200), handle.apply_netmap(snap_v2))
+            .await
+            .expect("apply_netmap MUST NOT block on STUN DNS lookup")
+            .expect("apply v2 result");
+        let elapsed = started.elapsed();
+
+        // Assert
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "apply_netmap took {elapsed:?}, expected < 200ms"
+        );
+        assert_eq!(rep_v2.removed_peer_ids, vec![id_b]);
+        assert!(
+            handle
+                .query_status()
+                .await
+                .expect("status")
+                .peers
+                .is_empty(),
+            "revoked peer MUST be purged immediately"
+        );
+
+        shutdown.cancel();
+        let shutdown_res = tokio::time::timeout(Duration::from_secs(2), engine_task).await;
+        assert!(
+            shutdown_res.is_ok(),
+            "engine shutdown MUST cancel in-flight STUN DNS lookup cleanly"
+        );
+    }
+
+    // Traces: HR-W21-08 (`US-035`, `US-036`)
+    #[tokio::test]
+    async fn test_rebind_underlay_blocks_direct_udp_on_failure_and_recovers_on_retry() {
+        // Arrange
+        let (kp_a, kp_b, dk_a, dk_b, id_a, id_b, ip_a, ip_b, cidr) = base_test_identity();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let shutdown = CancellationToken::new();
+        let probe_receiver = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind udp probe sink");
+        let probe_sink_addr = probe_receiver.local_addr().expect("sink addr");
+
+        let tun = Arc::new(FakeTunDevice::new(
+            TunConfig::with_default_mtu("mesh-rebind-test", ip_a, cidr)
+                .expect("valid test tun config"),
+        ));
+        let cfg = DatapathConfig {
+            local_node_id: id_a,
+            local_overlay_ip: ip_a,
+            overlay_cidr: cidr,
+            node_keypair: kp_a,
+            disco_keypair: dk_a,
+            socket_config: MagicSocketConfig::default()
+                .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            stun_config: StunClientConfig::default(),
+            disco_config: DiscoConfig::default(),
+            control_tcp_endpoint: None,
+            wg_timer_interval: Duration::from_millis(250),
+            disco_tick_interval: Duration::from_millis(250),
+        };
+        let mut engine = DatapathEngine::bind(cfg, tun, clock, None)
+            .await
+            .expect("bind engine");
+        engine.enable_loopback_disco_for_tests();
+        engine.inject_rebind_failure_for_tests(AppError::unavailable(
+            "simulated transient NIC bind failure",
+        ));
+        let handle = engine.handle();
+        let (_relay_tx, relay_rx) = mpsc::channel(8);
+        let (_rebind_handle, rebind_rx) = RebindHandle::channel();
+        let engine_task = tokio::spawn(engine.run(relay_rx, rebind_rx, shutdown.clone()));
+
+        let mut peer_b = mk_peer_entry(
+            id_b,
+            "peer-b",
+            ip_b,
+            kp_b.public_key(),
+            dk_b.public_key(),
+            probe_sink_addr,
+        );
+        peer_b.endpoints.push(CandidateEndpoint {
+            addr: probe_sink_addr,
+            source: CandidateSource::Lan,
+        });
+        let mut snap = mk_netmap(1, vec![peer_b], probe_sink_addr);
+        snap.relay_map.stun_udp_endpoints = vec![probe_sink_addr.to_string()];
+        handle
+            .apply_netmap(snap)
+            .await
+            .expect("apply initial netmap");
+
+        // Drain initial STUN probe triggered by netmap application
+        let mut recv_buf = [0u8; 256];
+        let initial_recv = tokio::time::timeout(
+            Duration::from_secs(2),
+            probe_receiver.recv_from(&mut recv_buf),
+        )
+        .await;
+        assert!(initial_recv.is_ok(), "initial STUN probe should arrive");
+        while probe_receiver.try_recv_from(&mut recv_buf).is_ok() {}
+
+        // Act 1: rebind fails -> MUST return Err AND block direct UDP egress
+        let fail_res = handle.rebind_underlay("eth0".to_owned(), None, false).await;
+        assert!(fail_res.is_err(), "first rebind MUST return Err");
+
+        handle
+            .send(DatapathCommand::TriggerStunProbe)
+            .await
+            .expect("queue stun probe");
+        handle
+            .send(DatapathCommand::InitiateHolePunch(id_b))
+            .await
+            .expect("queue hole punch");
+        let _status_barrier = handle.query_status().await.expect("status barrier");
+        let blocked_recv = tokio::time::timeout(
+            Duration::from_millis(120),
+            probe_receiver.recv_from(&mut recv_buf),
+        )
+        .await;
+        assert!(
+            blocked_recv.is_err(),
+            "direct UDP probes MUST be blocked while rebind is failed"
+        );
+
+        // Act 2: retry rebind succeeds -> unblocks UDP TX and returns bound port
+        let rebound_port = handle
+            .rebind_underlay("eth0".to_owned(), None, false)
+            .await
+            .expect("retry rebind MUST succeed");
+        assert!(rebound_port > 0);
+        handle
+            .send(DatapathCommand::TriggerStunProbe)
+            .await
+            .expect("queue stun probe after recovery");
+        let after_recv = tokio::time::timeout(
+            Duration::from_secs(2),
+            probe_receiver.recv_from(&mut recv_buf),
+        )
+        .await;
+        assert!(
+            after_recv.is_ok(),
+            "STUN probe MUST transmit once rebind succeeds"
+        );
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), engine_task)
+                .await
+                .is_ok()
+        );
     }
 }

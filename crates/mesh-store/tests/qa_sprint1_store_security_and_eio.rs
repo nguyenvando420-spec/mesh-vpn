@@ -172,6 +172,7 @@ mod tests {
                     reusable: false,
                     max_uses: Some(1),
                     ephemeral: false,
+                    ephemeral_timeout_secs: None,
                     ttl_secs: 3_600,
                     now_unix_ms: now_ms,
                 },
@@ -363,6 +364,7 @@ mod tests {
                     reusable: true,
                     max_uses: Some(5),
                     ephemeral: false,
+                    ephemeral_timeout_secs: None,
                     ttl_secs: 3_600,
                     now_unix_ms: now_ms,
                 },
@@ -389,19 +391,43 @@ mod tests {
             .expect("register node_a");
         let node_a = reg_a.record.node_id;
 
-        // Act Branch (a): revoke `node_a`, then inject Slot EIO and trigger emergency fallback path
+        let pk_b = PublicKey::from_bytes([0x43_u8; 32]).expect("pk_b");
+        let (reg_b, _) = store
+            .register_node(&RegisterNodeInput {
+                pubkey: pk_b,
+                disco_pubkey: PublicKey::from_bytes([0x44_u8; 32]).expect("dpk_b"),
+                previous_node_pubkey: None,
+                requested_name: NodeName::parse("dual-eio-node-b").expect("name_b"),
+                preauth_token_hash: key_hash,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: now_ms,
+            })
+            .expect("register node_b");
+        let node_b = reg_b.record.node_id;
+
+        // Act Branch (a): revoke `node_a`, then inject redb read+write EIO + Slot EIO (`Dual EIO` -> `RamOnly`)
         let first_rev = store.revoke_node(node_a, "admin").expect("primary revoke");
         assert_eq!(first_rev.persistence_tier, PersistenceTier::Redb);
+        store.inject_redb_failure(true, true);
+        assert!(
+            store.find_node_by_id(node_b).is_err(),
+            "simulated redb read EIO must reject direct DB lookups (IMP-W21-01)"
+        );
         backend.fail_slot_writes.store(true, Ordering::SeqCst);
 
-        // Trigger emergency fallback on `ControlStore` while slot write also fails (`Dual EIO` -> `RamOnly`)
+        // Expire `node_b` via RAM directory lookup while both `redb` AND slot writes fail (`Dual EIO` -> `RamOnly`)
         let degraded_outcome = store
-            .expire_node(node_a, "admin")
-            .expect("dual EIO fallback must succeed in RAM");
+            .expire_node(node_b, "admin")
+            .expect("dual EIO fallback must succeed in RAM via RAM node directory");
         assert_eq!(degraded_outcome.persistence_tier, PersistenceTier::RamOnly);
         assert!(store.is_disk_degraded());
-        assert!(store.is_node_revoked_ram(node_a));
-        assert!(store.is_pubkey_revoked_ram(&pk_a));
+        assert!(store.is_node_revoked_ram(node_b));
+        assert!(store.is_pubkey_revoked_ram(&pk_b));
 
         // Also verify `EmergencyRevocationState` preserves older `EmergencySlot` entries when a new
         // entry degrades to `RamOnly` under Slot EIO (`Gate 2 policy (a)`)
@@ -448,10 +474,11 @@ mod tests {
 
         // Recover hardware I/O and verify compaction folds `RamOnly` entries into `control.redb`
         backend.fail_slot_writes.store(false, Ordering::SeqCst);
+        store.inject_redb_failure(false, false);
         let compacted = store
             .try_compact_emergency_revocations()
             .expect("compaction after hardware recovery");
-        assert_eq!(compacted, 1);
+        assert!(compacted.is_some());
         assert!(!store.is_disk_degraded());
         assert_eq!(
             store
@@ -459,6 +486,13 @@ mod tests {
                 .expect("find node_a")
                 .map(|r| r.status),
             Some(NodeStatus::Revoked)
+        );
+        assert_eq!(
+            store
+                .find_node_by_id(node_b)
+                .expect("find node_b")
+                .map(|r| r.status),
+            Some(NodeStatus::Expired)
         );
 
         // Assert Branch (b) contract: when dual EIO coincides with exhausted lease (`netmap_version: None`),
@@ -503,6 +537,7 @@ mod tests {
                     reusable: false,
                     max_uses: Some(1),
                     ephemeral: false,
+                    ephemeral_timeout_secs: None,
                     ttl_secs: 3_600,
                     now_unix_ms: now_ms,
                 },

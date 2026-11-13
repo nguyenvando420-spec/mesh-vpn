@@ -294,6 +294,7 @@ async fn handle_create_preauth_key(
             reusable: parsed.reusable,
             max_uses: max_uses_cap,
             ephemeral: parsed.is_ephemeral,
+            ephemeral_timeout_secs: parsed.ephemeral_timeout_secs,
             ttl_secs: parsed.ttl_secs,
             now_unix_ms: now_ms,
         },
@@ -304,12 +305,20 @@ async fn handle_create_preauth_key(
     };
 
     let tls_status = state.acme.status();
-    let acme_ca_verified = state.config.tls_mode == TlsMode::Acme
-        && tls_status.as_ref().is_some_and(|s| s.ca_verified);
+    let active_tls_mode = state.listeners.active_tls_mode();
+    let acme_ca_verified =
+        active_tls_mode == TlsMode::Acme && tls_status.as_ref().is_some_and(|s| s.ca_verified);
     let active_pin = tls_status
         .map(|s| s.active_pin)
         .filter(|_| !acme_ca_verified);
-    let server_endpoint = format!("https://{}", state.config.public_control_endpoint());
+    let (tcp_port, _) = state.listeners.active_ports();
+    let active_host = state.listeners.active_public_host();
+    let host_port = if active_host.contains(':') && !active_host.starts_with('[') {
+        format!("[{active_host}]:{tcp_port}")
+    } else {
+        format!("{active_host}:{tcp_port}")
+    };
+    let server_endpoint = format!("https://{host_port}");
     let pin_flag = active_pin
         .map(|p| format!(" --server-pin {p}"))
         .unwrap_or_default();
@@ -462,10 +471,11 @@ async fn handle_rename_node(
         Ok(v) => v,
         Err(err) => return error_response(&err, &req_id),
     };
+    let active_host = state.listeners.active_public_host();
     match state.store.rename_node(
         rec.node_id,
         parsed.new_name,
-        &state.config.public_host,
+        &active_host,
         &state.config.domain_suffix,
     ) {
         Ok((updated, ver)) => {
@@ -486,32 +496,57 @@ async fn handle_expire_node(
 ) -> Response {
     let req_id = new_admin_req_id(&state);
     let actor = caller_principal_from_req(&req);
-    let rec = match resolve_node_ref(&state.store, &target_ref) {
-        Ok(r) => r,
+    let node_id = match resolve_node_id(&state.store, &target_ref) {
+        Ok(id) => id,
         Err(err) => return error_response(&err, &req_id),
     };
     let body: ExpireNodeRequest = match read_admin_json(req).await {
         Ok(v) => v,
         Err(err) => return error_response(&err, &req_id),
     };
+    let now_ms = state.store.clock().now_unix_ms();
     if body.never {
-        return error_response(
-            &AppError::invalid_argument("--never clearing requires direct node-key update"),
-            &req_id,
-        );
+        return match state.store.set_node_expiry_never(node_id, &actor) {
+            Ok((updated, netmap_ver)) => {
+                if let Err(err) = state.netmap_hub.broadcast_snapshot(netmap_ver) {
+                    tracing::warn!(
+                        component = "admin_service",
+                        event = "expire_never_broadcast_failed",
+                        node_id = %updated.node_id,
+                        error = %err,
+                        "failed broadcasting netmap snapshot after setting expiry --never"
+                    );
+                }
+                json_response(
+                    StatusCode::OK,
+                    &RevokeActionResponse {
+                        target_id: updated.node_id.to_string(),
+                        revoked: false,
+                        ram_enforced: true,
+                        persisted: true,
+                        persistence_tier: PersistenceTier::Redb,
+                        acted_at_ms: now_ms,
+                    },
+                )
+            }
+            Err(err) => error_response(&err, &req_id),
+        };
     }
 
-    let now_ms = state.store.clock().now_unix_ms();
-    match state.store.expire_node(rec.node_id, &actor) {
-        Ok(outcome) => {
-            enforce_revocation_disconnect(
+    match state
+        .store
+        .expire_node_with_hook(node_id, &actor, |nid, _| {
+            terminate_node_sessions(
                 &state,
-                &outcome,
+                nid,
                 TerminationReason::NodeKeyExpired,
                 RelayNoticeCode::NodeKeyExpired,
                 "node key expired by administrator",
                 now_ms,
             );
+        }) {
+        Ok(outcome) => {
+            enforce_post_revoke_broadcast(&state, &outcome);
             json_response(
                 StatusCode::OK,
                 &RevokeActionResponse {
@@ -535,21 +570,25 @@ async fn handle_revoke_node(
 ) -> Response {
     let req_id = new_admin_req_id(&state);
     let actor = caller_principal_from_req(&req);
-    let rec = match resolve_node_ref(&state.store, &target_ref) {
-        Ok(r) => r,
+    let node_id = match resolve_node_id(&state.store, &target_ref) {
+        Ok(id) => id,
         Err(err) => return error_response(&err, &req_id),
     };
     let now_ms = state.store.clock().now_unix_ms();
-    match state.store.revoke_node(rec.node_id, &actor) {
-        Ok(outcome) => {
-            enforce_revocation_disconnect(
+    match state
+        .store
+        .revoke_node_with_hook(node_id, &actor, |nid, _| {
+            terminate_node_sessions(
                 &state,
-                &outcome,
+                nid,
                 TerminationReason::NodeRevoked,
                 RelayNoticeCode::NodeRevoked,
                 "node revoked by administrator",
                 now_ms,
             );
+        }) {
+        Ok(outcome) => {
+            enforce_post_revoke_broadcast(&state, &outcome);
             json_response(
                 StatusCode::OK,
                 &RevokeActionResponse {
@@ -566,21 +605,23 @@ async fn handle_revoke_node(
     }
 }
 
-fn enforce_revocation_disconnect(
+fn terminate_node_sessions(
     state: &AdminAppState,
-    outcome: &mesh_store::RevokeStoreOutcome,
+    node_id: NodeId,
     term_reason: TerminationReason,
     relay_code: RelayNoticeCode,
     public_msg: &str,
     now_ms: u64,
 ) {
     // Queue direct termination notices BEFORE cancelling/closing streams so the acted-on node
-    // always drains IdentityTerminated + RelayNoticeCode cleanly even on Gate 2 policy (b).
+    // always drains IdentityTerminated + RelayNoticeCode cleanly before slow/failing disk writes.
     state
         .netmap_hub
-        .terminate_node_stream(outcome.node_id, term_reason, public_msg, now_ms);
-    state.relay_hub.disconnect_node(outcome.node_id, relay_code);
+        .terminate_node_stream(node_id, term_reason, public_msg, now_ms);
+    state.relay_hub.disconnect_node(node_id, relay_code);
+}
 
+fn enforce_post_revoke_broadcast(state: &AdminAppState, outcome: &mesh_store::RevokeStoreOutcome) {
     // Gate 2 policy (b): if dual-EIO exhausted lease prevented a durable netmap_version bump,
     // sever remaining open control & relay sessions so peers re-auth against RAM RevokedSet cleanly!
     if outcome.must_disconnect_all_peers_to_reauth {
@@ -629,8 +670,9 @@ async fn handle_server_status(State(state): State<AdminAppState>) -> Response {
     let tls_status = state.acme.status();
     let relay = state.relay_hub.metrics_snapshot();
 
-    let acme_ca_verified = state.config.tls_mode == TlsMode::Acme
-        && tls_status.as_ref().is_some_and(|s| s.ca_verified);
+    let active_tls_mode = state.listeners.active_tls_mode();
+    let acme_ca_verified =
+        active_tls_mode == TlsMode::Acme && tls_status.as_ref().is_some_and(|s| s.ca_verified);
     let tls_auth_mode = if acme_ca_verified {
         "system_ca"
     } else {
@@ -642,7 +684,7 @@ async fn handle_server_status(State(state): State<AdminAppState>) -> Response {
         &ServerAdminStatusResponse {
             control_tcp_listen: format!("{}:{}", state.config.control_bind_ip, tcp_port),
             stun_udp_listen: format!("{}:{}", state.config.stun_bind_ip, stun_port),
-            tls_mode: state.config.tls_mode.as_str().to_owned(),
+            tls_mode: active_tls_mode.as_str().to_owned(),
             tls_auth_mode: tls_auth_mode.to_owned(),
             active_pin: tls_status.as_ref().map(|s| s.active_pin),
             next_pin: tls_status.as_ref().and_then(|s| s.next_pin),
@@ -668,14 +710,22 @@ async fn handle_hardening_check(State(state): State<AdminAppState>) -> Response 
         passed: !state.config.obs_allow_non_loopback,
         detail: format!("obs_bind_addr={}", state.config.obs_bind_addr),
     });
-    let proxy_ok =
-        state.config.tls_mode != TlsMode::ReverseProxy || !state.config.trusted_proxies.is_empty();
+    let active_tls_mode = state.listeners.active_tls_mode();
+    let bind_is_loopback = state
+        .config
+        .control_bind_ip
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    let proxy_ok = active_tls_mode != TlsMode::ReverseProxy
+        || (!state.config.trusted_proxies.is_empty() && bind_is_loopback);
     items.push(HardeningCheckItem {
         check_id: "reverse_proxy_trust".to_owned(),
         passed: proxy_ok,
         detail: format!(
-            "trusted_proxies count={}",
-            state.config.trusted_proxies.len()
+            "tls_mode={} trusted_proxies count={} control_bind_ip={}",
+            active_tls_mode.as_str(),
+            state.config.trusted_proxies.len(),
+            state.config.control_bind_ip
         ),
     });
     items.push(HardeningCheckItem {
@@ -765,6 +815,7 @@ async fn handle_backup(State(state): State<AdminAppState>, req: Request<Body>) -
 #[serde(default, deny_unknown_fields)]
 struct RestoreQueryParams {
     allow_pin_change: bool,
+    min_netmap_version: Option<u64>,
 }
 
 async fn handle_restore(
@@ -785,7 +836,8 @@ async fn handle_restore(
         expected_published_pin: expected_pin,
         verify_sha256: parsed.verify_sha256,
         allow_pin_change: query.allow_pin_change,
-        min_netmap_version: 0,
+        min_netmap_version: query.min_netmap_version.unwrap_or(0),
+        min_required_snapshot_version: None,
     };
 
     match state.store.restore_backup(opts) {
@@ -835,7 +887,7 @@ async fn handle_rotate_tls_key(State(state): State<AdminAppState>, req: Request<
         Err(err) => return error_response(&err, &req_id),
     };
 
-    let sans = state.config.default_tls_sans();
+    let sans = state.listeners.active_tls_sans();
     match parsed.action {
         RotateTlsKeyAction::Stage => match state.store.stage_next_identity(&sans, 90, &actor) {
             Ok((id, netmap_ver)) => {
@@ -887,6 +939,13 @@ async fn handle_rotate_tls_key(State(state): State<AdminAppState>, req: Request<
     }
 }
 
+fn resolve_node_id(store: &ControlStore, target_ref: &str) -> AppResult<NodeId> {
+    if let Some(entry) = store.resolve_node_ram(target_ref) {
+        return Ok(entry.node_id);
+    }
+    resolve_node_ref(store, target_ref).map(|rec| rec.node_id)
+}
+
 fn resolve_node_ref(store: &ControlStore, target_ref: &str) -> AppResult<StoredNodeRecord> {
     let trimmed = target_ref.trim();
     if let Ok(node_id) = trimmed.parse::<NodeId>() {
@@ -914,10 +973,16 @@ fn record_to_admin_summary(
     let mut os_arch_parts = rec.os_arch.split('/');
     let os = os_arch_parts.next().unwrap_or("unknown").to_owned();
     let arch = os_arch_parts.next().unwrap_or("unknown").to_owned();
-    let status = match rec.status {
-        NodeStatus::Active => "active",
-        NodeStatus::Revoked => "revoked",
-        NodeStatus::Expired => "expired",
+    let status = if state.store.is_node_permanently_revoked_ram(rec.node_id) {
+        "revoked"
+    } else if state.store.is_node_expired_ram(rec.node_id) {
+        "expired"
+    } else {
+        match rec.status {
+            NodeStatus::Active => "active",
+            NodeStatus::Revoked => "revoked",
+            NodeStatus::Expired => "expired",
+        }
     }
     .to_owned();
 
@@ -928,7 +993,7 @@ fn record_to_admin_summary(
         status,
         online,
         last_seen_at_ms,
-        key_expires_at_ms: Some(rec.key_expires_at_ms),
+        key_expires_at_ms: rec.key_expires_at_ms,
         os,
         arch,
         agent_version: rec.agent_version.clone(),
@@ -963,8 +1028,8 @@ mod tests {
     use mesh_core::{Clock as _, FakeClock, NodeId, NodeName, PublicKey, SystemClock};
     use mesh_net::send_ipc_json_request;
     use mesh_proto::admin_ipc::{
-        AdminNodeSummary, CreatePreAuthKeyRequest, PersistenceTier, PreAuthKeyCreatedResponse,
-        RevokeActionResponse, ServerAdminStatusResponse,
+        AdminNodeSummary, BackupCreatedResponse, CreatePreAuthKeyRequest, PersistenceTier,
+        PreAuthKeyCreatedResponse, RevokeActionResponse, ServerAdminStatusResponse,
     };
     use mesh_store::{
         ControlStore, ControlStoreConfig, CreatePreAuthKeyInput, DEFAULT_NODE_KEY_TTL_MS,
@@ -1119,7 +1184,7 @@ mod tests {
             .expect("register");
         let sub = netmap_hub.subscribe(reg.record.node_id, now_ms);
         let other_sub = netmap_hub.subscribe(NodeId::new_v7(now_ms + 99), now_ms);
-        let _ = other_sub;
+        let _unused = other_sub;
 
         let io2 = spawn_admin_ipc_pair(admin_state.clone()).await;
         let nodes: Vec<AdminNodeSummary> = send_ipc_json_request::<_, (), _>(
@@ -1391,24 +1456,26 @@ mod tests {
         assert!(allowed.restored);
         assert_eq!(acme.status().expect("restored").active_pin, initial_pin);
 
-        // Act 4: verify enforce_revocation_disconnect sends notices to node_id BEFORE closing streams (`BLK-S1-02`)
+        // Act 4: verify termination helpers send notices to node_id BEFORE closing streams (`BLK-S1-02`)
         let mut target_sub = netmap_hub.subscribe(reg.record.node_id, now_ms);
         let mut target_relay = relay_hub.register_session(reg.record.node_id, peer_pk, now_ms);
         let peer_sub = netmap_hub.subscribe(NodeId::new_v7(now_ms + 77), now_ms);
-        super::enforce_revocation_disconnect(
+        let outcome = mesh_store::RevokeStoreOutcome {
+            node_id: reg.record.node_id,
+            persistence_tier: PersistenceTier::RamOnly,
+            netmap_version: None,
+            must_disconnect_all_peers_to_reauth: true,
+            record: None,
+        };
+        super::terminate_node_sessions(
             &admin_state,
-            &mesh_store::RevokeStoreOutcome {
-                node_id: reg.record.node_id,
-                persistence_tier: PersistenceTier::RamOnly,
-                netmap_version: None,
-                must_disconnect_all_peers_to_reauth: true,
-                record: None,
-            },
+            reg.record.node_id,
             mesh_proto::control::TerminationReason::NodeRevoked,
             mesh_proto::relay::RelayNoticeCode::NodeRevoked,
             "revoked under dual EIO",
             now_ms + 50,
         );
+        super::enforce_post_revoke_broadcast(&admin_state, &outcome);
         assert!(target_sub.cancel.is_cancelled());
         assert!(target_relay.cancel.is_cancelled());
         assert!(peer_sub.cancel.is_cancelled());
@@ -1428,6 +1495,309 @@ mod tests {
                 code: mesh_proto::relay::RelayNoticeCode::NodeRevoked
             }
         ));
+
+        // Act 5: verify expire --never clears expiry, ephemeral_timeout_secs passes through,
+        // and ?min_netmap_version rejects older snapshot BEFORE live DB swap (`US-031`, `US-006`, `US-045`)
+        let ephem_key: PreAuthKeyCreatedResponse = send_ipc_json_request(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::POST,
+            "/v1/admin/preauth-keys",
+            Some(&CreatePreAuthKeyRequest {
+                ttl_secs: 3_600,
+                reusable: false,
+                max_uses: 1,
+                is_ephemeral: true,
+                ephemeral_timeout_secs: Some(45),
+                target_node: None,
+            }),
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("create ephemeral key with custom timeout");
+        let eph_pk = PublicKey::from_bytes([0x6A_u8; 32]).expect("pk");
+        let (eph_reg, _) = store
+            .register_node(&RegisterNodeInput {
+                pubkey: eph_pk,
+                disco_pubkey: PublicKey::from_bytes([0x6B_u8; 32]).expect("dpk"),
+                previous_node_pubkey: None,
+                requested_name: NodeName::parse("ephem-worker").expect("name"),
+                preauth_token_hash: mesh_crypto::sha256_digest(ephem_key.raw_key.as_bytes()),
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: now_ms,
+            })
+            .expect("register ephem");
+        assert_eq!(eph_reg.record.ephemeral_timeout_secs, Some(45));
+
+        let never_res: RevokeActionResponse = send_ipc_json_request(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::POST,
+            "/v1/admin/nodes/ephem-worker/expire",
+            Some(&mesh_proto::admin_ipc::ExpireNodeRequest { never: true }),
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("expire --never");
+        assert!(!never_res.revoked);
+        let inspected: AdminNodeSummary = send_ipc_json_request::<_, (), _>(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::GET,
+            "/v1/admin/nodes/ephem-worker",
+            None,
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("inspect ephem-worker");
+        assert_eq!(inspected.key_expires_at_ms, None);
+
+        let snap2: BackupCreatedResponse = send_ipc_json_request::<_, (), _>(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::POST,
+            "/v1/admin/backup",
+            None,
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("create backup");
+        let required_higher = store.persisted_watermark().saturating_add(1_000_000);
+        let restore_uri = format!("/v1/admin/restore?min_netmap_version={required_higher}");
+        let restored_with_floor =
+            send_ipc_json_request::<_, _, mesh_proto::admin_ipc::RestoreBackupResponse>(
+                spawn_admin_ipc_pair(admin_state.clone()).await,
+                Method::POST,
+                &restore_uri,
+                Some(&mesh_proto::admin_ipc::RestoreBackupRequest {
+                    snapshot_path: snap2.snapshot_path,
+                    verify_sha256: true,
+                }),
+                MAX_ADMIN_IPC_BODY_BYTES,
+            )
+            .await
+            .expect("restore older valid snapshot while raising min_netmap_version floor");
+        assert!(restored_with_floor.restored);
+        assert!(restored_with_floor.netmap_version >= required_higher);
+        assert!(store.current_netmap_version() >= required_higher);
+
+        shutdown.cancel();
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_admin_live_listener_endpoint_rotate_tls_and_degraded_ram_status() {
+        // Arrange (`HR-W21-04`, `HR-W21-11`, `HR-W21-12`)
+        let dir = TempDir::new().expect("tempdir");
+        let tcp_p0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("tcp0");
+        let tcp_p1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("tcp1");
+        let udp_p0 = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp0");
+        let control_tcp_port = tcp_p0.local_addr().expect("addr").port();
+        let new_tcp_port = tcp_p1.local_addr().expect("addr").port();
+        let stun_udp_port = udp_p0.local_addr().expect("addr").port();
+        drop((tcp_p0, tcp_p1, udp_p0));
+
+        let cfg = Arc::new(ServerConfig {
+            control_bind_ip: "127.0.0.1".to_owned(),
+            control_tcp_port,
+            stun_bind_ip: "127.0.0.1".to_owned(),
+            stun_udp_port,
+            public_host: "127.0.0.1".to_owned(),
+            state_dir: dir.path().join("data"),
+            ..ServerConfig::default()
+        });
+        let now_ms = SystemClock::new().now_unix_ms();
+        let store = Arc::new(
+            ControlStore::open_with_clock(
+                ControlStoreConfig {
+                    db_path: cfg.db_path(),
+                    emergency_revocations_path: cfg.emergency_revocations_path(),
+                },
+                &cfg.overlay_cidr,
+                Arc::new(FakeClock::new(now_ms)),
+            )
+            .expect("open store"),
+        );
+        let init_id = store
+            .ensure_or_init_identity(&cfg.default_tls_sans(), 365)
+            .expect("init identity");
+        let acme = AcmeManager::initialize(&cfg, store.clone()).expect("init acme");
+        let netmap_hub = Arc::new(NetmapHub::new(
+            store.clone(),
+            cfg.public_control_endpoint(),
+            cfg.public_control_endpoint(),
+            vec![cfg.public_stun_endpoint()],
+            cfg.domain_suffix.clone(),
+        ));
+        let relay_hub = Arc::new(RelayHub::new(
+            store.clone(),
+            cfg.relay_bytes_per_sec,
+            cfg.relay_global_bytes_per_sec,
+        ));
+        let rate_limiter = Arc::new(RateLimiter::new(ClientIpExtractor::new(
+            cfg.tls_mode,
+            cfg.trusted_proxy_set(),
+        )));
+        let shutdown = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let ctrl_state = ControlAppState {
+            config: cfg.clone(),
+            trusted_proxies: Arc::new(cfg.trusted_proxy_set()),
+            store: store.clone(),
+            rate_limiter,
+            challenges: Arc::new(PendingChallengeStore::new()),
+            netmap_hub: netmap_hub.clone(),
+            relay_hub: relay_hub.clone(),
+            ws_tracker: tracker.clone(),
+            shutdown: shutdown.clone(),
+        };
+        let listeners = ListenerSet::bind_and_start(ctrl_state, acme.clone())
+            .await
+            .expect("bind");
+        let admin_state = AdminAppState {
+            config: cfg,
+            store: store.clone(),
+            acme: acme.clone(),
+            listeners: listeners.clone(),
+            netmap_hub: netmap_hub.clone(),
+            relay_hub: relay_hub.clone(),
+        };
+
+        // Act 1: migrate host & tcp_port -> verify preauth-keys & rotate-tls-key reflect live state
+        let mig_resp: mesh_proto::admin_ipc::MigrateEndpointResponse = send_ipc_json_request(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::POST,
+            "/v1/admin/server/migrate-endpoint",
+            Some(&mesh_proto::admin_ipc::MigrateEndpointRequest {
+                tcp_port: Some(mesh_core::Port::from_u16(new_tcp_port).expect("port")),
+                stun_port: None,
+                host: Some("edge-2.mesh.example".to_owned()),
+                tls_mode: None,
+                transition_window_secs: Some(30),
+                extend_window_secs: None,
+            }),
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("migrate endpoint");
+        assert_eq!(
+            mig_resp.control_tcp_endpoint,
+            format!("edge-2.mesh.example:{new_tcp_port}")
+        );
+
+        let key_resp: PreAuthKeyCreatedResponse = send_ipc_json_request(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::POST,
+            "/v1/admin/preauth-keys",
+            Some(&CreatePreAuthKeyRequest {
+                reusable: true,
+                max_uses: 5,
+                is_ephemeral: false,
+                ephemeral_timeout_secs: None,
+                ttl_secs: 3_600,
+                target_node: None,
+            }),
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("create preauth key");
+        assert_eq!(
+            key_resp.server_endpoint,
+            format!("https://edge-2.mesh.example:{new_tcp_port}")
+        );
+        assert_eq!(
+            store.load_active_identity().expect("id").spki_pin,
+            init_id.spki_pin,
+            "host migration must keep SPKI pin stable (`reissue_cert_same_key`)"
+        );
+
+        let rot_resp: mesh_proto::admin_ipc::RotateTlsKeyResponse = send_ipc_json_request(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::POST,
+            "/v1/admin/server/rotate-tls-key",
+            Some(&mesh_proto::admin_ipc::RotateTlsKeyRequest {
+                action: mesh_proto::admin_ipc::RotateTlsKeyAction::Stage,
+            }),
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("stage tls key");
+        assert!(rot_resp.staged);
+        assert!(
+            listeners
+                .active_tls_sans()
+                .iter()
+                .any(|s| s == "edge-2.mesh.example")
+        );
+
+        // Act 2: register node, subscribe streams, inject redb read+write EIO -> revoke via IPC
+        // must succeed via RAM dir and show "revoked" in degraded /v1/admin/nodes listing!
+        let token_hash = mesh_crypto::sha256_digest(key_resp.raw_key.as_bytes());
+        let (reg, _) = store
+            .register_node(&RegisterNodeInput {
+                pubkey: PublicKey::from_bytes([0x61_u8; 32]).expect("pk"),
+                disco_pubkey: PublicKey::from_bytes([0x62_u8; 32]).expect("dpk"),
+                previous_node_pubkey: None,
+                requested_name: NodeName::parse("degraded-edge").expect("name"),
+                preauth_token_hash: token_hash,
+                public_control_host: "edge-2.mesh.example",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: now_ms,
+            })
+            .expect("register node");
+        let sub = netmap_hub.subscribe(reg.record.node_id, now_ms);
+        let relay = relay_hub.register_session(
+            reg.record.node_id,
+            PublicKey::from_bytes([0x61_u8; 32]).expect("pk"),
+            now_ms,
+        );
+
+        store.inject_redb_failure(true, true);
+        let rev_resp: RevokeActionResponse = send_ipc_json_request::<_, (), _>(
+            spawn_admin_ipc_pair(admin_state.clone()).await,
+            Method::POST,
+            "/v1/admin/nodes/degraded-edge/revoke",
+            None,
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("revoke under redb read+write EIO via RAM dir");
+        assert!(rev_resp.revoked);
+        assert_eq!(rev_resp.persistence_tier, PersistenceTier::EmergencySlot);
+        assert!(sub.cancel.is_cancelled());
+        assert!(relay.cancel.is_cancelled());
+
+        // Clear read failure while keeping redb record stale (write failure true -> DB shows Active)
+        store.inject_redb_failure(false, true);
+        let listed: Vec<AdminNodeSummary> = send_ipc_json_request::<_, (), _>(
+            spawn_admin_ipc_pair(admin_state).await,
+            Method::GET,
+            "/v1/admin/nodes",
+            None,
+            MAX_ADMIN_IPC_BODY_BYTES,
+        )
+        .await
+        .expect("list nodes");
+        let edge_dto = listed
+            .iter()
+            .find(|n| n.node_id == reg.record.node_id)
+            .expect("node summary present");
+        assert_eq!(
+            edge_dto.status, "revoked",
+            "degraded node listing must reflect RAM revocation status (`HR-W21-12`)"
+        );
 
         shutdown.cancel();
         tracker.close();

@@ -171,6 +171,15 @@ pub fn configure_overlay_firewall_profile_for_cidr(
     WindowsFirewallManager::new().apply_overlay_rule(&spec, ledger)
 }
 
+/// Verifies/re-applies the `profile=any` overlay inbound rule after Windows roaming or resume,
+/// protecting connectivity if Windows assigns the new uplink the Public network profile (`US-036 AC3`).
+pub fn reconcile_overlay_firewall_on_roam(
+    interface_name: &str,
+    overlay_cidr: OverlayCidr,
+) -> AppResult<()> {
+    configure_overlay_firewall_profile_for_cidr(interface_name, overlay_cidr, None)
+}
+
 fn validate_owned_rule_name(rule_name: &str) -> AppResult<()> {
     let trimmed = rule_name.trim();
     if trimmed.is_empty()

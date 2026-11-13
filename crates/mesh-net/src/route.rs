@@ -8,7 +8,11 @@ use mesh_core::defaults::{
     LINUX_FWMARK, LINUX_ROUTING_TABLE, LINUX_RULE_PRIORITY_MAIN_SUPPRESS,
     LINUX_RULE_PRIORITY_OVERLAY,
 };
-use mesh_core::{AppError, AppResult, OverlayCidr};
+use mesh_core::{AppError, AppResult, ErrorKind, OverlayCidr};
+
+use crate::endpoint_filter::{
+    InterfaceSubnetSnapshot, OverlaySubnetConflict, detect_overlay_subnet_conflict,
+};
 
 /// Validated overlay CIDR route restricted strictly within the configured mesh overlay network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +99,36 @@ pub fn reject_non_overlay_cidr(raw_cidr: &str, allowed_overlay_cidr: OverlayCidr
     }
     let parsed = OverlayCidr::from_str(trimmed)?;
     ensure_cidr_contained(parsed, allowed_overlay_cidr)
+}
+
+/// Checks `physical_subnets` for an IPv4 subnet conflict against `overlay_cidr` before route
+/// installation (`US-037`).
+pub fn ensure_no_overlay_subnet_conflict(
+    overlay_cidr: OverlayCidr,
+    physical_subnets: &[InterfaceSubnetSnapshot],
+) -> Result<(), OverlaySubnetConflict> {
+    match detect_overlay_subnet_conflict(physical_subnets, overlay_cidr) {
+        Some(conflict) => Err(conflict),
+        None => Ok(()),
+    }
+}
+
+/// Refuses applying `spec` via `manager` when any active physical NIC overlaps
+/// `spec.destination_cidr` (`US-037`), returning [`ErrorKind::Conflict`].
+pub fn apply_overlay_route_checked(
+    manager: &dyn RouteManager,
+    spec: &RouteSpec,
+    physical_subnets: &[InterfaceSubnetSnapshot],
+) -> AppResult<()> {
+    if let Err(conflict) =
+        ensure_no_overlay_subnet_conflict(spec.destination_cidr, physical_subnets)
+    {
+        return Err(AppError::new(
+            ErrorKind::Conflict,
+            conflict.format_warning(),
+        ));
+    }
+    manager.apply_overlay_route(spec)
 }
 
 const fn ipv4_mask(prefix_len: u8) -> u32 {
@@ -352,8 +386,10 @@ mod tests {
     use mesh_core::OverlayCidr;
 
     use super::{
-        FakeRouteManager, LinuxPolicyRoutingSpec, RouteManager, RouteSpec, reject_non_overlay_cidr,
+        FakeRouteManager, LinuxPolicyRoutingSpec, RouteManager, RouteSpec,
+        apply_overlay_route_checked, reject_non_overlay_cidr,
     };
+    use crate::endpoint_filter::InterfaceSubnetSnapshot;
 
     #[test]
     fn test_route_rejects_default_and_external_cidrs_and_tracks_fake_routes() {
@@ -391,5 +427,45 @@ mod tests {
         assert!(mgr.remove_linux_policy(&policy).is_ok());
         assert!(mgr.active_routes().unwrap_or_default().is_empty());
         assert!(mgr.active_linux_policy().unwrap_or_default().is_none());
+    }
+
+    #[test]
+    fn test_route_refuses_overlay_install_on_physical_subnet_conflict() {
+        // Traces: US-037
+        // Arrange
+        let Ok(overlay) = "100.115.0.0/16".parse::<OverlayCidr>() else {
+            return;
+        };
+        let Ok(spec) = RouteSpec::new(overlay, overlay, "mesh0", None) else {
+            return;
+        };
+        let mgr = FakeRouteManager::new();
+        let conflicting = vec![InterfaceSubnetSnapshot {
+            if_index: 3,
+            interface_name: "eth0".to_owned(),
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 115, 2, 10)),
+            prefix_len: 24,
+            is_up: true,
+            is_virtual: false,
+            has_gateway: true,
+        }];
+        let clean = vec![InterfaceSubnetSnapshot {
+            if_index: 3,
+            interface_name: "eth0".to_owned(),
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 10, 20)),
+            prefix_len: 24,
+            is_up: true,
+            is_virtual: false,
+            has_gateway: true,
+        }];
+
+        // Act & Assert: conflict refused and no route installed
+        let err = apply_overlay_route_checked(&mgr, &spec, &conflicting);
+        assert!(err.is_err());
+        assert!(mgr.active_routes().unwrap_or_default().is_empty());
+
+        // Switching to clean network installs route normally
+        assert!(apply_overlay_route_checked(&mgr, &spec, &clean).is_ok());
+        assert_eq!(mgr.active_routes().unwrap_or_default().len(), 1);
     }
 }

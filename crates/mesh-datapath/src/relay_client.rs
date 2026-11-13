@@ -158,6 +158,7 @@ struct RelayQueueRegistry {
     queues: Mutex<HashMap<PublicKey, PeerTxChannel>>,
     active_rx_queues: Mutex<Vec<(PublicKey, mpsc::Receiver<Bytes>)>>,
     wake: Notify,
+    backoff_wake: Notify,
 }
 
 #[derive(Debug)]
@@ -171,6 +172,7 @@ impl RelayQueueRegistry {
             queues: Mutex::new(HashMap::new()),
             active_rx_queues: Mutex::new(Vec::new()),
             wake: Notify::new(),
+            backoff_wake: Notify::new(),
         }
     }
 }
@@ -243,6 +245,33 @@ impl RelayClientHandle {
     #[must_use]
     pub fn metrics_snapshot(&self) -> RelayMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Immediately drops bounded TX queues for removed or revoked peers (`US-030`).
+    ///
+    /// Returns the number of queues evicted so zero queued frames leave the client after cut.
+    pub fn remove_peer_queues(&self, pubkeys: &[PublicKey]) -> usize {
+        if pubkeys.is_empty() {
+            return 0;
+        }
+        let mut removed = 0usize;
+        if let Ok(mut map) = self.inner.queues.lock() {
+            for pk in pubkeys {
+                if map.remove(pk).is_some() {
+                    removed = removed.saturating_add(1);
+                }
+            }
+        }
+        if let Ok(mut rx_list) = self.inner.active_rx_queues.lock() {
+            rx_list.retain(|(pk, _)| !pubkeys.contains(pk));
+        }
+        removed
+    }
+
+    /// Wakes an active reconnect backoff sleep immediately on network transition (`US-034 AC4`),
+    /// or nudges an active WebSocket session with an immediate `KeepAlive` health check.
+    pub fn wake_reconnect(&self) {
+        self.inner.backoff_wake.notify_one();
     }
 
     fn drain_one_round(&self, max_total: usize) -> Vec<RelayFrame> {
@@ -395,11 +424,16 @@ impl ReconnectBackoffs {
 }
 
 fn is_tls_capped_error(err: &AppError) -> bool {
-    if matches!(err.kind(), ErrorKind::ClockSkew | ErrorKind::PinMismatch) {
+    if matches!(
+        err.kind(),
+        ErrorKind::ClockSkew | ErrorKind::PinMismatch | ErrorKind::Unauthenticated
+    ) {
         return true;
     }
     let msg = err.to_string();
-    msg.starts_with("TLS ") || msg.starts_with("relay TLS ")
+    msg.starts_with("TLS ")
+        || msg.starts_with("relay TLS ")
+        || msg.starts_with("relay captive portal ")
 }
 
 impl RelayClient {
@@ -531,6 +565,14 @@ impl RelayClient {
                         () = shutdown.cancelled() => break,
                         Ok(()) = config_rx.changed() => {
                             backoffs.reset_all();
+                        }
+                        () = self.handle.inner.backoff_wake.notified() => {
+                            backoffs.reset_all();
+                            info!(
+                                component = "datapath.relay_client",
+                                event = "relay_backoff_woken",
+                                "Blind Relay reconnect backoff woken early on network change"
+                            );
                         }
                         () = sleeper(step) => {}
                     }
@@ -684,6 +726,12 @@ impl RelayClient {
                 () = shutdown.cancelled() => return SessionExit::Shutdown,
                 Ok(()) = config_rx.changed() => return SessionExit::ConfigUpdated,
                 () = self.handle.inner.wake.notified() => {}
+                () = self.handle.inner.backoff_wake.notified() => {
+                    let frame = RelayFrame::KeepAlive { sent_at_ms: clock.now_unix_ms() };
+                    if let Err(err) = send_relay_frame(ws, &frame).await {
+                        return SessionExit::Reconnect { error: err, tls_capped: false };
+                    }
+                }
                 _ = keepalive_tick.tick() => {
                     let frame = RelayFrame::KeepAlive { sent_at_ms: clock.now_unix_ms() };
                     if let Err(err) = send_relay_frame(ws, &frame).await {
@@ -1067,6 +1115,11 @@ async fn execute_challenge_http(
     let (status_code, resp_body) = read_bounded_http_response(stream).await?;
     if status_code != 200 {
         return Err(map_http_status_error(status_code, &resp_body));
+    }
+    if looks_like_captive_portal_body(&resp_body) {
+        return Err(AppError::unavailable(
+            "relay captive portal returned HTML instead of JSON challenge",
+        ));
     }
     parse_challenge_response_json(&resp_body)
 }
@@ -1728,6 +1781,17 @@ fn parse_content_length(header: &str) -> AppResult<usize> {
     Ok(parsed.unwrap_or(0))
 }
 
+fn looks_like_captive_portal_body(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('<') {
+        return true;
+    }
+    let head = trimmed.get(..trimmed.len().min(256)).unwrap_or(trimmed);
+    let lower = head.to_ascii_lowercase();
+    lower.contains("<!doctype html") || lower.contains("<html")
+}
+
 fn map_http_status_error(status: u16, body: &[u8]) -> AppError {
     let text = String::from_utf8_lossy(body);
     if status == 403 {
@@ -1739,7 +1803,12 @@ fn map_http_status_error(status: u16, body: &[u8]) -> AppError {
         }
     }
     if status == 401 {
-        return AppError::unauthenticated("relay challenge authentication failed");
+        return AppError::unauthenticated("authentication failed");
+    }
+    if matches!(status, 300..=399 | 511) || looks_like_captive_portal_body(body) {
+        return AppError::unavailable(format!(
+            "relay captive portal or proxy interception returned status {status}"
+        ));
     }
     AppError::unavailable(format!("relay HTTP auth returned status {status}"))
 }
@@ -2472,5 +2541,186 @@ mod tests {
         // Assert
         assert!(res.is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // Traces: US-030
+    #[test]
+    fn test_relay_client_remove_peer_queues_purges_buffered_packets() {
+        // Arrange
+        let handle = RelayClientHandle::new();
+        let peer_a = NodeKeypair::generate().public_key();
+        let peer_b = NodeKeypair::generate().public_key();
+        assert!(handle.try_send_packet(peer_a, Bytes::from_static(b"keep-a")));
+        assert!(handle.try_send_packet(peer_b, Bytes::from_static(b"cut-b-1")));
+        assert!(handle.try_send_packet(peer_b, Bytes::from_static(b"cut-b-2")));
+
+        // Act
+        let removed = handle.remove_peer_queues(&[peer_b]);
+        let drained = handle.drain_one_round(16);
+
+        // Assert: zero queued frames for peer_b survive; peer_a stays intact
+        assert_eq!(removed, 1);
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            drained.first(),
+            Some(RelayFrame::ClientToPeerPacket { dst_pubkey, .. }) if *dst_pubkey == peer_a
+        ));
+    }
+
+    struct CaptivePortalAndRecoveryConnector {
+        mode: Arc<AtomicU64>,
+        addr: SocketAddr,
+    }
+
+    impl RelayConnector for CaptivePortalAndRecoveryConnector {
+        fn connect<'a>(
+            &'a self,
+            _config: &'a RelayClientConfig,
+        ) -> Pin<Box<dyn Future<Output = AppResult<ConnectedRelayTransport>> + Send + 'a>> {
+            let mode = self.mode.load(Ordering::Relaxed);
+            let addr = self.addr;
+            Box::pin(async move {
+                if mode == 0 {
+                    // Emulate an HTTPS-intercepting captive portal returning HTTP 200 HTML!
+                    let stream = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| AppError::unavailable(format!("connect fail: {e}")))?;
+                    Ok(ConnectedRelayTransport {
+                        stream: Box::new(stream),
+                        tls_exporter_binding: None,
+                    })
+                } else {
+                    Err(AppError::pin_mismatch("test pin mismatch"))
+                }
+            })
+        }
+    }
+
+    // Traces: US-034 AC4
+    #[tokio::test]
+    async fn test_relay_client_captive_portal_uses_5m_backoff_and_wake_resets_immediately() {
+        // Arrange: server writes HTTP 200 HTML portal login page on POST /v1/auth/challenge
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let portal_srv = tokio::spawn(async move {
+            for _ in 0..4 {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut req_buf = [0u8; 512];
+                    drop(
+                        tokio::time::timeout(Duration::from_millis(200), sock.read(&mut req_buf))
+                            .await,
+                    );
+                    let body = "<!DOCTYPE html><html><body>Captive Portal Sign-In</body></html>";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    drop(sock.write_all(resp.as_bytes()).await);
+                }
+            }
+        });
+
+        let cfg = RelayClientConfig {
+            endpoint: addr.to_string(),
+            server_name_override: None,
+            pin_set: None,
+            underlay_if_index: None,
+            linux_fwmark: None,
+            require_challenge_auth: true,
+            agent_version: "0.1.0-portal".to_owned(),
+        };
+        let client = RelayClient::with_connector(
+            cfg,
+            NodeKeypair::generate(),
+            DiscoKeypair::generate(),
+            Arc::new(CaptivePortalAndRecoveryConnector {
+                mode: Arc::new(AtomicU64::new(0)),
+                addr,
+            }),
+        );
+        let handle = client.handle();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(100_000));
+        let (ev_tx, mut ev_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let steps = Arc::new(Mutex::new(Vec::<ReconnectStep>::new()));
+        let steps_ref = Arc::clone(&steps);
+        let handle_ref = handle.clone();
+        let shutdown_ref = shutdown.clone();
+
+        // Act: 3 captive-portal steps accumulate tls_capped backoff, then wake_reconnect() wakes & resets to attempt 0
+        client
+            .run_with_sleeper(&clock, &ev_tx, &shutdown, move |step| {
+                let len = {
+                    let mut g = steps_ref.lock().expect("lock");
+                    g.push(step);
+                    g.len()
+                };
+                if len == 3 {
+                    handle_ref.wake_reconnect();
+                    // Give select! a realistic future to wake early on backoff_wake
+                    return Box::pin(async move {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    })
+                        as std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
+                }
+                if len >= 4 {
+                    shutdown_ref.cancel();
+                }
+                Box::pin(std::future::ready(()))
+            })
+            .await;
+
+        portal_srv.abort();
+        while ev_rx.try_recv().is_ok() {}
+
+        // Assert
+        let recorded = steps.lock().expect("lock");
+        assert_eq!(recorded.len(), 4);
+        assert!(recorded.iter().all(|s| s.tls_capped));
+        assert_eq!(recorded.first().map(|s| s.attempt), Some(0));
+        assert_eq!(recorded.get(1).map(|s| s.attempt), Some(1));
+        assert_eq!(recorded.get(2).map(|s| s.attempt), Some(2));
+        // Attempt 4 starts fresh at attempt 0 after wake_reconnect!
+        assert_eq!(recorded.get(3).map(|s| s.attempt), Some(0));
+    }
+
+    // Traces: US-034 AC2
+    #[test]
+    fn test_relay_client_fleet_jitter_backoff_spreads_20_agents_evenly() {
+        // Arrange: 20 independent agents disconnected simultaneously hitting ceiling step (~60 s)
+        let mut delays_ms = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let mut backoff = ExponentialBackoff::new(BackoffConfig::network());
+            for _ in 0..6 {
+                let _ignored = backoff.next_delay();
+            }
+            let d = u64::try_from(backoff.next_delay().as_millis()).unwrap_or(0);
+            delays_ms.push(d);
+        }
+
+        // Act: verify uniform spread across [0, 60_000 ms]
+        let min_ms = delays_ms.iter().copied().min().unwrap_or(0);
+        let max_ms = delays_ms.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_ms.saturating_sub(min_ms) >= 15_000,
+            "20 agents must not synchronize at one tick: delays={delays_ms:?}"
+        );
+        let mean = delays_ms.iter().sum::<u64>() as f64 / delays_ms.len() as f64;
+        let var = delays_ms
+            .iter()
+            .map(|&d| {
+                let diff = d as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / delays_ms.len() as f64;
+        let stddev_s = var.sqrt() / 1000.0;
+        assert!(
+            stddev_s >= 5.0,
+            "expected stddev >= 5 s for fleet-safe full jitter, got {stddev_s:.2} s"
+        );
     }
 }

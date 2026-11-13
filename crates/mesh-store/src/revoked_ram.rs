@@ -38,10 +38,12 @@ pub const MAX_SLOT_KEYS: usize = 250;
 
 const SLOT_FORMAT_VERSION: u16 = 2;
 
-/// Lock-friendly memory cache of revoked node, public-key, and pre-auth key identifiers (`SEC-08`).
+/// Lock-friendly memory cache of revoked node, expired node, public-key, and pre-auth key
+/// identifiers (`SEC-08`, `US-031 AC5`).
 #[derive(Debug, Default, Clone)]
 pub struct RevokedSet {
     nodes: HashSet<NodeId>,
+    expired_nodes: HashSet<NodeId>,
     pubkeys: HashSet<[u8; 32]>,
     keys: HashSet<KeyId>,
 }
@@ -53,10 +55,22 @@ impl RevokedSet {
         Self::default()
     }
 
-    /// Returns `true` if `node_id` has been revoked.
+    /// Returns `true` if `node_id` is currently blocked in RAM (`Revoked` OR `Expired`).
     #[must_use]
     pub fn contains(&self, node_id: NodeId) -> bool {
+        self.nodes.contains(&node_id) || self.expired_nodes.contains(&node_id)
+    }
+
+    /// Returns `true` if `node_id` is permanently administratively revoked (`NodeStatus::Revoked`).
+    #[must_use]
+    pub fn is_permanently_revoked(&self, node_id: NodeId) -> bool {
         self.nodes.contains(&node_id)
+    }
+
+    /// Returns `true` if `node_id` is blocked strictly due to key expiration (`NodeStatus::Expired`).
+    #[must_use]
+    pub fn is_expired(&self, node_id: NodeId) -> bool {
+        self.expired_nodes.contains(&node_id)
     }
 
     /// Returns `true` if a WireGuard node `pubkey` has been revoked or expired.
@@ -71,17 +85,37 @@ impl RevokedSet {
         self.keys.contains(&key_id)
     }
 
-    /// Records `node_id` into the in-memory revocation set.
+    /// Records permanently revoked `node_id` into the in-memory revocation set.
     pub fn insert(&mut self, node_id: NodeId) {
+        self.expired_nodes.remove(&node_id);
         self.nodes.insert(node_id);
     }
 
-    /// Records both `node_id` and its optional `PublicKey` into the in-memory revocation set.
+    /// Records permanently revoked `node_id` and its optional `PublicKey` into the in-memory
+    /// revocation set, promoting any prior temporary `Expired` entry to permanent `Revoked`.
     pub fn insert_node_with_pubkey(&mut self, node_id: NodeId, pubkey: Option<&PublicKey>) {
+        self.expired_nodes.remove(&node_id);
         self.nodes.insert(node_id);
         if let Some(pk) = pubkey {
             self.pubkeys.insert(*pk.as_bytes());
         }
+    }
+
+    /// Records an expired `node_id` (`NodeStatus::Expired`) and its optional `PublicKey` into RAM
+    /// without marking it permanently revoked (`HR-W21-02`).
+    pub fn insert_expired_node_with_pubkey(&mut self, node_id: NodeId, pubkey: Option<&PublicKey>) {
+        if !self.nodes.contains(&node_id) {
+            self.expired_nodes.insert(node_id);
+        }
+        if let Some(pk) = pubkey {
+            self.pubkeys.insert(*pk.as_bytes());
+        }
+    }
+
+    /// Clears a node's temporary `Expired` block after valid `--for <node>` renewal (`US-031 AC5`),
+    /// leaving `pubkeys` (superseded old keys) and permanent `Revoked` blocks intact.
+    pub fn clear_expired_node(&mut self, node_id: NodeId) {
+        self.expired_nodes.remove(&node_id);
     }
 
     /// Blocks a superseded node public key without marking `node_id` revoked (`BLK-S1-01`).
@@ -92,6 +126,34 @@ impl RevokedSet {
     /// Records a revoked pre-authentication `key_id` into RAM.
     pub fn insert_key(&mut self, key_id: KeyId) {
         self.keys.insert(key_id);
+    }
+
+    /// Reverts a speculative pre-write RAM revocation ONLY when primary healthy `redb` proves
+    /// `NotFound` or rejects a conflicting transition (`HR-W21-04`).
+    pub fn rollback_speculative_node(
+        &mut self,
+        node_id: NodeId,
+        pubkey_bytes: [u8; 32],
+        was_perm_revoked: bool,
+        was_expired: bool,
+        was_pubkey_revoked: bool,
+    ) {
+        if !was_perm_revoked {
+            self.nodes.remove(&node_id);
+        }
+        if !was_expired {
+            self.expired_nodes.remove(&node_id);
+        } else if !self.nodes.contains(&node_id) {
+            self.expired_nodes.insert(node_id);
+        }
+        if pubkey_bytes != [0_u8; 32] && !was_pubkey_revoked {
+            self.pubkeys.remove(&pubkey_bytes);
+        }
+    }
+
+    /// Reverts a speculative pre-write key revocation ONLY when primary healthy `redb` proves `NotFound`.
+    pub fn remove_key_for_rollback(&mut self, key_id: KeyId) {
+        self.keys.remove(&key_id);
     }
 }
 
@@ -289,20 +351,32 @@ impl EmergencyRevocationState {
     pub fn record_emergency_node(
         &mut self,
         revoked_ram: &mut RevokedSet,
-        entry: EmergencyRevocationNodeEntry,
+        mut entry: EmergencyRevocationNodeEntry,
         reason: &str,
         backend: &dyn EmergencyFileBackend,
     ) -> PersistenceTier {
         let pk_opt = PublicKey::from_bytes(entry.pubkey_bytes).ok();
-        revoked_ram.insert_node_with_pubkey(
-            entry.node_id,
-            pk_opt.as_ref().filter(|_| entry.pubkey_bytes != [0_u8; 32]),
-        );
+        let pk_ref = pk_opt.as_ref().filter(|_| entry.pubkey_bytes != [0_u8; 32]);
+        match entry.reason {
+            EmergencyNodeReason::Revoked => {
+                revoked_ram.insert_node_with_pubkey(entry.node_id, pk_ref)
+            }
+            EmergencyNodeReason::Expired => {
+                revoked_ram.insert_expired_node_with_pubkey(entry.node_id, pk_ref);
+            }
+        }
 
         let already_pending = self
             .pending_nodes
             .iter()
             .position(|existing| existing.node_id == entry.node_id);
+        if let Some(idx) = already_pending
+            && let Some(existing) = self.pending_nodes.get(idx)
+            && existing.reason == EmergencyNodeReason::Revoked
+            && entry.reason == EmergencyNodeReason::Expired
+        {
+            entry.reason = EmergencyNodeReason::Revoked;
+        }
         let candidate_nodes = if let Some(idx) = already_pending {
             let mut copy = self.pending_nodes.clone();
             if let Some(slot) = copy.get_mut(idx) {
@@ -452,6 +526,48 @@ impl EmergencyRevocationState {
         Ok(())
     }
 
+    /// Removes any pending [`EmergencyNodeReason::Expired`] entry for `node_id` after valid
+    /// `--for <node>` renewal (`US-031 AC5`, `HR-W21-02`), preserving permanent `Revoked` items.
+    pub fn clear_pending_expired_node(
+        &mut self,
+        node_id: NodeId,
+        backend: &dyn EmergencyFileBackend,
+    ) -> bool {
+        let had_expired = self
+            .pending_nodes
+            .iter()
+            .any(|e| e.node_id == node_id && e.reason == EmergencyNodeReason::Expired);
+        if !had_expired {
+            return false;
+        }
+        let remaining_nodes: Vec<EmergencyRevocationNodeEntry> = self
+            .pending_nodes
+            .iter()
+            .filter(|e| !(e.node_id == node_id && e.reason == EmergencyNodeReason::Expired))
+            .cloned()
+            .collect();
+        let tier = flush_slot_state(
+            EmergencySlotMeta {
+                emergency_file_path: &self.emergency_file_path,
+                current_seq_no: &mut self.current_seq_no,
+                min_netmap_version: self.min_netmap_version,
+                active_slot: &mut self.active_slot,
+            },
+            &remaining_nodes,
+            &self.pending_keys,
+            backend,
+        );
+        self.pending_nodes = remaining_nodes;
+        if self.pending_nodes.is_empty()
+            && self.pending_keys.is_empty()
+            && tier == PersistenceTier::EmergencySlot
+        {
+            self.disk_degraded = false;
+            self.degraded_reason = None;
+        }
+        true
+    }
+
     /// Returns whether any pending unmerged revocations remain in RAM/emergency slots.
     #[must_use]
     pub fn has_unmerged_entries(&self) -> bool {
@@ -583,10 +699,15 @@ fn recover_from_file_bytes(
     let mut revoked_ram = RevokedSet::new();
     for node in &chosen.nodes {
         let pk_opt = PublicKey::from_bytes(node.pubkey_bytes).ok();
-        revoked_ram.insert_node_with_pubkey(
-            node.node_id,
-            pk_opt.as_ref().filter(|_| node.pubkey_bytes != [0_u8; 32]),
-        );
+        let pk_ref = pk_opt.as_ref().filter(|_| node.pubkey_bytes != [0_u8; 32]);
+        match node.reason {
+            EmergencyNodeReason::Revoked => {
+                revoked_ram.insert_node_with_pubkey(node.node_id, pk_ref)
+            }
+            EmergencyNodeReason::Expired => {
+                revoked_ram.insert_expired_node_with_pubkey(node.node_id, pk_ref);
+            }
+        }
     }
     for key in &chosen.keys {
         revoked_ram.insert_key(key.key_id);

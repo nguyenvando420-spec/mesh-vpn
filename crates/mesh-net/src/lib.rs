@@ -48,8 +48,10 @@ pub mod tun_macos;
 pub mod tun_windows;
 
 pub use endpoint_filter::{
-    CandidateFilterContext, DiscoveredInterfaceEndpoint, filter_candidate_endpoints,
-    is_valid_candidate_endpoint, is_valid_candidate_ip, is_virtual_interface_name,
+    CandidateFilterContext, DiscoveredInterfaceEndpoint, InterfaceSubnetSnapshot,
+    OverlaySubnetConflict, detect_overlay_subnet_conflict, filter_candidate_endpoints,
+    ipv4_subnets_overlap, is_usable_dhcp_ip, is_valid_candidate_endpoint, is_valid_candidate_ip,
+    is_virtual_interface_name,
 };
 pub use hosts::{
     FakeHostsEditor, FileHostsEditor, HostsEditor, HostsEntry, remove_hosts_block,
@@ -66,12 +68,17 @@ pub use ledger::{
     ResourceLedgerData,
 };
 pub use netmon::{
-    Debouncer, FakeNetMonitor, NetEvent, NetMonitor, NetworkChangeEvent, check_clock_jump,
+    DEFAULT_DHCP_INITIAL_DELAY_MS, DEFAULT_DHCP_MAX_DELAY_MS, DEFAULT_DHCP_WAIT_TIMEOUT_MS,
+    Debouncer, DhcpWaitConfig, FakeNetMonitor, FakePhysicalNetworkProbe, NetEvent, NetMonitor,
+    NetworkChangeEvent, OsPhysicalNetworkProbe, PhysicalInterface, PhysicalNetworkProbe,
+    check_clock_jump, has_usable_ip_on_interface, list_os_interface_subnets,
+    probe_ready_primary_interface, query_os_primary_physical_interface,
+    wait_for_usable_ip_with_backoff,
 };
 pub use route::{
-    FakeRouteManager, LinuxPolicyRoutingSpec, RouteManager, RouteSpec, bind_underlay_socket2,
-    bind_underlay_udp_socket, disable_udp_dont_fragment, ensure_cidr_contained,
-    reject_non_overlay_cidr,
+    FakeRouteManager, LinuxPolicyRoutingSpec, RouteManager, RouteSpec, apply_overlay_route_checked,
+    bind_underlay_socket2, bind_underlay_udp_socket, disable_udp_dont_fragment,
+    ensure_cidr_contained, ensure_no_overlay_subnet_conflict, reject_non_overlay_cidr,
 };
 pub use sysexec::{
     AllowedBinary, CommandExecutor, CommandOutput, CommandSpec, FakeCommandExecutor,

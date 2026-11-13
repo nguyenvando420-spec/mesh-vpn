@@ -187,6 +187,7 @@ async fn run_server(cfg: ServerConfig) -> AppResult<()> {
             config.relay_alert_threshold_pct,
             config.relay_global_bytes_per_sec,
         )
+        .with_telegram_chat_id(config.alert_telegram_chat_id.clone())
         .with_disk_threshold(config.disk_alert_threshold_pct),
     );
     let maint_ctx = alert_worker::MaintenanceContext {

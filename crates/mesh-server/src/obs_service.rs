@@ -69,7 +69,7 @@ pub fn evaluate_readiness(state: &ObsAppState) -> ReadinessResponse {
 
     let ctrl_ok = state.listeners.is_control_healthy();
     let stun_ok = state.listeners.is_stun_healthy();
-    if state.listeners.config().tls_mode == crate::config::TlsMode::Acme {
+    if state.listeners.active_tls_mode() == crate::config::TlsMode::Acme {
         let ca_verified = state
             .listeners
             .acme()
@@ -107,27 +107,163 @@ pub fn evaluate_readiness(state: &ObsAppState) -> ReadinessResponse {
     }
 }
 
-/// Renders Prometheus text exposition (`0.0.4`) guaranteed free of secret key material.
+/// Renders Prometheus text exposition (`0.0.4`) aligned with `api-design.md` §6.2
+/// and guaranteed free of secret key material (`SEC-01`, `US-048`).
 #[must_use]
 pub fn render_prometheus_metrics(state: &ObsAppState) -> String {
     let relay = state.relay_hub.metrics_snapshot();
+    let per_node_bytes = state.relay_hub.per_node_forwarded_bytes();
     let stun = state.listeners.stun_state();
-    let mut out = String::with_capacity(1024);
+    let rate = state.rate_limiter.metrics_snapshot();
+    let now_ms = state.store.clock().now_unix_ms();
+
+    let (mut active_nodes, mut expired_nodes, mut revoked_nodes) = (0_u64, 0_u64, 0_u64);
+    if let Ok(nodes) = state.store.list_nodes() {
+        for node in nodes {
+            match node.status {
+                mesh_store::NodeStatus::Active => active_nodes = active_nodes.saturating_add(1),
+                mesh_store::NodeStatus::Expired => {
+                    expired_nodes = expired_nodes.saturating_add(1);
+                }
+                mesh_store::NodeStatus::Revoked => {
+                    revoked_nodes = revoked_nodes.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    let online_streams = u64::try_from(state.netmap_hub.active_stream_count()).unwrap_or(u64::MAX);
+    let tls_mode_label = state.listeners.active_tls_mode().as_str();
+    let cert_expiry_secs =
+        if state.listeners.active_tls_mode() == crate::config::TlsMode::ReverseProxy {
+            0
+        } else {
+            state
+                .listeners
+                .acme()
+                .status()
+                .map_or(0, |s| s.cert_not_after_ms.saturating_sub(now_ms) / 1_000)
+        };
+
+    let mut out = String::with_capacity(2048);
+
+    push_metric_header(
+        &mut out,
+        "mesh_control_nodes_total",
+        "gauge",
+        "Registered nodes partitioned by lifecycle status.",
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_nodes_total",
+        r#"status="active""#,
+        active_nodes,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_nodes_total",
+        r#"status="expired""#,
+        expired_nodes,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_nodes_total",
+        r#"status="revoked""#,
+        revoked_nodes,
+    );
 
     push_metric(
         &mut out,
-        "mesh_netmap_version",
+        "mesh_control_nodes_online",
+        "gauge",
+        "Currently connected active control stream peers.",
+        online_streams,
+    );
+    push_metric(
+        &mut out,
+        "mesh_control_netmap_version",
         "gauge",
         "Current monotonic netmap version.",
         state.store.current_netmap_version(),
     );
+
+    push_metric_header(
+        &mut out,
+        "mesh_control_registrations_total",
+        "counter",
+        "Node registration attempts partitioned by outcome.",
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_registrations_total",
+        r#"outcome="success""#,
+        rate.registrations_success_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_registrations_total",
+        r#"outcome="unauthenticated""#,
+        rate.registrations_unauthenticated_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_registrations_total",
+        r#"outcome="conflict""#,
+        rate.registrations_conflict_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_registrations_total",
+        r#"outcome="rate_limited""#,
+        rate.registrations_rate_limited_total,
+    );
+
+    push_metric_header(
+        &mut out,
+        "mesh_control_rate_limited_requests_total",
+        "counter",
+        "Requests rejected with HTTP 429 partitioned by endpoint.",
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_rate_limited_requests_total",
+        r#"endpoint="challenge""#,
+        rate.hits_challenge_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_rate_limited_requests_total",
+        r#"endpoint="register""#,
+        rate.hits_register_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_rate_limited_requests_total",
+        r#"endpoint="relay""#,
+        rate.hits_relay_total,
+    );
+
     push_metric(
         &mut out,
-        "mesh_online_control_streams",
+        "mesh_control_active_streams",
         "gauge",
         "Active /v1/netmap/stream WebSocket connections.",
-        u64::try_from(state.netmap_hub.active_stream_count()).unwrap_or(u64::MAX),
+        online_streams,
     );
+
+    push_metric_header(
+        &mut out,
+        "mesh_control_tls_cert_expiry_seconds",
+        "gauge",
+        "Seconds remaining until active server TLS certificate expiration.",
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_control_tls_cert_expiry_seconds",
+        &format!(r#"mode="{tls_mode_label}""#),
+        cert_expiry_secs,
+    );
+
     push_metric(
         &mut out,
         "mesh_relay_active_sessions",
@@ -135,61 +271,110 @@ pub fn render_prometheus_metrics(state: &ObsAppState) -> String {
         "Active /v1/relay WebSocket connections.",
         u64::try_from(relay.active_sessions).unwrap_or(u64::MAX),
     );
-    push_metric(
-        &mut out,
-        "mesh_relay_forwarded_packets_total",
-        "counter",
-        "Total packets relayed via Blind Relay.",
-        relay.forwarded_packets_total,
-    );
-    push_metric(
+
+    push_metric_header(
         &mut out,
         "mesh_relay_forwarded_bytes_total",
         "counter",
-        "Total payload bytes relayed via Blind Relay.",
-        relay.forwarded_bytes_total,
+        "Total payload bytes forwarded by Blind Relay per source node.",
     );
-    push_metric(
+    for (node_id, forwarded_bytes) in per_node_bytes {
+        push_metric_sample(
+            &mut out,
+            "mesh_relay_forwarded_bytes_total",
+            &format!(r#"node_id="{node_id}""#),
+            forwarded_bytes,
+        );
+    }
+
+    push_metric_header(
         &mut out,
         "mesh_relay_dropped_packets_total",
         "counter",
-        "Packets dropped due to full 256-slot peer queue or offline peer.",
-        relay.dropped_packets_total,
+        "Blind Relay packets dropped or rejected partitioned by reason.",
     );
-    push_metric(
+    push_metric_sample(
         &mut out,
-        "mesh_relay_throttled_packets_total",
-        "counter",
-        "Packets throttled by 20 Mbps per-node or global relay cap.",
-        relay.throttled_packets_total,
+        "mesh_relay_dropped_packets_total",
+        r#"reason="dest_offline""#,
+        relay.dropped_dest_offline_total,
     );
-    push_metric(
+    push_metric_sample(
+        &mut out,
+        "mesh_relay_dropped_packets_total",
+        r#"reason="dest_queue_full""#,
+        relay.dropped_dest_queue_full_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_relay_dropped_packets_total",
+        r#"reason="oversized""#,
+        relay.dropped_oversized_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_relay_dropped_packets_total",
+        r#"reason="unauthenticated""#,
+        relay.dropped_unauthenticated_total,
+    );
+
+    push_metric_header(
+        &mut out,
+        "mesh_relay_throttled_bytes_total",
+        "counter",
+        "Relay bytes throttled by per-node or global token bucket.",
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_relay_throttled_bytes_total",
+        r#"scope="per_node""#,
+        relay.throttled_bytes_per_node_total,
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_relay_throttled_bytes_total",
+        r#"scope="global""#,
+        relay.throttled_bytes_global_total,
+    );
+
+    push_metric_header(
         &mut out,
         "mesh_stun_requests_total",
         "counter",
-        "Valid STUN Binding Responses sent.",
+        "Embedded UDP STUN packets processed partitioned by outcome.",
+    );
+    push_metric_sample(
+        &mut out,
+        "mesh_stun_requests_total",
+        r#"outcome="ok""#,
         stun.requests_total(),
     );
-    push_metric(
+    push_metric_sample(
         &mut out,
-        "mesh_stun_rate_limited_total",
-        "counter",
-        "STUN packets dropped by per-IP 100 pps limit.",
+        "mesh_stun_requests_total",
+        r#"outcome="rate_limited""#,
         stun.dropped_rate_limited_total(),
     );
-    push_metric(
+    push_metric_sample(
         &mut out,
-        "mesh_auth_rate_limit_hits_total",
-        "counter",
-        "Authentication requests throttled or IP-locked.",
-        state.rate_limiter.total_hits(),
+        "mesh_stun_requests_total",
+        r#"outcome="malformed""#,
+        stun.malformed_total(),
     );
+
     push_metric(
         &mut out,
         "mesh_pending_challenges",
         "gauge",
         "Active single-use challenges awaiting consumption.",
         u64::try_from(state.challenges.len()).unwrap_or(u64::MAX),
+    );
+    push_metric(
+        &mut out,
+        "mesh_process_resident_memory_bytes",
+        "gauge",
+        "Resident set memory consumption in bytes when reported by OS procfs.",
+        process_resident_memory_bytes(),
     );
     push_metric(
         &mut out,
@@ -201,11 +386,31 @@ pub fn render_prometheus_metrics(state: &ObsAppState) -> String {
     out
 }
 
+fn push_metric_header(out: &mut String, name: &str, metric_type: &str, help: &str) {
+    if let Err(err) = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {metric_type}") {
+        tracing::debug!(
+            component = "obs_service",
+            event = "metric_format_error",
+            error = %err,
+            "failed formatting prometheus metric header"
+        );
+    }
+}
+
+fn push_metric_sample(out: &mut String, name: &str, labels: &str, value: u64) {
+    if let Err(err) = writeln!(out, "{name}{{{labels}}} {value}") {
+        tracing::debug!(
+            component = "obs_service",
+            event = "metric_format_error",
+            error = %err,
+            "failed formatting prometheus labeled sample"
+        );
+    }
+}
+
 fn push_metric(out: &mut String, name: &str, metric_type: &str, help: &str, value: u64) {
-    if let Err(err) = writeln!(
-        out,
-        "# HELP {name} {help}\n# TYPE {name} {metric_type}\n{name} {value}"
-    ) {
+    push_metric_header(out, name, metric_type, help);
+    if let Err(err) = writeln!(out, "{name} {value}") {
         tracing::debug!(
             component = "obs_service",
             event = "metric_format_error",
@@ -213,6 +418,17 @@ fn push_metric(out: &mut String, name: &str, metric_type: &str, help: &str, valu
             "failed formatting prometheus metric"
         );
     }
+}
+
+fn process_resident_memory_bytes() -> u64 {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(0, |pages| pages.saturating_mul(4_096))
 }
 
 /// Builds the dedicated read-only Axum observability router (`/healthz`, `/readyz`, `/metrics`).
@@ -417,7 +633,10 @@ mod tests {
         .expect("start obs listener");
 
         crate::acme::ensure_rustls_ring_provider();
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback obs client");
         let base = format!("http://{obs_addr}");
 
         // Act & Assert: /healthz 200 OK
@@ -441,7 +660,7 @@ mod tests {
         assert_eq!(rz_body.status, "ready");
         assert!(rz_body.db_healthy);
 
-        // /metrics renders expected counters without private key markers
+        // /metrics renders all §6.2 metrics cleanly without private key markers
         let metrics_resp = client
             .get(format!("{base}/metrics"))
             .send()
@@ -449,7 +668,21 @@ mod tests {
             .expect("get metrics");
         assert_eq!(metrics_resp.status(), reqwest::StatusCode::OK);
         let metrics_text = metrics_resp.text().await.expect("metrics text");
-        assert!(metrics_text.contains("mesh_netmap_version"));
+        assert!(metrics_text.contains(r#"mesh_control_nodes_total{status="active"}"#));
+        assert!(metrics_text.contains("mesh_control_nodes_online"));
+        assert!(metrics_text.contains("mesh_control_netmap_version"));
+        assert!(metrics_text.contains(r#"mesh_control_registrations_total{outcome="success"}"#));
+        assert!(
+            metrics_text.contains(r#"mesh_control_rate_limited_requests_total{endpoint="relay"}"#)
+        );
+        assert!(metrics_text.contains("mesh_control_active_streams"));
+        assert!(metrics_text.contains(r#"mesh_control_tls_cert_expiry_seconds{mode="ip_pinned"}"#));
+        assert!(metrics_text.contains("mesh_relay_active_sessions"));
+        assert!(metrics_text.contains("mesh_relay_forwarded_bytes_total"));
+        assert!(metrics_text.contains(r#"mesh_relay_dropped_packets_total{reason="oversized"}"#));
+        assert!(metrics_text.contains(r#"mesh_relay_throttled_bytes_total{scope="per_node"}"#));
+        assert!(metrics_text.contains(r#"mesh_stun_requests_total{outcome="malformed"}"#));
+        assert!(metrics_text.contains("mesh_process_resident_memory_bytes"));
         assert!(metrics_text.contains("mesh_disk_degraded 0"));
         assert!(!metrics_text.contains("BEGIN PRIVATE KEY"));
 

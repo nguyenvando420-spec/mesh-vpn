@@ -33,6 +33,9 @@ pub struct RelaySessionHandle {
     pub cancel: CancellationToken,
 }
 
+const MAX_TRACKED_NODE_BYTE_STATS: usize = 10_000;
+const THROTTLE_NOTICE_COOLDOWN_MS: u64 = 200;
+
 #[derive(Debug)]
 struct RelayPeerSession {
     pubkey: PublicKey,
@@ -40,6 +43,7 @@ struct RelayPeerSession {
     tx: mpsc::Sender<Bytes>,
     cancel: CancellationToken,
     tx_bucket: TokenBucket,
+    last_throttle_notice_ms: u64,
 }
 
 /// Outcome returned when processing an inbound WebSocket binary frame from a connected node.
@@ -70,6 +74,7 @@ pub struct RelayHub {
 struct RelayRouterState {
     by_node_id: HashMap<NodeId, RelayPeerSession>,
     pubkey_index: HashMap<[u8; 32], NodeId>,
+    forwarded_bytes_by_node: HashMap<NodeId, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -77,7 +82,13 @@ struct RelayMetrics {
     forwarded_bytes_total: AtomicU64,
     forwarded_packets_total: AtomicU64,
     dropped_packets_total: AtomicU64,
+    dropped_dest_offline_total: AtomicU64,
+    dropped_dest_queue_full_total: AtomicU64,
+    dropped_oversized_total: AtomicU64,
+    dropped_unauthenticated_total: AtomicU64,
     throttled_packets_total: AtomicU64,
+    throttled_bytes_per_node_total: AtomicU64,
+    throttled_bytes_global_total: AtomicU64,
 }
 
 /// Snapshot of Blind Relay counters exported via `/metrics` and `alert_worker`.
@@ -89,10 +100,22 @@ pub struct RelayMetricsSnapshot {
     pub forwarded_bytes_total: u64,
     /// Total forwarded frames.
     pub forwarded_packets_total: u64,
-    /// Total tail-dropped frames when destination queues (`256`) were full or peer was offline.
+    /// Total tail-dropped or rejected frames across all reasons.
     pub dropped_packets_total: u64,
+    /// Frames dropped because destination peer is offline or revoked (`reason="dest_offline"`).
+    pub dropped_dest_offline_total: u64,
+    /// Frames dropped because destination queue (`256`) was full (`reason="dest_queue_full"`).
+    pub dropped_dest_queue_full_total: u64,
+    /// Frames dropped because wire length exceeded `MAX_FRAME_SIZE` (`reason="oversized"`).
+    pub dropped_oversized_total: u64,
+    /// Frames dropped due to unregistered or revoked source (`reason="unauthenticated"`).
+    pub dropped_unauthenticated_total: u64,
     /// Total sender frames rejected by `20 Mbps` or global cap.
     pub throttled_packets_total: u64,
+    /// Total payload bytes throttled by per-node `20 Mbps` bucket (`scope="per_node"`).
+    pub throttled_bytes_per_node_total: u64,
+    /// Total payload bytes throttled by global VPS cap (`scope="global"`).
+    pub throttled_bytes_global_total: u64,
 }
 
 impl RelayHub {
@@ -106,14 +129,13 @@ impl RelayHub {
     #[must_use]
     pub fn new(store: Arc<ControlStore>, per_node_bps: u64, global_bps: u64) -> Self {
         let now_ms = store.clock().now_unix_ms();
+        let safe_per_node_bps = per_node_bps.max(MAX_FRAME_SIZE as u64);
+        let safe_global_bps = global_bps.max(MAX_FRAME_SIZE as u64);
+        let global_burst = (safe_global_bps / 4).max(MAX_FRAME_SIZE as u64);
         Self {
             store,
-            per_node_bps: per_node_bps.max(MAX_FRAME_SIZE as u64),
-            global_bucket: Mutex::new(TokenBucket::new(
-                global_bps.max(MAX_FRAME_SIZE as u64),
-                global_bps.max(MAX_FRAME_SIZE as u64),
-                now_ms,
-            )),
+            per_node_bps: safe_per_node_bps,
+            global_bucket: Mutex::new(TokenBucket::new(global_burst, safe_global_bps, now_ms)),
             next_seq: AtomicU64::new(1),
             state: Mutex::new(RelayRouterState::default()),
             metrics: RelayMetrics::default(),
@@ -130,13 +152,15 @@ impl RelayHub {
         let session_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(RELAY_QUEUE_CAPACITY);
         let cancel = CancellationToken::new();
+        let per_node_burst = (self.per_node_bps / 4).max(MAX_FRAME_SIZE as u64);
 
         let session = RelayPeerSession {
             pubkey,
             session_seq,
             tx,
             cancel: cancel.clone(),
-            tx_bucket: TokenBucket::new(self.per_node_bps, self.per_node_bps, now_ms),
+            tx_bucket: TokenBucket::new(per_node_burst, self.per_node_bps, now_ms),
+            last_throttle_notice_ms: 0,
         };
 
         if let Ok(mut guard) = self.state.lock() {
@@ -175,10 +199,28 @@ impl RelayHub {
         raw_frame: &[u8],
         now_ms: u64,
     ) -> RelayForwardOutcome {
-        if raw_frame.len() > MAX_FRAME_SIZE || self.store.is_node_revoked_ram(src_node_id) {
+        if raw_frame.len() > MAX_FRAME_SIZE {
+            self.metrics
+                .dropped_oversized_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .dropped_packets_total
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayForwardOutcome::Disconnect;
+        }
+        if self.store.is_node_revoked_ram(src_node_id) {
+            self.metrics
+                .dropped_unauthenticated_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .dropped_packets_total
+                .fetch_add(1, Ordering::Relaxed);
             return RelayForwardOutcome::Disconnect;
         }
         let Ok(decoded) = RelayFrame::decode(raw_frame) else {
+            self.metrics
+                .dropped_packets_total
+                .fetch_add(1, Ordering::Relaxed);
             return RelayForwardOutcome::Disconnect;
         };
 
@@ -189,8 +231,28 @@ impl RelayHub {
             } => {
                 self.forward_client_packet(src_node_id, src_pubkey, dst_pubkey, ciphertext, now_ms)
             }
-            RelayFrame::KeepAlive { .. } => RelayForwardOutcome::Forwarded,
+            RelayFrame::KeepAlive { .. } => {
+                let registered = self
+                    .state
+                    .lock()
+                    .map(|g| g.by_node_id.contains_key(&src_node_id))
+                    .unwrap_or(false);
+                if !registered {
+                    self.metrics
+                        .dropped_unauthenticated_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics
+                        .dropped_packets_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    RelayForwardOutcome::Disconnect
+                } else {
+                    RelayForwardOutcome::Forwarded
+                }
+            }
             RelayFrame::RelayToClientPacket { .. } | RelayFrame::ControlNotice { .. } => {
+                self.metrics
+                    .dropped_packets_total
+                    .fetch_add(1, Ordering::Relaxed);
                 RelayForwardOutcome::Disconnect
             }
         }
@@ -205,50 +267,89 @@ impl RelayHub {
         now_ms: u64,
     ) -> RelayForwardOutcome {
         let payload_len = u64::try_from(ciphertext.len()).unwrap_or(u64::MAX);
-        if let Ok(mut g_bucket) = self.global_bucket.lock()
-            && !g_bucket.try_consume(payload_len.max(1), now_ms)
+        let charge_bytes = payload_len.max(1);
+
+        // Step 1: Reject unregistered sessions and check per-node bucket BEFORE global bucket so an
+        // abusive node hitting its own 20 Mbps cap never drains the shared VPS quota (`US-027 AC2`).
         {
-            self.send_throttle_notice(src_node_id);
+            let Ok(mut guard) = self.state.lock() else {
+                return RelayForwardOutcome::Dropped;
+            };
+            let Some(src_sess) = guard.by_node_id.get_mut(&src_node_id) else {
+                self.metrics
+                    .dropped_unauthenticated_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .dropped_packets_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return RelayForwardOutcome::Disconnect;
+            };
+            if !src_sess.tx_bucket.can_consume(charge_bytes, now_ms) {
+                self.metrics
+                    .throttled_bytes_per_node_total
+                    .fetch_add(charge_bytes, Ordering::Relaxed);
+                self.metrics
+                    .throttled_packets_total
+                    .fetch_add(1, Ordering::Relaxed);
+                send_debounced_throttle_notice(src_sess, now_ms);
+                return RelayForwardOutcome::Throttled;
+            }
+        }
+
+        // Step 2: Check global VPS cap (`US-027 AC3`).
+        if let Ok(mut g_bucket) = self.global_bucket.lock()
+            && !g_bucket.try_consume(charge_bytes, now_ms)
+        {
+            self.metrics
+                .throttled_bytes_global_total
+                .fetch_add(charge_bytes, Ordering::Relaxed);
+            self.metrics
+                .throttled_packets_total
+                .fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut guard) = self.state.lock()
+                && let Some(src_sess) = guard.by_node_id.get_mut(&src_node_id)
+            {
+                send_debounced_throttle_notice(src_sess, now_ms);
+            }
             return RelayForwardOutcome::Throttled;
         }
 
+        // Step 3: Debit per-node token bucket and resolve active destination session.
         let dst_tx_opt = {
             let Ok(mut guard) = self.state.lock() else {
                 return RelayForwardOutcome::Dropped;
             };
-            let allowed = guard
-                .by_node_id
-                .get_mut(&src_node_id)
-                .is_some_and(|s| s.tx_bucket.try_consume(payload_len.max(1), now_ms));
-            if !allowed {
-                if let Some(sender) = guard.by_node_id.get(&src_node_id) {
-                    let notice = RelayFrame::ControlNotice {
-                        code: RelayNoticeCode::Throttled,
-                    };
-                    if let Ok(encoded) = notice.encode()
-                        && let Err(err) = sender.tx.try_send(encoded)
-                    {
-                        tracing::trace!(
-                            component = "relay_hub",
-                            event = "throttle_notice_dropped",
-                            error = %err,
-                            "dropped throttle notice because outbound queue is full"
-                        );
-                    }
-                }
+            let Some(src_sess) = guard.by_node_id.get_mut(&src_node_id) else {
+                self.metrics
+                    .dropped_unauthenticated_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .dropped_packets_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return RelayForwardOutcome::Disconnect;
+            };
+            if !src_sess.tx_bucket.try_consume(charge_bytes, now_ms) {
+                self.metrics
+                    .throttled_bytes_per_node_total
+                    .fetch_add(charge_bytes, Ordering::Relaxed);
                 self.metrics
                     .throttled_packets_total
                     .fetch_add(1, Ordering::Relaxed);
+                send_debounced_throttle_notice(src_sess, now_ms);
                 return RelayForwardOutcome::Throttled;
             }
             guard
                 .pubkey_index
                 .get(dst_pubkey.as_bytes())
                 .copied()
+                .filter(|dst_id| !self.store.is_node_revoked_ram(*dst_id))
                 .and_then(|dst_id| guard.by_node_id.get(&dst_id).map(|s| s.tx.clone()))
         };
 
         let Some(dst_tx) = dst_tx_opt else {
+            self.metrics
+                .dropped_dest_offline_total
+                .fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .dropped_packets_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -260,6 +361,9 @@ impl RelayHub {
             ciphertext,
         };
         let Ok(encoded) = outbound.encode() else {
+            self.metrics
+                .dropped_packets_total
+                .fetch_add(1, Ordering::Relaxed);
             return RelayForwardOutcome::Dropped;
         };
 
@@ -272,35 +376,27 @@ impl RelayHub {
                 self.metrics
                     .forwarded_bytes_total
                     .fetch_add(payload_len, Ordering::Relaxed);
+                if let Ok(mut guard) = self.state.lock()
+                    && (guard.forwarded_bytes_by_node.contains_key(&src_node_id)
+                        || guard.forwarded_bytes_by_node.len() < MAX_TRACKED_NODE_BYTE_STATS)
+                {
+                    let total = guard
+                        .forwarded_bytes_by_node
+                        .entry(src_node_id)
+                        .or_insert(0);
+                    *total = total.saturating_add(payload_len);
+                }
                 RelayForwardOutcome::Forwarded
             }
             Err(_) => {
+                self.metrics
+                    .dropped_dest_queue_full_total
+                    .fetch_add(1, Ordering::Relaxed);
                 self.metrics
                     .dropped_packets_total
                     .fetch_add(1, Ordering::Relaxed);
                 RelayForwardOutcome::Dropped
             }
-        }
-    }
-
-    fn send_throttle_notice(&self, src_node_id: NodeId) {
-        self.metrics
-            .throttled_packets_total
-            .fetch_add(1, Ordering::Relaxed);
-        if let Ok(guard) = self.state.lock()
-            && let Some(sender) = guard.by_node_id.get(&src_node_id)
-            && let Ok(encoded) = (RelayFrame::ControlNotice {
-                code: RelayNoticeCode::Throttled,
-            })
-            .encode()
-            && let Err(err) = sender.tx.try_send(encoded)
-        {
-            tracing::trace!(
-                component = "relay_hub",
-                event = "throttle_notice_dropped",
-                error = %err,
-                "dropped throttle notice because outbound queue is full"
-            );
         }
     }
 
@@ -374,8 +470,68 @@ impl RelayHub {
             forwarded_bytes_total: self.metrics.forwarded_bytes_total.load(Ordering::Relaxed),
             forwarded_packets_total: self.metrics.forwarded_packets_total.load(Ordering::Relaxed),
             dropped_packets_total: self.metrics.dropped_packets_total.load(Ordering::Relaxed),
+            dropped_dest_offline_total: self
+                .metrics
+                .dropped_dest_offline_total
+                .load(Ordering::Relaxed),
+            dropped_dest_queue_full_total: self
+                .metrics
+                .dropped_dest_queue_full_total
+                .load(Ordering::Relaxed),
+            dropped_oversized_total: self.metrics.dropped_oversized_total.load(Ordering::Relaxed),
+            dropped_unauthenticated_total: self
+                .metrics
+                .dropped_unauthenticated_total
+                .load(Ordering::Relaxed),
             throttled_packets_total: self.metrics.throttled_packets_total.load(Ordering::Relaxed),
+            throttled_bytes_per_node_total: self
+                .metrics
+                .throttled_bytes_per_node_total
+                .load(Ordering::Relaxed),
+            throttled_bytes_global_total: self
+                .metrics
+                .throttled_bytes_global_total
+                .load(Ordering::Relaxed),
         }
+    }
+
+    /// Snapshot of forwarded payload bytes broken down per `NodeId` (`US-048`).
+    #[must_use]
+    pub fn per_node_forwarded_bytes(&self) -> Vec<(NodeId, u64)> {
+        let mut entries: Vec<(NodeId, u64)> = self
+            .state
+            .lock()
+            .map(|g| {
+                g.forwarded_bytes_by_node
+                    .iter()
+                    .map(|(id, bytes)| (*id, *bytes))
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by_key(|(id, _)| id.to_string());
+        entries
+    }
+}
+
+fn send_debounced_throttle_notice(session: &mut RelayPeerSession, now_ms: u64) {
+    if session.last_throttle_notice_ms != 0
+        && now_ms.saturating_sub(session.last_throttle_notice_ms) < THROTTLE_NOTICE_COOLDOWN_MS
+    {
+        return;
+    }
+    session.last_throttle_notice_ms = now_ms;
+    if let Ok(encoded) = (RelayFrame::ControlNotice {
+        code: RelayNoticeCode::Throttled,
+    })
+    .encode()
+        && let Err(err) = session.tx.try_send(encoded)
+    {
+        tracing::trace!(
+            component = "relay_hub",
+            event = "throttle_notice_dropped",
+            error = %err,
+            "dropped throttle notice because outbound queue is full"
+        );
     }
 }
 
@@ -449,6 +605,102 @@ mod tests {
                 src_pubkey: src_pk,
                 ciphertext: vec![0xAB_u8; 64].into(),
             }
+        );
+    }
+
+    #[test]
+    fn test_relay_per_node_20mbps_and_global_fair_throttling_and_split_metrics() {
+        // Arrange
+        let dir = TempDir::new().expect("tempdir");
+        let now = 1_762_958_160_000_u64;
+        let clock = Arc::new(FakeClock::new(now));
+        let store = Arc::new(
+            ControlStore::open_with_clock(
+                ControlStoreConfig {
+                    db_path: dir.path().join("control.redb"),
+                    emergency_revocations_path: dir.path().join("emergency-revocations.bin"),
+                },
+                "10.100.0.0/24",
+                clock,
+            )
+            .expect("open store"),
+        );
+        // 20 Mbps per node (`2_500_000 B/s`) and 32 Mbps global cap (`4_000_000 B/s`)
+        let hub = RelayHub::new(Arc::clone(&store), 2_500_000, 4_000_000);
+        let a_id = NodeId::new_v7(now);
+        let a_pk = PublicKey::from_bytes([0x31_u8; 32]).expect("a pk");
+        let b_id = NodeId::new_v7(now + 1);
+        let b_pk = PublicKey::from_bytes([0x32_u8; 32]).expect("b pk");
+        let dst_id = NodeId::new_v7(now + 2);
+        let dst_pk = PublicKey::from_bytes([0x33_u8; 32]).expect("dst pk");
+
+        let mut a_sess = hub.register_session(a_id, a_pk, now);
+        let _b_sess = hub.register_session(b_id, b_pk, now);
+        let mut dst_sess = hub.register_session(dst_id, dst_pk, now);
+
+        // Unregistered node rejected before forwarding any byte (`US-027 AC1`)
+        let rogue_id = NodeId::new_v7(now + 9);
+        let rogue_pk = PublicKey::from_bytes([0x99_u8; 32]).expect("rogue pk");
+        let pkt = RelayFrame::ClientToPeerPacket {
+            dst_pubkey: dst_pk,
+            ciphertext: vec![0xCD_u8; 1_024].into(),
+        }
+        .encode()
+        .expect("encode");
+        assert_eq!(
+            hub.handle_inbound_frame(rogue_id, rogue_pk, &pkt, now),
+            RelayForwardOutcome::Disconnect
+        );
+
+        // Saturate node A's 20 Mbps burst bucket without draining B's fair access or overflowing global bucket
+        let mut throttled_count = 0_u64;
+        for _step in 0..700_u64 {
+            while dst_sess.rx.try_recv().is_ok() {}
+            let outcome = hub.handle_inbound_frame(a_id, a_pk, &pkt, now);
+            if outcome == RelayForwardOutcome::Throttled {
+                throttled_count += 1;
+            }
+        }
+        assert!(throttled_count > 0);
+        assert_eq!(
+            hub.handle_inbound_frame(b_id, b_pk, &pkt, now + 1),
+            RelayForwardOutcome::Forwarded
+        );
+
+        let snap = hub.metrics_snapshot();
+        assert!(snap.throttled_bytes_per_node_total > 0);
+        assert_eq!(snap.throttled_bytes_global_total, 0);
+        assert_eq!(snap.dropped_unauthenticated_total, 1);
+        let notice_bytes = a_sess.rx.try_recv().expect("throttle notice frame");
+        assert_eq!(
+            RelayFrame::decode(&notice_bytes).expect("decode notice"),
+            RelayFrame::ControlNotice {
+                code: mesh_proto::relay::RelayNoticeCode::Throttled,
+            }
+        );
+
+        // Verify global cap saturation hits global metric cleanly while per-node bucket still has capacity
+        let global_hub = RelayHub::new(Arc::clone(&store), 2_500_000, 40_000);
+        let _ga = global_hub.register_session(a_id, a_pk, now);
+        let _gd = global_hub.register_session(dst_id, dst_pk, now);
+        let mut global_throttled = 0_u64;
+        for _ in 0..25 {
+            if global_hub.handle_inbound_frame(a_id, a_pk, &pkt, now)
+                == RelayForwardOutcome::Throttled
+            {
+                global_throttled += 1;
+            }
+        }
+        assert!(global_throttled > 0);
+        let g_snap = global_hub.metrics_snapshot();
+        assert_eq!(g_snap.throttled_bytes_per_node_total, 0);
+        assert!(g_snap.throttled_bytes_global_total > 0);
+
+        // Disconnect revoked node drops session and notices cleanly
+        hub.disconnect_node(b_id, mesh_proto::relay::RelayNoticeCode::NodeRevoked);
+        assert_eq!(
+            hub.handle_inbound_frame(b_id, b_pk, &pkt, now + 5),
+            RelayForwardOutcome::Disconnect
         );
     }
 }

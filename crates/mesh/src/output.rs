@@ -108,9 +108,24 @@ const fn format_persistence_tier(tier: PersistenceTier) -> &'static str {
 #[must_use]
 pub(crate) fn format_status(resp: &AgentStatusResponse) -> String {
     let mut out = String::new();
+    let waiting_for_control = resp.daemon_state == DaemonState::Connecting
+        && (resp.netmap_version == 0
+            || resp
+                .server_connection
+                .as_ref()
+                .and_then(|c| c.last_error.as_deref())
+                .is_some_and(|e| e.contains("waiting_for_control")));
+    let state_suffix = if waiting_for_control {
+        " (waiting_for_control)"
+    } else {
+        ""
+    };
     push_line(
         &mut out,
-        format_args!("Daemon State : {}", format_daemon_state(resp.daemon_state)),
+        format_args!(
+            "Daemon State : {}{state_suffix}",
+            format_daemon_state(resp.daemon_state)
+        ),
     );
     push_line(
         &mut out,
@@ -140,6 +155,9 @@ pub(crate) fn format_status(resp: &AgentStatusResponse) -> String {
         &mut out,
         format_args!("Netmap       : v{}", resp.netmap_version),
     );
+    if let Some(exp_ms) = resp.key_expires_at_ms {
+        push_line(&mut out, format_args!("Key Expires  : {exp_ms} ms (epoch)"));
+    }
     if let Some(conn) = &resp.server_connection {
         push_line(
             &mut out,
@@ -874,5 +892,90 @@ mod tests {
         assert!(upgraded_text.contains("via=relay"));
         assert!(upgraded_text.contains("via=direct"));
         assert!(direct_fail_text.contains("direct UDP path could not be established"));
+    }
+
+    #[test]
+    fn test_format_waiting_for_control_netcheck_hints_and_bugreport_output() {
+        use mesh_core::defaults::DEFAULT_CONTROL_TCP_PORT;
+        use mesh_proto::agent_ipc::{
+            AgentStatusResponse, BugreportResponse, DaemonState, NetcheckResponse,
+            SelfNetworkStatus, ServerConnectionStatus, TlsAuthMode,
+        };
+        use mesh_proto::netmap::NatMappingKind;
+
+        use super::{format_bugreport, format_netcheck};
+
+        // Arrange: US-033 AC3 waiting_for_control status
+        let waiting_status = AgentStatusResponse {
+            daemon_state: DaemonState::Connecting,
+            node_id: None,
+            node_name: None,
+            fqdn: None,
+            overlay_ip: None,
+            overlay_cidr: None,
+            tun_interface_name: None,
+            tun_mtu: 1280,
+            netmap_version: 0,
+            key_expires_at_ms: None,
+            server_connection: Some(ServerConnectionStatus {
+                control_endpoint: "203.0.113.10:8443".to_owned(),
+                control_connected: false,
+                relay_endpoint: "203.0.113.10:8443".to_owned(),
+                relay_connected: false,
+                relay_rtt_ms: None,
+                stun_endpoints: vec![],
+                tls_auth_mode: TlsAuthMode::SpkiPin,
+                active_pin: None,
+                next_pin: None,
+                migration_pending_endpoint: None,
+                last_error: Some("waiting_for_control: cache checksum mismatch".to_owned()),
+            }),
+            self_network: SelfNetworkStatus {
+                local_udp_port: 51820,
+                bound_physical_interface: None,
+                nat_type: NatMappingKind::Unknown,
+                nat_classification_note: None,
+                overlay_conflict_warning: None,
+                macos_firewall_warning: None,
+                candidates: vec![],
+            },
+            peers: vec![],
+        };
+
+        // Act 1
+        let status_txt = format_status(&waiting_status);
+
+        // Assert 1
+        assert!(status_txt.contains("connecting (waiting_for_control)"));
+
+        // Arrange & Act 2: US-023 netcheck output + US-041 bugreport output
+        let netcheck = NetcheckResponse {
+            udp_egress_ok: false,
+            stun_reachable: false,
+            stun_endpoint_tested: None,
+            reflexive_ipv4: None,
+            ipv6_available: false,
+            nat_mapping: NatMappingKind::Unknown,
+            nat_note: "1-IP STUN heuristic".to_owned(),
+            control_tcp_reachable: true,
+            control_tcp_endpoint_tested: Some("203.0.113.10:8443".to_owned()),
+            relay_rtt_ms: Some(14.5),
+            diagnostic_hint: Some(format!(
+                "UDP blocked, relay-only: try port {DEFAULT_CONTROL_TCP_PORT}"
+            )),
+        };
+        let nc_txt = format_netcheck(&netcheck);
+        assert!(nc_txt.contains("UDP blocked, relay-only"));
+        assert!(nc_txt.contains("14.50 ms"));
+
+        let bugreport = BugreportResponse {
+            bundle_path: "/var/lib/meshd/bugreports/mesh-bugreport-1700000000.tar".to_owned(),
+            size_bytes: 8192,
+            scrubbed_items: 4,
+        };
+        let br_txt = format_bugreport(&bugreport);
+        assert!(br_txt.contains(".tar"));
+        assert!(br_txt.contains("8192 bytes"));
+        assert!(br_txt.contains("4 secret patterns scrubbed"));
     }
 }

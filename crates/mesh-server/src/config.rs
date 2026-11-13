@@ -23,6 +23,12 @@ pub const DEFAULT_STUN_PPS_PER_IP: u32 = 100;
 /// Minimum supported client control protocol version (`US-050`).
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 1;
 
+/// Default offline reaper threshold for ephemeral nodes in seconds (`5 minutes`, `US-006 AC2`).
+pub const DEFAULT_EPHEMERAL_TIMEOUT_SECS: u32 = 300;
+
+/// Default automatic hot backup cadence in seconds (`24 hours`, `US-045 AC1`).
+pub const DEFAULT_BACKUP_INTERVAL_SECS: u64 = 86_400;
+
 /// Control & Relay server TLS termination architecture mode (`US-047`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,10 +137,16 @@ pub struct ServerConfig {
     pub min_protocol_version: u16,
     /// Optional operational alert webhook URL (`US-049`).
     pub alert_webhook_url: Option<String>,
+    /// Optional Telegram chat ID used when `alert_webhook_url` points to `api.telegram.org`.
+    pub alert_telegram_chat_id: Option<String>,
     /// Allowed disk utilization percentage threshold before alert fires (`85%`).
     pub disk_alert_threshold_pct: u8,
     /// Allowed relay throughput ratio threshold (`80%`).
     pub relay_alert_threshold_pct: u8,
+    /// Default offline reap timeout in seconds for ephemeral nodes (`US-006 AC2`).
+    pub ephemeral_timeout_secs: u32,
+    /// Automatic hot backup schedule interval in seconds (`US-045 AC1`).
+    pub backup_interval_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -160,8 +172,11 @@ impl Default for ServerConfig {
             stun_pps_limit_per_ip: DEFAULT_STUN_PPS_PER_IP,
             min_protocol_version: MIN_SUPPORTED_PROTOCOL_VERSION,
             alert_webhook_url: None,
+            alert_telegram_chat_id: None,
             disk_alert_threshold_pct: 85,
             relay_alert_threshold_pct: 80,
+            ephemeral_timeout_secs: DEFAULT_EPHEMERAL_TIMEOUT_SECS,
+            backup_interval_secs: DEFAULT_BACKUP_INTERVAL_SECS,
         }
     }
 }
@@ -224,6 +239,17 @@ impl ServerConfig {
                 bind_ip = %control_ip,
                 "control_bind_ip is wildcard while tls_mode=reverse_proxy; 127.0.0.1 is strongly recommended"
             );
+        }
+
+        if self.ephemeral_timeout_secs == 0 {
+            return Err(AppError::invalid_argument(
+                "ephemeral_timeout_secs must be >= 1",
+            ));
+        }
+        if self.backup_interval_secs < 60 {
+            return Err(AppError::invalid_argument(
+                "backup_interval_secs must be >= 60",
+            ));
         }
 
         self.validate_acme_settings()?;

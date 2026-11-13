@@ -333,6 +333,18 @@ impl DiscoEngine {
         self.nat_mapping = nat_mapping;
     }
 
+    /// Immediately removes per-peer backoff, rate-limit, and pending probe state when peers are cut (`US-030`).
+    pub fn remove_peers(&mut self, peer_ids: &[NodeId]) {
+        if peer_ids.is_empty() {
+            return;
+        }
+        for id in peer_ids {
+            self.per_peer.remove(id);
+        }
+        self.pending_pings
+            .retain(|_, pending| !peer_ids.contains(&pending.peer_id));
+    }
+
     /// Returns an immutable metrics snapshot.
     #[must_use]
     pub fn metrics_snapshot(&self) -> DiscoMetricsSnapshot {
@@ -1535,5 +1547,79 @@ mod tests {
         ));
         assert_eq!(matched_tx, Some(*expected_tx_id));
         let _unused = id_a;
+    }
+
+    // Traces: US-030
+    #[test]
+    fn test_disco_remove_peers_purges_trackers_and_pending_pings() {
+        // Arrange
+        let dk_a = DiscoKeypair::generate();
+        let dk_b = DiscoKeypair::generate();
+        let id_a = NodeId::from_bytes([11u8; 16]);
+        let id_b = NodeId::from_bytes([22u8; 16]);
+        let mut map_a = PeerMap::new(id_a, NodeKeypair::generate());
+        let ep: SocketAddr = "198.51.100.12:51820".parse().expect("ep");
+        map_a.apply_diff(&NetmapSnapshot {
+            netmap_version: 1,
+            generated_at_ms: 1000,
+            overlay_cidr: "10.100.0.0/16".parse().expect("cidr"),
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: mesh_proto::netmap::RelayMap {
+                endpoint_version: 1,
+                control_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                relay_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                stun_udp_endpoints: vec![],
+            },
+            pin_set: mesh_proto::netmap::PinSetDto {
+                active_pin: mesh_core::SpkiPin::from_sha256_bytes([1u8; 32]),
+                next_pin: None,
+            },
+            peers: vec![PeerEntry {
+                node_id: id_b,
+                name: NodeName::parse("peer-b").expect("name"),
+                fqdn: "peer-b.mesh.internal".to_owned(),
+                overlay_ip: OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 2)).expect("ip"),
+                node_pubkey: NodeKeypair::generate().public_key(),
+                disco_pubkey: dk_b.public_key(),
+                endpoints: vec![CandidateEndpoint {
+                    addr: ep,
+                    source: CandidateSource::Reflexive,
+                }],
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            }],
+        });
+
+        let mut disco_a = DiscoEngine::new(dk_a, DiscoConfig::default());
+        let cand_ctx = CandidateFilterContext {
+            overlay_cidr: "10.100.0.0/16".parse().expect("cidr"),
+            control_tcp_endpoint: None,
+            stun_udp_endpoint: None,
+        };
+        let filter = DiscoFilterContext {
+            candidates: &cand_ctx,
+            excluded_stun: &[],
+        };
+        let built = disco_a.build_interactive_probes(
+            &map_a,
+            &filter,
+            InteractivePingRequest {
+                peer_id: id_b,
+                force_direct: true,
+                now_ms: 1_000,
+                timeout_ms: 500,
+            },
+        );
+        assert_eq!(built.len(), 1);
+        disco_a.per_peer.entry(id_b).or_default();
+        assert!(!disco_a.pending_pings.is_empty());
+
+        // Act
+        disco_a.remove_peers(&[id_b]);
+
+        // Assert
+        assert!(!disco_a.per_peer.contains_key(&id_b));
+        assert!(disco_a.pending_pings.is_empty());
     }
 }

@@ -33,4 +33,7 @@ pub use revoked_ram::{
     OsEmergencyFileBackend, RevokedSet, read_slot_min_netmap_version,
 };
 pub use schema::{SCHEMA_VERSION, VERSION_LEASE_STEP};
-pub use store::{ControlStore, ControlStoreConfig, MonotonicNetmapVersion, RevokeStoreOutcome};
+pub use store::{
+    ControlStore, ControlStoreConfig, MonotonicNetmapVersion, NodeDirectoryEntry,
+    RevokeStoreOutcome,
+};

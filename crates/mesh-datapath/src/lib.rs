@@ -12,7 +12,7 @@ pub mod stun_client;
 
 pub use cryptokey::{
     CryptokeyDropReason, CryptokeyMetricsSnapshot, CryptokeyValidator, FilterProtocol,
-    PacketFilterPolicy, PacketFilterRule, ParsedIpv4Header, PortRange,
+    PacketFilterPolicy, PacketFilterRule, ParsedIpv4Header, PortRange, parse_inbound_filter_spec,
 };
 pub use disco_engine::{
     DiscoConfig, DiscoEngine, DiscoEvent, DiscoFilterContext, DiscoMetricsSnapshot,

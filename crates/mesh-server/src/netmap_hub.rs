@@ -267,7 +267,10 @@ impl NetmapHub {
 
         let mut peers = Vec::new();
         for rec in nodes {
-            if rec.status != NodeStatus::Active {
+            if rec.status != NodeStatus::Active || rec.is_key_expired_at(now_ms) {
+                continue;
+            }
+            if self.store.is_node_revoked_ram(rec.node_id) {
                 continue;
             }
             let Some(overlay_ip) = rec.overlay_ip else {
@@ -276,6 +279,9 @@ impl NetmapHub {
             let Ok(node_pubkey) = PublicKey::from_bytes(rec.pubkey) else {
                 continue;
             };
+            if self.store.is_pubkey_revoked_ram(&node_pubkey) {
+                continue;
+            }
             let Ok(disco_pubkey) = PublicKey::from_bytes(rec.disco_pubkey) else {
                 continue;
             };
@@ -293,7 +299,7 @@ impl NetmapHub {
                 disco_pubkey,
                 endpoints: rec.endpoints,
                 relay_home: ep_cfg.relay_tcp_endpoint.clone(),
-                key_expires_at_ms: Some(rec.key_expires_at_ms),
+                key_expires_at_ms: rec.key_expires_at_ms,
                 online: is_online,
             });
         }
@@ -470,6 +476,7 @@ mod tests {
                     reusable: false,
                     max_uses: None,
                     ephemeral: false,
+                    ephemeral_timeout_secs: None,
                     ttl_secs: 3_600,
                     now_unix_ms: now,
                 },
@@ -525,5 +532,122 @@ mod tests {
             "revoked",
             now,
         );
+    }
+
+    #[test]
+    fn test_build_snapshot_excludes_ram_revoked_and_clock_expired_nodes() {
+        // Arrange: two nodes remain `Active` in `redb`; one revoked via RAM/EmergencySlot on EIO,
+        // and the second past its `key_expires_at_ms` TTL (`HR-W21-12`).
+        let dir = TempDir::new().expect("tempdir");
+        let now = 1_762_958_151_000_u64;
+        let clock = Arc::new(FakeClock::new(now));
+        let store = Arc::new(
+            ControlStore::open_with_clock(
+                ControlStoreConfig {
+                    db_path: dir.path().join("control.redb"),
+                    emergency_revocations_path: dir.path().join("emergency-revocations.bin"),
+                },
+                "10.100.0.0/24",
+                Arc::clone(&clock) as Arc<dyn mesh_core::Clock>,
+            )
+            .expect("open store"),
+        );
+        store
+            .ensure_or_init_identity(&["203.0.113.10".to_owned()], 365)
+            .expect("init id");
+
+        let token_hash = [0x44_u8; 32];
+        store
+            .create_preauth_key(
+                &CreatePreAuthKeyInput {
+                    key_id: KeyId::new_v7(now),
+                    token_hash,
+                    label: None,
+                    bound_node_name: None,
+                    reusable: true,
+                    max_uses: Some(5),
+                    ephemeral: false,
+                    ephemeral_timeout_secs: None,
+                    ttl_secs: 3_600,
+                    now_unix_ms: now,
+                },
+                "admin",
+            )
+            .expect("create key");
+
+        let (reg_healthy, _) = store
+            .register_node(&RegisterNodeInput {
+                pubkey: PublicKey::from_bytes([0x51_u8; 32]).expect("pk1"),
+                disco_pubkey: PublicKey::from_bytes([0x52_u8; 32]).expect("dpk1"),
+                previous_node_pubkey: None,
+                requested_name: NodeName::parse("healthy-node").expect("name1"),
+                preauth_token_hash: token_hash,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: 86_400_000,
+                now_unix_ms: now,
+            })
+            .expect("register healthy");
+        let (reg_degraded_rev, _) = store
+            .register_node(&RegisterNodeInput {
+                pubkey: PublicKey::from_bytes([0x53_u8; 32]).expect("pk2"),
+                disco_pubkey: PublicKey::from_bytes([0x54_u8; 32]).expect("dpk2"),
+                previous_node_pubkey: None,
+                requested_name: NodeName::parse("degraded-rev-node").expect("name2"),
+                preauth_token_hash: token_hash,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: 86_400_000,
+                now_unix_ms: now,
+            })
+            .expect("register degraded rev");
+        let (_reg_short_ttl, _) = store
+            .register_node(&RegisterNodeInput {
+                pubkey: PublicKey::from_bytes([0x55_u8; 32]).expect("pk3"),
+                disco_pubkey: PublicKey::from_bytes([0x56_u8; 32]).expect("dpk3"),
+                previous_node_pubkey: None,
+                requested_name: NodeName::parse("ttl-expired-node").expect("name3"),
+                preauth_token_hash: token_hash,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: 10_000,
+                now_unix_ms: now,
+            })
+            .expect("register ttl expired");
+
+        // Act: revoke node 2 while redb write fails (stays Active in redb, blocked in RAM) and advance
+        // clock past node 3's key_expires_at_ms without running DB sweeper yet.
+        store.inject_redb_failure(false, true);
+        let rev_res = store
+            .revoke_node(reg_degraded_rev.record.node_id, "admin")
+            .expect("emergency revoke");
+        assert_eq!(
+            rev_res.persistence_tier,
+            mesh_proto::admin_ipc::PersistenceTier::EmergencySlot
+        );
+        store.inject_redb_failure(false, false);
+        clock.advance(20_000);
+
+        let hub = NetmapHub::new(
+            store,
+            "203.0.113.10:8443".to_owned(),
+            "203.0.113.10:8443".to_owned(),
+            vec!["203.0.113.10:3478".to_owned()],
+            "mesh.internal".to_owned(),
+        );
+        let snapshot = hub.build_snapshot(None).expect("snapshot");
+
+        // Assert: ONLY healthy-node remains visible to connected peers
+        let peer_ids: Vec<_> = snapshot.peers.iter().map(|p| p.node_id).collect();
+        assert_eq!(peer_ids, vec![reg_healthy.record.node_id]);
     }
 }

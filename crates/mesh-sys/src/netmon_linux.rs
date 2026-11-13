@@ -1,12 +1,17 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Error};
 use std::mem::size_of;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::ptr;
 
 use crate::error::{SysError, SysResult};
 
 const NETLINK_MSG_HDR_LEN: usize = 16;
+
+/// Linux `ENOBUFS` OS error code reported when `NETLINK_ROUTE` receive buffers overflow.
+pub const ENOBUFS_ERRNO: i32 = libc::ENOBUFS;
 
 /// Coarse network change event decoded from Linux `NETLINK_ROUTE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,27 +22,191 @@ pub enum RawNetEventKind {
     PhysicalInterfaceChanged,
 }
 
-/// Queries the primary physical Linux interface index from the active default route table
-/// (`/proc/net/route` with `/proc/net/ipv6_route` fallback), ignoring virtual tunnel/loopback NICs.
-pub fn query_primary_physical_if_index() -> SysResult<u32> {
+/// Snapshot of a Linux network interface unicast address and subnet prefix (`US-035`, `US-037`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxInterfaceAddress {
+    pub if_index: u32,
+    pub name: String,
+    pub ip: IpAddr,
+    pub prefix_len: u8,
+    pub is_up: bool,
+    pub is_virtual: bool,
+}
+
+/// Queries the primary physical Linux interface `(if_index, name)` from the active default route
+/// table (`/proc/net/route` with `/proc/net/ipv6_route` and active physical `getifaddrs`
+/// fallbacks), ignoring virtual tunnel/loopback NICs.
+pub fn query_primary_physical_interface() -> SysResult<(u32, String)> {
     if let Ok(content) = fs::read_to_string("/proc/net/route")
         && let Some(ifname) = pick_primary_ipv4_default_iface(&content)
         && let Some(idx) = lookup_if_index(&ifname)
     {
-        return Ok(idx);
+        return Ok((idx, ifname));
     }
 
     if let Ok(content) = fs::read_to_string("/proc/net/ipv6_route")
         && let Some(ifname) = pick_primary_ipv6_default_iface(&content)
         && let Some(idx) = lookup_if_index(&ifname)
     {
-        return Ok(idx);
+        return Ok((idx, ifname));
+    }
+
+    if let Ok(addrs) = list_interface_addresses()
+        && let Some(found) = addrs
+            .into_iter()
+            .find(|a| a.is_up && !a.is_virtual && a.if_index != 0 && is_usable_linux_ip(a.ip))
+    {
+        return Ok((found.if_index, found.name));
     }
 
     Err(SysError::io(
-        "query_primary_physical_if_index",
+        "query_primary_physical_interface",
         Error::from_raw_os_error(libc::ENETUNREACH),
     ))
+}
+
+/// Queries the primary physical Linux interface index from the active default route table
+/// (`/proc/net/route` with `/proc/net/ipv6_route` fallback), ignoring virtual tunnel/loopback NICs.
+pub fn query_primary_physical_if_index() -> SysResult<u32> {
+    query_primary_physical_interface().map(|(idx, _)| idx)
+}
+
+/// Resolves a Linux interface name from its numeric interface index via `if_indextoname`.
+#[must_use]
+pub fn lookup_if_name(if_index: u32) -> Option<String> {
+    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: `buf` is a stack array of size `IF_NAMESIZE` required by `if_indextoname`.
+    let ptr = unsafe { libc::if_indextoname(if_index, buf.as_mut_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Non-null `if_indextoname` result guarantees NUL-terminated bytes inside `buf`.
+    Some(
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Enumerates active Linux interface unicast addresses and CIDR prefixes via `getifaddrs` (`US-037`).
+pub fn list_interface_addresses() -> SysResult<Vec<LinuxInterfaceAddress>> {
+    const OP: &str = "netmon_linux::list_interface_addresses";
+    let mut list: *mut libc::ifaddrs = ptr::null_mut();
+    // SAFETY: `list` is initialized to null and populated by `libc::getifaddrs`.
+    if unsafe { libc::getifaddrs(&raw mut list) } != 0 {
+        return Err(SysError::io(OP, Error::last_os_error()));
+    }
+
+    let mut out = Vec::new();
+    let mut cursor = list;
+    let mut visited = 0usize;
+
+    while !cursor.is_null() && visited < 4096 {
+        visited += 1;
+        // SAFETY: `cursor` traverses non-null nodes returned by `getifaddrs` prior to `freeifaddrs`.
+        let ifa = unsafe { &*cursor };
+        cursor = ifa.ifa_next;
+
+        if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
+            continue;
+        }
+        // SAFETY: Non-null `ifa_name` points to a valid NUL-terminated C string from `getifaddrs`.
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let flags = ifa.ifa_flags as libc::c_int;
+        let is_up = (flags & libc::IFF_UP) != 0;
+        let is_virtual = (flags & libc::IFF_LOOPBACK) != 0 || is_virtual_linux_ifname(&name);
+        let if_index = lookup_if_index(&name).unwrap_or(0);
+
+        // SAFETY: Non-null `ifa_addr` points to a valid `libc::sockaddr` allocated by `getifaddrs`.
+        let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
+        match family {
+            libc::AF_INET => {
+                // SAFETY: `sa_family == AF_INET` ensures `ifa_addr` holds `libc::sockaddr_in`.
+                let sa_in =
+                    unsafe { ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in>()) };
+                let ip = Ipv4Addr::from(sa_in.sin_addr.s_addr.to_ne_bytes());
+                let prefix_len = read_linux_ipv4_mask_prefix(ifa.ifa_netmask);
+                out.push(LinuxInterfaceAddress {
+                    if_index,
+                    name,
+                    ip: IpAddr::V4(ip),
+                    prefix_len,
+                    is_up,
+                    is_virtual,
+                });
+            }
+            libc::AF_INET6 => {
+                // SAFETY: `sa_family == AF_INET6` ensures `ifa_addr` holds `libc::sockaddr_in6`.
+                let sa_in6 =
+                    unsafe { ptr::read_unaligned(ifa.ifa_addr.cast::<libc::sockaddr_in6>()) };
+                let ip = Ipv6Addr::from(sa_in6.sin6_addr.s6_addr);
+                let prefix_len = read_linux_ipv6_mask_prefix(ifa.ifa_netmask);
+                out.push(LinuxInterfaceAddress {
+                    if_index,
+                    name,
+                    ip: IpAddr::V6(ip),
+                    prefix_len,
+                    is_up,
+                    is_virtual,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // SAFETY: `list` was allocated by `libc::getifaddrs` and is freed exactly once here.
+    unsafe { libc::freeifaddrs(list) };
+    Ok(out)
+}
+
+fn read_linux_ipv4_mask_prefix(netmask_ptr: *const libc::sockaddr) -> u8 {
+    if netmask_ptr.is_null() {
+        return 32;
+    }
+    // SAFETY: Non-null `ifa_netmask` points to a valid `libc::sockaddr` from `getifaddrs`.
+    let family = i32::from(unsafe { (*netmask_ptr).sa_family });
+    if family != libc::AF_INET {
+        return 32;
+    }
+    // SAFETY: `sa_family == AF_INET` ensures `netmask_ptr` holds `libc::sockaddr_in`.
+    let mask_in = unsafe { ptr::read_unaligned(netmask_ptr.cast::<libc::sockaddr_in>()) };
+    ipv4_netmask_to_prefix(Ipv4Addr::from(mask_in.sin_addr.s_addr.to_ne_bytes()))
+}
+
+fn read_linux_ipv6_mask_prefix(netmask_ptr: *const libc::sockaddr) -> u8 {
+    if netmask_ptr.is_null() {
+        return 128;
+    }
+    // SAFETY: Non-null `ifa_netmask` points to a valid `libc::sockaddr` from `getifaddrs`.
+    let family = i32::from(unsafe { (*netmask_ptr).sa_family });
+    if family != libc::AF_INET6 {
+        return 128;
+    }
+    // SAFETY: `sa_family == AF_INET6` ensures `netmask_ptr` holds `libc::sockaddr_in6`.
+    let mask_in6 = unsafe { ptr::read_unaligned(netmask_ptr.cast::<libc::sockaddr_in6>()) };
+    ipv6_netmask_to_prefix(mask_in6.sin6_addr.s6_addr)
+}
+
+fn ipv4_netmask_to_prefix(mask: Ipv4Addr) -> u8 {
+    let bits = u32::from(mask);
+    u8::try_from(bits.leading_ones()).unwrap_or(32)
+}
+
+fn ipv6_netmask_to_prefix(octets: [u8; 16]) -> u8 {
+    let bits = u128::from_be_bytes(octets);
+    u8::try_from(bits.leading_ones()).unwrap_or(128)
+}
+
+fn is_usable_linux_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_loopback() && !v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let first_seg = v6.segments().first().copied().unwrap_or(0);
+            !v6.is_unspecified() && !v6.is_loopback() && (first_seg & 0xffc0) != 0xfe80
+        }
+    }
 }
 
 /// Opens a non-blocking `NETLINK_ROUTE` multicast socket subscribed to link, address, and route changes.
@@ -344,5 +513,24 @@ eth0\t00000000\t010011AC\t0003\t0\t0\t100\t00000000\t0\t0\t0
             ]
         );
         assert!(parse_netlink_messages(&[0x04, 0x00, 0x00, 0x00]).is_empty());
+    }
+
+    #[test]
+    fn test_netmon_linux_netmask_prefix_and_usable_ip_helpers() {
+        // Arrange / Act / Assert
+        assert_eq!(
+            super::ipv4_netmask_to_prefix(super::Ipv4Addr::new(255, 192, 0, 0)),
+            10
+        );
+        assert_eq!(
+            super::ipv4_netmask_to_prefix(super::Ipv4Addr::new(255, 255, 255, 0)),
+            24
+        );
+        assert!(!super::is_usable_linux_ip(super::IpAddr::V4(
+            super::Ipv4Addr::new(169, 254, 12, 34)
+        )));
+        assert!(super::is_usable_linux_ip(super::IpAddr::V4(
+            super::Ipv4Addr::new(192, 168, 1, 50)
+        )));
     }
 }

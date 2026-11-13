@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 use std::io::{self, Error};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::ptr;
 
@@ -18,6 +19,9 @@ const DARWIN_RTA_DST: i32 = 0x1;
 const DARWIN_RTA_GATEWAY: i32 = 0x2;
 const DARWIN_RTA_NETMASK: i32 = 0x4;
 
+/// macOS `ENOBUFS` OS error code reported when `PF_ROUTE` receive buffers overflow.
+pub const ENOBUFS_ERRNO: i32 = libc::ENOBUFS;
+
 /// Coarse network change event decoded from macOS `PF_ROUTE` BSD routing sockets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawNetEventKind {
@@ -27,21 +31,181 @@ pub enum RawNetEventKind {
     PhysicalInterfaceChanged,
 }
 
-/// Queries the primary physical macOS interface index (e.g. `en0`) from the kernel default route
-/// via `sysctl(NET_RT_DUMP)` with an active non-virtual `getifaddrs` fallback, never choosing `utun*`.
-pub fn query_primary_physical_if_index() -> SysResult<u32> {
-    if let Some(idx) = query_default_route_if_index_via_sysctl()? {
-        return Ok(idx);
+/// Snapshot of a macOS network interface unicast address and subnet prefix (`US-035`, `US-037`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacOsInterfaceAddress {
+    pub if_index: u32,
+    pub name: String,
+    pub ip: IpAddr,
+    pub prefix_len: u8,
+    pub is_up: bool,
+    pub is_virtual: bool,
+}
+
+/// Resolves a macOS interface name from its numeric interface index via `if_indextoname`.
+#[must_use]
+pub fn lookup_if_name(if_index: u32) -> Option<String> {
+    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: `buf` is a stack array of size `IF_NAMESIZE` required by `if_indextoname`.
+    let ptr = unsafe { libc::if_indextoname(if_index, buf.as_mut_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Non-null `if_indextoname` return guarantees NUL-terminated bytes inside `buf`.
+    Some(
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Queries the primary physical macOS interface `(if_index, name)` (e.g. `(4, "en0")`) from the
+/// kernel default route via `sysctl(NET_RT_DUMP)` with an active non-virtual `getifaddrs`
+/// fallback, never selecting virtual interfaces (`utun*`, `awdl*`, `llw*`, `bridge*`, `lo*`).
+pub fn query_primary_physical_interface() -> SysResult<(u32, String)> {
+    if let Some(idx) = query_default_route_if_index_via_sysctl()?
+        && let Some(name) = lookup_if_name(idx)
+        && !is_virtual_macos_ifname(&name)
+    {
+        return Ok((idx, name));
     }
 
-    if let Some(idx) = query_active_physical_if_index_via_ifaddrs()? {
-        return Ok(idx);
+    if let Some(idx) = query_active_physical_if_index_via_ifaddrs()?
+        && let Some(name) = lookup_if_name(idx)
+        && !is_virtual_macos_ifname(&name)
+    {
+        return Ok((idx, name));
     }
 
     Err(SysError::io(
-        "query_primary_physical_if_index",
+        "query_primary_physical_interface",
         Error::from_raw_os_error(libc::ENETUNREACH),
     ))
+}
+
+/// Queries the primary physical macOS interface index (e.g. `en0`) from the kernel default route
+/// via `sysctl(NET_RT_DUMP)` with an active non-virtual `getifaddrs` fallback, never choosing `utun*`.
+pub fn query_primary_physical_if_index() -> SysResult<u32> {
+    query_primary_physical_interface().map(|(idx, _)| idx)
+}
+
+/// Enumerates active macOS interface unicast addresses and CIDR prefixes via `getifaddrs` (`US-037`).
+pub fn list_interface_addresses() -> SysResult<Vec<MacOsInterfaceAddress>> {
+    const OP: &str = "netmon_macos::list_interface_addresses";
+    let mut list: *mut libc::ifaddrs = ptr::null_mut();
+    // SAFETY: `list` is initialized to null and populated by `libc::getifaddrs`.
+    if unsafe { libc::getifaddrs(&raw mut list) } != 0 {
+        return Err(SysError::io(OP, Error::last_os_error()));
+    }
+
+    let mut out = Vec::new();
+    let mut cursor = list;
+    let mut visited = 0usize;
+
+    while !cursor.is_null() && visited < 4096 {
+        visited += 1;
+        // SAFETY: `cursor` traverses valid nodes allocated by `getifaddrs` before `freeifaddrs`.
+        let ifa = unsafe { &*cursor };
+        cursor = ifa.ifa_next;
+
+        if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
+            continue;
+        }
+        // SAFETY: Non-null `ifa_name` points to a valid NUL-terminated C string from `getifaddrs`.
+        let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let flags = ifa.ifa_flags as libc::c_int;
+        let is_up = (flags & libc::IFF_UP) != 0 && (flags & libc::IFF_RUNNING) != 0;
+        let is_virtual = (flags & libc::IFF_LOOPBACK) != 0 || is_virtual_macos_ifname(&name);
+        // SAFETY: `ifa.ifa_name` is a valid NUL-terminated C string.
+        let if_index = unsafe { libc::if_nametoindex(ifa.ifa_name) };
+
+        let addr_bytes = copy_darwin_sockaddr_bytes(ifa.ifa_addr);
+        let mask_bytes = copy_darwin_sockaddr_bytes(ifa.ifa_netmask);
+        if let Some((ip, prefix_len)) = parse_darwin_addr_and_mask(&addr_bytes, mask_bytes.as_ref())
+        {
+            out.push(MacOsInterfaceAddress {
+                if_index,
+                name,
+                ip,
+                prefix_len,
+                is_up,
+                is_virtual,
+            });
+        }
+    }
+
+    // SAFETY: `list` came from `libc::getifaddrs` and must be freed with `libc::freeifaddrs`.
+    unsafe { libc::freeifaddrs(list) };
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DarwinSockaddrBytes {
+    len: usize,
+    data: [u8; 28],
+}
+
+fn copy_darwin_sockaddr_bytes(sa_ptr: *const libc::sockaddr) -> Option<DarwinSockaddrBytes> {
+    if sa_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: Non-null `sockaddr` from `getifaddrs` has at least its leading `sa_len: u8` byte.
+    let sa_len = usize::from(unsafe { *sa_ptr.cast::<u8>() });
+    let bounded = sa_len.min(28);
+    if bounded < 2 {
+        return None;
+    }
+    let mut data = [0u8; 28];
+    // SAFETY: Darwin sockaddrs store their valid length in the leading `sa_len` byte (`bounded`).
+    let src = unsafe { std::slice::from_raw_parts(sa_ptr.cast::<u8>(), bounded) };
+    if let Some(dst) = data.get_mut(..bounded) {
+        dst.copy_from_slice(src);
+    }
+    Some(DarwinSockaddrBytes { len: bounded, data })
+}
+
+fn parse_darwin_addr_and_mask(
+    addr: &Option<DarwinSockaddrBytes>,
+    mask: Option<&DarwinSockaddrBytes>,
+) -> Option<(IpAddr, u8)> {
+    let addr = addr.as_ref()?;
+    let family = i32::from(addr.data.get(1).copied().unwrap_or(0));
+    match family {
+        libc::AF_INET => {
+            if addr.len < 8 {
+                return None;
+            }
+            let octets: [u8; 4] = addr.data.get(4..8).and_then(|s| s.try_into().ok())?;
+            let ip = IpAddr::V4(Ipv4Addr::from(octets));
+            let prefix_len = match mask {
+                Some(m) if m.len >= 4 => {
+                    let mask_octets: [u8; 4] = m.data.get(4..8).and_then(|s| s.try_into().ok())?;
+                    u8::try_from(u32::from_be_bytes(mask_octets).leading_ones()).unwrap_or(32)
+                }
+                _ => 32,
+            };
+            Some((ip, prefix_len))
+        }
+        libc::AF_INET6 => {
+            if addr.len < 24 {
+                return None;
+            }
+            let octets: [u8; 16] = addr.data.get(8..24).and_then(|s| s.try_into().ok())?;
+            let ip = IpAddr::V6(Ipv6Addr::from(octets));
+            let prefix_len = match mask {
+                Some(m) if m.len >= 8 => {
+                    let mask_octets: [u8; 16] =
+                        m.data.get(8..24).and_then(|s| s.try_into().ok())?;
+                    u8::try_from(u128::from_be_bytes(mask_octets).leading_ones()).unwrap_or(128)
+                }
+                _ => 128,
+            };
+            Some((ip, prefix_len))
+        }
+        _ => None,
+    }
 }
 
 /// Opens a non-blocking, close-on-exec macOS `PF_ROUTE` raw routing socket for async change events.
@@ -331,14 +495,9 @@ fn query_active_physical_if_index_via_ifaddrs() -> SysResult<Option<u32>> {
 }
 
 fn is_physical_if_index(if_index: u32) -> bool {
-    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
-    // SAFETY: `buf` is a stack array of size `IF_NAMESIZE` matching `if_indextoname`.
-    let ptr = unsafe { libc::if_indextoname(if_index, buf.as_mut_ptr()) };
-    if ptr.is_null() {
+    let Some(name) = lookup_if_name(if_index) else {
         return false;
-    }
-    // SAFETY: Non-null return guarantees `buf` contains a valid NUL-terminated name.
-    let name = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+    };
     !is_virtual_macos_ifname(&name)
 }
 
@@ -489,6 +648,43 @@ mod tests {
                 RawNetEventKind::AddressChanged,
                 RawNetEventKind::InterfaceUpChanged,
             ]
+        );
+    }
+
+    #[test]
+    fn test_netmon_macos_parses_compressed_bsd_netmask_safely() {
+        // Arrange: compressed /24 BSD netmask has sa_len = 7 (trailing .0 omitted)
+        let mut addr_buf = [0u8; 28];
+        write_at(
+            &mut addr_buf,
+            0,
+            &[16, libc::AF_INET as u8, 0, 0, 100, 64, 1, 20],
+        );
+        let addr = Some(super::DarwinSockaddrBytes {
+            len: 16,
+            data: addr_buf,
+        });
+        let mut mask_buf = [0u8; 28];
+        write_at(
+            &mut mask_buf,
+            0,
+            &[7, libc::AF_INET as u8, 0, 0, 255, 255, 255],
+        );
+        let mask = super::DarwinSockaddrBytes {
+            len: 7,
+            data: mask_buf,
+        };
+
+        // Act
+        let parsed = super::parse_darwin_addr_and_mask(&addr, Some(&mask));
+
+        // Assert
+        assert_eq!(
+            parsed,
+            Some((
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 1, 20)),
+                24
+            ))
         );
     }
 }

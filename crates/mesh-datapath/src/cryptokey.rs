@@ -4,9 +4,9 @@ use std::net::Ipv4Addr;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tracing::warn;
+use tracing::{error, warn};
 
-use mesh_core::{OverlayCidr, OverlayIp};
+use mesh_core::{AppError, AppResult, OverlayCidr, OverlayIp};
 
 const IPV4_MIN_HEADER_LEN: usize = 20;
 const PROTO_ICMP: u8 = 1;
@@ -134,6 +134,8 @@ pub enum PacketFilterPolicy {
     AllowAllOverlay,
     /// Allow only packets matching at least one explicit allow rule (default deny).
     AllowRules(Vec<PacketFilterRule>),
+    /// Block packets matching any explicit deny rule while allowing remaining overlay packets (`US-018`).
+    DenyRules(Vec<PacketFilterRule>),
     /// Drop every packet (fail-closed state when policy reload fails validation).
     FailClosed,
 }
@@ -143,9 +145,136 @@ impl PacketFilterPolicy {
         match self {
             Self::AllowAllOverlay => true,
             Self::AllowRules(rules) => rules.iter().any(|rule| rule.matches(header)),
+            Self::DenyRules(rules) => {
+                if header.is_non_initial_fragment
+                    && rules.iter().any(|rule| rule.dst_ports.is_some())
+                {
+                    return false;
+                }
+                !rules.iter().any(|rule| rule.matches(header))
+            }
             Self::FailClosed => false,
         }
     }
+}
+
+/// Parses a human/config inbound filter rule list into [`PacketFilterPolicy`] (`US-018`).
+///
+/// Supported syntax (comma or semicolon delimited):
+/// - `""` or `"allow-all"` -> [`PacketFilterPolicy::AllowAllOverlay`]
+/// - `"fail-closed"` or `"deny-all"` -> [`PacketFilterPolicy::FailClosed`]
+/// - Port/protocol block entries (`DenyRules`): `"3389"`, `"tcp:3389"`, `"udp:5353"`,
+///   `"tcp:8000-8080"`, `"deny:tcp:3389"`, `"block:3389"`, `"icmp"`.
+pub fn parse_inbound_filter_spec(spec: &str) -> AppResult<PacketFilterPolicy> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("allow-all")
+        || trimmed.eq_ignore_ascii_case("allow_all")
+        || trimmed.eq_ignore_ascii_case("all")
+    {
+        return Ok(PacketFilterPolicy::AllowAllOverlay);
+    }
+    if trimmed.eq_ignore_ascii_case("fail-closed")
+        || trimmed.eq_ignore_ascii_case("fail_closed")
+        || trimmed.eq_ignore_ascii_case("deny-all")
+        || trimmed.eq_ignore_ascii_case("deny_all")
+    {
+        return Ok(PacketFilterPolicy::FailClosed);
+    }
+
+    let mut deny_rules = Vec::new();
+    for raw_item in trimmed.split([',', ';', '\n']) {
+        let item = raw_item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let lower = item.to_ascii_lowercase();
+        let without_action = if let Some(rest) = lower.strip_prefix("deny:") {
+            rest.trim()
+        } else if let Some(rest) = lower.strip_prefix("block:") {
+            rest.trim()
+        } else if lower.starts_with("allow:") {
+            return Err(AppError::invalid_argument(format!(
+                "invalid inbound filter rule '{item}': only deny/block port rules are supported here"
+            )));
+        } else {
+            lower.as_str()
+        };
+
+        let rule = parse_single_deny_rule(without_action, item)?;
+        deny_rules.push(rule);
+    }
+
+    if deny_rules.is_empty() {
+        return Err(AppError::invalid_argument(
+            "inbound filter rule specification contained no valid rules",
+        ));
+    }
+    Ok(PacketFilterPolicy::DenyRules(deny_rules))
+}
+
+fn parse_single_deny_rule(normalized: &str, original: &str) -> AppResult<PacketFilterRule> {
+    if normalized == "icmp" {
+        return Ok(PacketFilterRule {
+            source_peer_ip: None,
+            protocol: FilterProtocol::Icmp,
+            dst_ports: None,
+        });
+    }
+    let (protocol, port_spec) = if let Some((proto_str, ports_str)) = normalized.split_once(':') {
+        let proto = match proto_str.trim() {
+            "tcp" => FilterProtocol::Tcp,
+            "udp" => FilterProtocol::Udp,
+            "any" | "*" => FilterProtocol::Any,
+            _ => {
+                return Err(AppError::invalid_argument(format!(
+                    "unsupported protocol in inbound filter rule '{original}'"
+                )));
+            }
+        };
+        (proto, ports_str.trim())
+    } else {
+        (FilterProtocol::Any, normalized)
+    };
+    let range = parse_port_range_token(port_spec, original)?;
+    Ok(PacketFilterRule {
+        source_peer_ip: None,
+        protocol,
+        dst_ports: Some(range),
+    })
+}
+
+fn parse_port_range_token(token: &str, original: &str) -> AppResult<PortRange> {
+    if token.is_empty() {
+        return Err(AppError::invalid_argument(format!(
+            "missing port number in inbound filter rule '{original}'"
+        )));
+    }
+    if let Some((start_raw, end_raw)) = token.split_once('-') {
+        let start = start_raw.trim().parse::<u16>().map_err(|_| {
+            AppError::invalid_argument(format!("invalid start port in filter rule '{original}'"))
+        })?;
+        let end = end_raw.trim().parse::<u16>().map_err(|_| {
+            AppError::invalid_argument(format!("invalid end port in filter rule '{original}'"))
+        })?;
+        if start == 0 || end == 0 {
+            return Err(AppError::invalid_argument(format!(
+                "port 0 is forbidden in filter rule '{original}'"
+            )));
+        }
+        return PortRange::new(start, end).ok_or_else(|| {
+            AppError::invalid_argument(format!("inverted port range in filter rule '{original}'"))
+        });
+    }
+    let port = token.parse::<u16>().map_err(|_| {
+        AppError::invalid_argument(format!("invalid port in filter rule '{original}'"))
+    })?;
+    if port == 0 {
+        return Err(AppError::invalid_argument(format!(
+            "port 0 is forbidden in filter rule '{original}'"
+        )));
+    }
+    Ok(PortRange::single(port))
 }
 
 /// Reason a decapsulated or outbound tunnel packet was dropped by `CryptokeyValidator`.
@@ -235,6 +364,34 @@ impl CryptokeyValidator {
     /// Replaces the active packet filter policy (for atomic fail-closed reloads).
     pub fn set_policy(&mut self, policy: PacketFilterPolicy) {
         self.policy = policy;
+    }
+
+    /// Returns a reference to the active inbound packet filter policy (`US-018`).
+    #[must_use]
+    pub const fn policy(&self) -> &PacketFilterPolicy {
+        &self.policy
+    }
+
+    /// Parses and atomically applies an inbound filter specification (`US-018 AC4`).
+    ///
+    /// Rejecting invalid syntax logs an `error` event and **preserves the previous valid
+    /// policy** without leaving the tunnel unprotected or breaking active flows.
+    pub fn try_reload_policy_spec(&mut self, spec: &str) -> AppResult<()> {
+        match parse_inbound_filter_spec(spec) {
+            Ok(next_policy) => {
+                self.policy = next_policy;
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    component = "datapath.cryptokey",
+                    event = "inbound_filter_reload_rejected",
+                    error = %err,
+                    "rejected invalid inbound filter configuration; preserving previous policy"
+                );
+                Err(err)
+            }
+        }
     }
 
     /// Returns true when `observed_src` equals the peer's locked `/32` `expected_peer_ip`.
@@ -579,5 +736,46 @@ mod tests {
             Err(CryptokeyDropReason::PolicyDenied)
         );
         assert_eq!(validator.metrics_snapshot().filtered_packets_dropped, 2);
+    }
+
+    // Traces: US-018
+    #[test]
+    fn test_cryptokey_deny_rules_and_fail_safe_reload_preserves_previous_policy() {
+        // Arrange: default allows all, then load block rule for port 3389
+        let mut validator = CryptokeyValidator::new();
+        let peer_ip = overlay_ip(10);
+        let local_ip = overlay_ip(2);
+        let pkt_3389 = build_ipv4_udp_packet(peer_ip.as_ipv4(), local_ip.as_ipv4(), 50000, 3389);
+        let pkt_22 = build_ipv4_udp_packet(peer_ip.as_ipv4(), local_ip.as_ipv4(), 50000, 22);
+
+        validator
+            .try_reload_policy_spec("3389,tcp:8443-8444")
+            .expect("valid blocklist");
+
+        // Act & Assert: 3389 blocked, 22 allowed
+        assert_eq!(
+            validator.validate_inbound(peer_ip, Some(local_ip), overlay_cidr(), &pkt_3389),
+            Err(CryptokeyDropReason::PolicyDenied)
+        );
+        assert!(
+            validator
+                .validate_inbound(peer_ip, Some(local_ip), overlay_cidr(), &pkt_22)
+                .is_ok()
+        );
+
+        // Invalid reload MUST fail cleanly AND preserve previous blocklist!
+        let err = validator
+            .try_reload_policy_spec("tcp:notaport,99999")
+            .expect_err("invalid rule must error");
+        assert!(err.to_string().contains("invalid port"));
+        assert_eq!(
+            validator.validate_inbound(peer_ip, Some(local_ip), overlay_cidr(), &pkt_3389),
+            Err(CryptokeyDropReason::PolicyDenied)
+        );
+        assert!(
+            validator
+                .validate_inbound(peer_ip, Some(local_ip), overlay_cidr(), &pkt_22)
+                .is_ok()
+        );
     }
 }

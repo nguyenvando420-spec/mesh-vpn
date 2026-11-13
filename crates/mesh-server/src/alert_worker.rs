@@ -7,12 +7,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mesh_core::Clock;
 use mesh_proto::control::TerminationReason;
 use mesh_proto::relay::RelayNoticeCode;
 use mesh_store::ControlStore;
 use mesh_sys::{SysResult, filesystem_usage_percent};
 use serde::Serialize;
+use serde_json::json;
 use tokio::time::{interval, sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -68,6 +68,7 @@ type DiskUsageProbe = Arc<dyn Fn(&Path) -> SysResult<u8> + Send + Sync>;
 /// Evaluates operational health conditions and emits rate-limited webhook & structured alerts.
 pub struct AlertEvaluator {
     webhook_url: Option<String>,
+    telegram_chat_id: Option<String>,
     relay_threshold_pct: u8,
     relay_global_bps: u64,
     disk_threshold_pct: u8,
@@ -79,6 +80,7 @@ impl fmt::Debug for AlertEvaluator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AlertEvaluator")
             .field("webhook_url", &self.webhook_url)
+            .field("telegram_chat_id", &self.telegram_chat_id)
             .field("relay_threshold_pct", &self.relay_threshold_pct)
             .field("relay_global_bps", &self.relay_global_bps)
             .field("disk_threshold_pct", &self.disk_threshold_pct)
@@ -103,12 +105,20 @@ impl AlertEvaluator {
     ) -> Self {
         Self {
             webhook_url,
+            telegram_chat_id: None,
             relay_threshold_pct,
             relay_global_bps: relay_global_bps.max(1),
             disk_threshold_pct: DEFAULT_DISK_ALERT_THRESHOLD_PCT,
             disk_usage_probe: Arc::new(filesystem_usage_percent),
             tracker: Mutex::new(AlertTracker::default()),
         }
+    }
+
+    /// Configures an optional Telegram `chat_id` when `alert_webhook_url` targets `api.telegram.org`.
+    #[must_use]
+    pub fn with_telegram_chat_id(mut self, telegram_chat_id: Option<String>) -> Self {
+        self.telegram_chat_id = telegram_chat_id;
+        self
     }
 
     /// Overrides the disk usage firing threshold percentage (default `85%`, recovers `< threshold - 5%`).
@@ -132,6 +142,12 @@ impl AlertEvaluator {
     #[must_use]
     pub fn webhook_url(&self) -> Option<&str> {
         self.webhook_url.as_deref()
+    }
+
+    /// Configured optional Telegram target chat ID.
+    #[must_use]
+    pub fn telegram_chat_id(&self) -> Option<&str> {
+        self.telegram_chat_id.as_deref()
     }
 
     /// Evaluates active alert predicates at `now_ms`, returning `(condition, is_firing, summary)` events
@@ -203,8 +219,9 @@ impl AlertEvaluator {
         if let Ok(nodes) = obs_state.store.list_nodes() {
             let expiring_soon = nodes.iter().any(|n| {
                 n.status == mesh_store::NodeStatus::Active
-                    && n.key_expires_at_ms > now_ms
-                    && n.key_expires_at_ms.saturating_sub(now_ms) <= NODE_KEY_EXPIRING_ALERT_MS
+                    && n.key_expires_at_ms.is_some_and(|exp| {
+                        exp > now_ms && exp.saturating_sub(now_ms) <= NODE_KEY_EXPIRING_ALERT_MS
+                    })
             });
             if expiring_soon {
                 active.insert(
@@ -293,96 +310,259 @@ pub struct MaintenanceContext {
     pub cancel: CancellationToken,
 }
 
+/// Tracks periodic housekeeping timestamps across maintenance ticks (`US-006`, `US-045`).
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenanceSchedule {
+    /// Timestamp of the last completed automatic snapshot backup (UTC ms).
+    pub last_backup_at_ms: u64,
+    /// Timestamp of the last overlay-IP quarantine sweep (UTC ms).
+    pub last_quarantine_reclaim_ms: u64,
+}
+
+impl MaintenanceSchedule {
+    /// Initializes schedule watermarks to `now_ms`.
+    #[must_use]
+    pub const fn new(now_ms: u64) -> Self {
+        Self {
+            last_backup_at_ms: now_ms,
+            last_quarantine_reclaim_ms: now_ms,
+        }
+    }
+}
+
+/// Executes one deterministic maintenance cycle (used by [`run_background_maintenance`] and tests).
+pub async fn run_maintenance_cycle(ctx: &MaintenanceContext, sched: &mut MaintenanceSchedule) {
+    let now_ms = ctx.store.clock().now_unix_ms();
+    let cfg = ctx.obs_state.listeners.config();
+    let _sent_hb = ctx.netmap_hub.broadcast_heartbeats(now_ms);
+    let _cutover = ctx.obs_state.listeners.check_migration_cutover();
+
+    if ctx.store.is_disk_degraded() {
+        match ctx.store.try_compact_emergency_revocations() {
+            Ok(Some(compacted_ver)) => {
+                if let Err(err) = ctx.netmap_hub.broadcast_snapshot(compacted_ver) {
+                    tracing::warn!(
+                        component = "alert_worker",
+                        event = "compaction_broadcast_failed",
+                        netmap_version = compacted_ver,
+                        error = %err,
+                        "failed broadcasting netmap snapshot after emergency compaction"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(
+                    component = "alert_worker",
+                    event = "compaction_deferred",
+                    error = %err,
+                    "deferring emergency compaction until storage recovers"
+                );
+            }
+        }
+    }
+
+    if let Ok(expired) = ctx.store.sweep_expired_nodes() {
+        for outcome in expired {
+            ctx.netmap_hub.terminate_node_stream(
+                outcome.node_id,
+                TerminationReason::NodeKeyExpired,
+                "node key expired",
+                now_ms,
+            );
+            ctx.relay_hub
+                .disconnect_node(outcome.node_id, RelayNoticeCode::NodeKeyExpired);
+            if outcome.must_disconnect_all_peers_to_reauth {
+                ctx.netmap_hub.close_all_streams_for_reauth();
+                ctx.relay_hub.close_all_sessions();
+            } else if let Some(ver) = outcome.netmap_version
+                && let Err(err) = ctx.netmap_hub.broadcast_snapshot(ver)
+            {
+                tracing::warn!(
+                    component = "alert_worker",
+                    event = "expiry_broadcast_failed",
+                    error = %err,
+                    "failed broadcasting netmap snapshot after node key expiry"
+                );
+            }
+        }
+    }
+
+    match ctx.store.reap_expired_ephemeral_nodes(
+        cfg.ephemeral_timeout_secs,
+        |id| ctx.netmap_hub.node_runtime_info(id).is_some(),
+        "ephemeral-reaper",
+    ) {
+        Ok((reaped_nodes, latest_ver)) if !reaped_nodes.is_empty() => {
+            for rec in &reaped_nodes {
+                ctx.netmap_hub.terminate_node_stream(
+                    rec.node_id,
+                    TerminationReason::NodeRevoked,
+                    "ephemeral node offline timeout reaped",
+                    now_ms,
+                );
+                ctx.relay_hub
+                    .disconnect_node(rec.node_id, RelayNoticeCode::NodeRevoked);
+            }
+            if let Some(ver) = latest_ver
+                && let Err(err) = ctx.netmap_hub.broadcast_snapshot(ver)
+            {
+                tracing::warn!(
+                    component = "alert_worker",
+                    event = "ephemeral_reap_broadcast_failed",
+                    error = %err,
+                    "failed broadcasting netmap snapshot after ephemeral reap"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                component = "alert_worker",
+                event = "ephemeral_reap_failed",
+                error = %err,
+                "ephemeral offline reaper encountered an error"
+            );
+        }
+    }
+
+    if now_ms.saturating_sub(sched.last_quarantine_reclaim_ms) >= 60_000 {
+        sched.last_quarantine_reclaim_ms = now_ms;
+        if let Err(err) = ctx.store.reclaim_expired_quarantines() {
+            tracing::debug!(
+                component = "alert_worker",
+                event = "quarantine_reclaim_failed",
+                error = %err,
+                "periodic overlay IP quarantine sweep failed"
+            );
+        }
+    }
+
+    let backup_interval_ms = cfg.backup_interval_secs.saturating_mul(1_000);
+    if backup_interval_ms > 0
+        && now_ms.saturating_sub(sched.last_backup_at_ms) >= backup_interval_ms
+    {
+        match ctx
+            .store
+            .create_backup(&cfg.backup_dir(), "auto-backup-scheduler")
+        {
+            Ok(artifact) => {
+                sched.last_backup_at_ms = now_ms;
+                tracing::info!(
+                    component = "alert_worker",
+                    event = "scheduled_backup_completed",
+                    snapshot = %artifact.snapshot_path.display(),
+                    size_bytes = artifact.size_bytes,
+                    "scheduled automatic hot backup succeeded"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    component = "alert_worker",
+                    event = "scheduled_backup_failed",
+                    error = %err,
+                    "scheduled automatic hot backup failed"
+                );
+            }
+        }
+    }
+
+    if let Err(err) = ctx.acme.run_renewal_check().await {
+        tracing::warn!(
+            component = "alert_worker",
+            event = "acme_renewal_failed",
+            error = %err,
+            "ACME renewal check deferred"
+        );
+    }
+
+    let events = ctx
+        .evaluator
+        .evaluate_tick(&ctx.obs_state, &ctx.acme, now_ms);
+    if let Some(url) = ctx.evaluator.webhook_url() {
+        for (cond, is_firing, summary) in events {
+            let payload = WebhookAlertPayload {
+                condition: cond,
+                state: if is_firing { "firing" } else { "resolved" },
+                summary,
+                timestamp_at_ms: now_ms,
+            };
+            dispatch_webhook_with_retries(
+                url,
+                ctx.evaluator.telegram_chat_id(),
+                &payload,
+                &ctx.cancel,
+            )
+            .await;
+        }
+    }
+}
+
 /// Runs periodic maintenance (control heartbeats without version bumps, emergency compaction,
-/// expired node sweeps, ACME checks, migration cutovers, and webhook alert delivery).
+/// expired node sweeps, ephemeral reaper, quarantine reclamation, 24h backups, ACME checks,
+/// migration cutovers, and webhook/Telegram alert delivery).
 pub async fn run_background_maintenance(ctx: MaintenanceContext) {
-    let MaintenanceContext {
-        store,
-        acme,
-        netmap_hub,
-        relay_hub,
-        obs_state,
-        evaluator,
-        cancel,
-    } = ctx;
     let mut ticker = interval(Duration::from_secs(WORKER_TICK_INTERVAL_SECS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut sched = MaintenanceSchedule::new(ctx.store.clock().now_unix_ms());
 
     loop {
         tokio::select! {
             biased;
-            () = cancel.cancelled() => break,
+            () = ctx.cancel.cancelled() => break,
             _ = ticker.tick() => {
-                let now_ms = store.clock().now_unix_ms();
-                let _ = netmap_hub.broadcast_heartbeats(now_ms);
-                obs_state.listeners.check_migration_cutover();
-
-                if store.is_disk_degraded()
-                    && let Err(err) = store.try_compact_emergency_revocations()
-                {
-                    tracing::debug!(
-                        component = "alert_worker",
-                        event = "compaction_deferred",
-                        error = %err,
-                        "deferring emergency compaction until storage recovers"
-                    );
-                }
-
-                if let Ok(expired) = store.sweep_expired_nodes() {
-                    for outcome in expired {
-                        netmap_hub.terminate_node_stream(
-                            outcome.node_id,
-                            TerminationReason::NodeKeyExpired,
-                            "node key expired",
-                            now_ms,
-                        );
-                        relay_hub.disconnect_node(outcome.node_id, RelayNoticeCode::NodeKeyExpired);
-                        if outcome.must_disconnect_all_peers_to_reauth {
-                            netmap_hub.close_all_streams_for_reauth();
-                            relay_hub.close_all_sessions();
-                        } else if let Some(ver) = outcome.netmap_version
-                            && let Err(err) = netmap_hub.broadcast_snapshot(ver)
-                        {
-                            tracing::warn!(
-                                component = "alert_worker",
-                                event = "expiry_broadcast_failed",
-                                error = %err,
-                                "failed broadcasting netmap snapshot after node key expiry"
-                            );
-                        }
-                    }
-                }
-
-                if let Err(err) = acme.run_renewal_check().await {
-                    tracing::warn!(
-                        component = "alert_worker",
-                        event = "acme_renewal_failed",
-                        error = %err,
-                        "ACME renewal check deferred"
-                    );
-                }
-
-                let events = evaluator.evaluate_tick(&obs_state, &acme, now_ms);
-                if let Some(url) = evaluator.webhook_url() {
-                    for (cond, is_firing, summary) in events {
-                        let payload = WebhookAlertPayload {
-                            condition: cond,
-                            state: if is_firing { "firing" } else { "resolved" },
-                            summary,
-                            timestamp_at_ms: now_ms,
-                        };
-                        dispatch_webhook_with_retries(url, &payload, &cancel).await;
-                    }
-                }
+                run_maintenance_cycle(&ctx, &mut sched).await;
             }
         }
     }
-    let _ = Arc::strong_count(&store) as u64;
-    let _: Option<&dyn Clock> = Some(store.clock());
+}
+
+fn build_alert_http_body(
+    url: &str,
+    telegram_chat_id: Option<&str>,
+    payload: &WebhookAlertPayload,
+) -> serde_json::Value {
+    if url.contains("api.telegram.org") {
+        let query_chat_id = url.split_once('?').and_then(|(_, q)| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("chat_id="))
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        });
+        if let Some(chat_id) = telegram_chat_id
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .or(query_chat_id)
+        {
+            return json!({
+                "chat_id": chat_id,
+                "text": format!(
+                    "[mesh-server][{}] {:?}: {} (ts={})",
+                    payload.state.to_ascii_uppercase(),
+                    payload.condition,
+                    payload.summary,
+                    payload.timestamp_at_ms
+                ),
+            });
+        }
+        tracing::warn!(
+            component = "alert_worker",
+            event = "telegram_chat_id_missing",
+            "alert_webhook_url points to api.telegram.org without alert_telegram_chat_id; sending raw JSON payload"
+        );
+    }
+    serde_json::to_value(payload).unwrap_or_else(|_| {
+        json!({
+            "state": payload.state,
+            "summary": payload.summary,
+            "timestamp_at_ms": payload.timestamp_at_ms,
+        })
+    })
 }
 
 async fn dispatch_webhook_with_retries(
     url: &str,
+    telegram_chat_id: Option<&str>,
     payload: &WebhookAlertPayload,
     cancel: &CancellationToken,
 ) {
@@ -393,11 +573,12 @@ async fn dispatch_webhook_with_retries(
     else {
         return;
     };
+    let body = build_alert_http_body(url, telegram_chat_id, payload);
     for attempt in 0_u32..3 {
         if cancel.is_cancelled() {
             return;
         }
-        if let Ok(resp) = client.post(url).json(payload).send().await
+        if let Ok(resp) = client.post(url).json(&body).send().await
             && resp.status().is_success()
         {
             return;
@@ -631,7 +812,7 @@ mod tests {
         }
         .encode()
         .expect("encode");
-        let _ = relay_hub.handle_inbound_frame(node_a, kp_a.public_key(), &pkt, start_ms + 500);
+        let _fwd = relay_hub.handle_inbound_frame(node_a, kp_a.public_key(), &pkt, start_ms + 500);
 
         let firing = evaluator.evaluate_tick(&obs_state, &acme, start_ms + 1_000);
         assert!(
@@ -776,6 +957,384 @@ mod tests {
                     && !*is_firing
                     && msg.contains("[RESOLVED]")),
             "expected DiskUsageHigh recovery below 80%"
+        );
+
+        shutdown.cancel();
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_maintenance_cycle_reaps_ephemeral_runs_daily_backup_and_formats_telegram() {
+        // Arrange
+        let dir = TempDir::new().expect("tempdir");
+        let start_ms = 1_762_958_151_000_u64;
+        let clock = Arc::new(FakeClock::new(start_ms));
+        let store = Arc::new(
+            ControlStore::open_with_clock(
+                ControlStoreConfig {
+                    db_path: dir.path().join("control.redb"),
+                    emergency_revocations_path: dir.path().join("emergency-revocations.bin"),
+                },
+                "10.100.0.0/24",
+                clock.clone(),
+            )
+            .expect("open store"),
+        );
+
+        let tcp_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("tcp");
+        let udp_probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("udp");
+        let free_tcp = tcp_probe.local_addr().expect("addr").port();
+        let free_udp = udp_probe.local_addr().expect("addr").port();
+        drop((tcp_probe, udp_probe));
+        let cfg = Arc::new(ServerConfig {
+            control_bind_ip: "127.0.0.1".to_owned(),
+            control_tcp_port: free_tcp,
+            stun_bind_ip: "127.0.0.1".to_owned(),
+            stun_udp_port: free_udp,
+            state_dir: dir.path().to_path_buf(),
+            ephemeral_timeout_secs: 60,
+            backup_interval_secs: 86_400,
+            ..ServerConfig::default()
+        });
+
+        let tok_hash = mesh_crypto::sha256_digest(b"mpk_ephem_worker_token");
+        store
+            .create_preauth_key(
+                &mesh_store::CreatePreAuthKeyInput {
+                    key_id: mesh_core::KeyId::new_v7(start_ms),
+                    token_hash: tok_hash,
+                    label: None,
+                    bound_node_name: None,
+                    reusable: false,
+                    max_uses: Some(1),
+                    ephemeral: true,
+                    ephemeral_timeout_secs: Some(30),
+                    ttl_secs: 3_600,
+                    now_unix_ms: start_ms,
+                },
+                "admin",
+            )
+            .expect("create key");
+        let eph_kp = mesh_crypto::NodeKeypair::generate();
+        let eph_dkp = mesh_crypto::DiscoKeypair::generate();
+        let (eph_reg, _) = store
+            .register_node(&mesh_store::RegisterNodeInput {
+                pubkey: eph_kp.public_key(),
+                disco_pubkey: eph_dkp.public_key(),
+                previous_node_pubkey: None,
+                requested_name: mesh_core::NodeName::parse("ephem-ci").expect("name"),
+                preauth_token_hash: tok_hash,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: mesh_store::DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: start_ms,
+            })
+            .expect("register ephemeral node");
+
+        let acme = AcmeManager::initialize(&cfg, store.clone()).expect("init acme");
+        let netmap_hub = Arc::new(NetmapHub::new(
+            store.clone(),
+            cfg.public_control_endpoint(),
+            cfg.public_control_endpoint(),
+            vec![cfg.public_stun_endpoint()],
+            cfg.domain_suffix.clone(),
+        ));
+        let relay_hub = Arc::new(RelayHub::new(
+            store.clone(),
+            cfg.relay_bytes_per_sec,
+            cfg.relay_global_bytes_per_sec,
+        ));
+        let rate_limiter = Arc::new(RateLimiter::new(ClientIpExtractor::new(
+            cfg.tls_mode,
+            cfg.trusted_proxy_set(),
+        )));
+        let challenges = Arc::new(PendingChallengeStore::new());
+        let shutdown = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let ctrl_state = ControlAppState {
+            config: cfg.clone(),
+            trusted_proxies: Arc::new(Default::default()),
+            store: store.clone(),
+            rate_limiter: rate_limiter.clone(),
+            challenges: challenges.clone(),
+            netmap_hub: netmap_hub.clone(),
+            relay_hub: relay_hub.clone(),
+            ws_tracker: tracker.clone(),
+            shutdown: shutdown.clone(),
+        };
+        let listeners = ListenerSet::bind_and_start(ctrl_state, acme.clone())
+            .await
+            .expect("bind listeners");
+        let obs_state = ObsAppState {
+            store: store.clone(),
+            listeners,
+            netmap_hub: netmap_hub.clone(),
+            relay_hub: relay_hub.clone(),
+            challenges,
+            rate_limiter,
+        };
+        let evaluator = Arc::new(
+            AlertEvaluator::new(
+                Some("https://api.telegram.org/botTOKEN/sendMessage".to_owned()),
+                80,
+                50_000_000,
+            )
+            .with_telegram_chat_id(Some("123456789".to_owned()))
+            .with_disk_usage_probe(|_| Ok(25)),
+        );
+        let ctx = super::MaintenanceContext {
+            store: store.clone(),
+            acme,
+            netmap_hub,
+            relay_hub,
+            obs_state,
+            evaluator,
+            cancel: shutdown.clone(),
+        };
+        let mut sched = super::MaintenanceSchedule::new(start_ms);
+
+        // Act 1: 20s (< 30s) offline keeps ephemeral node intact
+        clock.advance(20_000);
+        super::run_maintenance_cycle(&ctx, &mut sched).await;
+        assert!(
+            store
+                .find_node_by_id(eph_reg.record.node_id)
+                .expect("lookup")
+                .is_some()
+        );
+
+        // Act 2: +15s (35s > 30s) offline reaps ephemeral node and releases IP immediately
+        clock.advance(15_000);
+        super::run_maintenance_cycle(&ctx, &mut sched).await;
+        assert!(
+            store
+                .find_node_by_id(eph_reg.record.node_id)
+                .expect("lookup after reap")
+                .is_none()
+        );
+
+        // Act 3: advance 24h triggers automatic hot snapshot + .sha256 in backup_dir (`US-045 AC1`)
+        clock.advance(86_400 * 1_000);
+        super::run_maintenance_cycle(&ctx, &mut sched).await;
+        let backups: Vec<_> = std::fs::read_dir(cfg.backup_dir())
+            .expect("backup dir exists")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            backups
+                .iter()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".redb"))
+        );
+        assert!(
+            backups
+                .iter()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".sha256"))
+        );
+
+        // Act 4: verify Telegram formatting vs generic webhook formatting (`US-049`)
+        let sample = super::WebhookAlertPayload {
+            condition: AlertCondition::NodeKeyExpiring,
+            state: "firing",
+            summary: "node-a key expires in 5 days".to_owned(),
+            timestamp_at_ms: start_ms,
+        };
+        let tg = super::build_alert_http_body(
+            "https://api.telegram.org/botXYZ/sendMessage",
+            Some("-1009988"),
+            &sample,
+        );
+        assert_eq!(tg.get("chat_id").and_then(|v| v.as_str()), Some("-1009988"));
+        assert!(
+            tg.get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("node-a key expires in 5 days"))
+        );
+        let generic =
+            super::build_alert_http_body("https://hooks.example.com/alert", None, &sample);
+        assert_eq!(
+            generic.get("state").and_then(|v| v.as_str()),
+            Some("firing")
+        );
+
+        shutdown.cancel();
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_compaction_on_maintenance_cycle_broadcasts_updated_netmap_snapshot() {
+        // Arrange (`HR-W21-12`)
+        let dir = TempDir::new().expect("tempdir");
+        let start_ms = 1_762_958_151_000_u64;
+        let clock = Arc::new(FakeClock::new(start_ms));
+        let store = Arc::new(
+            ControlStore::open_with_clock(
+                ControlStoreConfig {
+                    db_path: dir.path().join("control.redb"),
+                    emergency_revocations_path: dir.path().join("emergency-revocations.bin"),
+                },
+                "10.100.0.0/24",
+                Arc::clone(&clock) as Arc<dyn mesh_core::Clock>,
+            )
+            .expect("open store"),
+        );
+        store
+            .ensure_or_init_identity(&["127.0.0.1".to_owned()], 365)
+            .expect("identity");
+
+        let token_hash = [0x91_u8; 32];
+        store
+            .create_preauth_key(
+                &mesh_store::CreatePreAuthKeyInput {
+                    key_id: mesh_core::KeyId::new_v7(start_ms),
+                    token_hash,
+                    label: None,
+                    bound_node_name: None,
+                    reusable: true,
+                    max_uses: Some(4),
+                    ephemeral: false,
+                    ephemeral_timeout_secs: None,
+                    ttl_secs: 3_600,
+                    now_unix_ms: start_ms,
+                },
+                "admin",
+            )
+            .expect("key");
+        let (reg_a, _) = store
+            .register_node(&mesh_store::RegisterNodeInput {
+                pubkey: mesh_core::PublicKey::from_bytes([0x92_u8; 32]).expect("pk_a"),
+                disco_pubkey: mesh_core::PublicKey::from_bytes([0x93_u8; 32]).expect("dpk_a"),
+                previous_node_pubkey: None,
+                requested_name: mesh_core::NodeName::parse("compact-peer-a").expect("name_a"),
+                preauth_token_hash: token_hash,
+                public_control_host: "127.0.0.1",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: mesh_store::DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: start_ms,
+            })
+            .expect("register a");
+        let (reg_b, ver_before_revoke) = store
+            .register_node(&mesh_store::RegisterNodeInput {
+                pubkey: mesh_core::PublicKey::from_bytes([0x94_u8; 32]).expect("pk_b"),
+                disco_pubkey: mesh_core::PublicKey::from_bytes([0x95_u8; 32]).expect("dpk_b"),
+                previous_node_pubkey: None,
+                requested_name: mesh_core::NodeName::parse("compact-peer-b").expect("name_b"),
+                preauth_token_hash: token_hash,
+                public_control_host: "127.0.0.1",
+                domain_suffix: "mesh.internal",
+                os_arch: "linux/amd64",
+                agent_version: "0.1.0",
+                protocol_version: 1,
+                node_key_ttl_ms: mesh_store::DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: start_ms,
+            })
+            .expect("register b");
+
+        let cfg = Arc::new(ServerConfig {
+            control_bind_ip: "127.0.0.1".to_owned(),
+            stun_bind_ip: "127.0.0.1".to_owned(),
+            control_tcp_port: 0,
+            stun_udp_port: 0,
+            ..ServerConfig::default()
+        });
+        let acme = AcmeManager::initialize(&cfg, store.clone()).expect("acme");
+        let netmap_hub = Arc::new(NetmapHub::new(
+            store.clone(),
+            cfg.public_control_endpoint(),
+            cfg.public_control_endpoint(),
+            vec![cfg.public_stun_endpoint()],
+            cfg.domain_suffix.clone(),
+        ));
+        let relay_hub = Arc::new(RelayHub::new(
+            store.clone(),
+            cfg.relay_bytes_per_sec,
+            cfg.relay_global_bytes_per_sec,
+        ));
+        let rate_limiter = Arc::new(RateLimiter::new(ClientIpExtractor::new(
+            cfg.tls_mode,
+            cfg.trusted_proxy_set(),
+        )));
+        let challenges = Arc::new(PendingChallengeStore::new());
+        let shutdown = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let ctrl_state = ControlAppState {
+            config: cfg,
+            trusted_proxies: Arc::new(Default::default()),
+            store: store.clone(),
+            rate_limiter: rate_limiter.clone(),
+            challenges: challenges.clone(),
+            netmap_hub: netmap_hub.clone(),
+            relay_hub: relay_hub.clone(),
+            ws_tracker: tracker.clone(),
+            shutdown: shutdown.clone(),
+        };
+        let listeners = ListenerSet::bind_and_start(ctrl_state, acme.clone())
+            .await
+            .expect("bind");
+        let obs_state = ObsAppState {
+            store: store.clone(),
+            listeners,
+            netmap_hub: netmap_hub.clone(),
+            relay_hub: relay_hub.clone(),
+            challenges,
+            rate_limiter,
+        };
+        let evaluator = Arc::new(AlertEvaluator::new(None, 80, 100));
+        let ctx = super::MaintenanceContext {
+            store: store.clone(),
+            acme,
+            netmap_hub: netmap_hub.clone(),
+            relay_hub,
+            obs_state,
+            evaluator,
+            cancel: shutdown.clone(),
+        };
+        let mut sched = super::MaintenanceSchedule::new(start_ms);
+
+        // Subscribe peer A, then revoke peer B under redb write failure so compaction is deferred.
+        let mut sub_a = netmap_hub.subscribe(reg_a.record.node_id, start_ms);
+        store.inject_redb_failure(false, true);
+        let revoked = store
+            .revoke_node(reg_b.record.node_id, "admin")
+            .expect("emergency revoke");
+        assert_eq!(
+            revoked.persistence_tier,
+            mesh_proto::admin_ipc::PersistenceTier::EmergencySlot
+        );
+        assert!(store.is_disk_degraded());
+
+        // Clear fault and run maintenance cycle -> compaction persists and broadcasts snapshot.
+        store.inject_redb_failure(false, false);
+        while sub_a.rx.try_recv().is_ok() {}
+        super::run_maintenance_cycle(&ctx, &mut sched).await;
+
+        assert!(!store.is_disk_degraded());
+        assert!(store.current_netmap_version() > ver_before_revoke);
+        let snapshot_netmap = std::iter::from_fn(|| sub_a.rx.try_recv().ok())
+            .find_map(|frame| match frame {
+                mesh_proto::control::ServerControlFrame::NetmapSnapshot { netmap, .. } => {
+                    Some(netmap)
+                }
+                _ => None,
+            })
+            .expect("subscriber must receive netmap snapshot after compaction");
+        assert!(snapshot_netmap.netmap_version > ver_before_revoke);
+        assert!(
+            snapshot_netmap
+                .peers
+                .iter()
+                .all(|p| p.node_id != reg_b.record.node_id)
         );
 
         shutdown.cancel();

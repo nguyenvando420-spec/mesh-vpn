@@ -35,6 +35,8 @@ pub struct CreatePreAuthKeyInput {
     pub max_uses: Option<u32>,
     /// Whether nodes registered with this key auto-expire on idle/offline (`US-006`).
     pub ephemeral: bool,
+    /// Optional offline auto-reap timeout in seconds for `--ephemeral` nodes (`US-006`).
+    pub ephemeral_timeout_secs: Option<u32>,
     /// Key lifetime in seconds (`1..=MAX_PREAUTH_TTL_SECS`).
     pub ttl_secs: u64,
     /// Creation timestamp (`unix_ms` UTC).
@@ -60,6 +62,9 @@ pub struct StoredPreAuthKeyRecord {
     pub max_uses: Option<u32>,
     /// Ephemeral flag (`false` by default).
     pub ephemeral: bool,
+    /// Optional offline reap timeout in seconds (`US-006`).
+    #[serde(default)]
+    pub ephemeral_timeout_secs: Option<u32>,
     /// UTC creation timestamp in milliseconds.
     pub created_at_ms: u64,
     /// UTC expiration timestamp in milliseconds.
@@ -95,6 +100,16 @@ impl KeysRepository {
                 "pre-auth key max_uses must be at least 1",
             ));
         }
+        if !input.ephemeral && input.ephemeral_timeout_secs.is_some() {
+            return Err(AppError::invalid_argument(
+                "ephemeral_timeout_secs requires --ephemeral",
+            ));
+        }
+        if let Some(0) = input.ephemeral_timeout_secs {
+            return Err(AppError::invalid_argument(
+                "ephemeral_timeout_secs must be at least 1",
+            ));
+        }
 
         let expires_at_ms = input
             .now_unix_ms
@@ -112,6 +127,7 @@ impl KeysRepository {
             reusable: input.reusable,
             max_uses: input.max_uses,
             ephemeral: input.ephemeral,
+            ephemeral_timeout_secs: input.ephemeral_timeout_secs,
             created_at_ms: input.now_unix_ms,
             expires_at_ms,
             used_count: 0,
@@ -163,6 +179,7 @@ impl KeysRepository {
                 "bound_node_name": record.bound_node_name,
                 "reusable": record.reusable,
                 "ephemeral": record.ephemeral,
+                "ephemeral_timeout_secs": record.ephemeral_timeout_secs,
                 "expires_at_ms": record.expires_at_ms,
             }),
         };
@@ -382,6 +399,7 @@ mod tests {
                 reusable: false,
                 max_uses: None,
                 ephemeral: false,
+                ephemeral_timeout_secs: None,
                 ttl_secs: MAX_PREAUTH_TTL_SECS + 1,
                 now_unix_ms: now_ms,
             };
@@ -400,6 +418,7 @@ mod tests {
             reusable: false,
             max_uses: None,
             ephemeral: false,
+            ephemeral_timeout_secs: None,
             ttl_secs: 3_600,
             now_unix_ms: now_ms,
         };
@@ -459,6 +478,7 @@ mod tests {
             reusable: true,
             max_uses: Some(2),
             ephemeral: false,
+            ephemeral_timeout_secs: None,
             ttl_secs: 3_600,
             now_unix_ms: now_ms,
         };
@@ -495,6 +515,64 @@ mod tests {
         assert_eq!(
             third.as_ref().err().map(|e| e.kind()),
             Some(ErrorKind::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn test_ephemeral_timeout_validation_and_persistence() {
+        // Arrange
+        let Some((_dir, db)) = open_test_db() else {
+            return;
+        };
+        let now_ms = 1_731_480_200_000;
+        let Ok(tx) = db.begin_write() else {
+            return;
+        };
+
+        // Act: non-ephemeral with ephemeral_timeout_secs or zero timeout rejected
+        let bad_non_ephemeral = CreatePreAuthKeyInput {
+            key_id: KeyId::new_v7(now_ms),
+            token_hash: [0xA1_u8; 32],
+            label: None,
+            bound_node_name: None,
+            reusable: false,
+            max_uses: None,
+            ephemeral: false,
+            ephemeral_timeout_secs: Some(60),
+            ttl_secs: 3_600,
+            now_unix_ms: now_ms,
+        };
+        assert_eq!(
+            KeysRepository::create_key_in_tx(&tx, &bad_non_ephemeral, "admin")
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::InvalidArgument)
+        );
+
+        let valid_ephemeral = CreatePreAuthKeyInput {
+            key_id: KeyId::new_v7(now_ms + 1),
+            token_hash: [0xA2_u8; 32],
+            label: Some("ephem-ci".to_owned()),
+            bound_node_name: None,
+            reusable: true,
+            max_uses: Some(3),
+            ephemeral: true,
+            ephemeral_timeout_secs: Some(120),
+            ttl_secs: 3_600,
+            now_unix_ms: now_ms,
+        };
+        let saved = KeysRepository::create_key_in_tx(&tx, &valid_ephemeral, "admin")
+            .expect("valid ephemeral key");
+        tx.commit().expect("commit");
+
+        // Assert
+        assert!(saved.ephemeral);
+        assert_eq!(saved.ephemeral_timeout_secs, Some(120));
+        let listed = KeysRepository::list_keys(&db).expect("list keys");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed.first().and_then(|k| k.ephemeral_timeout_secs),
+            Some(120)
         );
     }
 }

@@ -57,12 +57,16 @@ pub struct StoredNodeRecord {
     pub preauth_key_id: KeyId,
     /// Ephemeral node marker (`US-006`).
     pub ephemeral: bool,
+    /// Optional idle offline reap timeout in seconds (`US-006`).
+    #[serde(default)]
+    pub ephemeral_timeout_secs: Option<u32>,
     /// UTC epoch milliseconds when the node was created.
     pub created_at_ms: u64,
     /// UTC epoch milliseconds of latest verified heartbeat/API activity.
     pub last_seen_at_ms: u64,
-    /// UTC epoch milliseconds when the node key expires (`US-031`).
-    pub key_expires_at_ms: u64,
+    /// UTC epoch milliseconds when the node key expires (`None` = `--never`, `US-031`).
+    #[serde(default)]
+    pub key_expires_at_ms: Option<u64>,
     /// Optional explicit revocation timestamp.
     pub revoked_at_ms: Option<u64>,
     /// Optional expiration transition timestamp.
@@ -77,6 +81,14 @@ pub struct StoredNodeRecord {
     pub protocol_version: u16,
     /// Latest reported ICE/STUN/local UDP candidate endpoints.
     pub endpoints: Vec<CandidateEndpoint>,
+}
+
+impl StoredNodeRecord {
+    /// Returns `true` if the node has a finite expiration at or before `now_unix_ms`.
+    #[must_use]
+    pub const fn is_key_expired_at(&self, now_unix_ms: u64) -> bool {
+        matches!(self.key_expires_at_ms, Some(exp) if now_unix_ms >= exp)
+    }
 }
 
 /// Input arguments for single-transaction idempotent node registration (`US-004`, `US-005`).
@@ -151,7 +163,7 @@ impl NodesRepository {
             && let Some(prev_record) = lookup_node_by_pubkey_in_tx(tx, &prev_pk)?
         {
             if prev_record.status == NodeStatus::Revoked
-                || input.now_unix_ms >= prev_record.key_expires_at_ms
+                || input.pubkey.as_bytes() == &prev_record.pubkey
                 || prev_record.node_name != input.requested_name.as_str()
                 || consumed_key.bound_node_name.as_deref() != Some(prev_record.node_name.as_str())
             {
@@ -159,7 +171,7 @@ impl NodesRepository {
                     "pre-auth key is not authorized for key rotation on target node",
                 ));
             }
-            return handle_key_rotation_registration(tx, prev_record, consumed_key.key_id, input);
+            return handle_key_rotation_registration(tx, prev_record, &consumed_key, input);
         }
 
         if let Some(existing_by_name) =
@@ -335,7 +347,8 @@ impl NodesRepository {
             ephemeral: false,
             created_at_ms: revoked_at_ms,
             last_seen_at_ms: revoked_at_ms,
-            key_expires_at_ms: revoked_at_ms,
+            key_expires_at_ms: Some(revoked_at_ms),
+            ephemeral_timeout_secs: None,
             revoked_at_ms: (!mark_expired).then_some(revoked_at_ms),
             expired_at_ms: mark_expired.then_some(revoked_at_ms),
             quarantine_until_ms: Some(revoked_at_ms.saturating_add(QUARANTINE_DURATION_MS)),
@@ -370,7 +383,11 @@ impl NodesRepository {
         }
         record.status = NodeStatus::Expired;
         record.expired_at_ms = Some(now_unix_ms);
-        record.key_expires_at_ms = record.key_expires_at_ms.min(now_unix_ms);
+        record.key_expires_at_ms = Some(
+            record
+                .key_expires_at_ms
+                .map_or(now_unix_ms, |prev| prev.min(now_unix_ms)),
+        );
         record.quarantine_until_ms = Some(now_unix_ms.saturating_add(QUARANTINE_DURATION_MS));
         save_node_record_in_tx(tx, &record)?;
         let audit = AuditEventInput {
@@ -386,6 +403,141 @@ impl NodesRepository {
         };
         AuditRepository::append_audit_in_tx(tx, &audit)?;
         Ok(record)
+    }
+
+    /// Clears expiration indefinitely (`--never`, `US-031 AC2`) on an active trusted node.
+    pub fn set_node_expiry_never_in_tx(
+        tx: &WriteTransaction,
+        node_id: NodeId,
+        now_unix_ms: u64,
+        actor: &str,
+    ) -> AppResult<StoredNodeRecord> {
+        let mut record = load_node_by_id_in_tx(tx, node_id)?
+            .ok_or_else(|| AppError::not_found(format!("node {node_id} not found")))?;
+        if record.status == NodeStatus::Revoked {
+            return Err(AppError::conflict("cannot set --never on a revoked node"));
+        }
+        if record.status == NodeStatus::Expired || record.is_key_expired_at(now_unix_ms) {
+            return Err(AppError::conflict(
+                "cannot set --never on an already expired node; re-authenticate with --for <node>",
+            ));
+        }
+        record.key_expires_at_ms = None;
+        save_node_record_in_tx(tx, &record)?;
+        let audit = AuditEventInput {
+            occurred_at_ms: now_unix_ms,
+            actor,
+            action: "node_expiry_updated",
+            target: &node_id.to_string(),
+            outcome: "success",
+            metadata: serde_json::json!({
+                "node_name": record.node_name,
+                "expiry": "never",
+            }),
+        };
+        AuditRepository::append_audit_in_tx(tx, &audit)?;
+        Ok(record)
+    }
+
+    /// Updates `last_seen_at_ms` without emitting a Netmap version bump (`US-006`, `US-009`).
+    pub fn touch_last_seen_in_tx(
+        tx: &WriteTransaction,
+        node_id: NodeId,
+        now_unix_ms: u64,
+    ) -> AppResult<bool> {
+        let Some(mut record) = load_node_by_id_in_tx(tx, node_id)? else {
+            return Ok(false);
+        };
+        if record.status != NodeStatus::Active {
+            return Ok(false);
+        }
+        if now_unix_ms > record.last_seen_at_ms {
+            record.last_seen_at_ms = now_unix_ms;
+            save_node_record_in_tx(tx, &record)?;
+        }
+        Ok(true)
+    }
+
+    /// Deletes an expired offline ephemeral node, immediately releasing its IP and name (`US-006`).
+    pub fn reap_ephemeral_node_in_tx(
+        tx: &WriteTransaction,
+        node_id: NodeId,
+        now_unix_ms: u64,
+        timeout_secs: u32,
+        actor: &str,
+    ) -> AppResult<Option<StoredNodeRecord>> {
+        let Some(record) = load_node_by_id_in_tx(tx, node_id)? else {
+            return Ok(None);
+        };
+        if !record.ephemeral || record.status != NodeStatus::Active {
+            return Ok(None);
+        }
+        let elapsed_ms = now_unix_ms.saturating_sub(record.last_seen_at_ms);
+        let threshold_ms = u64::from(timeout_secs).saturating_mul(1_000);
+        if elapsed_ms < threshold_ms {
+            return Ok(None);
+        }
+
+        let node_u128 = node_id_to_u128(record.node_id);
+        {
+            let mut nodes_tbl = tx
+                .open_table(TABLE_NODES)
+                .map_err(|e| map_store_err("open write nodes reap ephemeral", e))?;
+            nodes_tbl
+                .remove(node_u128)
+                .map_err(|e| map_store_err("remove reaped ephemeral node", e))?;
+
+            let mut pk_idx = tx
+                .open_table(TABLE_IDX_NODES_PUBKEY)
+                .map_err(|e| map_store_err("open write idx_nodes_pubkey reap ephemeral", e))?;
+            pk_idx
+                .remove(&record.pubkey)
+                .map_err(|e| map_store_err("remove reaped idx_nodes_pubkey", e))?;
+
+            let mut name_idx = tx
+                .open_table(TABLE_IDX_NODES_NAME)
+                .map_err(|e| map_store_err("open write idx_nodes_name reap ephemeral", e))?;
+            let existing_name_owner = name_idx
+                .get(record.node_name.as_str())
+                .map_err(|e| map_store_err("read idx_nodes_name reap ephemeral", e))?
+                .map(|g| g.value());
+            if existing_name_owner == Some(node_u128) {
+                name_idx
+                    .remove(record.node_name.as_str())
+                    .map_err(|e| map_store_err("remove reaped idx_nodes_name", e))?;
+            }
+
+            if let Some(ip) = record.overlay_ip {
+                let ip_u32 = overlay_ip_to_u32(ip);
+                let mut ip_idx = tx
+                    .open_table(TABLE_IDX_NODES_OVERLAY_IP)
+                    .map_err(|e| map_store_err("open write idx_nodes_overlay_ip reap", e))?;
+                let existing_ip_owner = ip_idx
+                    .get(ip_u32)
+                    .map_err(|e| map_store_err("read idx_nodes_overlay_ip reap", e))?
+                    .map(|g| g.value());
+                if existing_ip_owner == Some(node_u128) {
+                    ip_idx
+                        .remove(ip_u32)
+                        .map_err(|e| map_store_err("remove reaped idx_nodes_overlay_ip", e))?;
+                }
+            }
+        }
+
+        let audit = AuditEventInput {
+            occurred_at_ms: now_unix_ms,
+            actor,
+            action: "ephemeral_node_reaped",
+            target: &record.node_id.to_string(),
+            outcome: "success",
+            metadata: serde_json::json!({
+                "node_name": record.node_name,
+                "released_ip": record.overlay_ip.map(|ip| ip.to_string()),
+                "timeout_secs": timeout_secs,
+            }),
+        };
+        AuditRepository::append_audit_in_tx(tx, &audit)?;
+        Ok(Some(record))
     }
 
     /// Reclaims `idx_nodes_overlay_ip` entries for nodes whose 24h quarantine has elapsed (`US-008`).
@@ -626,7 +778,7 @@ impl NodesRepository {
         };
 
         for node in all_nodes {
-            if node.status == NodeStatus::Active && now_unix_ms >= node.key_expires_at_ms {
+            if node.status == NodeStatus::Active && node.is_key_expired_at(now_unix_ms) {
                 let id = node.node_id;
                 Self::expire_node_in_tx(tx, id, now_unix_ms, "system:expiry_sweeper")?;
                 expired_ids.push(id);
@@ -640,7 +792,7 @@ fn ensure_node_active(record: &StoredNodeRecord, now_unix_ms: u64) -> AppResult<
     match record.status {
         NodeStatus::Revoked => Err(AppError::unauthenticated("node has been revoked")),
         NodeStatus::Expired => Err(AppError::unauthenticated("node key has expired")),
-        NodeStatus::Active if now_unix_ms >= record.key_expires_at_ms => {
+        NodeStatus::Active if record.is_key_expired_at(now_unix_ms) => {
             Err(AppError::unauthenticated("node key reached expiration"))
         }
         NodeStatus::Active => Ok(()),
@@ -652,7 +804,7 @@ fn handle_existing_pubkey_registration(
     mut existing: StoredNodeRecord,
     input: &RegisterNodeInput<'_>,
 ) -> AppResult<RegisterNodeOutcome> {
-    if existing.status != NodeStatus::Active || input.now_unix_ms >= existing.key_expires_at_ms {
+    if existing.status != NodeStatus::Active || existing.is_key_expired_at(input.now_unix_ms) {
         return Err(AppError::unauthenticated(
             "cannot re-register with a revoked or expired node key",
         ));
@@ -689,7 +841,7 @@ fn handle_existing_pubkey_registration(
 fn handle_key_rotation_registration(
     tx: &WriteTransaction,
     mut existing: StoredNodeRecord,
-    new_preauth_key_id: KeyId,
+    consumed_key: &crate::keys_repo::StoredPreAuthKeyRecord,
     input: &RegisterNodeInput<'_>,
 ) -> AppResult<RegisterNodeOutcome> {
     let old_pubkey = existing.pubkey;
@@ -706,11 +858,26 @@ fn handle_key_rotation_registration(
             .map_err(|e| map_store_err("insert new idx_nodes_pubkey rotation", e))?;
     }
 
+    let preserved_ip = match existing.overlay_ip {
+        Some(ip) => ip,
+        None => allocate_next_overlay_ip_in_tx(tx, existing.node_id, input.now_unix_ms)?,
+    };
+
     existing.pubkey = *input.pubkey.as_bytes();
     existing.disco_pubkey = *input.disco_pubkey.as_bytes();
-    existing.preauth_key_id = new_preauth_key_id;
+    existing.overlay_ip = Some(preserved_ip);
+    existing.last_overlay_ip = Some(preserved_ip);
+    existing.status = NodeStatus::Active;
+    existing.preauth_key_id = consumed_key.key_id;
+    existing.ephemeral = consumed_key.ephemeral || existing.ephemeral;
+    if consumed_key.ephemeral_timeout_secs.is_some() {
+        existing.ephemeral_timeout_secs = consumed_key.ephemeral_timeout_secs;
+    }
+    existing.revoked_at_ms = None;
+    existing.expired_at_ms = None;
+    existing.quarantine_until_ms = None;
     existing.last_seen_at_ms = input.now_unix_ms;
-    existing.key_expires_at_ms = input.now_unix_ms.saturating_add(input.node_key_ttl_ms);
+    existing.key_expires_at_ms = Some(input.now_unix_ms.saturating_add(input.node_key_ttl_ms));
     existing.os_arch = input.os_arch.to_owned();
     existing.agent_version = input.agent_version.to_owned();
     existing.protocol_version = input.protocol_version;
@@ -757,7 +924,7 @@ fn handle_name_collision_registration(
     let explicitly_bound =
         consumed_key.bound_node_name.as_deref() == Some(existing.node_name.as_str());
     let expired_or_past =
-        existing.status == NodeStatus::Expired || input.now_unix_ms >= existing.key_expires_at_ms;
+        existing.status == NodeStatus::Expired || existing.is_key_expired_at(input.now_unix_ms);
     if existing.status == NodeStatus::Revoked || !expired_or_past || !explicitly_bound {
         return Err(AppError::conflict(format!(
             "node name `{}` already registered",
@@ -790,10 +957,13 @@ fn handle_name_collision_registration(
     existing.last_overlay_ip = Some(preserved_ip);
     existing.status = NodeStatus::Active;
     existing.preauth_key_id = consumed_key.key_id;
+    existing.ephemeral = consumed_key.ephemeral;
+    existing.ephemeral_timeout_secs = consumed_key.ephemeral_timeout_secs;
+    existing.revoked_at_ms = None;
     existing.expired_at_ms = None;
     existing.quarantine_until_ms = None;
     existing.last_seen_at_ms = input.now_unix_ms;
-    existing.key_expires_at_ms = input.now_unix_ms.saturating_add(input.node_key_ttl_ms);
+    existing.key_expires_at_ms = Some(input.now_unix_ms.saturating_add(input.node_key_ttl_ms));
     existing.os_arch = input.os_arch.to_owned();
     existing.agent_version = input.agent_version.to_owned();
     existing.protocol_version = input.protocol_version;
@@ -919,9 +1089,10 @@ fn build_new_node_record(
         status: NodeStatus::Active,
         preauth_key_id: key.key_id,
         ephemeral: key.ephemeral,
+        ephemeral_timeout_secs: key.ephemeral_timeout_secs,
         created_at_ms: input.now_unix_ms,
         last_seen_at_ms: input.now_unix_ms,
-        key_expires_at_ms: input.now_unix_ms.saturating_add(input.node_key_ttl_ms),
+        key_expires_at_ms: Some(input.now_unix_ms.saturating_add(input.node_key_ttl_ms)),
         revoked_at_ms: None,
         expired_at_ms: None,
         quarantine_until_ms: None,
@@ -1088,6 +1259,7 @@ mod tests {
                 reusable: false,
                 max_uses: None,
                 ephemeral: false,
+                ephemeral_timeout_secs: None,
                 ttl_secs: 3_600,
                 now_unix_ms: now,
             },
@@ -1372,5 +1544,120 @@ mod tests {
         // Assert
         assert_ne!(out2.record.node_id, out1.record.node_id);
         assert_eq!(out2.record.status, NodeStatus::Active);
+    }
+
+    #[test]
+    fn test_expired_node_reauth_with_bound_key_requires_new_pubkey_and_preserves_ip() {
+        // Arrange
+        let (_dir, db) = setup_db("10.100.0.0/24");
+        let now = 1_731_480_000_000;
+        let k1 = mint_key(&db, 0x71, None, now);
+        let pk1 = PublicKey::from_bytes([0x72_u8; 32]).expect("pk1");
+        let disco1 = PublicKey::from_bytes([0x73_u8; 32]).expect("disco1");
+        let name = NodeName::parse("laptop-x").expect("name");
+        let tx1 = db.begin_write().expect("tx1");
+        let out1 = NodesRepository::register_node_in_tx(
+            &tx1,
+            &RegisterNodeInput {
+                pubkey: pk1,
+                disco_pubkey: disco1,
+                previous_node_pubkey: None,
+                requested_name: name.clone(),
+                preauth_token_hash: k1,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "darwin/arm64",
+                agent_version: "0.2.0",
+                protocol_version: 2,
+                node_key_ttl_ms: 10_000,
+                now_unix_ms: now,
+            },
+        )
+        .expect("register laptop-x");
+        NodesRepository::expire_node_in_tx(&tx1, out1.record.node_id, now + 10_000, "admin")
+            .expect("expire laptop-x");
+        tx1.commit().expect("commit tx1");
+
+        // Act 1: reusing the old public key MUST fail even with a bound `--for` key
+        let k_bound_bad = mint_key(&db, 0x74, Some("laptop-x"), now + 11_000);
+        let tx_same_pk = db.begin_write().expect("tx same pk");
+        let same_res = NodesRepository::register_node_in_tx(
+            &tx_same_pk,
+            &RegisterNodeInput {
+                pubkey: pk1,
+                disco_pubkey: disco1,
+                previous_node_pubkey: Some(pk1),
+                requested_name: name.clone(),
+                preauth_token_hash: k_bound_bad,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "darwin/arm64",
+                agent_version: "0.2.0",
+                protocol_version: 2,
+                node_key_ttl_ms: DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: now + 11_500,
+            },
+        );
+        assert!(same_res.is_err());
+        tx_same_pk.abort().expect("abort");
+
+        // Act 2: unbound key trying to re-register existing expired name is rejected (`US-031 AC6`)
+        let pk2 = PublicKey::from_bytes([0x75_u8; 32]).expect("pk2");
+        let disco2 = PublicKey::from_bytes([0x76_u8; 32]).expect("disco2");
+        let k_unbound = mint_key(&db, 0x77, None, now + 12_000);
+        let tx_unbound = db.begin_write().expect("tx unbound");
+        let unbound_res = NodesRepository::register_node_in_tx(
+            &tx_unbound,
+            &RegisterNodeInput {
+                pubkey: pk2,
+                disco_pubkey: disco2,
+                previous_node_pubkey: Some(pk1),
+                requested_name: name.clone(),
+                preauth_token_hash: k_unbound,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "darwin/arm64",
+                agent_version: "0.2.0",
+                protocol_version: 2,
+                node_key_ttl_ms: DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: now + 12_500,
+            },
+        );
+        assert!(unbound_res.is_err());
+        tx_unbound.abort().expect("abort");
+
+        // Act 3: bound `--for laptop-x` key + new pubkey succeeds and preserves node_id & overlay_ip
+        let k_bound_ok = mint_key(&db, 0x78, Some("laptop-x"), now + 13_000);
+        let tx_ok = db.begin_write().expect("tx ok");
+        let reauth = NodesRepository::register_node_in_tx(
+            &tx_ok,
+            &RegisterNodeInput {
+                pubkey: pk2,
+                disco_pubkey: disco2,
+                previous_node_pubkey: Some(pk1),
+                requested_name: name,
+                preauth_token_hash: k_bound_ok,
+                public_control_host: "203.0.113.10",
+                domain_suffix: "mesh.internal",
+                os_arch: "darwin/arm64",
+                agent_version: "0.2.0",
+                protocol_version: 2,
+                node_key_ttl_ms: DEFAULT_NODE_KEY_TTL_MS,
+                now_unix_ms: now + 13_500,
+            },
+        )
+        .expect("reauth ok");
+        tx_ok.commit().expect("commit reauth");
+
+        // Assert
+        assert_eq!(reauth.record.node_id, out1.record.node_id);
+        assert_eq!(reauth.record.overlay_ip, out1.record.overlay_ip);
+        assert_eq!(reauth.record.status, NodeStatus::Active);
+        assert_eq!(reauth.replaced_pubkey, Some(pk1));
+        assert!(
+            NodesRepository::find_by_pubkey(&db, &pk1)
+                .expect("find old pk")
+                .is_none()
+        );
     }
 }

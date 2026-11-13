@@ -5,7 +5,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::net::lookup_host;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use mesh_core::AppResult;
@@ -154,18 +156,52 @@ impl StunClient {
             return false;
         }
         self.raw_endpoints.clone_from(&relay_map.stun_udp_endpoints);
-        let parsed: Vec<SocketAddr> = relay_map
-            .stun_udp_endpoints
-            .iter()
-            .filter_map(|raw| raw.parse::<SocketAddr>().ok())
-            .collect();
+        let mut parsed = Vec::new();
+        for raw in &relay_map.stun_udp_endpoints {
+            if let Ok(addr) = raw.parse::<SocketAddr>()
+                && !parsed.contains(&addr)
+            {
+                parsed.push(addr);
+            }
+        }
         self.apply_resolved_endpoints(parsed);
+        true
+    }
+
+    /// Returns `true` if `endpoints` contains any non-literal hostname requiring background DNS lookup.
+    #[must_use]
+    pub fn has_unresolved_hostnames(endpoints: &[String]) -> bool {
+        endpoints
+            .iter()
+            .any(|raw| raw.parse::<SocketAddr>().is_err())
+    }
+
+    /// Applies background-resolved DNS `SocketAddr`s only when `raw_endpoints` still matches the
+    /// active `RelayMap` list, returning `true` when `tracked_endpoints` changed (`HR-W21-07`).
+    pub fn apply_resolved_endpoints_for_raw(
+        &mut self,
+        raw_endpoints: &[String],
+        resolved: Vec<SocketAddr>,
+    ) -> bool {
+        if self.raw_endpoints != raw_endpoints {
+            return false;
+        }
+        if self.resolved_endpoints == resolved {
+            return false;
+        }
+        self.apply_resolved_endpoints(resolved);
         true
     }
 
     /// Resolves hostnames/ports in `relay_map.stun_udp_endpoints` asynchronously (bounded to 5 s).
     pub async fn sync_and_resolve_relay_map(&mut self, relay_map: &RelayMap) -> bool {
         let changed = self.raw_endpoints != relay_map.stun_udp_endpoints;
+        if !changed
+            && (!self.resolved_endpoints.is_empty()
+                || !Self::has_unresolved_hostnames(&self.raw_endpoints))
+        {
+            return false;
+        }
         self.raw_endpoints.clone_from(&relay_map.stun_udp_endpoints);
         let resolved = resolve_endpoint_strings(&relay_map.stun_udp_endpoints).await;
         self.apply_resolved_endpoints(resolved);
@@ -192,6 +228,12 @@ impl StunClient {
         now_ms: u64,
     ) -> Vec<(SocketAddr, [u8; 28])> {
         let _ = self.sync_relay_map(relay_map);
+        self.start_probe_for_resolved(now_ms)
+    }
+
+    /// Prepares a STUN Binding Request round over already-tracked resolved endpoints without
+    /// altering cached raw `RelayMap` strings (`HR-W21-07`).
+    pub fn start_probe_round_tracked(&mut self, now_ms: u64) -> Vec<(SocketAddr, [u8; 28])> {
         self.start_probe_for_resolved(now_ms)
     }
 
@@ -363,25 +405,76 @@ impl StunClient {
     }
 }
 
-async fn resolve_endpoint_strings(endpoints: &[String]) -> Vec<SocketAddr> {
+/// Resolves `stun_udp_endpoints` concurrently with an overall `<= 5 s` deadline and immediate
+/// cooperative cancellation via `cancel` (`HR-W21-07`).
+pub(crate) async fn resolve_stun_endpoints_cancellable(
+    endpoints: &[String],
+    cancel: &CancellationToken,
+) -> Vec<SocketAddr> {
     let mut resolved = Vec::new();
+    let mut hostnames = Vec::new();
     for raw in endpoints {
         if let Ok(addr) = raw.parse::<SocketAddr>() {
             if !resolved.contains(&addr) {
                 resolved.push(addr);
             }
-            continue;
+        } else {
+            hostnames.push(raw.clone());
         }
-        if let Ok(Ok(addrs)) = tokio::time::timeout(MAX_STUN_PROBE_TIMEOUT, lookup_host(raw)).await
-        {
-            for addr in addrs {
-                if !resolved.contains(&addr) {
-                    resolved.push(addr);
+    }
+    if hostnames.is_empty() {
+        return resolved;
+    }
+
+    let mut join_set = JoinSet::new();
+    for host in hostnames {
+        let child = cancel.child_token();
+        join_set.spawn(async move {
+            tokio::select! {
+                () = child.cancelled() => Vec::new(),
+                res = tokio::time::timeout(MAX_STUN_PROBE_TIMEOUT, lookup_host(host)) => {
+                    match res {
+                        Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    }
+                }
+            }
+        });
+    }
+
+    let deadline = tokio::time::sleep(MAX_STUN_PROBE_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                join_set.abort_all();
+                break;
+            }
+            () = &mut deadline => {
+                join_set.abort_all();
+                break;
+            }
+            next = join_set.join_next() => {
+                match next {
+                    Some(Ok(addrs)) => {
+                        for addr in addrs {
+                            if !resolved.contains(&addr) {
+                                resolved.push(addr);
+                            }
+                        }
+                    }
+                    Some(Err(_)) => {}
+                    None => break,
                 }
             }
         }
     }
     resolved
+}
+
+async fn resolve_endpoint_strings(endpoints: &[String]) -> Vec<SocketAddr> {
+    let cancel = CancellationToken::new();
+    resolve_stun_endpoints_cancellable(endpoints, &cancel).await
 }
 
 /// Classifies NAT mapping honestly from STUN observations (`US-019 AC2`).

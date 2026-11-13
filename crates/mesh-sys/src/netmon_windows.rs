@@ -3,6 +3,7 @@
 use std::ffi::{OsString, c_void};
 use std::fmt;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -15,11 +16,13 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     CancelMibChangeNotify2, GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, GetBestInterfaceEx,
     IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211, IF_TYPE_PPP, IF_TYPE_PPPMULTILINKBUNDLE,
     IF_TYPE_PROP_VIRTUAL, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH,
-    MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, MibInitialNotification, NotifyIpInterfaceChange,
+    IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+    MIB_UNICASTIPADDRESS_ROW, MibInitialNotification, NotifyIpInterfaceChange,
+    NotifyUnicastIpAddressChange,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_UNSPEC, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN,
+    AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
 };
 use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
@@ -74,15 +77,36 @@ pub struct WindowsAdapterInfo {
     pub has_gateway: bool,
 }
 
+/// Unicast IP address and on-link prefix snapshot for a Windows adapter (`US-036`, `US-037`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsInterfaceAddress {
+    /// Interface index (`IfIndex` for IPv4, `Ipv6IfIndex` for IPv6).
+    pub if_index: u32,
+    /// Human-readable Windows adapter friendly name (e.g., `"Wi-Fi"`, `"Ethernet"`).
+    pub friendly_name: String,
+    /// Unicast IPv4 or IPv6 address assigned to this interface.
+    pub ip: IpAddr,
+    /// On-link subnet prefix length (`0..=32` IPv4, `0..=128` IPv6).
+    pub prefix_len: u8,
+    /// Whether operational status is `IfOperStatusUp`.
+    pub is_up: bool,
+    /// Whether this adapter is virtual/tunnel/loopback and must be excluded as physical uplink.
+    pub is_virtual: bool,
+    /// Whether Windows lists at least one default gateway on this adapter.
+    pub has_gateway: bool,
+}
+
 #[derive(Debug)]
 struct IpChangeContext {
     change_count: AtomicU64,
     tx: SyncSender<()>,
 }
 
-/// Active subscription to `NotifyIpInterfaceChange`; dropping cancels the kernel callback safely.
+/// Active subscription to Windows `NotifyIpInterfaceChange` and `NotifyUnicastIpAddressChange`;
+/// dropping cancels all kernel callbacks synchronously.
 pub struct IpChangeSubscription {
-    handle: HANDLE,
+    iface_handle: HANDLE,
+    unicast_handle: HANDLE,
     raw_ctx: *const IpChangeContext,
 }
 
@@ -101,22 +125,28 @@ impl fmt::Debug for IpChangeSubscription {
 
 impl Drop for IpChangeSubscription {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            // SAFETY: `CancelMibChangeNotify2` synchronously drains and waits for any active
-            // `ip_interface_change_callback` invocation before returning, so reclaiming `raw_ctx`
-            // immediately afterwards cannot trigger a use-after-free.
-            let rc = unsafe { CancelMibChangeNotify2(self.handle) };
-            if rc != NO_ERROR {
-                tracing::warn!(
-                    target: "mesh::sys::netmon_windows",
-                    error_code = rc,
-                    "CancelMibChangeNotify2 returned non-zero status on drop"
-                );
+        for (label, handle) in [
+            ("iface", self.iface_handle),
+            ("unicast", self.unicast_handle),
+        ] {
+            if !handle.is_null() {
+                // SAFETY: `CancelMibChangeNotify2` synchronously drains and waits for any active
+                // callback invocation before returning, so reclaiming `raw_ctx` afterwards cannot
+                // trigger a use-after-free.
+                let rc = unsafe { CancelMibChangeNotify2(handle) };
+                if rc != NO_ERROR {
+                    tracing::warn!(
+                        target: "mesh::sys::netmon_windows",
+                        subscription = label,
+                        error_code = rc,
+                        "CancelMibChangeNotify2 returned non-zero status on drop"
+                    );
+                }
             }
         }
         if !self.raw_ctx.is_null() {
-            // SAFETY: `self.raw_ctx` was created via `Arc::into_raw` when registering and
-            // `CancelMibChangeNotify2` has completed above.
+            // SAFETY: `self.raw_ctx` was created via `Arc::into_raw` when registering and all
+            // kernel notifications have completed `CancelMibChangeNotify2` above.
             let reclaimed = unsafe { Arc::from_raw(self.raw_ctx) };
             drop(reclaimed);
         }
@@ -204,9 +234,7 @@ pub fn is_virtual_adapter(if_type: u32, friendly_name: &str, description: &str) 
         .any(|kw| friendly_lower.contains(kw) || desc_lower.contains(kw))
 }
 
-/// Enumerates Windows network adapters using `GetAdaptersAddresses`.
-pub fn list_adapters() -> SysResult<Vec<WindowsAdapterInfo>> {
-    const OP: &str = "netmon_windows::list_adapters";
+fn fetch_adapters_raw_buffer(op: &'static str) -> SysResult<Vec<u64>> {
     let mut size: u32 = 16 * 1024;
     let mut aligned_buf: Vec<u64> = Vec::new();
     let mut attempts: u8 = 0;
@@ -229,15 +257,21 @@ pub fn list_adapters() -> SysResult<Vec<WindowsAdapterInfo>> {
             )
         };
         if status == NO_ERROR {
-            break;
+            return Ok(aligned_buf);
         }
         if status == ERROR_BUFFER_OVERFLOW && attempts < 4 {
             attempts += 1;
             continue;
         }
         let err = io::Error::from_raw_os_error(i32::try_from(status).unwrap_or(i32::MAX));
-        return Err(SysError::io(OP, err));
+        return Err(SysError::io(op, err));
     }
+}
+
+/// Enumerates Windows network adapters using `GetAdaptersAddresses`.
+pub fn list_adapters() -> SysResult<Vec<WindowsAdapterInfo>> {
+    const OP: &str = "netmon_windows::list_adapters";
+    let aligned_buf = fetch_adapters_raw_buffer(OP)?;
 
     let mut out = Vec::new();
     let mut current: *const IP_ADAPTER_ADDRESSES_LH =
@@ -272,6 +306,113 @@ pub fn list_adapters() -> SysResult<Vec<WindowsAdapterInfo>> {
     Ok(out)
 }
 
+/// Enumerates unicast IPv4/IPv6 addresses and on-link prefix lengths for all Windows adapters
+/// (`US-036` DHCP wait, `US-037` CGNAT overlap detection).
+pub fn list_interface_addresses() -> SysResult<Vec<WindowsInterfaceAddress>> {
+    const OP: &str = "netmon_windows::list_interface_addresses";
+    let aligned_buf = fetch_adapters_raw_buffer(OP)?;
+
+    let mut out = Vec::new();
+    let mut current: *const IP_ADAPTER_ADDRESSES_LH =
+        aligned_buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    let mut visited_adapters: usize = 0;
+
+    while !current.is_null() && visited_adapters < 4096 {
+        visited_adapters += 1;
+        // SAFETY: `GetAdaptersAddresses` succeeded and wrote a linked list inside `aligned_buf`.
+        let node = unsafe { &*current };
+        // SAFETY: `Anonymous1.Anonymous` is the active Win32 union variant populated by IP Helper.
+        let ipv4_if_index = unsafe { node.Anonymous1.Anonymous.IfIndex };
+        let ipv6_if_index = node.Ipv6IfIndex;
+        let friendly_name = decode_wide_ptr(node.FriendlyName);
+        let description = decode_wide_ptr(node.Description);
+        let is_virtual = is_virtual_adapter(node.IfType, &friendly_name, &description);
+        let is_up = node.OperStatus == IfOperStatusUp;
+        let has_gateway = !node.FirstGatewayAddress.is_null();
+
+        let mut ucast: *const IP_ADAPTER_UNICAST_ADDRESS_LH = node.FirstUnicastAddress.cast_const();
+        let mut visited_ucast: usize = 0;
+        while !ucast.is_null() && visited_ucast < 256 {
+            visited_ucast += 1;
+            // SAFETY: `ucast` traverses valid unicast address nodes owned by `aligned_buf`.
+            let entry = unsafe { &*ucast };
+            if let Some(ip) =
+                extract_windows_sockaddr_ip(entry.Address.lpSockaddr, entry.Address.iSockaddrLength)
+            {
+                let (if_index, max_prefix) = match ip {
+                    IpAddr::V4(_) => (ipv4_if_index, 32_u8),
+                    IpAddr::V6(_) => (
+                        if ipv6_if_index != 0 {
+                            ipv6_if_index
+                        } else {
+                            ipv4_if_index
+                        },
+                        128_u8,
+                    ),
+                };
+                out.push(WindowsInterfaceAddress {
+                    if_index,
+                    friendly_name: friendly_name.clone(),
+                    ip,
+                    prefix_len: entry.OnLinkPrefixLength.min(max_prefix),
+                    is_up,
+                    is_virtual,
+                    has_gateway,
+                });
+            }
+            ucast = entry.Next.cast_const();
+        }
+
+        current = node.Next.cast_const();
+    }
+
+    Ok(out)
+}
+
+fn extract_windows_sockaddr_ip(sockaddr_ptr: *const SOCKADDR, sockaddr_len: i32) -> Option<IpAddr> {
+    if sockaddr_ptr.is_null() || sockaddr_len < i32::try_from(size_of::<SOCKADDR>()).ok()? {
+        return None;
+    }
+    // SAFETY: Caller verified non-null `sockaddr_ptr` with byte length >= `size_of::<SOCKADDR>()`.
+    let family = unsafe { (*sockaddr_ptr).sa_family };
+    if family == AF_INET {
+        let min_len = i32::try_from(size_of::<SOCKADDR_IN>()).ok()?;
+        if sockaddr_len < min_len {
+            return None;
+        }
+        // SAFETY: `sa_family == AF_INET` and length >= `size_of::<SOCKADDR_IN>()`.
+        let sa_in = unsafe { ptr::read_unaligned(sockaddr_ptr.cast::<SOCKADDR_IN>()) };
+        // SAFETY: `IN_ADDR_0::S_addr` stores IPv4 octets in network byte order.
+        let octets = unsafe { sa_in.sin_addr.S_un.S_addr }.to_ne_bytes();
+        return Some(IpAddr::V4(Ipv4Addr::from(octets)));
+    }
+    if family == AF_INET6 {
+        let min_len = i32::try_from(size_of::<SOCKADDR_IN6>()).ok()?;
+        if sockaddr_len < min_len {
+            return None;
+        }
+        // SAFETY: `sa_family == AF_INET6` and length >= `size_of::<SOCKADDR_IN6>()`.
+        let sa_in6 = unsafe { ptr::read_unaligned(sockaddr_ptr.cast::<SOCKADDR_IN6>()) };
+        // SAFETY: `IN6_ADDR_0::Byte` stores the 16 IPv6 octets in network order.
+        let octets = unsafe { sa_in6.sin6_addr.u.Byte };
+        return Some(IpAddr::V6(Ipv6Addr::from(octets)));
+    }
+    None
+}
+
+/// Returns `true` when `ip` is a routable/usable interface address (excludes unspecified,
+/// loopback, IPv4 APIPA `169.254.0.0/16`, and IPv6 link-local `fe80::/10`).
+#[must_use]
+pub fn is_usable_dhcp_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_loopback() && !v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let first_seg = v6.segments().first().copied().unwrap_or(0);
+            !v6.is_unspecified() && !v6.is_loopback() && (first_seg & 0xffc0) != 0xfe80
+        }
+    }
+}
+
 /// Queries the best Windows interface index for reaching `dest_ipv4` via `GetBestInterfaceEx`.
 pub fn query_best_interface_for_ipv4(dest_ipv4: [u8; 4]) -> SysResult<u32> {
     const OP: &str = "netmon_windows::query_best_interface_for_ipv4";
@@ -302,29 +443,42 @@ pub fn query_best_interface_for_ipv4(dest_ipv4: [u8; 4]) -> SysResult<u32> {
     Ok(best_index)
 }
 
+/// Queries the current primary physical egress `(if_index, friendly_name)` on Windows,
+/// filtering out Wintun/virtual/WSL/Hyper-V/loopback interfaces (`US-016`, `US-036`, `REL-09`).
+pub fn query_primary_physical_interface() -> SysResult<(u32, String)> {
+    const OP: &str = "netmon_windows::query_primary_physical_interface";
+    let adapters = list_adapters()?;
+    select_primary_physical_adapter(&adapters)
+        .map(|a| (a.if_index, a.friendly_name.clone()))
+        .ok_or_else(|| {
+            SysError::io(
+                OP,
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no active physical Windows network interface found",
+                ),
+            )
+        })
+}
+
 /// Queries the current primary physical egress interface index on Windows, filtering out
 /// Wintun/virtual/WSL/Hyper-V/loopback interfaces (`US-016`, `REL-09`).
 pub fn query_primary_physical_if_index() -> SysResult<u32> {
-    const OP: &str = "netmon_windows::query_primary_physical_if_index";
-    let adapters = list_adapters()?;
-    select_primary_physical_if_index(&adapters).ok_or_else(|| {
-        SysError::io(
-            OP,
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "no active physical Windows network interface found",
-            ),
-        )
-    })
+    query_primary_physical_interface().map(|(idx, _)| idx)
 }
 
+#[cfg(test)]
 fn select_primary_physical_if_index(adapters: &[WindowsAdapterInfo]) -> Option<u32> {
+    select_primary_physical_adapter(adapters).map(|a| a.if_index)
+}
+
+fn select_primary_physical_adapter(adapters: &[WindowsAdapterInfo]) -> Option<&WindowsAdapterInfo> {
     if let Ok(best_idx) = query_best_interface_for_ipv4([1, 1, 1, 1])
-        && adapters
+        && let Some(found) = adapters
             .iter()
-            .any(|a| a.if_index == best_idx && a.is_up && !a.is_virtual)
+            .find(|a| a.if_index == best_idx && a.is_up && !a.is_virtual)
     {
-        return Some(best_idx);
+        return Some(found);
     }
 
     adapters
@@ -342,10 +496,10 @@ fn select_primary_physical_if_index(adapters: &[WindowsAdapterInfo]) -> Option<u
                 a.if_index,
             )
         })
-        .map(|a| a.if_index)
 }
 
-/// Subscribes to Windows IP interface add/delete/parameter changes (`NotifyIpInterfaceChange`).
+/// Subscribes to Windows IP interface and unicast IP add/delete/parameter changes
+/// (`NotifyIpInterfaceChange` + `NotifyUnicastIpAddressChange`).
 pub fn subscribe_ip_interface_changes() -> SysResult<(IpChangeSubscription, Receiver<()>)> {
     const OP: &str = "netmon_windows::subscribe_ip_interface_changes";
     let (tx, rx) = mpsc::sync_channel(16);
@@ -354,7 +508,7 @@ pub fn subscribe_ip_interface_changes() -> SysResult<(IpChangeSubscription, Rece
         tx,
     });
     let raw_ctx = Arc::into_raw(ctx);
-    let mut handle: HANDLE = ptr::null_mut();
+    let mut iface_handle: HANDLE = ptr::null_mut();
 
     // SAFETY: `ip_interface_change_callback` never blocks, and `raw_ctx` stays valid until
     // `IpChangeSubscription::drop` completes `CancelMibChangeNotify2`.
@@ -364,7 +518,7 @@ pub fn subscribe_ip_interface_changes() -> SysResult<(IpChangeSubscription, Rece
             Some(ip_interface_change_callback),
             raw_ctx.cast::<c_void>(),
             0,
-            &raw mut handle,
+            &raw mut iface_handle,
         )
     };
     if status != NO_ERROR {
@@ -375,7 +529,35 @@ pub fn subscribe_ip_interface_changes() -> SysResult<(IpChangeSubscription, Rece
         return Err(SysError::io(OP, err));
     }
 
-    Ok((IpChangeSubscription { handle, raw_ctx }, rx))
+    let mut unicast_handle: HANDLE = ptr::null_mut();
+    // SAFETY: `unicast_ip_change_callback` shares `raw_ctx`, which remains live until both
+    // `iface_handle` and `unicast_handle` finish `CancelMibChangeNotify2` in `Drop`.
+    let unicast_status = unsafe {
+        NotifyUnicastIpAddressChange(
+            AF_UNSPEC,
+            Some(unicast_ip_change_callback),
+            raw_ctx.cast::<c_void>(),
+            0,
+            &raw mut unicast_handle,
+        )
+    };
+    if unicast_status != NO_ERROR {
+        unicast_handle = ptr::null_mut();
+        tracing::debug!(
+            target: "mesh::sys::netmon_windows",
+            error_code = unicast_status,
+            "NotifyUnicastIpAddressChange registration failed; falling back to NotifyIpInterfaceChange only"
+        );
+    }
+
+    Ok((
+        IpChangeSubscription {
+            iface_handle,
+            unicast_handle,
+            raw_ctx,
+        },
+        rx,
+    ))
 }
 
 unsafe extern "system" fn ip_interface_change_callback(
@@ -383,11 +565,23 @@ unsafe extern "system" fn ip_interface_change_callback(
     _row: *const MIB_IPINTERFACE_ROW,
     notification_type: MIB_NOTIFICATION_TYPE,
 ) {
+    notify_ip_change(caller_context, notification_type);
+}
+
+unsafe extern "system" fn unicast_ip_change_callback(
+    caller_context: *const c_void,
+    _row: *const MIB_UNICASTIPADDRESS_ROW,
+    notification_type: MIB_NOTIFICATION_TYPE,
+) {
+    notify_ip_change(caller_context, notification_type);
+}
+
+fn notify_ip_change(caller_context: *const c_void, notification_type: MIB_NOTIFICATION_TYPE) {
     if caller_context.is_null() || notification_type == MibInitialNotification {
         return;
     }
     // SAFETY: `caller_context` is an `Arc::into_raw(IpChangeContext)` live until
-    // `CancelMibChangeNotify2` completes in `IpChangeSubscription::drop`.
+    // `CancelMibChangeNotify2` completes for all registered handles in `IpChangeSubscription::drop`.
     let ctx = unsafe { &*caller_context.cast::<IpChangeContext>() };
     ctx.change_count.fetch_add(1, Ordering::AcqRel);
     match ctx.tx.try_send(()) {
@@ -628,5 +822,26 @@ mod tests {
             assert!(pct <= 100);
         }
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn test_netmon_windows_list_interface_addresses_and_dhcp_filter() {
+        // Arrange / Act
+        let addrs = super::list_interface_addresses();
+
+        // Assert
+        assert!(addrs.is_ok(), "list_interface_addresses failed: {addrs:?}");
+        if let Ok(list) = addrs {
+            assert!(!list.is_empty());
+        }
+        assert!(!super::is_usable_dhcp_ip(super::IpAddr::V4(
+            super::Ipv4Addr::new(169, 254, 10, 20)
+        )));
+        assert!(!super::is_usable_dhcp_ip(super::IpAddr::V4(
+            super::Ipv4Addr::LOCALHOST
+        )));
+        assert!(super::is_usable_dhcp_ip(super::IpAddr::V4(
+            super::Ipv4Addr::new(192, 168, 1, 25)
+        )));
     }
 }

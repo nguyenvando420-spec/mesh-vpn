@@ -64,6 +64,27 @@ function Set-DirectorySddl {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
+function Resolve-SourceArtifactPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$PrimaryDir,
+        [Parameter(Mandatory = $true)][string]$FileName
+    )
+    $direct = Join-Path $PrimaryDir $FileName
+    if (Test-Path -LiteralPath $direct) {
+        return $direct
+    }
+    if ($PrimaryDir -eq $PSScriptRoot -and -not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $parentDir = Split-Path -Parent $PSScriptRoot
+        if (-not [string]::IsNullOrWhiteSpace($parentDir)) {
+            $parentCandidate = Join-Path $parentDir $FileName
+            if (Test-Path -LiteralPath $parentCandidate) {
+                return $parentCandidate
+            }
+        }
+    }
+    return $direct
+}
+
 function Resolve-ExpectedWintunSha256 {
     param(
         [string]$ExplicitHash,
@@ -74,7 +95,7 @@ function Resolve-ExpectedWintunSha256 {
     if ([string]::IsNullOrWhiteSpace($candidate)) {
         $resolvedFile = $HashFilePath
         if ([string]::IsNullOrWhiteSpace($resolvedFile)) {
-            $fallback = Join-Path $DefaultSourceDir "wintun.dll.sha256"
+            $fallback = Resolve-SourceArtifactPath -PrimaryDir $DefaultSourceDir -FileName "wintun.dll.sha256"
             if (Test-Path -LiteralPath $fallback) {
                 $resolvedFile = $fallback
             }
@@ -214,9 +235,9 @@ function Install-MeshService {
         -HashFilePath $WintunSha256File `
         -DefaultSourceDir $SourceDir
 
-    $srcMeshd = Join-Path $SourceDir "meshd.exe"
-    $srcMesh = Join-Path $SourceDir "mesh.exe"
-    $srcWintun = Join-Path $SourceDir "wintun.dll"
+    $srcMeshd = Resolve-SourceArtifactPath -PrimaryDir $SourceDir -FileName "meshd.exe"
+    $srcMesh = Resolve-SourceArtifactPath -PrimaryDir $SourceDir -FileName "mesh.exe"
+    $srcWintun = Resolve-SourceArtifactPath -PrimaryDir $SourceDir -FileName "wintun.dll"
 
     foreach ($bin in @($srcMeshd, $srcMesh, $srcWintun)) {
         if (-not (Test-Path -LiteralPath $bin)) {
@@ -238,9 +259,9 @@ function Install-MeshService {
         Copy-Item -LiteralPath $srcWintun -Destination $dstWintun -Force
         Assert-FileSha256 -Path $dstWintun -ExpectedSha256 $expectedHash
 
-        $dstLicense = Join-Path $SourceDir "WINTUN-LICENSE.txt"
-        if (Test-Path -LiteralPath $dstLicense) {
-            Copy-Item -LiteralPath $dstLicense -Destination (Join-Path $InstallDir "WINTUN-LICENSE.txt") -Force
+        $srcLicense = Resolve-SourceArtifactPath -PrimaryDir $SourceDir -FileName "WINTUN-LICENSE.txt"
+        if (Test-Path -LiteralPath $srcLicense) {
+            Copy-Item -LiteralPath $srcLicense -Destination (Join-Path $InstallDir "WINTUN-LICENSE.txt") -Force
         }
 
         $binPath = "`"$(Join-Path $InstallDir 'meshd.exe')`" --service"

@@ -35,7 +35,10 @@ use mesh_proto::control::{
 use mesh_proto::netmap::CandidateEndpoint;
 use mesh_proto::relay::RelayNoticeCode;
 use mesh_proto::{MIN_DISCO_PACKET_LEN, is_disco_packet};
-use mesh_store::{ControlStore, DEFAULT_NODE_KEY_TTL_MS, NodeStatus, RegisterNodeInput};
+use mesh_store::{
+    AuditEventInput, ControlStore, DEFAULT_NODE_KEY_TTL_MS, NodeStatus, RegisterNodeInput,
+};
+use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -45,9 +48,9 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocket, WebSocketConfig}
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, TlsMode};
 use crate::netmap_hub::NetmapHub;
-use crate::rate_limit::{RateLimitDecision, RateLimiter};
+use crate::rate_limit::{RateLimitDecision, RateLimitEndpoint, RateLimiter, RegistrationOutcome};
 use crate::relay_hub::{RelayForwardOutcome, RelayHub};
 
 /// Hard memory ceiling on outstanding single-use challenges (`4096` entries, `api-design.md` §1.2).
@@ -66,6 +69,8 @@ pub struct ConnectionTlsContext {
     pub peer_addr: SocketAddr,
     /// RFC 5705 TLS exporter binding base64 extracted on direct TLS connections (`None` behind proxy).
     pub tls_exporter_b64: Option<String>,
+    /// Effective TLS mode of the listener that accepted this TCP connection (`HR-W21-05`).
+    pub listener_tls_mode: TlsMode,
 }
 
 impl Default for ConnectionTlsContext {
@@ -73,6 +78,7 @@ impl Default for ConnectionTlsContext {
         Self {
             peer_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tls_exporter_b64: None,
+            listener_tls_mode: TlsMode::IpPinned,
         }
     }
 }
@@ -213,10 +219,20 @@ async fn handle_auth_challenge(
     req: Request<Body>,
 ) -> Response {
     let req_id = new_request_id(&state);
-    let client_ip = resolve_request_client_ip(&state, req.headers(), req.extensions().get());
+    let conn_ctx_opt = req.extensions().get::<ConnectionTlsContext>();
+    let listener_tls_mode = conn_ctx_opt.map_or(state.config.tls_mode, |c| c.listener_tls_mode);
+    let client_ip =
+        resolve_request_client_ip(&state, listener_tls_mode, req.headers(), conn_ctx_opt);
     let now_ms = state.store.clock().now_unix_ms();
 
-    if let Some(resp) = enforce_auth_rate_limit(&state, client_ip, now_ms, &req_id) {
+    if let Some(resp) = enforce_auth_rate_limit(
+        &state,
+        listener_tls_mode,
+        RateLimitEndpoint::Challenge,
+        client_ip,
+        now_ms,
+        &req_id,
+    ) {
         return resp;
     }
 
@@ -237,7 +253,7 @@ async fn handle_auth_challenge(
     if parsed.protocol_version < state.config.min_protocol_version {
         return error_response(
             &AppError::invalid_argument(format!(
-                "client protocol version {} unsupported (min {})",
+                "agent upgrade required: client protocol version {} unsupported (min {})",
                 parsed.protocol_version, state.config.min_protocol_version
             )),
             &req_id,
@@ -260,10 +276,25 @@ async fn handle_register_node(
         .extensions()
         .get::<ConnectionTlsContext>()
         .cloned()
-        .unwrap_or_default();
-    let client_ip = resolve_request_client_ip(&state, req.headers(), Some(&conn_ctx));
+        .unwrap_or_else(|| ConnectionTlsContext {
+            listener_tls_mode: state.config.tls_mode,
+            ..ConnectionTlsContext::default()
+        });
+    let client_ip = resolve_request_client_ip(
+        &state,
+        conn_ctx.listener_tls_mode,
+        req.headers(),
+        Some(&conn_ctx),
+    );
 
-    if let Some(resp) = enforce_auth_rate_limit(&state, client_ip, now_ms, &req_id) {
+    if let Some(resp) = enforce_auth_rate_limit(
+        &state,
+        conn_ctx.listener_tls_mode,
+        RateLimitEndpoint::Register,
+        client_ip,
+        now_ms,
+        &req_id,
+    ) {
         return resp;
     }
 
@@ -286,8 +317,23 @@ async fn handle_register_node(
         },
     ) {
         Ok(a) => a,
-        Err(err) => return error_response(&err, &req_id),
+        Err(err) => {
+            state
+                .rate_limiter
+                .record_registration_outcome(RegistrationOutcome::Unauthenticated);
+            return error_response(&err, &req_id);
+        }
     };
+
+    if auth.protocol_version < state.config.min_protocol_version {
+        return error_response(
+            &AppError::invalid_argument(format!(
+                "agent upgrade required: client protocol version {} unsupported (min {})",
+                auth.protocol_version, state.config.min_protocol_version
+            )),
+            &req_id,
+        );
+    }
 
     let parsed: RegisterNodeRequest = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -299,6 +345,16 @@ async fn handle_register_node(
         }
     };
     if parsed.node_pubkey != auth.pubkey || parsed.disco_pubkey != auth.proof.disco_pubkey {
+        state
+            .rate_limiter
+            .record_registration_outcome(RegistrationOutcome::Unauthenticated);
+        record_auth_failure_with_audit(
+            &state,
+            conn_ctx.listener_tls_mode,
+            client_ip,
+            now_ms,
+            "/v1/nodes/register",
+        );
         return error_response(
             &AppError::unauthenticated("register payload key mismatch"),
             &req_id,
@@ -322,10 +378,52 @@ async fn handle_register_node(
     });
 
     let (outcome, netmap_ver) = match reg_outcome {
-        Ok(pair) => pair,
+        Ok(pair) => {
+            state
+                .rate_limiter
+                .record_registration_outcome(RegistrationOutcome::Success);
+            state.rate_limiter.record_auth_success(client_ip);
+            pair
+        }
         Err(err) => {
-            if err.kind() == ErrorKind::Unauthenticated {
-                let _ = state.rate_limiter.record_auth_failure(client_ip, now_ms);
+            match err.kind() {
+                ErrorKind::Unauthenticated => {
+                    state
+                        .rate_limiter
+                        .record_registration_outcome(RegistrationOutcome::Unauthenticated);
+                    record_auth_failure_with_audit(
+                        &state,
+                        conn_ctx.listener_tls_mode,
+                        client_ip,
+                        now_ms,
+                        "/v1/nodes/register",
+                    );
+                }
+                ErrorKind::Conflict => {
+                    state
+                        .rate_limiter
+                        .record_registration_outcome(RegistrationOutcome::Conflict);
+                    tracing::warn!(
+                        component = "control_handlers",
+                        event = "node_registration_conflict",
+                        client_ip = %client_ip,
+                        node_name = %parsed.node_name,
+                        error = %err,
+                        "rejected node registration due to name/identity conflict"
+                    );
+                    state.store.record_audit_best_effort(&AuditEventInput {
+                        occurred_at_ms: now_ms,
+                        actor: "control:register",
+                        action: "node_registration_conflict",
+                        target: parsed.node_name.as_str(),
+                        outcome: "denied",
+                        metadata: json!({
+                            "client_ip": client_ip.to_string(),
+                            "node_name": parsed.node_name,
+                        }),
+                    });
+                }
+                _ => {}
             }
             return error_response(&err, &req_id);
         }
@@ -374,7 +472,7 @@ async fn handle_register_node(
         node_name,
         overlay_ip,
         overlay_cidr: snapshot.overlay_cidr,
-        key_expires_at_ms: Some(outcome.record.key_expires_at_ms),
+        key_expires_at_ms: outcome.record.key_expires_at_ms,
         netmap: snapshot,
     };
     json_response(StatusCode::OK, &resp)
@@ -390,8 +488,26 @@ async fn handle_update_endpoints(
         .extensions()
         .get::<ConnectionTlsContext>()
         .cloned()
-        .unwrap_or_default();
-    let client_ip = resolve_request_client_ip(&state, req.headers(), Some(&conn_ctx));
+        .unwrap_or_else(|| ConnectionTlsContext {
+            listener_tls_mode: state.config.tls_mode,
+            ..ConnectionTlsContext::default()
+        });
+    let client_ip = resolve_request_client_ip(
+        &state,
+        conn_ctx.listener_tls_mode,
+        req.headers(),
+        Some(&conn_ctx),
+    );
+    if let Some(resp) = enforce_ip_lockout(
+        &state,
+        conn_ctx.listener_tls_mode,
+        "/v1/endpoints",
+        client_ip,
+        now_ms,
+        &req_id,
+    ) {
+        return resp;
+    }
 
     let headers = req.headers().clone();
     let body = match read_bounded_body(req.into_body()).await {
@@ -471,8 +587,26 @@ async fn handle_call_me_maybe(
         .extensions()
         .get::<ConnectionTlsContext>()
         .cloned()
-        .unwrap_or_default();
-    let client_ip = resolve_request_client_ip(&state, req.headers(), Some(&conn_ctx));
+        .unwrap_or_else(|| ConnectionTlsContext {
+            listener_tls_mode: state.config.tls_mode,
+            ..ConnectionTlsContext::default()
+        });
+    let client_ip = resolve_request_client_ip(
+        &state,
+        conn_ctx.listener_tls_mode,
+        req.headers(),
+        Some(&conn_ctx),
+    );
+    if let Some(resp) = enforce_ip_lockout(
+        &state,
+        conn_ctx.listener_tls_mode,
+        "/v1/disco/call-me-maybe",
+        client_ip,
+        now_ms,
+        &req_id,
+    ) {
+        return resp;
+    }
 
     let headers = req.headers().clone();
     let body = match read_bounded_body(req.into_body()).await {
@@ -525,7 +659,7 @@ async fn handle_call_me_maybe(
         return error_response(&err, &req_id);
     }
 
-    let _ = state.netmap_hub.relay_call_me_maybe(
+    let _relayed = state.netmap_hub.relay_call_me_maybe(
         rec.node_id,
         verified_pubkey,
         parsed.dst_node_id,
@@ -544,8 +678,26 @@ async fn handle_netmap_stream_ws(
         .extensions()
         .get::<ConnectionTlsContext>()
         .cloned()
-        .unwrap_or_default();
-    let client_ip = resolve_request_client_ip(&state, req.headers(), Some(&conn_ctx));
+        .unwrap_or_else(|| ConnectionTlsContext {
+            listener_tls_mode: state.config.tls_mode,
+            ..ConnectionTlsContext::default()
+        });
+    let client_ip = resolve_request_client_ip(
+        &state,
+        conn_ctx.listener_tls_mode,
+        req.headers(),
+        Some(&conn_ctx),
+    );
+    if let Some(resp) = enforce_ip_lockout(
+        &state,
+        conn_ctx.listener_tls_mode,
+        "/v1/netmap/stream",
+        client_ip,
+        now_ms,
+        &req_id,
+    ) {
+        return resp;
+    }
 
     let (rec, pubkey) = match authenticate_active_node(
         &state,
@@ -601,8 +753,27 @@ async fn handle_relay_ws(State(state): State<ControlAppState>, mut req: Request<
         .extensions()
         .get::<ConnectionTlsContext>()
         .cloned()
-        .unwrap_or_default();
-    let client_ip = resolve_request_client_ip(&state, req.headers(), Some(&conn_ctx));
+        .unwrap_or_else(|| ConnectionTlsContext {
+            listener_tls_mode: state.config.tls_mode,
+            ..ConnectionTlsContext::default()
+        });
+    let client_ip = resolve_request_client_ip(
+        &state,
+        conn_ctx.listener_tls_mode,
+        req.headers(),
+        Some(&conn_ctx),
+    );
+
+    if let Some(resp) = enforce_auth_rate_limit(
+        &state,
+        conn_ctx.listener_tls_mode,
+        RateLimitEndpoint::Relay,
+        client_ip,
+        now_ms,
+        &req_id,
+    ) {
+        return resp;
+    }
 
     let (rec, pubkey) = match authenticate_active_node(
         &state,
@@ -617,7 +788,25 @@ async fn handle_relay_ws(State(state): State<ControlAppState>, mut req: Request<
         },
     ) {
         Ok(pair) => pair,
-        Err(err) => return error_response(&err, &req_id),
+        Err(err) => {
+            if state
+                .rate_limiter
+                .should_emit_lockout_audit(client_ip, now_ms)
+            {
+                state.store.record_audit_best_effort(&AuditEventInput {
+                    occurred_at_ms: now_ms,
+                    actor: "relay:auth",
+                    action: "relay_auth_rejected",
+                    target: &client_ip.to_string(),
+                    outcome: "denied",
+                    metadata: json!({
+                        "client_ip": client_ip.to_string(),
+                        "error_kind": format!("{:?}", err.kind()),
+                    }),
+                });
+            }
+            return error_response(&err, &req_id);
+        }
     };
 
     let ws_accept = match extract_ws_accept_header(req.headers()) {
@@ -649,7 +838,7 @@ async fn run_netmap_ws_session<S>(
     node_id: NodeId,
     pubkey: PublicKey,
     disco_pubkey: PublicKey,
-    key_expires_at_ms: u64,
+    _initial_key_expires_at_ms: Option<u64>,
     io: S,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -695,13 +884,12 @@ async fn run_netmap_ws_session<S>(
                     let check_ms = store_clone.clock().now_unix_ms();
                     let still_active = !store_clone.is_pubkey_revoked_ram(&pubkey)
                         && !store_clone.is_node_revoked_ram(node_id)
-                        && check_ms < key_expires_at_ms
                         && store_clone
                             .find_node_by_pubkey(&pubkey)
                             .ok()
                             .flatten()
                             .is_some_and(|n| {
-                                n.status == NodeStatus::Active && check_ms < n.key_expires_at_ms
+                                n.status == NodeStatus::Active && !n.is_key_expired_at(check_ms)
                             });
                     if !still_active {
                         return false;
@@ -734,6 +922,17 @@ async fn run_netmap_ws_session<S>(
         }
     }
     state.netmap_hub.unsubscribe(node_id, sub.session_seq);
+    if state.netmap_hub.node_runtime_info(node_id).is_none()
+        && let Err(err) = state.store.touch_node_last_seen(node_id)
+    {
+        tracing::debug!(
+            component = "control_handlers",
+            event = "touch_last_seen_failed",
+            node_id = %node_id,
+            error = %err,
+            "failed updating last_seen_at_ms on netmap disconnect"
+        );
+    }
 }
 
 struct ControlWsPeerCtx<'a> {
@@ -830,7 +1029,7 @@ async fn run_relay_ws_session<S>(
     state: ControlAppState,
     node_id: NodeId,
     pubkey: PublicKey,
-    key_expires_at_ms: u64,
+    key_expires_at_ms: Option<u64>,
     io: S,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -856,9 +1055,8 @@ async fn run_relay_ws_session<S>(
         },
         move |msg| {
             let check_ms = store.clock().now_unix_ms();
-            if store.is_pubkey_revoked_ram(&pubkey)
-                || store.is_node_revoked_ram(node_id)
-                || check_ms >= key_expires_at_ms
+            let expired = key_expires_at_ms.is_some_and(|exp| check_ms >= exp);
+            if store.is_pubkey_revoked_ram(&pubkey) || store.is_node_revoked_ram(node_id) || expired
             {
                 return false;
             }
@@ -1093,6 +1291,35 @@ struct VerifiedAuthProof {
     protocol_version: u16,
 }
 
+fn record_auth_failure_with_audit(
+    state: &ControlAppState,
+    listener_tls_mode: TlsMode,
+    client_ip: IpAddr,
+    now_ms: u64,
+    path: &str,
+) {
+    if let Some(locked_until_ms) =
+        state
+            .rate_limiter
+            .record_auth_failure_for_mode(listener_tls_mode, client_ip, now_ms)
+        && state
+            .rate_limiter
+            .should_emit_lockout_audit(client_ip, now_ms)
+    {
+        state.store.record_audit_best_effort(&AuditEventInput {
+            occurred_at_ms: now_ms,
+            actor: "control:rate_limiter",
+            action: "rate_limit_ip_locked",
+            target: &client_ip.to_string(),
+            outcome: "denied",
+            metadata: json!({
+                "path": path,
+                "locked_until_ms": locked_until_ms,
+            }),
+        });
+    }
+}
+
 fn verify_signed_proof(
     state: &ControlAppState,
     conn_ctx: &ConnectionTlsContext,
@@ -1101,14 +1328,15 @@ fn verify_signed_proof(
     meta: ProofRequestMeta<'_>,
 ) -> AppResult<VerifiedAuthProof> {
     match verify_signed_proof_inner(state, conn_ctx, headers, meta) {
-        Ok(verified) => {
-            state.rate_limiter.record_auth_success(client_ip);
-            Ok(verified)
-        }
+        Ok(verified) => Ok(verified),
         Err(err) => {
-            let _ = state
-                .rate_limiter
-                .record_auth_failure(client_ip, meta.now_ms);
+            record_auth_failure_with_audit(
+                state,
+                conn_ctx.listener_tls_mode,
+                client_ip,
+                meta.now_ms,
+                meta.path,
+            );
             Err(err)
         }
     }
@@ -1151,7 +1379,7 @@ fn verify_signed_proof_inner(
         pending.server_eph_keypair.secret_bytes(),
     )?;
 
-    let trusted_reverse_proxy = state.config.tls_mode == crate::config::TlsMode::ReverseProxy
+    let trusted_reverse_proxy = conn_ctx.listener_tls_mode == TlsMode::ReverseProxy
         && state.trusted_proxies.contains(&conn_ctx.peer_addr.ip());
 
     let expected_tls_exporter_b64 = if trusted_reverse_proxy {
@@ -1196,30 +1424,45 @@ fn authenticate_active_node(
     meta: ProofRequestMeta<'_>,
 ) -> AppResult<(mesh_store::StoredNodeRecord, PublicKey)> {
     let auth = verify_signed_proof(state, conn_ctx, client_ip, headers, meta)?;
+    let rec = match state.store.find_node_by_pubkey(&auth.pubkey) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            record_auth_failure_with_audit(
+                state,
+                conn_ctx.listener_tls_mode,
+                client_ip,
+                meta.now_ms,
+                meta.path,
+            );
+            return Err(AppError::unauthenticated("unknown node public key"));
+        }
+        Err(err) => {
+            if state.store.is_pubkey_revoked_ram(&auth.pubkey) {
+                return Err(AppError::node_revoked("node identity has been revoked"));
+            }
+            return Err(err);
+        }
+    };
+    if state.store.is_node_permanently_revoked_ram(rec.node_id) || rec.status == NodeStatus::Revoked
+    {
+        return Err(AppError::node_revoked("node identity has been revoked"));
+    }
+    if state.store.is_node_expired_ram(rec.node_id)
+        || rec.status == NodeStatus::Expired
+        || rec.is_key_expired_at(meta.now_ms)
+    {
+        return Err(AppError::node_key_expired("node key has expired"));
+    }
     if state.store.is_pubkey_revoked_ram(&auth.pubkey) {
-        let _ = state
-            .rate_limiter
-            .record_auth_failure(client_ip, meta.now_ms);
-        return Err(AppError::unauthenticated("node pubkey revoked in RAM"));
+        return Err(AppError::node_revoked("node identity has been revoked"));
     }
-    let rec = state
-        .store
-        .find_node_by_pubkey(&auth.pubkey)?
-        .ok_or_else(|| AppError::unauthenticated("unknown node public key"))?;
-    if rec.status != NodeStatus::Active || meta.now_ms >= rec.key_expires_at_ms {
-        let _ = state
-            .rate_limiter
-            .record_auth_failure(client_ip, meta.now_ms);
-        return Err(AppError::unauthenticated("node inactive or expired"));
-    }
-    if state.store.is_node_revoked_ram(rec.node_id) {
-        return Err(AppError::unauthenticated("node revoked in RAM"));
-    }
+    state.rate_limiter.record_auth_success(client_ip);
     Ok((rec, auth.pubkey))
 }
 
 fn resolve_request_client_ip(
     state: &ControlAppState,
+    listener_tls_mode: TlsMode,
     headers: &HeaderMap,
     conn_ctx: Option<&ConnectionTlsContext>,
 ) -> IpAddr {
@@ -1228,25 +1471,110 @@ fn resolve_request_client_ip(
         .unwrap_or_else(|| IpAddr::V4(Ipv4Addr::LOCALHOST));
     let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
     let x_real = headers.get("x-real-ip").and_then(|v| v.to_str().ok());
-    state.rate_limiter.resolve_client_ip(peer_ip, xff, x_real)
+    state
+        .rate_limiter
+        .resolve_client_ip_for_mode(listener_tls_mode, peer_ip, xff, x_real)
 }
 
-fn enforce_auth_rate_limit(
+fn build_rate_limited_response(retry_after_secs: u64, req_id: &str) -> Response {
+    let err = AppError::rate_limited("rate limit exceeded");
+    let mut resp = error_response(&err, req_id);
+    if let Ok(hdr_val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut().insert("retry-after", hdr_val);
+    }
+    resp
+}
+
+fn enforce_ip_lockout(
     state: &ControlAppState,
+    listener_tls_mode: TlsMode,
+    path: &str,
     client_ip: IpAddr,
     now_ms: u64,
     req_id: &str,
 ) -> Option<Response> {
-    match state.rate_limiter.check_auth_request(client_ip, now_ms) {
+    let retry_after_secs =
+        state
+            .rate_limiter
+            .check_ip_lockout_for_mode(listener_tls_mode, client_ip, now_ms)?;
+    if state
+        .rate_limiter
+        .should_emit_lockout_audit(client_ip, now_ms)
+    {
+        state.store.record_audit_best_effort(&AuditEventInput {
+            occurred_at_ms: now_ms,
+            actor: "control:rate_limiter",
+            action: "rate_limit_ip_locked",
+            target: &client_ip.to_string(),
+            outcome: "denied",
+            metadata: json!({
+                "path": path,
+                "retry_after_secs": retry_after_secs,
+            }),
+        });
+    }
+    Some(build_rate_limited_response(retry_after_secs, req_id))
+}
+
+fn enforce_auth_rate_limit(
+    state: &ControlAppState,
+    listener_tls_mode: TlsMode,
+    endpoint: RateLimitEndpoint,
+    client_ip: IpAddr,
+    now_ms: u64,
+    req_id: &str,
+) -> Option<Response> {
+    match state.rate_limiter.check_endpoint_request_for_mode(
+        listener_tls_mode,
+        endpoint,
+        client_ip,
+        now_ms,
+    ) {
         RateLimitDecision::Allowed => None,
-        RateLimitDecision::IpLocked { retry_after_secs }
-        | RateLimitDecision::GlobalLimitExceeded { retry_after_secs } => {
-            let err = AppError::rate_limited("rate limit exceeded");
-            let mut resp = error_response(&err, req_id);
-            if let Ok(hdr_val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                resp.headers_mut().insert("retry-after", hdr_val);
+        RateLimitDecision::IpLocked { retry_after_secs } => {
+            if endpoint == RateLimitEndpoint::Register {
+                state
+                    .rate_limiter
+                    .record_registration_outcome(RegistrationOutcome::RateLimited);
             }
-            Some(resp)
+            if state
+                .rate_limiter
+                .should_emit_lockout_audit(client_ip, now_ms)
+            {
+                state.store.record_audit_best_effort(&AuditEventInput {
+                    occurred_at_ms: now_ms,
+                    actor: "control:rate_limiter",
+                    action: "rate_limit_ip_locked",
+                    target: &client_ip.to_string(),
+                    outcome: "denied",
+                    metadata: json!({
+                        "endpoint": format!("{endpoint:?}"),
+                        "retry_after_secs": retry_after_secs,
+                    }),
+                });
+            }
+            Some(build_rate_limited_response(retry_after_secs, req_id))
+        }
+        RateLimitDecision::GlobalLimitExceeded { retry_after_secs } => {
+            if endpoint == RateLimitEndpoint::Register {
+                state
+                    .rate_limiter
+                    .record_registration_outcome(RegistrationOutcome::RateLimited);
+            }
+            if state.rate_limiter.should_emit_global_limit_audit(now_ms) {
+                state.store.record_audit_best_effort(&AuditEventInput {
+                    occurred_at_ms: now_ms,
+                    actor: "control:rate_limiter",
+                    action: "rate_limit_global_exceeded",
+                    target: "global",
+                    outcome: "denied",
+                    metadata: json!({
+                        "endpoint": format!("{endpoint:?}"),
+                        "retry_after_secs": retry_after_secs,
+                    }),
+                });
+            }
+            Some(build_rate_limited_response(retry_after_secs, req_id))
         }
     }
 }
@@ -1327,7 +1655,7 @@ fn validate_call_me_maybe_relay(
     let Some(dst) = store.find_node_by_id(dst_node_id)? else {
         return Err(AppError::not_found("target peer not found"));
     };
-    if dst.status != NodeStatus::Active || now_ms >= dst.key_expires_at_ms {
+    if dst.status != NodeStatus::Active || dst.is_key_expired_at(now_ms) {
         return Err(AppError::not_found("target peer is not active"));
     }
     let dst_disco_pubkey = PublicKey::from_bytes(dst.disco_pubkey)
@@ -1444,7 +1772,10 @@ mod tests {
     use hyper::service::{Service as _, service_fn};
     use hyper_util::rt::TokioIo;
     use hyper_util::service::TowerToHyperService;
-    use mesh_core::{Clock as _, FakeClock, KeyId, NodeId, NodeName, PublicKey, SystemClock};
+    use mesh_core::{
+        Clock as _, ErrorKind, ErrorResponse, FakeClock, KeyId, NodeId, NodeName, PublicKey,
+        SystemClock,
+    };
     use mesh_crypto::{
         DiscoKeypair, NodeKeypair, PreAuthToken, ProofPayload, seal_proof, sha256_digest,
         sha256_hex,
@@ -1469,7 +1800,7 @@ mod tests {
         ConnectionTlsContext, ControlAppState, MAX_PENDING_CHALLENGES, PendingChallengeStore,
         build_control_router,
     };
-    use crate::config::ServerConfig;
+    use crate::config::{ServerConfig, TlsMode};
     use crate::netmap_hub::NetmapHub;
     use crate::rate_limit::{ClientIpExtractor, RateLimiter};
     use crate::relay_hub::RelayHub;
@@ -1479,6 +1810,15 @@ mod tests {
         ctx: ConnectionTlsContext,
         req: Request<Body>,
     ) -> (StatusCode, Vec<u8>) {
+        let (status, _, bytes) = send_router_req_with_headers(router, ctx, req).await;
+        (status, bytes)
+    }
+
+    async fn send_router_req_with_headers(
+        router: axum::Router,
+        ctx: ConnectionTlsContext,
+        req: Request<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
         let (client_io, server_io) = tokio::io::duplex(65_536);
         let svc = service_fn(move |hreq: Request<hyper::body::Incoming>| {
             let r = router.clone();
@@ -1501,6 +1841,7 @@ mod tests {
         let conn_task = tokio::spawn(conn);
         let resp = sender.send_request(req).await.expect("send request");
         let status = resp.status();
+        let headers = resp.headers().clone();
         let bytes = to_bytes(Body::new(resp.into_body()), 131_072)
             .await
             .expect("read resp bytes")
@@ -1512,7 +1853,7 @@ mod tests {
         if let Ok(Err(err)) = srv_task.await {
             tracing::debug!(error = %err, "server http conn closed in test");
         }
-        (status, bytes)
+        (status, headers, bytes)
     }
 
     fn test_state(dir: &TempDir, now_ms: u64) -> (ControlAppState, String) {
@@ -1529,12 +1870,9 @@ mod tests {
             .expect("open store"),
         );
         let token = PreAuthToken::generate();
-        let token_hash = token.sha256_digest();
-        // Read plaintext safely inside test setup via Debug-free serde roundtrip or generate manually
-        let _ = token;
         let raw_token = "mpk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
         let raw_hash = mesh_crypto::sha256_digest(raw_token.as_bytes());
-        let _ = token_hash;
+        let _unused = token.sha256_digest();
         store
             .create_preauth_key(
                 &CreatePreAuthKeyInput {
@@ -1545,6 +1883,7 @@ mod tests {
                     reusable: false,
                     max_uses: None,
                     ephemeral: false,
+                    ephemeral_timeout_secs: None,
                     ttl_secs: 3_600,
                     now_unix_ms: now_ms,
                 },
@@ -1602,6 +1941,7 @@ mod tests {
         let conn_ctx = ConnectionTlsContext {
             peer_addr: "198.51.100.44:50000".parse().expect("addr"),
             tls_exporter_b64: Some(exporter_b64.clone()),
+            listener_tls_mode: TlsMode::IpPinned,
         };
 
         // Act 1: Request challenge
@@ -1711,6 +2051,7 @@ mod tests {
         let conn_ctx = ConnectionTlsContext {
             peer_addr: "198.51.100.44:50000".parse().expect("addr"),
             tls_exporter_b64: Some(BASE64_STANDARD.encode([0x11_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
         };
         let (ch_st, ch_bytes) =
             send_router_req(standalone_router.clone(), conn_ctx.clone(), ch_req).await;
@@ -1799,6 +2140,7 @@ mod tests {
         let proxy_ctx = ConnectionTlsContext {
             peer_addr: std::net::SocketAddr::new(proxy_ip, 44444),
             tls_exporter_b64: None,
+            listener_tls_mode: TlsMode::ReverseProxy,
         };
         let (st2, b2) = send_router_req(proxy_router.clone(), proxy_ctx.clone(), ch_req2).await;
         assert_eq!(st2, StatusCode::OK);
@@ -1935,6 +2277,7 @@ mod tests {
         let conn_ctx = ConnectionTlsContext {
             peer_addr: "198.51.100.44:50000".parse().expect("addr"),
             tls_exporter_b64: Some(BASE64_STANDARD.encode([0x33_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
         };
         let kp = NodeKeypair::generate();
         let dkp = DiscoKeypair::generate();
@@ -1946,7 +2289,8 @@ mod tests {
             now_ms,
         };
         let reg = sign_register_node(&drain_client, &raw_token, "drain-node", None).await;
-        let expires_ms = reg.key_expires_at_ms.expect("expires");
+        let expires_ms = reg.key_expires_at_ms;
+        assert!(expires_ms.is_some());
 
         let (mut client_ctrl, server_ctrl) = tokio::io::duplex(65_536);
         let ctrl_task = tokio::spawn(super::run_netmap_ws_session(
@@ -2074,6 +2418,7 @@ mod tests {
         let conn_ctx = ConnectionTlsContext {
             peer_addr: "198.51.100.44:50000".parse().expect("addr"),
             tls_exporter_b64: Some(BASE64_STANDARD.encode([0x44_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
         };
         let kp_old = NodeKeypair::generate();
         let dkp_old = DiscoKeypair::generate();
@@ -2105,6 +2450,7 @@ mod tests {
                     reusable: false,
                     max_uses: None,
                     ephemeral: false,
+                    ephemeral_timeout_secs: None,
                     ttl_secs: 3_600,
                     now_unix_ms: now_ms,
                 },
@@ -2156,6 +2502,7 @@ mod tests {
         let conn_ctx = ConnectionTlsContext {
             peer_addr: "198.51.100.44:50000".parse().expect("addr"),
             tls_exporter_b64: Some(BASE64_STANDARD.encode([0x55_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
         };
         let kp_a = NodeKeypair::generate();
         let dkp_a = DiscoKeypair::generate();
@@ -2180,6 +2527,7 @@ mod tests {
                     reusable: false,
                     max_uses: None,
                     ephemeral: false,
+                    ephemeral_timeout_secs: None,
                     ttl_secs: 3_600,
                     now_unix_ms: now_ms,
                 },
@@ -2297,5 +2645,385 @@ mod tests {
             sub_b.rx.try_recv(),
             Ok(ServerControlFrame::CallMeMaybeRelay { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_control_protocol_n_minus_1_revoked_expired_status_and_lockout_audit() {
+        // Arrange
+        let dir = TempDir::new().expect("tempdir");
+        let now_ms = SystemClock::new().now_unix_ms();
+        let (mut state, raw_token) = test_state(&dir, now_ms);
+        let mut cfg_updated = (*state.config).clone();
+        cfg_updated.min_protocol_version = 2;
+        state.config = Arc::new(cfg_updated);
+        let router = build_control_router(state.clone());
+        let conn_ctx = ConnectionTlsContext {
+            peer_addr: "198.51.100.77:44444".parse().expect("addr"),
+            tls_exporter_b64: Some(BASE64_STANDARD.encode([0x77_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
+        };
+
+        // Act 1: N-2 client rejected with explicit agent upgrade required message (`US-050 AC2`)
+        let old_proto_kp = NodeKeypair::generate();
+        let old_proto_dkp = DiscoKeypair::generate();
+        let old_proto_req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/auth/challenge")
+            .body(Body::from(
+                serde_json::to_vec(&ChallengeRequest {
+                    node_pubkey: old_proto_kp.public_key(),
+                    disco_pubkey: old_proto_dkp.public_key(),
+                    protocol_version: 1,
+                    agent_version: "0.0.1".to_owned(),
+                    os: TargetOs::Linux,
+                    arch: TargetArch::Amd64,
+                })
+                .expect("json"),
+            ))
+            .expect("req");
+        let (st, raw_body) = send_router_req(router.clone(), conn_ctx.clone(), old_proto_req).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let err_json: ErrorResponse = serde_json::from_slice(&raw_body).expect("err json");
+        assert!(err_json.error.message.contains("agent upgrade required"));
+
+        // Lower min_protocol_version back to 1 for authenticated node checks
+        let mut cfg_v1 = (*state.config).clone();
+        cfg_v1.min_protocol_version = 1;
+        state.config = Arc::new(cfg_v1);
+        let router = build_control_router(state.clone());
+
+        let kp = NodeKeypair::generate();
+        let dkp = DiscoKeypair::generate();
+        let client = TestSignedClient {
+            router: &router,
+            conn_ctx: &conn_ctx,
+            node_kp: &kp,
+            disco_kp: &dkp,
+            now_ms,
+        };
+        let node = sign_register_node(&client, &raw_token, "exp-node", None).await;
+
+        // Act 2: Expired node returns 403 NodeKeyExpired over verified TLS channel (`US-031 AC4`)
+        state
+            .store
+            .expire_node(node.node_id, "admin")
+            .expect("expire node");
+        let ep_body = serde_json::to_vec(&UpdateEndpointsRequest {
+            endpoints: Vec::new(),
+            nat_type: mesh_proto::netmap::NatMappingKind::Unknown,
+            acked_endpoint_version: 0,
+        })
+        .expect("ep");
+        let (exp_st, exp_raw) =
+            send_signed_post(&client, "/v1/endpoints", ep_body.clone(), 5).await;
+        assert_eq!(exp_st, StatusCode::FORBIDDEN);
+        let exp_err: ErrorResponse = serde_json::from_slice(&exp_raw).expect("err json");
+        assert_eq!(exp_err.error.kind, ErrorKind::NodeKeyExpired);
+
+        // Act 3: Revoked node returns 403 NodeRevoked over verified TLS channel (`US-029`)
+        state
+            .store
+            .revoke_node(node.node_id, "admin")
+            .expect("revoke node");
+        let (rev_st, rev_raw) = send_signed_post(&client, "/v1/endpoints", ep_body, 6).await;
+        assert_eq!(rev_st, StatusCode::FORBIDDEN);
+        let rev_err: ErrorResponse = serde_json::from_slice(&rev_raw).expect("err json");
+        assert_eq!(rev_err.error.kind, ErrorKind::NodeRevoked);
+
+        // Act 4: 10 bad auth proofs trigger IP lockout (429 + Retry-After + audit row, `US-042`)
+        let attacker_ctx = ConnectionTlsContext {
+            peer_addr: "203.0.113.199:55555".parse().expect("addr"),
+            tls_exporter_b64: Some(BASE64_STANDARD.encode([0x88_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
+        };
+        for _ in 0..10 {
+            let bad_req = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/nodes/register")
+                .body(Body::from(b"{}".to_vec()))
+                .expect("req");
+            let (bad_st, _) = send_router_req(router.clone(), attacker_ctx.clone(), bad_req).await;
+            assert_eq!(bad_st, StatusCode::UNAUTHORIZED);
+        }
+        let locked_req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/auth/challenge")
+            .body(Body::from(b"{}".to_vec()))
+            .expect("req");
+        let (locked_st, locked_hdrs, _) =
+            send_router_req_with_headers(router.clone(), attacker_ctx, locked_req).await;
+        assert_eq!(locked_st, StatusCode::TOO_MANY_REQUESTS);
+        assert!(locked_hdrs.contains_key("retry-after"));
+        let audits = state
+            .store
+            .list_audit_events(&mesh_store::AuditQuery {
+                limit: 50,
+                ..Default::default()
+            })
+            .expect("audits");
+        assert!(audits.iter().any(|a| a.action == "rate_limit_ip_locked"));
+    }
+
+    #[tokio::test]
+    async fn test_valid_proof_with_invalid_preauth_or_unknown_pubkey_triggers_ip_lockout() {
+        // Arrange (`HR-W21-03`)
+        let dir = TempDir::new().expect("tempdir");
+        let now_ms = SystemClock::new().now_unix_ms();
+        let (state, _) = test_state(&dir, now_ms);
+        let router = build_control_router(state.clone());
+
+        // Part A: valid SalsaBox proof + invalid preauth_key on /v1/nodes/register must NOT reset failures
+        let kp_a = NodeKeypair::generate();
+        let dkp_a = DiscoKeypair::generate();
+        let reg_ctx = ConnectionTlsContext {
+            peer_addr: "198.51.100.201:40000".parse().expect("addr"),
+            tls_exporter_b64: Some(BASE64_STANDARD.encode([0x91_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
+        };
+        let reg_client = TestSignedClient {
+            router: &router,
+            conn_ctx: &reg_ctx,
+            node_kp: &kp_a,
+            disco_kp: &dkp_a,
+            now_ms,
+        };
+        let bad_reg_body = serde_json::to_vec(&RegisterNodeRequest {
+            node_pubkey: kp_a.public_key(),
+            disco_pubkey: dkp_a.public_key(),
+            preauth_key: "mpk_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_owned(),
+            node_name: NodeName::parse("rogue-reg").expect("name"),
+            previous_node_pubkey: None,
+        })
+        .expect("bad reg body");
+        for i in 0..10_u64 {
+            let (st, _) =
+                send_signed_post(&reg_client, "/v1/nodes/register", bad_reg_body.clone(), i).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        let reg_locked = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/auth/challenge")
+            .body(Body::from(b"{}".to_vec()))
+            .expect("req");
+        let (reg_11_st, reg_11_hdrs, _) =
+            send_router_req_with_headers(router.clone(), reg_ctx, reg_locked).await;
+        assert_eq!(reg_11_st, StatusCode::TOO_MANY_REQUESTS);
+        assert!(reg_11_hdrs.contains_key("retry-after"));
+
+        // Part B: valid SalsaBox proof for unregistered pubkey on /v1/endpoints locks IP after 10 failures
+        let kp_b = NodeKeypair::generate();
+        let dkp_b = DiscoKeypair::generate();
+        let unk_ctx = ConnectionTlsContext {
+            peer_addr: "198.51.100.202:40001".parse().expect("addr"),
+            tls_exporter_b64: Some(BASE64_STANDARD.encode([0x92_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
+        };
+        let unk_client = TestSignedClient {
+            router: &router,
+            conn_ctx: &unk_ctx,
+            node_kp: &kp_b,
+            disco_kp: &dkp_b,
+            now_ms,
+        };
+        let ep_body = serde_json::to_vec(&UpdateEndpointsRequest {
+            endpoints: Vec::new(),
+            nat_type: mesh_proto::netmap::NatMappingKind::Unknown,
+            acked_endpoint_version: 0,
+        })
+        .expect("ep body");
+        for i in 0..10_u64 {
+            let (st, _) = send_signed_post(&unk_client, "/v1/endpoints", ep_body.clone(), i).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        let locked_ep_req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/endpoints")
+            .body(Body::from(ep_body))
+            .expect("ep11 req");
+        let (ep_11_st, ep_11_hdrs, _) =
+            send_router_req_with_headers(router, unk_ctx, locked_ep_req).await;
+        assert_eq!(ep_11_st, StatusCode::TOO_MANY_REQUESTS);
+        assert!(ep_11_hdrs.contains_key("retry-after"));
+    }
+
+    #[tokio::test]
+    async fn test_per_listener_tls_mode_overrides_boot_config_for_proof_and_rate_limiter() {
+        // Arrange Direction 1 (`HR-W21-05`): server booted as IpPinned, connection accepted by ReverseProxy listener
+        let dir1 = TempDir::new().expect("tempdir1");
+        let now_ms = SystemClock::new().now_unix_ms();
+        let (mut ip_boot_state, raw_token) = test_state(&dir1, now_ms);
+        let proxy_ip: std::net::IpAddr = "127.0.0.10".parse().expect("proxy ip");
+        let mut trusted = std::collections::HashSet::new();
+        trusted.insert(proxy_ip);
+        let mut cfg1 = (*ip_boot_state.config).clone();
+        cfg1.tls_mode = crate::config::TlsMode::IpPinned;
+        cfg1.trusted_proxies = vec![proxy_ip];
+        ip_boot_state.config = Arc::new(cfg1);
+        ip_boot_state.trusted_proxies = Arc::new(trusted.clone());
+        ip_boot_state.rate_limiter = Arc::new(RateLimiter::new(ClientIpExtractor::new(
+            crate::config::TlsMode::IpPinned,
+            trusted.clone(),
+        )));
+        let router1 = build_control_router(ip_boot_state);
+
+        // ReverseProxy listener context (no TLS exporter) succeeds AND honors X-Forwarded-For per client IP
+        let reverse_proxy_ctx = ConnectionTlsContext {
+            peer_addr: std::net::SocketAddr::new(proxy_ip, 44444),
+            tls_exporter_b64: None,
+            listener_tls_mode: crate::config::TlsMode::ReverseProxy,
+        };
+        let kp_p = NodeKeypair::generate();
+        let dkp_p = DiscoKeypair::generate();
+        let ch_body = serde_json::to_vec(&ChallengeRequest {
+            node_pubkey: kp_p.public_key(),
+            disco_pubkey: dkp_p.public_key(),
+            protocol_version: 1,
+            agent_version: "0.1.0".to_owned(),
+            os: TargetOs::Linux,
+            arch: TargetArch::Amd64,
+        })
+        .expect("ch");
+        let (st_ch, b_ch) = send_router_req(
+            router1.clone(),
+            reverse_proxy_ctx.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/auth/challenge")
+                .header("x-forwarded-for", "203.0.113.55")
+                .body(Body::from(ch_body.clone()))
+                .expect("ch req"),
+        )
+        .await;
+        assert_eq!(st_ch, StatusCode::OK);
+        let ch: ChallengeResponse = serde_json::from_slice(&b_ch).expect("ch json");
+        let reg_body = serde_json::to_vec(&RegisterNodeRequest {
+            node_pubkey: kp_p.public_key(),
+            disco_pubkey: dkp_p.public_key(),
+            preauth_key: raw_token,
+            node_name: NodeName::parse("proxy-listener-node").expect("name"),
+            previous_node_pubkey: None,
+        })
+        .expect("reg");
+        let proof = ProofPayload {
+            challenge_id: ch.challenge_id,
+            challenge_nonce: ch.challenge_nonce,
+            method: "POST".to_owned(),
+            path: "/v1/nodes/register".to_owned(),
+            body_sha256: sha256_hex(&reg_body),
+            node_pubkey: kp_p.public_key(),
+            disco_pubkey: dkp_p.public_key(),
+            timestamp_at_ms: now_ms,
+            tls_exporter_binding: String::new(),
+        };
+        let sealed = seal_proof(&proof, &ch.server_eph_pubkey, &kp_p).expect("seal");
+        let (ok_reg, _) = send_router_req(
+            router1.clone(),
+            reverse_proxy_ctx.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/nodes/register")
+                .header("x-forwarded-for", "203.0.113.55")
+                .header(HEADER_CHALLENGE_ID, ch.challenge_id.to_string())
+                .header(
+                    HEADER_NODE_PUBKEY,
+                    BASE64_STANDARD.encode(kp_p.public_key().as_bytes()),
+                )
+                .header(HEADER_BOX_NONCE, BASE64_STANDARD.encode(sealed.box_nonce))
+                .header(
+                    HEADER_AUTH_PROOF,
+                    BASE64_STANDARD.encode(&sealed.ciphertext),
+                )
+                .body(Body::from(reg_body))
+                .expect("reg req"),
+        )
+        .await;
+        assert_eq!(ok_reg, StatusCode::OK);
+
+        // Lock out XFF IP `203.0.113.55` without affecting another client IP behind the same proxy
+        for _ in 0..10 {
+            let (bad_st, _) = send_router_req(
+                router1.clone(),
+                reverse_proxy_ctx.clone(),
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/nodes/register")
+                    .header("x-forwarded-for", "203.0.113.55")
+                    .body(Body::from(b"{}".to_vec()))
+                    .expect("bad"),
+            )
+            .await;
+            assert_eq!(bad_st, StatusCode::UNAUTHORIZED);
+        }
+        let (locked_xff_st, _) = send_router_req(
+            router1.clone(),
+            reverse_proxy_ctx.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/auth/challenge")
+                .header("x-forwarded-for", "203.0.113.55")
+                .body(Body::from(ch_body.clone()))
+                .expect("locked"),
+        )
+        .await;
+        assert_eq!(locked_xff_st, StatusCode::TOO_MANY_REQUESTS);
+        let (other_xff_st, _) = send_router_req(
+            router1,
+            reverse_proxy_ctx,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/auth/challenge")
+                .header("x-forwarded-for", "203.0.113.56")
+                .body(Body::from(ch_body.clone()))
+                .expect("other"),
+        )
+        .await;
+        assert_eq!(other_xff_st, StatusCode::OK);
+
+        // Arrange Direction 2 (`HR-W21-05`): server booted as ReverseProxy, connection accepted by IpPinned listener
+        let dir2 = TempDir::new().expect("tempdir2");
+        let (mut proxy_boot_state, _) = test_state(&dir2, now_ms);
+        let mut cfg2 = (*proxy_boot_state.config).clone();
+        cfg2.tls_mode = crate::config::TlsMode::ReverseProxy;
+        cfg2.trusted_proxies = vec![proxy_ip];
+        proxy_boot_state.config = Arc::new(cfg2);
+        proxy_boot_state.trusted_proxies = Arc::new(trusted.clone());
+        proxy_boot_state.rate_limiter = Arc::new(RateLimiter::new(ClientIpExtractor::new(
+            crate::config::TlsMode::ReverseProxy,
+            trusted,
+        )));
+        let router2 = build_control_router(proxy_boot_state);
+
+        let ip_pinned_ctx = ConnectionTlsContext {
+            peer_addr: std::net::SocketAddr::new(proxy_ip, 55555),
+            tls_exporter_b64: None,
+            listener_tls_mode: crate::config::TlsMode::IpPinned,
+        };
+        for _ in 0..10 {
+            let (st, _) = send_router_req(
+                router2.clone(),
+                ip_pinned_ctx.clone(),
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/nodes/register")
+                    .header("x-forwarded-for", "203.0.113.88")
+                    .body(Body::from(b"{}".to_vec()))
+                    .expect("bad pinned"),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        // IpPinned listener ignores XFF and enforces lockout on peer_addr (`127.0.0.10`), not exempting proxy!
+        let (pinned_locked_st, _) = send_router_req(
+            router2,
+            ip_pinned_ctx,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/auth/challenge")
+                .header("x-forwarded-for", "203.0.113.89")
+                .body(Body::from(ch_body))
+                .expect("pinned locked"),
+        )
+        .await;
+        assert_eq!(pinned_locked_st, StatusCode::TOO_MANY_REQUESTS);
     }
 }
