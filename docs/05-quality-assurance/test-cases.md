@@ -1,0 +1,78 @@
+# Danh Mục Kịch Bản Kiểm Thử Độc Lập Sprint 1 (Sprint 1 Test Cases & Traceability)
+
+- **Dự án**: Mesh VPN (Rust `1.94.1`, `edition = "2024"`)
+- **Phạm vi**: Sprint 1 (`WP-S1-00` .. `WP-S1-06`, **38 `Must` User Stories / 174 SP**)
+- **Người thực hiện**: `agile-qa` (`gemini-4-argon-high`)
+- **Ngày thực thi**: `2026-11-13`
+
+---
+
+## 1. Bộ Kiểm Thử Tích Hợp, Concurrency & AppSec Độc Lập Do QA Bổ Sung (`8/8 PASS`)
+
+| Mã TC | Tên Hàm Kiểm Thử Tự Động | File Kiểm Thử | Stories / Ràng Buộc Bảo Phủ | Kịch Bản & Dữ Liệu Đầu Vào | Kết Quả Mong Đợi | Kết Quả Thực Tế |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **TC-QA-01** | `test_preauth_key_sha256_and_three_concurrent_registrations_create_single_node` | `crates/mesh-store/tests/qa_sprint1_store_security_and_eio.rs` | `US-002`, `US-004`, `US-005 AC2/AC3`, `SEC-05` | 1. Tạo `PreAuthToken` (`mpk_...`), băm SHA-256 lưu vào `ControlStore`.<br>2. Dùng `Barrier::new(3)` bắn đồng thời 3 luồng `register_node` với cùng `node_pubkey` và one-time key.<br>3. Thử đăng ký lần 4 bằng `node_pubkey` khác trên cùng one-time key.<br>4. Quét byte nhị phân file `control.redb`. | - Cả 3 luồng đồng thời trả về cùng 1 `NodeId` và 1 `OverlayIp`; đúng 1 luồng `state_changed == true`, 2 luồng là idempotent replay.<br>- Luồng thứ 4 với khóa khác bị chặn `401 "authentication failed"`.<br>- `0` byte chuỗi `mpk_...` xuất hiện trong `control.redb`. | **PASS** |
+| **TC-QA-02** | `test_single_use_challenge_proof_replay_blocked_100_percent_with_generic_401` | `crates/mesh-store/tests/qa_sprint1_store_security_and_eio.rs` | `US-003 AC4`, `SEC-05`, `ADR-003` | 1. Cấp `challenge_id` dùng một lần kèm khóa tạm X25519 của server.<br>2. Client niêm phong `ProofPayload` (`SalsaBox`) gắn `method`, `path`, `body_sha256`, `tls_exporter_binding`.<br>3. Xác thực lần 1 (tiêu thụ nguyên tử `challenge_id` trước khi giải mã).<br>4. Phát lại (replay) cùng `challenge_id` và `SalsaBox` lần 2. | - Lần 1 giải mã và khớp toàn bộ claims thời gian hằng số (`ct_eq_bytes`).<br>- Lần 2 bị chặn ngay lập tức với `ErrorKind::Unauthenticated` (`HTTP 401`) và thông điệp công khai cố định `"authentication failed"`. | **PASS** |
+| **TC-QA-03** | `test_dual_eio_branches_ram_enforcement_compaction_fold_and_exhausted_lease_reauth` | `crates/mesh-store/tests/qa_sprint1_store_security_and_eio.rs` | `US-029`, `SEC-08`, Gate 2 Dual `EIO` (a) & (b) | 1. Mở `ControlStore` với `FaultInjectingEmergencyBackend`.<br>2. Nhánh (a): Tiêm lỗi `EIO` kép (`redb` + `emergency-revocations.bin`), thu hồi node, kiểm tra không đánh bật mục `EmergencySlot` cũ khi mục mới rơi vào `RamOnly`, sau đó khôi phục I/O và chạy `try_compact_emergency_revocations()`.<br>3. Nhánh (b): Kiểm tra hợp đồng `RevokeStoreOutcome` khi `EIO` kép trùng lúc cạn lease `MonotonicNetmapVersion`. | - Nhánh (a): Trả về `PersistenceTier::RamOnly`, chặn ngay trong `RevokedSet` RAM (`is_node_revoked_ram` & `is_pubkey_revoked_ram`), giữ nguyên các mục `EmergencySlot` trước đó; khi đĩa hồi phục, gộp sạch mục `RamOnly` vào `control.redb` và xóa `disk_degraded`.<br>- Nhánh (b): `netmap_version == None`, `must_disconnect_all_peers_to_reauth == true`. | **PASS** |
+| **TC-QA-04** | `test_no_secrets_in_outputs_across_store_identity_keys_and_audit_log` | `crates/mesh-store/tests/qa_sprint1_store_security_and_eio.rs` | `SEC-01`, `US-013 AC4` | Kiểm tra `Debug`, `Display`, và chuỗi JSON của `PreAuthToken`, `ServerIdentity`, `StoredPreAuthKeyRecord`, và `StoredAuditEventRecord`. | - `PreAuthToken` in `"[REDACTED]"`.<br>- Không có `"PRIVATE KEY"` hay chuỗi `mpk_...` trong `Debug`, `Display`, JSON hay bảng `audit_events`. | **PASS** |
+| **TC-QA-05** | `test_e2e_netmap_sync_blind_relay_forwarding_and_per_peer_queue_isolation` | `crates/mesh-datapath/tests/qa_sprint1_e2e_datapath_and_appsec.rs` | `US-009`, `US-010`, `US-024`, `US-025 AC6` | 1. Đồng bộ `NetmapSnapshot` vào `PeerMap` của Node A, B, C.<br>2. Bắt tay WireGuard Noise (`defguard_boringtun`) và truyền gói IPv4 mã hóa qua khung Blind Relay `0x01` -> `0x02` gắn `src_pubkey` xác thực.<br>3. Làm đầy hàng đợi `256` gói của Peer B trên `RelayClientHandle`, gửi gói thứ 257 cho B rồi gửi gói cho Peer C. | - Bắt tay WireGuard và giải mã gói IPv4 qua Relay thành công 100%.<br>- Gói 257 tới Peer B bị drop-tail tức thì (`dropped_tail_packets == 1`), trong khi gói tới Peer C vẫn đi qua bình thường (không bị Cross-Peer HoL blocking). | **PASS** |
+| **TC-QA-06** | `test_disco_direct_upgrade_anti_reflection_and_relay_pong_never_poisons_direct_addr` | `crates/mesh-datapath/tests/qa_sprint1_e2e_datapath_and_appsec.rs` | `US-021 AC5`, `US-022`, `HR-G2-04` | 1. Node A tạo `DiscoPing` (`b"MESHDS"` >= `172 B`).<br>2. Kẻ tấn công phản xạ lại gói Ping của A (kể cả sửa khóa ngoài thành khóa của B).<br>3. Node B trả lời `DiscoPong` nhưng gói đi qua `IngressSource::Relay`.<br>4. Node B trả lời `DiscoPong` qua `IngressSource::DirectUdp`, sau đó mô phỏng 3 lần timeout liên tiếp. | - Gói phản xạ bị từ chối (`DiscoEvent::Rejected`, `invalid_packets == 1`).<br>- `DiscoPong` qua Relay chỉ đo RTT (`RelayRttMeasured`), **tuyệt đối không** nâng cấp `active_path` lên `Direct` hay ghi đè `direct_addr`.<br>- `DiscoPong` qua `DirectUdp` nâng cấp lên `Direct`; sau 3 lần mất Pong liên tiếp tự động hạ về `Relay` (`direct_failovers == 1`). | **PASS** |
+| **TC-QA-07** | `test_cryptokey_allowed_ips_slash32_drops_inner_source_spoofing_in_wireguard_tunnel` | `crates/mesh-datapath/tests/qa_sprint1_e2e_datapath_and_appsec.rs` | `US-014 AC4`, `SEC-11` | Node B (được cấp `10.100.0.21/32`) mã hóa gói IPv4 bên trong có IP nguồn giả mạo là `10.100.0.99` gửi qua đường hầm WireGuard tới Node A (`10.100.0.20/32`). | Node A giải mã WireGuard và `CryptokeyValidator::validate_inbound` chặn gói tin với `Err(CryptokeyDropReason::SpoofedSourceIp)`, tăng bộ đếm `spoofed_packets_dropped == 1`. | **PASS** |
+| **TC-QA-08** | `test_no_secrets_in_outputs_datapath_config_and_keypairs` | `crates/mesh-datapath/tests/qa_sprint1_e2e_datapath_and_appsec.rs` | `SEC-01` | Định dạng `{:?}` cho `DatapathConfig`, `NodeKeypair`, và `DiscoKeypair`. | Toàn bộ khóa bí mật hiển thị `"[REDACTED]"`, không rò rỉ byte khóa thô. | **PASS** |
+
+---
+
+## 2. Ma Trận Truy Xuất 38 `Must` User Stories Sprint 1 (`174 SP`)
+
+| Story ID | Tên Story | SP | Work Package | Bài Kiểm Thử Tự Động Đối Chiếu (Unit / Integration / Lab) | Trạng Thái |
+| :--- | :--- | :---: | :---: | :--- | :---: |
+| **US-001** | Khởi tạo Control Server & quản lý danh tính máy chủ | 5 | `WP-S1-01` | `mesh-store::identity_repo::tests`, `mesh-server::acme::tests` | **PASS** |
+| **US-002** | Quản lý Pre-Auth Keys (SHA-256, TTL, वन-time/reusable, ephemeral) | 5 | `WP-S1-01` | `mesh-store::keys_repo::tests`, `TC-QA-01`, `TC-QA-04` | **PASS** |
+| **US-003** | Xác thực Challenge-Response Single-Use + TLS Exporter Binding | 5 | `WP-S1-01` | `mesh-crypto::auth_box::tests`, `mesh-server::control_handlers::tests`, `TC-QA-02` | **PASS** |
+| **US-004** | Đăng ký Node mới & cấp phát IPv4 Overlay `/32` trong 1 giao dịch ACID | 5 | `WP-S1-01` | `mesh-store::nodes_repo::tests`, `TC-QA-01` | **PASS** |
+| **US-005** | Đăng ký Node Idempotent & chống Race Condition đồng thời | 3 | `WP-S1-01` | `mesh-store::nodes_repo::tests`, `TC-QA-01` (3 luồng `Barrier`) | **PASS** |
+| **US-006** | Hỗ trợ Ephemeral Nodes & tự động dọn dẹp khi offline quá hạn | 3 | `WP-S1-01` | `mesh-store::nodes_repo::tests`, `mesh-server::control_handlers::tests` | **PASS** |
+| **US-007** | Lưu trữ `redb` ACID 9 bảng, kiểm tra toàn vẹn lúc khởi động & Hot Backup/Restore | 5 | `WP-S1-01` | `mesh-store::schema::tests`, `mesh-store::backup::tests`, `mesh-store::store::tests` | **PASS** |
+| **US-008** | Quản lý dải IPv4 Overlay CIDR & cách ly IP 24 giờ (`quarantine_until_ms`) | 3 | `WP-S1-01` | `mesh-store::nodes_repo::tests`, `mesh-core::types::tests` | **PASS** |
+| **US-009** | Đồng bộ Netmap thời gian thực qua WebSocket (`/v1/netmap/stream`) | 5 | `WP-S1-01` | `mesh-server::netmap_hub::tests`, `meshd::control_client::tests` | **PASS** |
+| **US-010** | Áp dụng Netmap Diff không làm rớt kết nối WireGuard đang hoạt động | 5 | `WP-S1-02` | `mesh-datapath::peer_map::tests`, `TC-QA-05` | **PASS** |
+| **US-011** | Quản lý khối `# BEGIN mesh ... # END mesh` an toàn trong file `hosts` | 3 | `WP-S1-03` | `mesh-net::hosts::tests` (bao gồm `proptest!`, chặn `localhost`/`wpad`/public host) | **PASS** |
+| **US-012** | Đặt tên & đổi tên Node chuẩn RFC 1123 (`1..=63` ký tự) | 2 | `WP-S1-01` | `mesh-store::nodes_repo::tests`, `mesh-server::admin_service::tests` | **PASS** |
+| **US-013** | Nhật ký kiểm toán bảo mật bất biến (Append-Only Audit Log) & không chứa bí mật | 3 | `WP-S1-01` | `mesh-store::audit_repo::tests`, `TC-QA-04` | **PASS** |
+| **US-014** | Thiết lập đường hầm WireGuard Userspace (`defguard_boringtun`) & `AllowedIPs = /32` | 8 | `WP-S1-02` | `mesh-datapath::peer_map::tests`, `mesh-datapath::cryptokey::tests`, `TC-QA-07` | **PASS** |
+| **US-015** | Tạo thiết bị mạng ảo `utun` & định tuyến an toàn trên macOS (`IP_BOUND_IF`) | 5 | `WP-S1-03` | `mesh-sys::macos::tests`, `mesh-net::tun_macos::tests`, `mesh-net::route_macos::tests` | **PASS** |
+| **US-016** | Tích hợp `wintun.dll` (kiểm tra SHA-256) & định tuyến an toàn trên Windows | 5 | `WP-S1-04` | `mesh-sys::windows::tests`, `mesh-net::tun_windows::tests`, `mesh-net::route_windows::tests` | **PASS** |
+| **US-017** | Thiết bị `/dev/net/tun` & định tuyến chính sách `SO_MARK = 0x5d56` trên Linux | 5 | `WP-S1-05` | `mesh-sys::linux::tests`, `mesh-net::tun_linux::tests`, `mesh-net::route_linux::tests` | **PASS** |
+| **US-018** | Bộ lọc gói tin phía Host (Packet Filter) với cơ chế nạp lại Fail-Closed | 5 | `WP-S1-02` | `mesh-datapath::cryptokey::tests` | **PASS** |
+| **US-019** | Dịch vụ STUN RFC 5389 tích hợp & phân loại NAT (`EIM` vs `HardNAT`) | 5 | `WP-S1-02` / `03` | `mesh-proto::stun::tests`, `mesh-datapath::stun_client::tests`, `mesh-server::stun_server::tests` | **PASS** |
+| **US-020** | Thu thập & lọc ứng viên UDP P2P (loại bỏ NIC ảo, loopback, cổng STUN) | 3 | `WP-S1-02` | `mesh-net::endpoint_filter::tests`, `mesh-datapath::stun_client::tests` | **PASS** |
+| **US-021** | Đục lỗ UDP xác thực (`DiscoPing`/`DiscoPong`/`CallMeMaybe`) & chống đầu độc qua Relay | 8 | `WP-S1-02` | `mesh-datapath::disco_engine::tests`, `TC-QA-06` | **PASS** |
+| **US-022** | Giữ kết nối theo nhu cầu (On-Demand Keepalive 25s, nghỉ sau 3-5p) & 3-Strike Failover | 5 | `WP-S1-02` | `mesh-datapath::disco_engine::tests`, `TC-QA-06` | **PASS** |
+| **US-023** | Tự động Rebind `MagicSocket` khi chuyển mạng Wi-Fi / Ethernet / Roaming | 5 | `WP-S1-02` | `mesh-datapath::rebind::tests`, `mesh-net::netmon::tests` | **PASS** |
+| **US-024** | Dịch vụ Blind Relay qua HTTPS/WebSocket (`/v1/relay`, không giải mã gói tin) | 8 | `WP-S1-01` | `mesh-server::relay_hub::tests`, `mesh-datapath::relay_client::tests`, `TC-QA-05` | **PASS** |
+| **US-025** | Giới hạn băng thông Relay (`20 Mbps`/node) & cô lập hàng đợi `mpsc::channel(256)` | 5 | `WP-S1-01` | `mesh-server::relay_hub::tests`, `mesh-datapath::relay_client::tests`, `TC-QA-05` | **PASS** |
+| **US-026** | Kết nối tức thì qua Blind Relay (`<= 1 s`) trong khi đục lỗ UDP chạy nền | 5 | `WP-S1-02` | `mesh-datapath::engine::tests`, `TC-QA-05` | **PASS** |
+| **US-029** | Thu hồi Node/Key tức thì (`RevokedSet` RAM + `EmergencySlot` A/B + Dual `EIO`) | 5 | `WP-S1-01` | `mesh-store::revoked_ram::tests`, `mesh-store::store::tests`, `TC-QA-03` | **PASS** |
+| **US-031** | Hết hạn khóa Node tự động (`180 ngày`) & cưỡng chế ngắt kết nối khi hết hạn | 3 | `WP-S1-01` | `mesh-store::nodes_repo::tests`, `mesh-server::admin_service::tests` | **PASS** |
+| **US-032** | Lưu trữ khóa Node an toàn theo OS & xoay khóa không đổi IP Overlay | 5 | `WP-S1-03` | `mesh-net::keystore::tests`, `mesh-store::nodes_repo::tests` | **PASS** |
+| **US-034** | Kết nối lại với Exponential Backoff + Jitter & chỉ dừng khi bị thu hồi/hết hạn thật | 5 | `WP-S1-02` | `mesh-core::backoff::tests`, `mesh-datapath::relay_client::tests`, `meshd::control_client::tests` | **PASS** |
+| **US-035** | Sổ cái `ResourceLedger` & khôi phục sạch cấu hình mạng sau khi crash (`SIGKILL`) | 5 | `WP-S1-03` | `mesh-net::ledger::tests`, `meshd::daemon::tests` | **PASS** |
+| **US-036** | CLI `mesh up` / `mesh down` & tách biệt 2 kênh IPC (`admin` vs `ro`) | 5 | `WP-S1-03` | `mesh::cli::tests`, `meshd::ipc_server::tests`, `mesh-net::ipc::tests` | **PASS** |
+| **US-037** | CLI `mesh status` & `mesh peers` (bảng & `--json`, không cần `sudo`) | 3 | `WP-S1-03` | `mesh::cli::tests`, `meshd::ipc_server::tests` | **PASS** |
+| **US-038** | CLI `mesh ping` (Direct vs Relay RTT) & `mesh netcheck` (chẩn đoán NAT/STUN/Relay) | 3 | `WP-S1-03` | `mesh::cli::tests`, `mesh-datapath::engine::tests` | **PASS** |
+| **US-039** | Dịch vụ `LaunchDaemon` trên macOS (`plist`, quyền `root:wheel`, dọn sạch khi gỡ) | 3 | `WP-S1-03` | `scripts/install-macos.sh` (`wsl bash -n`), `lab/macos/verify-macos-host.sh`, `meshd` tests | **PASS** |
+| **US-040** | Dịch vụ Windows Service (`SCM`) & Named Pipe SDDL (`SY`+`BA` vs `WD` chỉ đọc) | 5 | `WP-S1-04` | `mesh-net::ipc_windows::tests`, `meshd::service_windows::tests` | **PASS** |
+| **US-041** | Dịch vụ `systemd` trên Linux Client & Unix Socket `SO_PEERCRED` | 3 | `WP-S1-05` | `mesh-net::ipc_linux::tests`, `deploy/systemd/meshd.service` | **PASS** |
+| **US-042** | Bảo vệ chống Brute-Force/DoS & giới hạn kích thước khung điều khiển/IPC | 5 | `WP-S1-01` / `05` | `mesh-server::rate_limit::tests`, `mesh-server::control_handlers::tests` | **PASS** |
+| **US-045** | Kịch bản cài đặt `mesh-server` 1 lệnh trên VPS Linux (`install-server.sh`) | 3 | `WP-S1-06` | `scripts/install-server.sh` (`wsl bash -n`), `deploy/systemd/mesh-server.service` | **PASS** |
+| **US-047** | TLS 1.3 linh hoạt: IP + SPKI Pinning (`sha256:<hex>`), ACME, Reverse Proxy & Dual-Pin Rotation | 5 | `WP-S1-01` | `mesh-crypto::tls_pin::tests`, `mesh-server::acme::tests`, `mesh-server::admin_service::tests` | **PASS** |
+| **US-048** | Đóng gói & kiểm tra bảo mật bộ cài macOS (`install-macos.sh`, cấm tắt Gatekeeper) | 3 | `WP-S1-03` | `scripts/install-macos.sh`, `mesh-net::sysexec::tests` | **PASS** |
+| **US-049** | Bộ kiểm thử tích hợp tự động trên môi trường mạng/NAT giả lập (`lab/`) | 5 | `WP-S1-06` | `lab/run-lab.sh`, `lab/acceptance/test-us057-lab-smoke.sh` (`wsl bash -n`) | **PASS** |
+| **US-050** | Bộ cài đặt Windows & dọn sạch Wintun/Firewall/Hosts khi gỡ cài đặt | 3 | `WP-S1-04` | `scripts/install-windows.ps1`, `mesh-net::ledger::tests` | **PASS** |
+| **US-051** | Chạy hoàn toàn bằng địa chỉ IPv4/IPv6 Public của VPS không cần mua Domain | 3 | `WP-S1-01` | `mesh-crypto::tls_pin::tests`, `mesh-server::acme::tests` | **PASS** |
+| **US-055** | Vượt tường lửa doanh nghiệp chặn hoàn toàn UDP (chỉ mở TCP `:443`) | 3 | `WP-S1-06` | `lab/acceptance/test-udp-blocked-443-only.sh` (`wsl bash -n`), `TC-QA-05` | **PASS** |
+| **US-056** | Chống xung đột với VPN khác, Docker, WSL2 & bảo vệ DNS/Default Gateway | 5 | `WP-S1-03..06` | `mesh-net::endpoint_filter::tests`, `mesh-net::route_*::tests` | **PASS** |
+| **US-057** | Môi trường Lab Docker Compose đa vùng mạng & kịch bản tiêm lỗi `ENOSPC`/`EIO` | 5 | `WP-S1-06` | `lab/docker-compose.yml`, `lab/faults/inject-fault.sh`, `lab/acceptance/test-us057-lab-smoke.sh` | **PASS** |
+| **US-074** | Cấu hình tự do cổng Control/Relay & STUN và di chuyển cổng an toàn (`migrate-endpoint`) | 3 | `WP-S1-01` | `mesh-server::listener_set::tests`, `mesh-server::admin_service::tests`, `scripts/check.ps1` (GNFR-11) | **PASS** |
+
+*(Lưu ý: Bảng trên bao phủ toàn bộ 38 `Must` stories của Sprint 1 cùng các stories nền tảng phụ thuộc trực tiếp trong `WP-S1-00..06`).*

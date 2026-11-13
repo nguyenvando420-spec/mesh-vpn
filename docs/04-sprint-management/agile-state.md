@@ -6,8 +6,8 @@
 
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `3 - Sprint Execution & Parallel Implementation`
-- **Sprint hiện tại**: `Sprint 1 (Milestone 1 — 38 Must / 174 SP)`
-- **Bước tiếp theo**: `Wave 1.2 (WP-S1-05..06) đã đạt [APPROVED FOR GATE] (15/15 CLOSED, 215 tests pass), đã commit & push origin/main -> Đang chạy Kiểm thử độc lập Sprint 1 (agile-qa gemini-4-argon-high) -> Sprint 2 Wave 2.1 (WP-S2-01..03 song song)`
+- **Sprint hiện tại**: `Sprint 2 (Milestone 2 — 13 Must / 60 SP + 11 Should / 35 SP)`
+- **Bước tiếp theo**: `Sprint 1 đã đạt [PASS - ĐẠT DoD] từ agile-qa (38/38 Must, 223/223 tests pass) -> Commit & Push Sprint 1 QA -> Chạy song song Sprint 2 Wave 2.1 (WP-S2-01, WP-S2-02, WP-S2-03 với 0% trùng file)`
 
 ## Trạng thái Gate
 
@@ -21,7 +21,7 @@
 
 | Vai trò | Model | conversationId / tên worker | Nhiệm vụ gần nhất | Trạng thái |
 |---|---|---|---|---|
-| agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) (dự phòng chuyên biệt: `gemini-pro-orchestrator`) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Đã push `WP-S1-00` (`664c5de`) & Wave 1.1 (`d5a74f2`); đang kiểm chứng & phản biện Wave 1.2 (`WP-S1-05` + `WP-S1-06`) | 🟢 Active |
+| agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) (dự phòng chuyên biệt: `gemini-pro-orchestrator`) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Đã kiểm chứng nghiệm thu Sprint 1 QA (`223` tests pass); điều phối song song Sprint 2 Wave 2.1 (`WP-S2-01..03`) | 🟢 Active |
 | agile-researcher | claude-opus-5-5-high | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
 | agile-tech-lead | gemini-4-argon-high (dự phòng tiếp theo: `gemini-4-hydrogen-xhigh` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41) | 111ccb61-76da-4415-aa05-654afdb784c6 | Đã hoàn tất nâng cấp `scripts/check.ps1 -Cross` (`zig cc` shim + cross-clippy `--all-targets`) & `.gitignore` `*.o` | ✅ Done (`check.ps1 -Cross`) |
@@ -30,11 +30,11 @@
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-ai-engineer | — (Chưa kích hoạt) | | | ⚪ Inactive |
-| agile-developer | gemini-4-hydrogen-xhigh (dự phòng cho `claude-sonnet-5-5-high` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41; tách biệt biến thể với QA `argon` & Critic `carbon`) | S1-00:`7c614aab`, S1-01:`bd18233a`, S1-02:`1ac515a0`, S1-03:`9b29b7ab`, S1-04:`97e9a6ea`, S1-05:`7334a952` | Đã hoàn tất & PASS Critic R2 cho `WP-S1-05` (`215` tests pass toàn workspace) | ✅ Done (`WP-S1-05`) |
-| agile-qa | gemini-4-argon-high | (đang chạy) | Đang kiểm thử độc lập Sprint 1 (Integration/E2E/AppSec + `sprint-1-dod-verification.md`) | 🟢 Active (`Sprint 1 QA`) |
+| agile-developer | gemini-4-hydrogen-xhigh (dự phòng cho `claude-sonnet-5-5-high` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41; tách biệt biến thể với QA `argon` & Critic `carbon`) | S1-00:`7c614aab`, S1-01:`bd18233a`, S1-02:`1ac515a0`, S1-03:`9b29b7ab`, S1-04:`97e9a6ea`, S1-05:`7334a952`; đang mở S2-01..03 | Đang thực thi song song Sprint 2 Wave 2.1 (`WP-S2-01`, `WP-S2-02`, `WP-S2-03`) | 🟢 Active (`Wave 2.1`) |
+| agile-qa | gemini-4-argon-high | 45988c3a-c359-4dc0-96f5-d89777a38085 | Đã nghiệm thu độc lập Sprint 1 `[PASS - ĐẠT DoD]` (`38/38` Must, `8` integration/AppSec tests mới, tổng `223` tests pass) | ✅ Done (`Sprint 1 QA`) |
 | agile-mlops-eval | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-devops | gemini-4-hydrogen-high (nâng cấp từ `gemini-3.8-flash-high` ngày 2026-11-13) | 9ff5c3f2-1a8a-422a-92f1-15dd8fee9bba | Đã hoàn tất & PASS Critic R2 cho `WP-S1-06` (`Dockerfile`, `lab/**`, `.github/workflows/{ci.yml,release.yml}`) | ✅ Done (`WP-S1-06`) |
-| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol / gpt-6-astra / gpt-6.1-terra | (gọi qua codex_task.py) | Cửa sổ quota ChatGPT báo chạm hạn mức tới `14:35+07:00` khi gọi lúc `11:26`; tạm duy trì phản biện khác biến thể `agile-critic` (`carbon-high`) + `agile-qa` (`argon-high`) tới `14:35` | ⏳ Quota Reset `14:35` |
+| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol / gpt-6-astra / gpt-6.1-terra | (gọi qua codex_task.py) | Cửa sổ quota ChatGPT dự kiến mở lại lúc `14:35+07:00` để chạy song song phản biện Wave 2.1 & Gate 3 | ⏳ Quota Reset `14:35` |
 
 ## Kết luận Critic gần nhất
 
@@ -44,10 +44,12 @@
 - `Gate 2 Vòng 3 Cuối (2026-11-12): agile-critic [APPROVED FOR GATE] (0B/0H/0 Notes) + agile-codex (0B / 2 lưu ý nhánh lỗi phần cứng EIO kép) — Người dùng đã duyệt Gate 2 ngày 2026-11-13.`
 - `Sprint 1 Wave 1.0 WP-S1-00 Vòng 2 (2026-11-13): agile-critic [APPROVED FOR GATE] (11/11 CLOSED) — Đã commit & push 664c5de.`
 - `Sprint 1 Wave 1.1 WP-S1-01..04 Vòng 3 (2026-11-13): agile-critic [APPROVED FOR GATE] (23/23 R1 + 2/2 R2 = 100% CLOSED, 173 tests pass) — Đã commit & push d5a74f2.`
-- `Sprint 1 Wave 1.2 WP-S1-05..06 Vòng 2 (2026-11-13): agile-critic [APPROVED FOR GATE] (15/15 R1 + USER mesh supplementary group = 100% CLOSED, 215 tests pass) — Đã commit & push origin/main.`
+- `Sprint 1 Wave 1.2 WP-S1-05..06 Vòng 2 (2026-11-13): agile-critic [APPROVED FOR GATE] (15/15 R1 + USER mesh supplementary group = 100% CLOSED, 215 tests pass) — Đã commit & push edb836d.`
+- `Sprint 1 Independent QA (2026-11-13): agile-qa [PASS - ĐẠT DoD] (38/38 Must = 174 SP, 0 lỗi mở, 223/223 tests pass qua scripts/check.ps1 -Cross).`
 
 ## Việc còn dở / Vấn đề mở
 
 - ✅ **Đã chốt & áp dụng (2026-11-13 05:19 — Nâng cấp Plugin v2.4.0)**: Đã bổ sung `gemini-pro-orchestrator`, `gemini-4-hydrogen-{low,medium,high,xhigh}` (`agy 1.5.7`), dải `gpt-6-astra` / `gpt-6.1-terra` / `gpt-6-luna` + `--effort` / `--ephemeral` / `--diff-*` (`Codex CLI 0.167.2`), và mở khóa khai báo tool `swarm` / `schedule` / `ask_question` trong `agile-scrum-master.md` đồng bộ trên cả `D:\Project\Codex` và `~/.gemini/config/plugins/agile-scrum-team`.
 - ✅ **Gate 2 đã được người dùng duyệt lúc 05:47 ngày 2026-11-13**.
-- Đang thực thi **Sprint 1 — Wave 1.0 (`WP-S1-00`)** → Wave 1.1 (`WP-S1-01..04` song song) → Wave 1.2 (`WP-S1-05..06` song song) → Kiểm định `agile-qa` + `agile-codex` + `agile-critic`.
+- ✅ **Sprint 1 (`38 Must / 174 SP`) đã hoàn tất 100% và đạt `[PASS - ĐẠT DoD]` (`223` tests pass)**.
+- Đang thực thi **Sprint 2 — Wave 2.1 (`WP-S2-01..03` song song)** → Phản biện `agile-critic` + `agile-codex` → Wave 2.2 (`WP-S2-04` SLO + Runbook + Release/Rollback) → Kiểm định cuối `agile-qa` + Phản biện `agile-critic` & `agile-codex` → **Gate 3**.
