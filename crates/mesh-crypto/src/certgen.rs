@@ -8,11 +8,15 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use rcgen::{
-    CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose, date_time_ymd,
+    CertificateParams, CustomExtension, DnType, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose,
+    date_time_ymd,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
+use x509_cert::Certificate;
+use x509_cert::der::{Decode as _, Encode as _};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use mesh_core::{AppError, AppResult, SpkiPin};
@@ -240,6 +244,128 @@ pub fn generate_acme_csr_der(
     })
 }
 
+/// Generates a short-lived RFC 8737 `tls-alpn-01` validation certificate carrying the
+/// critical `id-pe-acmeIdentifier` (`1.3.6.1.5.5.7.1.31`) extension for `domain`.
+pub fn generate_tls_alpn_01_challenge_cert(
+    domain: &str,
+    key_auth_sha256: [u8; 32],
+    now_unix_secs: u64,
+) -> AppResult<GeneratedTlsIdentity> {
+    let trimmed_domain = domain.trim();
+    if trimmed_domain.is_empty() {
+        return Err(AppError::invalid_argument(
+            "TLS-ALPN-01 challenge certificate requires non-empty DNS domain",
+        ));
+    }
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(|err| {
+        AppError::internal(format!(
+            "failed generating TLS-ALPN-01 ECDSA P-256 keypair: {err}"
+        ))
+    })?;
+    let mut params = CertificateParams::new(vec![trimmed_domain.to_owned()])
+        .map_err(|err| AppError::invalid_argument(format!("invalid ACME SAN domain: {err}")))?;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, trimmed_domain);
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params
+        .custom_extensions
+        .push(CustomExtension::new_acme_identifier(&key_auth_sha256));
+
+    let epoch = date_time_ymd(1970, 1, 1);
+    let backdate_secs = now_unix_secs.saturating_sub(3_600);
+    let expiry_secs = now_unix_secs.saturating_add(7 * 86_400);
+    params.not_before = epoch + Duration::from_secs(backdate_secs);
+    params.not_after = epoch + Duration::from_secs(expiry_secs);
+
+    let cert = params.self_signed(&key_pair).map_err(|err| {
+        AppError::internal(format!("failed signing TLS-ALPN-01 certificate: {err}"))
+    })?;
+    let cert_der = cert.der().to_vec();
+    let cert_pem = cert.pem();
+    let spki_pin = extract_spki_pin_from_der(&cert_der)?;
+
+    Ok(GeneratedTlsIdentity {
+        cert_pem,
+        cert_der,
+        key_pkcs8_pem: Secret::new(key_pair.serialize_pem()),
+        key_pkcs8_der: Secret::new(key_pair.serialize_der()),
+        spki_pin,
+    })
+}
+
+/// Parses a DER-encoded X.509 certificate via `x509-cert` and extracts its `NotAfter` UTC
+/// timestamp in milliseconds (`BLK-S1-03`).
+pub fn extract_cert_not_after_ms_from_der(cert_der: &[u8]) -> AppResult<u64> {
+    let cert = Certificate::from_der(cert_der).map_err(|err| {
+        AppError::invalid_argument(format!("invalid X.509 DER certificate: {err}"))
+    })?;
+    let not_before = cert.tbs_certificate.validity.not_before.to_unix_duration();
+    let not_after = cert.tbs_certificate.validity.not_after.to_unix_duration();
+    if not_before > not_after {
+        return Err(AppError::invalid_argument(
+            "certificate has inverted validity dates",
+        ));
+    }
+    let not_after_ms = not_after.as_millis();
+    u64::try_from(not_after_ms).map_err(|_| {
+        AppError::invalid_argument("certificate NotAfter timestamp overflows u64 milliseconds")
+    })
+}
+
+/// Constructs a `rustls::sign::CertifiedKey` for RFC 8737 `tls-alpn-01` challenge certificates.
+///
+/// `rustls::ServerConfig::with_single_cert` uses `webpki` certificate validation which rejects
+/// unknown critical extensions (`id-pe-acmeIdentifier`). Building [`CertifiedKey::new`] directly
+/// after validating key/SPKI consistency via `x509-cert` lets `acme-tls/1` handshakes succeed.
+pub fn build_tls_alpn_certified_key_from_der(
+    cert_chain_der: Vec<Vec<u8>>,
+    key_pkcs8_der: &Secret<Vec<u8>>,
+) -> AppResult<Arc<CertifiedKey>> {
+    let leaf_der = cert_chain_der.first().ok_or_else(|| {
+        AppError::invalid_argument("TLS-ALPN-01 certificate chain must not be empty")
+    })?;
+    let parsed = Certificate::from_der(leaf_der).map_err(|err| {
+        AppError::invalid_argument(format!("invalid TLS-ALPN-01 leaf X.509 DER: {err}"))
+    })?;
+    let cert_spki_der = parsed
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|err| {
+            AppError::internal(format!("failed encoding TLS-ALPN-01 SPKI DER: {err}"))
+        })?;
+
+    let key_der = PrivateKeyDer::Pkcs8(
+        PrivatePkcs8KeyDer::from(key_pkcs8_der.expose_secret().as_slice()).clone_key(),
+    );
+    let provider = rustls::crypto::ring::default_provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key_der)
+        .map_err(|err| {
+            AppError::invalid_argument(format!("invalid TLS-ALPN-01 private key DER: {err}"))
+        })?;
+    let key_spki = signing_key.public_key().ok_or_else(|| {
+        AppError::invalid_argument("TLS-ALPN-01 signing key did not expose SPKI bytes")
+    })?;
+    if key_spki.as_ref() != cert_spki_der.as_slice() {
+        return Err(AppError::invalid_argument(
+            "TLS-ALPN-01 certificate SPKI does not match private key",
+        ));
+    }
+
+    let certs: Vec<CertificateDer<'static>> = cert_chain_der
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect();
+    Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+}
+
 fn build_server_config_inner(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -260,11 +386,15 @@ fn build_server_config_inner(
 
 #[cfg(test)]
 mod tests {
+    use x509_cert::Certificate;
+    use x509_cert::der::Decode as _;
+
     use super::{
         build_rustls_server_config_from_der, build_rustls_server_config_from_pem,
-        decode_pkcs8_der_from_keystore, encode_pkcs8_der_for_keystore, generate_acme_csr_der,
-        generate_ip_pinned_cert, load_certs_from_pem, parse_private_key_from_pem,
-        reissue_cert_preserving_key,
+        build_tls_alpn_certified_key_from_der, decode_pkcs8_der_from_keystore,
+        encode_pkcs8_der_for_keystore, extract_cert_not_after_ms_from_der, generate_acme_csr_der,
+        generate_ip_pinned_cert, generate_tls_alpn_01_challenge_cert, load_certs_from_pem,
+        parse_private_key_from_pem, reissue_cert_preserving_key,
     };
 
     #[test]
@@ -346,5 +476,55 @@ mod tests {
         assert!(decode_pkcs8_der_from_keystore("").is_err());
         assert!(decode_pkcs8_der_from_keystore("not!base64").is_err());
         assert!(generate_acme_csr_der(&[], None).is_err());
+    }
+
+    #[test]
+    fn test_tls_alpn_01_challenge_cert_and_extract_not_after_ms() {
+        // Arrange
+        let now_secs = 1_762_958_151_u64;
+        let digest = [0x5A_u8; 32];
+
+        // Act
+        let alpn_res = generate_tls_alpn_01_challenge_cert("vpn.example.com", digest, now_secs);
+        assert!(alpn_res.is_ok());
+        let Ok(alpn) = alpn_res else {
+            return;
+        };
+        let not_after_ms = extract_cert_not_after_ms_from_der(&alpn.cert_der);
+
+        // Assert: id-pe-acmeIdentifier (1.3.6.1.5.5.7.1.31) critical extension contains OCTET STRING(digest)
+        let parsed = Certificate::from_der(&alpn.cert_der);
+        assert!(parsed.is_ok());
+        if let Ok(cert) = parsed {
+            let acme_ext = cert.tbs_certificate.extensions.as_ref().and_then(|exts| {
+                exts.iter()
+                    .find(|e| e.extn_id.to_string() == "1.3.6.1.5.5.7.1.31")
+            });
+            assert!(acme_ext.is_some());
+            if let Some(ext) = acme_ext {
+                assert!(ext.critical);
+                let mut expected_der_val = Vec::with_capacity(34);
+                expected_der_val.extend_from_slice(&[0x04, 0x20]);
+                expected_der_val.extend_from_slice(&digest);
+                assert_eq!(ext.extn_value.as_bytes(), expected_der_val.as_slice());
+            }
+        }
+        assert_eq!(not_after_ms.ok(), Some((now_secs + 7 * 86_400) * 1_000));
+        let cert_key_res =
+            build_tls_alpn_certified_key_from_der(vec![alpn.cert_der.clone()], &alpn.key_pkcs8_der);
+        assert!(cert_key_res.is_ok(), "unexpected error: {cert_key_res:?}");
+        if let Ok(cert_key) = cert_key_res {
+            assert_eq!(cert_key.cert.len(), 1);
+        }
+        let wrong_res = generate_ip_pinned_cert(&["127.0.0.1".to_owned()], 30, now_secs);
+        assert!(wrong_res.is_ok(), "unexpected error: {wrong_res:?}");
+        if let Ok(wrong) = wrong_res {
+            assert!(
+                build_tls_alpn_certified_key_from_der(vec![alpn.cert_der], &wrong.key_pkcs8_der)
+                    .is_err()
+            );
+        }
+        assert!(generate_tls_alpn_01_challenge_cert("  ", digest, now_secs).is_err());
+        assert!(extract_cert_not_after_ms_from_der(b"not-der").is_err());
     }
 }

@@ -1,0 +1,25 @@
+# Mesh VPN Reverse Proxy Configuration Example (Caddy v2)
+# Match mesh-server /etc/mesh/server.toml settings:
+#   tls_mode = "reverse_proxy"
+#   control_bind_ip = "127.0.0.1"
+#   control_tcp_port = 8443
+#   trusted_proxies = ["127.0.0.1"]
+
+mesh.example.com {
+    tls {
+        protocols tls1.3
+    }
+
+    request_body {
+        max_size 64KB
+    }
+
+    handle /v1/* {
+        reverse_proxy 127.0.0.1:8443 {
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto https
+            flush_interval -1
+        }
+    }
+}

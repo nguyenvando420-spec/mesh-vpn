@@ -1,5 +1,5 @@
-//! Pure-Rust ACID `redb` 2.4 storage skeleton, fail-closed revocation boot log,
-//! and atomic backup manager (implemented in `WP-S1-01`).
+//! ACID control-plane state storage (`redb`), emergency `64 KiB` A/B revocation log,
+//! monotonic netmap version leasing, and atomic MVCC backups (`WP-S1-01`).
 
 pub mod audit_repo;
 pub mod backup;
@@ -10,11 +10,27 @@ pub mod revoked_ram;
 pub mod schema;
 pub mod store;
 
-pub use audit_repo::AuditRepository;
-pub use backup::{BackupManager, DEFAULT_BACKUP_RETENTION};
-pub use identity_repo::{IdentityRepository, ServerIdentity};
-pub use keys_repo::KeysRepository;
-pub use nodes_repo::NodesRepository;
-pub use revoked_ram::{EMERGENCY_REVOCATION_FILE_BYTES, RevokedSet};
+pub use audit_repo::{AuditEventInput, AuditQuery, AuditRepository, StoredAuditEventRecord};
+pub use backup::{
+    BackupArtifact, BackupManager, DEFAULT_BACKUP_RETENTION, RESTORE_WATERMARK_JUMP,
+    RestoreOptions, RestoreOutcome, StagedRestore,
+};
+pub use identity_repo::{
+    AcmeAccountCredentialsBox, IdentityRepository, ServerIdentity, StagedServerIdentity,
+};
+pub use keys_repo::{
+    CreatePreAuthKeyInput, DEFAULT_PREAUTH_TTL_SECS, KeysRepository, MAX_PREAUTH_TTL_SECS,
+    StoredPreAuthKeyRecord,
+};
+pub use nodes_repo::{
+    DEFAULT_NODE_KEY_TTL_MS, NodeStatus, NodesRepository, QUARANTINE_DURATION_MS,
+    RegisterNodeInput, RegisterNodeOutcome, StoredNodeRecord,
+};
+pub use revoked_ram::{
+    DecodedEmergencySlot, EMERGENCY_REVOCATION_FILE_BYTES, EMERGENCY_SLOT_BYTES,
+    EmergencyFileBackend, EmergencyNodeReason, EmergencyRevocationKeyEntry,
+    EmergencyRevocationNodeEntry, EmergencyRevocationState, MAX_SLOT_KEYS, MAX_SLOT_NODES,
+    OsEmergencyFileBackend, RevokedSet, read_slot_min_netmap_version,
+};
 pub use schema::{SCHEMA_VERSION, VERSION_LEASE_STEP};
-pub use store::{ControlStore, ControlStoreConfig};
+pub use store::{ControlStore, ControlStoreConfig, MonotonicNetmapVersion, RevokeStoreOutcome};

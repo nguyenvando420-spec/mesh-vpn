@@ -18,6 +18,8 @@ Desktop.ini
 *.so
 *.dylib
 *.pdb
+*.o
+.intentionally-empty-file.o
 *.dSYM/
 *.profraw
 *.profdata

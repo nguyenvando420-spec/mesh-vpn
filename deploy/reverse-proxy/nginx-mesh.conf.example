@@ -1,0 +1,64 @@
+# Mesh VPN Reverse Proxy Configuration Example (Nginx)
+# Match mesh-server /etc/mesh/server.toml settings:
+#   tls_mode = "reverse_proxy"
+#   control_bind_ip = "127.0.0.1"
+#   control_tcp_port = 8443
+#   trusted_proxies = ["127.0.0.1"]
+
+upstream mesh_control_backend {
+    server 127.0.0.1:8443;
+    keepalive 64;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name mesh.example.com;
+
+    # Strict TLS 1.3 matching mesh-crypto transport baseline
+    ssl_protocols TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    ssl_certificate /etc/letsencrypt/live/mesh.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mesh.example.com/privkey.pem;
+
+    # Enforce strict request body cap aligned with MAX_HTTP_BODY_BYTES (64 KiB)
+    client_max_body_size 64k;
+
+    location /v1/netmap/stream {
+        proxy_pass http://mesh_control_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    location /v1/relay {
+        proxy_pass http://mesh_control_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    location /v1/ {
+        proxy_pass http://mesh_control_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}

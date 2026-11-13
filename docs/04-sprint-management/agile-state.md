@@ -7,7 +7,7 @@
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
 - **Giai đoạn**: `3 - Sprint Execution & Parallel Implementation`
 - **Sprint hiện tại**: `Sprint 1 (Milestone 1 — 38 Must / 174 SP)`
-- **Bước tiếp theo**: `Wave 1.0 (WP-S1-00) đã PASS Critic R2 (11/11 CLOSED, 63 tests) & Commit/Push -> Đang chạy song song 4 workers Wave 1.1 (WP-S1-01 Server/Store, WP-S1-02 Datapath, WP-S1-03 macOS/Linux, WP-S1-04 Windows)`
+- **Bước tiếp theo**: `Wave 1.1 (WP-S1-01..04) đã đạt [APPROVED FOR GATE] (23/23 R1 + 2/2 R2 CLOSED, 173 tests xanh, pass check.ps1 -Cross) -> Commit & Push origin/main -> Đang thực thi song song Wave 1.2 (WP-S1-05 meshd + mesh CLI & WP-S1-06 Docker NAT Lab + 4-target CI/CD)`
 
 ## Trạng thái Gate
 
@@ -24,17 +24,17 @@
 | agile-scrum-master (Dual-mode: Main Agent / Subagent) | Gemini 4 Carbon (High) (dự phòng chuyên biệt: `gemini-pro-orchestrator`) | 61ff2afa-a00e-406b-acba-ec4bf1a4eb39 | Ghi nhận duyệt Gate 2 (`2026-11-13`) & điều phối thực thi Sprint 1 Wave 1.0 (`WP-S1-00`) | 🟢 Active |
 | agile-researcher | claude-opus-5-5-high | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | claude-sonnet-5-5-high | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
-| agile-tech-lead | gemini-4-argon-high (dự phòng tiếp theo: `gemini-4-hydrogen-xhigh` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41) | 111ccb61-76da-4415-aa05-654afdb784c6 | Hoàn tất Vòng sửa 2 Gate 2 (`bootstrap-toolchain.ps1` Msvc parity, tách `/run/mesh-server` vs `/var/run/meshd`, `ADR-005..007` & `coding-standards` v2.2, rule 9,887 B) | ✅ Done (Rust v2.2) |
+| agile-tech-lead | gemini-4-argon-high (dự phòng tiếp theo: `gemini-4-hydrogen-xhigh` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41) | 111ccb61-76da-4415-aa05-654afdb784c6 | Đã hoàn tất nâng cấp `scripts/check.ps1 -Cross` (`zig cc` shim + cross-clippy `--all-targets`) & `.gitignore` `*.o` | ✅ Done (`check.ps1 -Cross`) |
 | agile-architect | gemini-4-argon-high (dự phòng tiếp theo: `gemini-4-hydrogen-xhigh` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41) | 991a5bee-a698-49a3-b364-1ee99581e4f1 | Hoàn tất Vòng sửa 2 Gate 2 (`system-architecture.md`, `database-design.md`, `api-design.md` v2.2: High-Watermark Lease `1_024`, `persistence_tier`, tách IPC/state dir, UDP filter) | ✅ Done (Rust v2.2) |
-| agile-critic | gemini-4-carbon-high | 0b42ff44-f6f8-46d8-b066-4b942a7ec8fe | Tái thẩm định `WP-S1-00` Vòng 2: `[APPROVED FOR GATE]` (`11/11 CLOSED`, `0B/0H`) | ✅ Done (`WP-S1-00 R2`) |
+| agile-critic | gemini-4-carbon-high | 5f0e59f6-e355-49aa-9c7f-2bf1c6bf3aae | Hoàn tất Phản biện Wave 1.1 R1 (`wave-1-1-critique.md`): `[REVISION REQUIRED]` (`10B/11H/2M`) | ✅ Done (`Wave 1.1 R1`) |
 | agile-ai-data-engineer | — (Chưa kích hoạt - dự án thuần hạ tầng mạng) | | | ⚪ Inactive |
 | agile-slm-trainer | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-ai-engineer | — (Chưa kích hoạt) | | | ⚪ Inactive |
-| agile-developer | gemini-4-hydrogen-xhigh (dự phòng cho `claude-sonnet-5-5-high` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41; tách biệt biến thể với QA `argon` & Critic `carbon`) | 4 parallel workers (`WP-S1-01..04`) | Đã hoàn tất `WP-S1-00`; đang chạy song song 4 gói Wave 1.1 (`WP-S1-01..04`, 0% file overlap) | 🟢 Active (`Wave 1.1 x4`) |
+| agile-developer | gemini-4-hydrogen-xhigh (dự phòng cho `claude-sonnet-5-5-high` — nhóm Claude chạm trần tuần tới ~2026-11-18 13:41; tách biệt biến thể với QA `argon` & Critic `carbon`) | S1-01:`bd18233a`, S1-02:`1ac515a0`, S1-03:`9b29b7ab`, S1-04:`97e9a6ea` | Đang chạy song song Vòng sửa 1 cho cả 4 gói Wave 1.1 (`BLK-S1-01..10`, `HR-S1-01..11`, `IMP-S1-01..02`) | 🟢 Active (`Wave 1.1 Rev1 x4`) |
 | agile-qa | gemini-4-argon-high | | | ⚪ Pending |
 | agile-mlops-eval | — (Chưa kích hoạt) | | | ⚪ Inactive |
 | agile-devops | gemini-4-hydrogen-high (nâng cấp từ `gemini-3.8-flash-high` ngày 2026-11-13) | | | ⚪ Pending |
-| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol / gpt-6-astra (tạm chạm trần quota ChatGPT tới `2026-11-13 09:20+07:00` — áp dụng mục 1 `model-routing.md`: tạm thay bằng `agile-critic` `gemini-4-carbon-high` tới 09:20) | (gọi qua codex_task.py) | Chạm hạn mức cửa sổ ChatGPT lúc 06:50 (`resets at 09:20 AM`); tự động kích hoạt lại sau 09:20 | ⏸️ Quota Wait (`09:20`) |
+| agile-codex (Codex CLI, ngoài Antigravity) | gpt-6.1-sol / gpt-6-astra / gpt-6.1-terra | (gọi qua codex_task.py) | Cửa sổ quota ChatGPT báo chạm hạn mức tới `14:35+07:00` khi gọi lúc `11:26`; tạm duy trì phản biện khác biến thể `agile-critic` (`carbon-high`) + `agile-qa` (`argon-high`) tới `14:35` | ⏳ Quota Reset `14:35` |
 
 ## Kết luận Critic gần nhất
 

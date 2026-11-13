@@ -16,9 +16,11 @@ pub use auth_box::{
 };
 pub use certgen::{
     GeneratedAcmeCsr, GeneratedTlsIdentity, build_rustls_server_config_from_der,
-    build_rustls_server_config_from_pem, decode_pkcs8_der_from_keystore,
-    encode_pkcs8_der_for_keystore, generate_acme_csr_der, generate_ip_pinned_cert,
-    load_certs_from_pem, parse_private_key_from_pem, reissue_cert_preserving_key,
+    build_rustls_server_config_from_pem, build_tls_alpn_certified_key_from_der,
+    decode_pkcs8_der_from_keystore, encode_pkcs8_der_for_keystore,
+    extract_cert_not_after_ms_from_der, generate_acme_csr_der, generate_ip_pinned_cert,
+    generate_tls_alpn_01_challenge_cert, load_certs_from_pem, parse_private_key_from_pem,
+    reissue_cert_preserving_key,
 };
 pub use disco_box::{
     DISCO_INNER_HEADER_LEN, DISCO_OUTER_HEADER_LEN, DISCO_PROTOCOL_VERSION, DiscoRejectReason,

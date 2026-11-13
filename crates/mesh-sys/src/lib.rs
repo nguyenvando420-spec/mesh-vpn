@@ -35,3 +35,7 @@ pub mod netmon_macos;
 pub mod netmon_windows;
 
 pub use error::{SysError, SysResult};
+#[cfg(unix)]
+pub use fs_unix::filesystem_usage_percent;
+#[cfg(target_os = "windows")]
+pub use netmon_windows::filesystem_usage_percent;

@@ -15,6 +15,7 @@ mesh-crypto.workspace = true
 mesh-proto.workspace = true
 mesh-store.workspace = true
 mesh-net.workspace = true
+mesh-sys.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true

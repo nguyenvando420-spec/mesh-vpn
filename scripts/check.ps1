@@ -173,18 +173,75 @@ try {
         Write-Host "==> [Cross] Checking cross-compilation targets..." -ForegroundColor Cyan
         $CrossTargets = @("x86_64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin")
         $hasZigbuild = [bool](Get-Command cargo-zigbuild -ErrorAction SilentlyContinue)
+        $hasZig = [bool](Get-Command zig -ErrorAction SilentlyContinue)
+        $hasAppleSdk = (($null -ne $env:SDKROOT) -and ($env:SDKROOT.Trim().Length -gt 0) -and (Test-Path $env:SDKROOT)) -or
+                       [bool](Get-Command xcrun -ErrorAction SilentlyContinue)
+
+        # Prepare temporary zig cc / zig ar shims in $env:TEMP so ring's cc-rs build.rs compiles cleanly
+        # for cross-target clippy --all-targets --all-features without requiring xcrun or musl-gcc.
+        if ($hasZig -and $hasZigbuild) {
+            $zigExePath = (Get-Command zig -ErrorAction Stop).Source
+            $zigVerStr = ((& $zigExePath version) | Out-String).Trim()
+            $zigbuildExePath = (Get-Command cargo-zigbuild -ErrorAction Stop).Source
+
+            $ShimDir = Join-Path $env:TEMP "mesh-zigcc-shims"
+            New-Item -ItemType Directory -Force -Path $ShimDir | Out-Null
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+            $muslCc = Join-Path $ShimDir "zigcc-x86_64-unknown-linux-musl.bat"
+            $aarchDarwinCc = Join-Path $ShimDir "zigcc-aarch64-apple-darwin.bat"
+            $x86DarwinCc = Join-Path $ShimDir "zigcc-x86_64-apple-darwin.bat"
+            $zigAr = Join-Path $ShimDir "zig-ar.bat"
+
+            $shimHeader = "@echo off`r`nsetlocal DisableDelayedExpansion`r`nset CARGO_ZIGBUILD_ZIG_VERSION=$zigVerStr`r`nset `"CARGO_ZIGBUILD_ZIG_COMMAND=$zigExePath`"`r`n"
+            [System.IO.File]::WriteAllText($muslCc, "$shimHeader`"$zigbuildExePath`" zig cc -- -g -fno-sanitize=all -target x86_64-linux-musl %*`r`n", $utf8NoBom)
+            [System.IO.File]::WriteAllText($aarchDarwinCc, "$shimHeader`"$zigbuildExePath`" zig cc -- -g -fno-sanitize=all -target aarch64-macos-none %*`r`n", $utf8NoBom)
+            [System.IO.File]::WriteAllText($x86DarwinCc, "$shimHeader`"$zigbuildExePath`" zig cc -- -g -fno-sanitize=all -target x86_64-macos-none %*`r`n", $utf8NoBom)
+            [System.IO.File]::WriteAllText($zigAr, "@echo off`r`n`"$zigExePath`" ar %*`r`n", $utf8NoBom)
+
+            $env:CC_x86_64_unknown_linux_musl = $muslCc
+            $env:AR_x86_64_unknown_linux_musl = $zigAr
+            $env:CC_aarch64_apple_darwin = $aarchDarwinCc
+            $env:AR_aarch64_apple_darwin = $zigAr
+            $env:CC_x86_64_apple_darwin = $x86DarwinCc
+            $env:AR_x86_64_apple_darwin = $zigAr
+        }
+
         foreach ($t in $CrossTargets) {
-            if ($hasZigbuild) {
-                Write-Host "    cargo zigbuild --workspace --target $t"
-                & cargo @CargoToolchainArgs zigbuild --workspace --target $t
+            if ($t -eq "x86_64-unknown-linux-musl") {
+                if ($hasZigbuild) {
+                    Write-Host "    cargo zigbuild --workspace --target $t"
+                    & cargo @CargoToolchainArgs zigbuild --workspace --target $t
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Error "Cross-link (cargo zigbuild) failed for target $t"
+                        exit 1
+                    }
+                }
+                Write-Host "    cargo clippy --workspace --all-targets --all-features --target $t -- -D warnings"
+                & cargo @CargoToolchainArgs clippy --workspace --all-targets --all-features --target $t -- -D warnings
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Error "Cross-clippy failed for target $t"
+                    exit 1
+                }
             }
-            else {
-                Write-Host "    cargo check --workspace --target $t"
-                & cargo @CargoToolchainArgs check --workspace --target $t
-            }
-            if ($LASTEXITCODE -ne 0) {
-                Write-Error "Cross-check failed for target $t"
-                exit 1
+            elseif ($t -like "*-apple-darwin") {
+                if ($hasZigbuild -and $hasAppleSdk) {
+                    Write-Host "    cargo zigbuild --workspace --target $t"
+                    & cargo @CargoToolchainArgs zigbuild --workspace --target $t
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Error "Cross-link (cargo zigbuild) failed for target $t"
+                        exit 1
+                    }
+                }
+                else {
+                    Write-Host "    [Cross] SDKROOT not set for $t; running full clippy --all-targets --all-features (-D warnings) cross-check" -ForegroundColor Yellow
+                }
+                Write-Host "    cargo clippy --workspace --all-targets --all-features --target $t -- -D warnings"
+                & cargo @CargoToolchainArgs clippy --workspace --all-targets --all-features --target $t -- -D warnings
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Error "Cross-clippy failed for target $t"
+                    exit 1
+                }
             }
         }
     }
@@ -192,5 +249,9 @@ try {
     Write-Host "==> ALL CHECKS PASSED!" -ForegroundColor Green
 }
 finally {
+    $EmptyObj = Join-Path $RepoRoot ".intentionally-empty-file.o"
+    if (Test-Path $EmptyObj) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $EmptyObj
+    }
     Pop-Location
 }
