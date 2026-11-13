@@ -1,0 +1,383 @@
+name: CI Gate
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "feat/**"
+      - "fix/**"
+      - "sprint/**"
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      run_live_nat_lab:
+        description: "Run live Docker NAT Lab US-028 acceptance suite"
+        type: boolean
+        default: false
+      flap_duration_secs:
+        description: "NAT port-flap duration in seconds for live lab run"
+        type: string
+        default: "90"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  static-and-lab-lint:
+    name: Static, BOM/LF & Lab Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify UTF-8 No BOM and LF line endings on DevOps/CI/Lab files
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          targets = []
+          for p in sorted(pathlib.Path(".").glob("Dockerfile*")):
+              if p.is_file():
+                  targets.append(p)
+          for folder in ("lab", ".github/workflows"):
+              root = pathlib.Path(folder)
+              if root.exists():
+                  for p in sorted(root.rglob("*")):
+                      if p.is_file() and ".tmp" not in p.parts:
+                          targets.append(p)
+
+          errors = []
+          for path in targets:
+              data = path.read_bytes()
+              if data.startswith(b"\xef\xbb\xbf"):
+                  errors.append(f"UTF-8 BOM detected: {path}")
+              try:
+                  data.decode("utf-8")
+              except UnicodeDecodeError as exc:
+                  errors.append(f"Invalid UTF-8 in {path}: {exc}")
+              if b"\r\n" in data:
+                  errors.append(f"CRLF detected (expected LF): {path}")
+
+          if errors:
+              for err in errors:
+                  print(err, file=sys.stderr)
+              sys.exit(1)
+          print(f"Verified UTF-8 No BOM and LF across {len(targets)} files.")
+          PY
+
+      - name: Check bash syntax on all shell scripts
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            echo "Checking syntax: $script"
+            bash -n "$script"
+          done < <(find lab scripts -type f -name '*.sh' -print0 | sort -z)
+
+      - name: Validate NAT Lab compose & no-privileged invariant
+        run: |
+          set -euo pipefail
+          docker compose -f lab/docker-compose.nat-lab.yml --profile reverse-proxy config --quiet
+          if grep -Eiq 'privileged:[[:space:]]*true' lab/docker-compose.nat-lab.yml; then
+            echo "ERROR: privileged: true is forbidden in lab/docker-compose.nat-lab.yml" >&2
+            exit 1
+          fi
+
+  check-linux:
+    name: Check Linux (scripts/check.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-deny 0.20.2
+        id: cache-deny
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-linux-${{ runner.arch }}
+
+      - name: Install cargo-deny 0.20.2 if not cached
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Run scripts/check.sh
+        run: sh scripts/check.sh
+
+  check-macos:
+    name: Check macOS arm64 (scripts/check.sh & verify-macos-host)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-deny 0.20.2
+        id: cache-deny
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-macos-${{ runner.arch }}
+
+      - name: Install cargo-deny 0.20.2 if not cached
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Run scripts/check.sh
+        run: sh scripts/check.sh
+
+      - name: Validate macOS verification script syntax and dry-run checks
+        run: |
+          bash -n lab/macos/verify-macos-host.sh
+          bash lab/macos/verify-macos-host.sh --ci-dry-run
+
+  check-windows:
+    name: Check Windows (scripts/check.ps1)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-deny 0.20.2
+        id: cache-deny
+        uses: actions/cache@v4
+        with:
+          path: ~/sdk/bin/cargo-deny.exe
+          key: cargo-deny-0.20.2-windows-${{ runner.arch }}
+
+      - name: Download verified cargo-deny 0.20.2 binary
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-pc-windows-msvc.tar.gz'
+          $expectedSha256 = '975a22143262fd27476d19ee00c7af67978426e40e1dee94eed6bbade1cf87dc'
+          $sdkBin = Join-Path $env:USERPROFILE 'sdk\bin'
+          $tmpDir = Join-Path $env:RUNNER_TEMP 'cargo-deny'
+          New-Item -ItemType Directory -Force -Path $sdkBin | Out-Null
+          New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+          $archive = Join-Path $tmpDir 'cargo-deny.tar.gz'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expectedSha256) {
+            throw "cargo-deny SHA-256 mismatch: expected $expectedSha256, got $actual"
+          }
+          tar -xzf $archive -C $tmpDir
+          $exe = Get-ChildItem -Path $tmpDir -Filter 'cargo-deny.exe' -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'cargo-deny.exe not found inside archive' }
+          Copy-Item -Path $exe.FullName -Destination (Join-Path $sdkBin 'cargo-deny.exe') -Force
+
+      - name: Run scripts/check.ps1
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
+
+  release-build-matrix:
+    name: Build 4-Target Release Matrix (${{ matrix.target }})
+    needs: [static-and-lab-lint, check-linux, check-macos, check-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bins: "mesh meshd mesh-server"
+            ext: ""
+            codesign: "false"
+            check_gnu: "false"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bins: "mesh meshd mesh-server"
+            ext: ""
+            codesign: "true"
+            check_gnu: "false"
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bins: "mesh meshd mesh-server"
+            ext: ""
+            codesign: "true"
+            check_gnu: "false"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bins: "mesh meshd mesh-server"
+            ext: ".exe"
+            codesign: "false"
+            check_gnu: "true"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: ${{ matrix.target }}
+
+      - name: Add x86_64-pc-windows-gnu target for compile verification
+        if: matrix.check_gnu == 'true'
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Install musl-tools for Linux static musl build
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Download & verify Wintun 0.14.1 and export MESH_WINTUN_SHA256 (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
+          $expectedZipSha256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          $tmpDir = Join-Path $env:RUNNER_TEMP 'wintun-download'
+          $stageDir = Join-Path $env:RUNNER_TEMP 'wintun-stage'
+          New-Item -ItemType Directory -Force -Path $tmpDir, $stageDir | Out-Null
+          $zipPath = Join-Path $tmpDir 'wintun-0.14.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          $actualZip = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualZip -ne $expectedZipSha256) {
+            throw "Wintun archive SHA-256 mismatch: expected $expectedZipSha256, got $actualZip"
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $tmpDir -Force
+          $dllPath = Join-Path $tmpDir 'wintun\bin\amd64\wintun.dll'
+          if (-not (Test-Path -LiteralPath $dllPath)) {
+            throw "wintun/bin/amd64/wintun.dll not found inside archive"
+          }
+          $dllSha256 = (Get-FileHash -LiteralPath $dllPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($dllSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "Invalid computed wintun.dll SHA-256: $dllSha256"
+          }
+          Copy-Item -LiteralPath $dllPath -Destination (Join-Path $stageDir 'wintun.dll') -Force
+          "MESH_WINTUN_SHA256=$dllSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MESH_WINTUN_STAGE_DIR=$stageDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output "Verified Wintun 0.14.1 SHA-256 and exported MESH_WINTUN_SHA256=$dllSha256"
+
+      - name: Build release binaries (${{ matrix.target }})
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mesh --bin meshd --bin mesh-server
+
+      - name: Verify x86_64-pc-windows-gnu target compilation
+        if: matrix.check_gnu == 'true'
+        run: cargo check --locked --target x86_64-pc-windows-gnu --bin mesh --bin meshd --bin mesh-server
+
+      - name: Ad-hoc codesign macOS binaries
+        if: matrix.codesign == 'true'
+        run: |
+          set -euo pipefail
+          for b in ${{ matrix.bins }}; do
+            bin_path="target/${{ matrix.target }}/release/$b"
+            codesign --force -s - "$bin_path"
+            codesign -v "$bin_path"
+          done
+
+      - name: Enforce binary size ceiling and report against 6 MiB goal
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_BYTES=$((16 * 1024 * 1024))
+          GOAL_BYTES=$((6 * 1024 * 1024))
+          mkdir -p dist/${{ matrix.target }}
+          for b in ${{ matrix.bins }}; do
+            src="target/${{ matrix.target }}/release/${b}${{ matrix.ext }}"
+            test -f "$src"
+            size_bytes="$(wc -c < "$src" | tr -d '[:space:]')"
+            size_mib="$(awk "BEGIN { printf \"%.2f\", $size_bytes / 1048576 }")"
+            echo "${b} (${{ matrix.target }}): ${size_bytes} bytes (${size_mib} MiB)"
+            if [ "$size_bytes" -gt "$MAX_BYTES" ]; then
+              echo "ERROR: ${src} exceeds hard 16 MiB gate (${size_bytes} > ${MAX_BYTES})" >&2
+              exit 1
+            fi
+            if [ "$size_bytes" -gt "$GOAL_BYTES" ]; then
+              echo "::warning file=${src}::Binary ${b} (${size_mib} MiB) exceeds 6.00 MiB design target"
+            fi
+            cp "$src" "dist/${{ matrix.target }}/"
+          done
+
+      - name: Upload built target binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-binaries-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/*
+          if-no-files-found: error
+
+  docker-build-and-lab:
+    name: Docker Multi-Stage Build & Optional NAT Lab
+    needs: [static-and-lab-lint, check-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build NAT Lab & mesh-server Docker images
+        run: |
+          docker compose -f lab/docker-compose.nat-lab.yml --profile reverse-proxy build
+
+      - name: Verify mesh-server runs as non-root user with mesh-admin group
+        run: |
+          uid="$(docker run --rm --entrypoint id mesh-vpn/mesh-server:lab -u)"
+          groups="$(docker run --rm --entrypoint id mesh-vpn/mesh-server:lab -Gn)"
+          echo "mesh-server container UID=$uid GROUPS=$groups"
+          test "$uid" != "0"
+          printf ' %s ' "$groups" | grep -q ' mesh-admin '
+
+      - name: Run US-028 UDP-Blocked / 443-Only Acceptance Suite (opt-in / manual)
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.run_live_nat_lab == true) ||
+          vars.ENABLE_LIVE_NAT_LAB == 'true'
+        env:
+          US028_FLAP_DURATION_SECS: ${{ inputs.flap_duration_secs || '90' }}
+        run: |
+          bash lab/acceptance/test-udp-blocked-443-only.sh --flap-duration "$US028_FLAP_DURATION_SECS"
+
+      - name: Upload US-028 Acceptance Reports
+        if: always() && ((github.event_name == 'workflow_dispatch' && inputs.run_live_nat_lab == true) || vars.ENABLE_LIVE_NAT_LAB == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: us028-acceptance-report
+          path: lab/.tmp/
+          if-no-files-found: ignore

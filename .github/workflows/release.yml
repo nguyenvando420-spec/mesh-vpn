@@ -1,0 +1,323 @@
+name: Release 4-Target Artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag label (e.g. v0.1.0-rc1)"
+        type: string
+        required: true
+      draft:
+        description: "Publish as draft GitHub Release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-and-build:
+    name: Verify & Package (${{ matrix.pkg_name }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            pkg_name: mesh-linux-x86_64-musl
+            archive_ext: tar.gz
+            bin_ext: ""
+            platform: linux
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            pkg_name: mesh-darwin-arm64
+            archive_ext: tar.gz
+            bin_ext: ""
+            platform: macos
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            pkg_name: mesh-darwin-x86_64
+            archive_ext: tar.gz
+            bin_ext: ""
+            platform: macos
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            pkg_name: mesh-windows-x86_64-msvc
+            archive_ext: zip
+            bin_ext: ".exe"
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools for Linux static build
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Add Windows GNU target for compatibility check
+        if: matrix.platform == 'windows'
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Cache cargo-deny 0.20.2 (Unix)
+        if: matrix.platform != 'windows'
+        id: cache-deny-unix
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-deny 0.20.2 (Unix)
+        if: matrix.platform != 'windows' && steps.cache-deny-unix.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Cache cargo-deny 0.20.2 (Windows)
+        if: matrix.platform == 'windows'
+        id: cache-deny-win
+        uses: actions/cache@v4
+        with:
+          path: ~/sdk/bin/cargo-deny.exe
+          key: cargo-deny-0.20.2-windows-${{ runner.arch }}
+
+      - name: Download verified cargo-deny 0.20.2 (Windows)
+        if: matrix.platform == 'windows' && steps.cache-deny-win.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-pc-windows-msvc.tar.gz'
+          $expectedSha256 = '975a22143262fd27476d19ee00c7af67978426e40e1dee94eed6bbade1cf87dc'
+          $sdkBin = Join-Path $env:USERPROFILE 'sdk\bin'
+          $tmpDir = Join-Path $env:RUNNER_TEMP 'cargo-deny'
+          New-Item -ItemType Directory -Force -Path $sdkBin | Out-Null
+          New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+          $archive = Join-Path $tmpDir 'cargo-deny.tar.gz'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expectedSha256) {
+            throw "cargo-deny SHA-256 mismatch: expected $expectedSha256, got $actual"
+          }
+          tar -xzf $archive -C $tmpDir
+          $exe = Get-ChildItem -Path $tmpDir -Filter 'cargo-deny.exe' -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'cargo-deny.exe not found inside archive' }
+          Copy-Item -Path $exe.FullName -Destination (Join-Path $sdkBin 'cargo-deny.exe') -Force
+
+      - name: Run full verification check (Unix)
+        if: matrix.platform != 'windows'
+        run: sh scripts/check.sh
+
+      - name: Run full verification check (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
+
+      - name: Download & verify Wintun 0.14.1 and export MESH_WINTUN_SHA256 (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
+          $expectedZipSha256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          $tmpDir = Join-Path $env:RUNNER_TEMP 'wintun-download'
+          $stageDir = Join-Path $env:RUNNER_TEMP 'wintun-stage'
+          New-Item -ItemType Directory -Force -Path $tmpDir, $stageDir | Out-Null
+          $zipPath = Join-Path $tmpDir 'wintun-0.14.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          $actualZip = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualZip -ne $expectedZipSha256) {
+            throw "Wintun archive SHA-256 mismatch: expected $expectedZipSha256, got $actualZip"
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $tmpDir -Force
+          $dllPath = Join-Path $tmpDir 'wintun\bin\amd64\wintun.dll'
+          if (-not (Test-Path -LiteralPath $dllPath)) {
+            throw "wintun/bin/amd64/wintun.dll not found inside archive"
+          }
+          $dllSha256 = (Get-FileHash -LiteralPath $dllPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($dllSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "Invalid computed wintun.dll SHA-256: $dllSha256"
+          }
+          Copy-Item -LiteralPath $dllPath -Destination (Join-Path $stageDir 'wintun.dll') -Force
+          $licenseFile = Get-ChildItem -Path (Join-Path $tmpDir 'wintun') -Filter 'LICENSE*' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($licenseFile) {
+            Copy-Item -LiteralPath $licenseFile.FullName -Destination (Join-Path $stageDir 'WINTUN-LICENSE.txt') -Force
+          }
+          $readmeFile = Get-ChildItem -Path (Join-Path $tmpDir 'wintun') -Filter 'README*' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($readmeFile) {
+            Copy-Item -LiteralPath $readmeFile.FullName -Destination (Join-Path $stageDir 'README-WINTUN.md') -Force
+            if (-not $licenseFile) {
+              Copy-Item -LiteralPath $readmeFile.FullName -Destination (Join-Path $stageDir 'WINTUN-LICENSE.txt') -Force
+            }
+          }
+          "MESH_WINTUN_SHA256=$dllSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "MESH_WINTUN_STAGE_DIR=$stageDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output "Verified Wintun 0.14.1 SHA-256 and exported MESH_WINTUN_SHA256=$dllSha256"
+
+      - name: Build release binaries for ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin mesh --bin meshd --bin mesh-server
+
+      - name: Verify Windows GNU compilation
+        if: matrix.platform == 'windows'
+        run: cargo check --locked --target x86_64-pc-windows-gnu --bin mesh --bin meshd --bin mesh-server
+
+      - name: Ad-hoc codesign macOS binaries
+        if: matrix.platform == 'macos'
+        run: |
+          set -euo pipefail
+          for b in mesh meshd mesh-server; do
+            bin_path="target/${{ matrix.target }}/release/$b"
+            codesign --force -s - "$bin_path"
+            codesign -v "$bin_path"
+          done
+
+      - name: Package release bundle & compute SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX_BYTES=$((16 * 1024 * 1024))
+          STAGE="stage/${{ matrix.pkg_name }}"
+          OUT="artifacts"
+          mkdir -p "$STAGE" "$OUT"
+
+          for b in mesh meshd mesh-server; do
+            src="target/${{ matrix.target }}/release/${b}${{ matrix.bin_ext }}"
+            test -f "$src"
+            size_bytes="$(wc -c < "$src" | tr -d '[:space:]')"
+            size_mib="$(awk "BEGIN { printf \"%.2f\", $size_bytes / 1048576 }")"
+            echo "${b} (${{ matrix.target }}): ${size_bytes} bytes (${size_mib} MiB)"
+            if [ "$size_bytes" -gt "$MAX_BYTES" ]; then
+              echo "ERROR: $src exceeds hard 16 MiB gate" >&2
+              exit 1
+            fi
+            cp "$src" "$STAGE/"
+          done
+
+          if [ "${{ matrix.platform }}" = "linux" ]; then
+            mkdir -p "$STAGE/scripts" "$STAGE/deploy/systemd"
+            cp scripts/install-server.sh "$STAGE/scripts/"
+            cp deploy/systemd/mesh-server.service "$STAGE/deploy/systemd/"
+            cp deploy/systemd/meshd.service "$STAGE/deploy/systemd/"
+          elif [ "${{ matrix.platform }}" = "macos" ]; then
+            mkdir -p "$STAGE/scripts" "$STAGE/deploy/launchd"
+            cp scripts/install-macos.sh "$STAGE/scripts/"
+            cp deploy/launchd/internal.mesh.meshd.plist "$STAGE/deploy/launchd/"
+          elif [ "${{ matrix.platform }}" = "windows" ]; then
+            mkdir -p "$STAGE/scripts"
+            cp scripts/install-windows.ps1 "$STAGE/scripts/"
+            wintun_dir="$(cygpath -u "$MESH_WINTUN_STAGE_DIR" 2>/dev/null || printf '%s' "$MESH_WINTUN_STAGE_DIR")"
+            test -f "${wintun_dir}/wintun.dll"
+            cp "${wintun_dir}/wintun.dll" "$STAGE/wintun.dll"
+            printf '%s  wintun.dll\n' "${MESH_WINTUN_SHA256}" > "$STAGE/wintun.dll.sha256"
+            if [ -f "${wintun_dir}/WINTUN-LICENSE.txt" ]; then
+              cp "${wintun_dir}/WINTUN-LICENSE.txt" "$STAGE/WINTUN-LICENSE.txt"
+            fi
+            if [ -f "${wintun_dir}/README-WINTUN.md" ]; then
+              cp "${wintun_dir}/README-WINTUN.md" "$STAGE/README-WINTUN.md"
+            fi
+          fi
+
+          (
+            cd "$STAGE"
+            if command -v sha256sum >/dev/null 2>&1; then
+              if [ -f wintun.dll ]; then
+                sha256sum mesh* wintun.dll > SHA256SUMS
+              else
+                sha256sum mesh* > SHA256SUMS
+              fi
+            else
+              if [ -f wintun.dll ]; then
+                shasum -a 256 mesh* wintun.dll > SHA256SUMS
+              else
+                shasum -a 256 mesh* > SHA256SUMS
+              fi
+            fi
+          )
+
+          if [ "${{ matrix.archive_ext }}" = "tar.gz" ]; then
+            tar -C "$STAGE" -czf "${OUT}/${{ matrix.pkg_name }}.tar.gz" .
+          else
+            powershell -NoProfile -Command "Compress-Archive -Path '${STAGE}/*' -DestinationPath '${OUT}/${{ matrix.pkg_name }}.zip' -Force"
+          fi
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.pkg_name }}
+          path: artifacts/${{ matrix.pkg_name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  build-server-container:
+    name: Build & Verify mesh-server Production Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build unprivileged mesh-server Docker image
+        run: |
+          docker build --target mesh-server -t mesh-server:release .
+          uid="$(docker run --rm --entrypoint id mesh-server:release -u)"
+          groups="$(docker run --rm --entrypoint id mesh-server:release -Gn)"
+          echo "mesh-server container UID=$uid GROUPS=$groups"
+          test "$uid" != "0"
+          printf ' %s ' "$groups" | grep -q ' mesh-admin '
+
+      - name: Export mesh-server OCI tarball
+        run: |
+          mkdir -p artifacts
+          docker save mesh-server:release | gzip -c > artifacts/mesh-server-image-linux-amd64.tar.gz
+
+      - name: Upload container tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mesh-server-image
+          path: artifacts/mesh-server-image-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Unified SHA256SUMS & GitHub Release
+    needs: [verify-and-build, build-server-container]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-dist
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd release-dist
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Mesh VPN ${{ inputs.tag || github.ref_name }}
+          draft: ${{ inputs.draft == true }}
+          generate_release_notes: true
+          files: |
+            release-dist/*.tar.gz
+            release-dist/*.zip
+            release-dist/SHA256SUMS

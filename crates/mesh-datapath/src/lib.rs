@@ -16,7 +16,7 @@ pub use cryptokey::{
 };
 pub use disco_engine::{
     DiscoConfig, DiscoEngine, DiscoEvent, DiscoFilterContext, DiscoMetricsSnapshot,
-    OutboundDiscoPacket,
+    InteractivePingRequest, OutboundDiscoPacket, PingProbeOutcome, PingProbePath,
 };
 pub use engine::{
     DatapathCommand, DatapathConfig, DatapathEngine, DatapathHandle, DatapathPeerStatus,
@@ -35,7 +35,7 @@ pub use rebind::{
 pub use relay_client::{
     ConnectedRelayTransport, RelayClient, RelayClientConfig, RelayClientHandle,
     RelayConnectionState, RelayConnector, RelayEvent, RelayIoStream, RelayMetricsSnapshot,
-    TlsRelayConnector,
+    TlsRelayConnector, connect_bound_tcp_with_timeout,
 };
 pub use stun_client::{
     StunClient, StunClientConfig, StunObservation, StunProbeReport, collect_and_sort_candidates,

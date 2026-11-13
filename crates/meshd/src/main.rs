@@ -10,22 +10,43 @@ mod roaming_loop;
 mod service_windows;
 mod supervisor;
 
+use std::io::Write as _;
+use std::sync::Arc;
+
 use clap::Parser;
-use mesh_core::AppResult;
 use tokio::runtime::Builder;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+
+use mesh_core::clock::SystemClock;
+use mesh_core::{AppError, AppResult, LoggingConfig, init_json_logging};
+
+use config::{BootstrapStore, DaemonRuntimePaths};
+use roaming_loop::create_platform_net_monitor;
+use supervisor::{DaemonSupervisor, ProductionPlatformAdapters};
+
+const DAEMON_WORKER_THREADS: usize = 2;
+const DAEMON_MAX_BLOCKING_THREADS: usize = 2;
+const DAEMON_THREAD_STACK_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "meshd", about = "Mesh VPN background agent daemon")]
 struct DaemonArgs {
-    /// Print initialized subsystem summary and exit without touching host interfaces.
+    /// Validate bootstrap config and initialized subsystems without touching host interfaces.
     #[arg(long)]
     check_config: bool,
+    /// Force foreground console execution instead of attaching to OS service managers.
+    #[arg(long)]
+    foreground: bool,
+    /// Run explicitly as a Windows Service Control Manager (SCM) service (fail-closed outside SCM).
+    #[arg(long, conflicts_with = "foreground")]
+    service: bool,
 }
 
 fn collect_subsystem_labels() -> Vec<String> {
-    let cfg = config::BootstrapConfig::default();
+    let cfg = BootstrapStore::new(DaemonRuntimePaths::system_default().bootstrap_path);
     let base_labels = vec![
-        format!("bootstrap:pins={}", cfg.pins.len()),
+        format!("bootstrap_store:{}", cfg.path().display()),
         netmap_cache::NetmapCacheStore::status_label().to_owned(),
         supervisor::DaemonSupervisor::status_label(),
         control_loop::ControlLoop::status_label().to_owned(),
@@ -44,42 +65,166 @@ fn collect_subsystem_labels() -> Vec<String> {
     labels
 }
 
-fn run_daemon(args: &DaemonArgs) -> AppResult<()> {
+fn check_daemon_config(paths: &DaemonRuntimePaths) -> AppResult<()> {
+    let store = BootstrapStore::new(paths.bootstrap_path.clone());
+    let bootstrap = store.load_or_default()?;
+    bootstrap.validate()?;
     let labels = collect_subsystem_labels();
-    tracing::info!(
+    info!(
         component = "meshd",
         event = "daemon_bootstrap_check",
         subsystems = ?labels,
-        check_only = args.check_config,
-        "meshd subsystem workspace skeleton loaded"
+        has_server_endpoint = bootstrap.server_endpoint.is_some(),
+        "meshd configuration and subsystems validated"
     );
     Ok(())
 }
 
-fn main() -> std::process::ExitCode {
-    let args = DaemonArgs::parse();
-    let runtime = match Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(512 * 1024)
+fn build_daemon_runtime() -> AppResult<tokio::runtime::Runtime> {
+    Builder::new_multi_thread()
+        .worker_threads(DAEMON_WORKER_THREADS)
+        .max_blocking_threads(DAEMON_MAX_BLOCKING_THREADS)
+        .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
         .enable_all()
         .build()
+        .map_err(|err| {
+            AppError::internal(format!("failed constructing meshd Tokio runtime: {err}"))
+        })
+}
+
+async fn wait_for_os_shutdown_signal(root_shutdown: CancellationToken) {
+    #[cfg(unix)]
     {
-        Ok(rt) => rt,
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let term_res = signal(SignalKind::terminate());
+        let int_res = signal(SignalKind::interrupt());
+        match (term_res, int_res) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    () = root_shutdown.cancelled() => return,
+                    _ = term.recv() => {
+                        info!(
+                            component = "meshd",
+                            event = "sigterm_received",
+                            "received SIGTERM; starting <= 5 s graceful shutdown"
+                        );
+                    }
+                    _ = int.recv() => {
+                        info!(
+                            component = "meshd",
+                            event = "sigint_received",
+                            "received SIGINT; starting <= 5 s graceful shutdown"
+                        );
+                    }
+                }
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                warn!(
+                    component = "meshd",
+                    event = "unix_signal_setup_failed",
+                    error = %err,
+                    "failed registering Unix SIGTERM/SIGINT handlers; waiting on ctrl_c"
+                );
+                tokio::select! {
+                    () = root_shutdown.cancelled() => return,
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            () = root_shutdown.cancelled() => return,
+            res = tokio::signal::ctrl_c() => {
+                if let Err(err) = res {
+                    warn!(
+                        component = "meshd",
+                        event = "ctrl_c_wait_failed",
+                        error = %err,
+                        "ctrl_c signal handler reported error"
+                    );
+                } else {
+                    info!(
+                        component = "meshd",
+                        event = "ctrl_c_received",
+                        "received Ctrl+C; starting <= 5 s graceful shutdown"
+                    );
+                }
+            }
+        }
+    }
+
+    root_shutdown.cancel();
+}
+
+fn run_foreground_daemon(paths: DaemonRuntimePaths) -> AppResult<()> {
+    let runtime = build_daemon_runtime()?;
+    let adapters = Arc::new(ProductionPlatformAdapters::new(paths.wintun_sha256.clone()));
+    let supervisor = DaemonSupervisor::boot(paths, Arc::new(SystemClock::new()), adapters)?;
+    let (monitor, _power_tx) = create_platform_net_monitor();
+    let root_shutdown = CancellationToken::new();
+
+    runtime.block_on(async move {
+        let signal_shutdown = root_shutdown.clone();
+        let (run_res, ()) = tokio::join!(
+            supervisor.run(monitor, root_shutdown.clone()),
+            wait_for_os_shutdown_signal(signal_shutdown),
+        );
+        run_res
+    })
+}
+
+fn run_entry(args: &DaemonArgs) -> AppResult<()> {
+    let paths = DaemonRuntimePaths::system_default();
+    if args.check_config {
+        return check_daemon_config(&paths);
+    }
+
+    #[cfg(target_os = "windows")]
+    if args.service {
+        return service_windows::run_as_service(&paths);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if args.service {
+        warn!(
+            component = "meshd",
+            event = "service_flag_ignored",
+            "ignoring --service flag on non-Windows host and running normal daemon loop"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    if !args.foreground
+        && service_windows::try_run_as_service(&paths)?
+            == service_windows::ServiceDispatchOutcome::RanAsService
+    {
+        return Ok(());
+    }
+
+    run_foreground_daemon(paths)
+}
+
+fn main() -> std::process::ExitCode {
+    let args = DaemonArgs::parse();
+    let _log_guard = match init_json_logging(&LoggingConfig::for_component("meshd")) {
+        Ok(guard) => guard,
         Err(err) => {
-            tracing::error!(
-                component = "meshd",
-                event = "runtime_init_failed",
-                error = %err,
-                "failed to construct meshd Tokio runtime"
-            );
+            let mut stderr = std::io::stderr().lock();
+            if writeln!(stderr, "failed initializing meshd logging: {err}").is_err() {
+                return std::process::ExitCode::FAILURE;
+            }
             return std::process::ExitCode::FAILURE;
         }
     };
 
-    match runtime.block_on(async move { run_daemon(&args) }) {
+    match run_entry(&args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            tracing::error!(
+            error!(
                 component = "meshd",
                 event = "daemon_exit_error",
                 error = %err,
@@ -92,7 +237,12 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_subsystem_labels;
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    use crate::config::DaemonRuntimePaths;
+
+    use super::{DaemonArgs, check_daemon_config, collect_subsystem_labels};
 
     #[test]
     fn test_meshd_subsystems_compile_cleanly() {
@@ -100,10 +250,61 @@ mod tests {
         let labels = collect_subsystem_labels();
 
         // Assert
-        if cfg!(target_os = "windows") {
-            assert_eq!(labels.len(), 8);
-        } else {
-            assert_eq!(labels.len(), 7);
-        }
+        assert!(
+            labels
+                .iter()
+                .any(|item| item.starts_with("bootstrap_store:"))
+        );
+        assert!(labels.iter().any(|item| item == "netmap_cache:ready"));
+        assert!(
+            labels
+                .iter()
+                .any(|item| item.starts_with("supervisor:ready"))
+        );
+        assert!(labels.iter().any(|item| item == "control_loop:ready"));
+        assert!(labels.iter().any(|item| item == "roaming_loop:ready"));
+        assert!(labels.iter().any(|item| item == "ipc_service:ready"));
+        assert!(labels.iter().any(|item| item == "ping_probe:ready"));
+    }
+
+    #[test]
+    fn test_meshd_check_config_validates_without_side_effects() {
+        // Arrange
+        let tmp = TempDir::new().expect("temp dir");
+        let paths = DaemonRuntimePaths::for_temp_dir(tmp.path(), "check");
+
+        // Act
+        let result = check_daemon_config(&paths);
+
+        // Assert
+        assert!(result.is_ok(), "check-config failed: {result:?}");
+        assert!(!paths.ledger_path.exists());
+    }
+
+    #[test]
+    fn test_meshd_cli_flags_parse_expected_modes() {
+        // Arrange / Act
+        let args = DaemonArgs::try_parse_from(["meshd", "--check-config", "--foreground"])
+            .expect("parse flags");
+
+        // Assert
+        assert!(args.check_config);
+        assert!(args.foreground);
+        assert!(!args.service);
+    }
+
+    #[test]
+    fn test_meshd_service_flag_parses_and_conflicts_with_foreground() {
+        // Arrange / Act
+        let service_args =
+            DaemonArgs::try_parse_from(["meshd", "--service"]).expect("parse --service");
+        let conflict = DaemonArgs::try_parse_from(["meshd", "--service", "--foreground"]);
+
+        // Assert
+        assert!(service_args.service);
+        assert!(!service_args.foreground);
+        assert!(conflict.is_err());
+        #[cfg(target_os = "windows")]
+        assert_eq!(crate::service_windows::WINDOWS_SERVICE_NAME, "MeshVpnAgent");
     }
 }

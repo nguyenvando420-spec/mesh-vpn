@@ -1,5 +1,6 @@
 //! Full WireGuard/Disco/Relay data-plane runtime loop and `DatapathEngine` (`US-026`).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use mesh_core::clock::Clock;
 use mesh_core::defaults::MAX_FRAME_SIZE;
-use mesh_core::{AppError, AppResult, NodeId, OverlayCidr, OverlayIp};
+use mesh_core::{AppError, AppResult, NodeId, OverlayCidr, OverlayIp, PublicKey};
 use mesh_crypto::{DiscoKeypair, NodeKeypair};
 use mesh_net::endpoint_filter::CandidateFilterContext;
 use mesh_net::tun::TunDevice;
@@ -22,7 +23,10 @@ use mesh_proto::netmap::{NatMappingKind, NetmapSnapshot};
 use mesh_proto::{DemuxPacket, demux_packet};
 
 use crate::cryptokey::{CryptokeyMetricsSnapshot, CryptokeyValidator, PacketFilterPolicy};
-use crate::disco_engine::{DiscoConfig, DiscoEngine, DiscoFilterContext, DiscoMetricsSnapshot};
+use crate::disco_engine::{
+    DiscoConfig, DiscoEngine, DiscoEvent, DiscoFilterContext, DiscoMetricsSnapshot,
+    InteractivePingRequest, PingProbeOutcome, PingProbePath,
+};
 use crate::magic_socket::{MAGIC_SOCKET_BUFFER_SIZE, MagicSocket, MagicSocketConfig, PacketBuffer};
 use crate::peer_map::{ApplyDiffReport, PeerActivePath, PeerMap, PeerSendTarget};
 use crate::rebind::{RebindCommand, RebindOutcome, SocketRebinder};
@@ -125,6 +129,29 @@ pub enum DatapathCommand {
     SetPacketFilter(PacketFilterPolicy),
     /// Triggers immediate simultaneous NAT hole punching toward a peer (`US-021`, `US-026`).
     InitiateHolePunch(NodeId),
+    /// Sends an end-to-end encrypted `DiscoPing` probe (`Direct` or `Relay`) and waits up to
+    /// `timeout_ms` for the matching `DiscoPong` (`BLK-W12-02`).
+    SendPingProbe {
+        /// Destination peer UUID.
+        peer_id: NodeId,
+        /// Probe Direct UDP candidate endpoints even if currently active on Relay.
+        force_direct: bool,
+        /// Kick simultaneous NAT hole punching on initial Relay ping so subsequent pings upgrade.
+        kick_hole_punch: bool,
+        /// Maximum time to wait for a matching `DiscoPong`.
+        timeout_ms: u64,
+        /// Completion channel returning measured RTT & path or `PingProbePath::Timeout`.
+        reply: oneshot::Sender<PingProbeOutcome>,
+    },
+    /// Delivers an authenticated `CallMeMaybeRelay` Disco frame received via Control WS (`BLK-W12-04`).
+    HandleRelayedDisco {
+        /// Authenticated peer UUID.
+        src_node_id: NodeId,
+        /// Server-verified sender WireGuard public key.
+        verified_src_pubkey: PublicKey,
+        /// Complete `MESHDS` encrypted frame payload.
+        packet: Bytes,
+    },
     /// Queries an immutable snapshot of data-plane metrics and active peer paths.
     QueryStatus(oneshot::Sender<DatapathStatusSnapshot>),
 }
@@ -163,6 +190,57 @@ impl DatapathHandle {
         rx.await
             .map_err(|_| AppError::unavailable("datapath netmap diff reply dropped"))
     }
+
+    /// Sends one interactive encrypted `DiscoPing` probe and measures actual RTT (`BLK-W12-02`).
+    pub async fn send_ping_probe(
+        &self,
+        peer_id: NodeId,
+        force_direct: bool,
+        kick_hole_punch: bool,
+        timeout_ms: u64,
+    ) -> AppResult<PingProbeOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.send(DatapathCommand::SendPingProbe {
+            peer_id,
+            force_direct,
+            kick_hole_punch,
+            timeout_ms,
+            reply: tx,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| AppError::unavailable("datapath ping probe canceled during shutdown"))
+    }
+
+    /// Feeds an authenticated `CallMeMaybeRelay` Disco frame from Control WS (`BLK-W12-04`).
+    pub async fn handle_relayed_disco(
+        &self,
+        src_node_id: NodeId,
+        verified_src_pubkey: PublicKey,
+        packet: Bytes,
+    ) -> AppResult<()> {
+        self.send(DatapathCommand::HandleRelayedDisco {
+            src_node_id,
+            verified_src_pubkey,
+            packet,
+        })
+        .await
+    }
+}
+
+struct PendingPingWaiter {
+    started_at: tokio::time::Instant,
+    expires_at: tokio::time::Instant,
+    force_direct: bool,
+    slot: Arc<std::sync::Mutex<Option<oneshot::Sender<PingProbeOutcome>>>>,
+}
+
+struct SendPingProbeCmd {
+    peer_id: NodeId,
+    force_direct: bool,
+    kick_hole_punch: bool,
+    timeout_ms: u64,
+    reply: oneshot::Sender<PingProbeOutcome>,
 }
 
 /// Non-blocking WireGuard/Disco/STUN/Relay coordinator wired to a [`TunDevice`] and [`MagicSocket`].
@@ -176,6 +254,7 @@ pub struct DatapathEngine {
     last_stun_report: Option<StunProbeReport>,
     disco: DiscoEngine,
     advertised_endpoints: Vec<SocketAddr>,
+    pending_ping_waiters: HashMap<[u8; 12], PendingPingWaiter>,
     relay_handle: Option<RelayClientHandle>,
     relay_state: RelayConnectionState,
     clock: Arc<dyn Clock>,
@@ -226,6 +305,7 @@ impl DatapathEngine {
             last_stun_report: None,
             disco,
             advertised_endpoints,
+            pending_ping_waiters: HashMap::new(),
             relay_handle,
             relay_state: RelayConnectionState::Disconnected,
             clock,
@@ -282,8 +362,12 @@ impl DatapathEngine {
         );
 
         loop {
+            let next_ping_deadline = self.earliest_ping_waiter_expiry();
             tokio::select! {
                 () = shutdown.cancelled() => break,
+                () = wait_optional_deadline(next_ping_deadline) => {
+                    self.expire_ping_waiters();
+                }
                 udp_res = self.magic_socket.recv_from(&mut udp_rx_buf) => {
                     self.handle_udp_recv_result(udp_res, &udp_rx_buf, &mut wg_rx_buf).await;
                 }
@@ -406,7 +490,8 @@ impl DatapathEngine {
         }
     }
 
-    async fn shutdown_cleanup(&self, tracker: TaskTracker) {
+    async fn shutdown_cleanup(&mut self, tracker: TaskTracker) {
+        self.drain_ping_waiters_as_timeout();
         if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, self.tun.close())
             .await
             .is_err()
@@ -452,22 +537,8 @@ impl DatapathEngine {
                 }
             }
             DemuxPacket::Disco(disco_bytes) => {
-                let ctx = self.filter_context();
-                let excluded = self.stun_client.tracked_endpoints().to_vec();
-                let filter = DiscoFilterContext {
-                    candidates: &ctx,
-                    excluded_stun: &excluded,
-                };
-                let (_event, replies) = self.disco.handle_incoming(
-                    disco_bytes,
-                    IngressSource::DirectUdp(remote_addr),
-                    &mut self.peer_map,
-                    &filter,
-                    now_ms,
-                );
-                for pkt in replies {
-                    self.dispatch_send(pkt.target, &pkt.bytes).await;
-                }
+                self.handle_disco_bytes(disco_bytes, IngressSource::DirectUdp(remote_addr))
+                    .await;
             }
             DemuxPacket::Stun(stun_bytes) => {
                 if let Some(_obs) =
@@ -547,24 +618,13 @@ impl DatapathEngine {
                         }
                     }
                     DemuxPacket::Disco(disco_bytes) => {
-                        let ctx = self.filter_context();
-                        let excluded = self.stun_client.tracked_endpoints().to_vec();
-                        let filter = DiscoFilterContext {
-                            candidates: &ctx,
-                            excluded_stun: &excluded,
-                        };
-                        let (_ev, replies) = self.disco.handle_incoming(
+                        self.handle_disco_bytes(
                             disco_bytes,
                             IngressSource::Relay {
                                 verified_src_node_pubkey: src_pubkey,
                             },
-                            &mut self.peer_map,
-                            &filter,
-                            now_ms,
-                        );
-                        for pkt in replies {
-                            self.dispatch_send(pkt.target, &pkt.bytes).await;
-                        }
+                        )
+                        .await;
                     }
                     DemuxPacket::Stun(_) | DemuxPacket::Unknown => {}
                 }
@@ -593,22 +653,18 @@ impl DatapathEngine {
                 }
             }
             DatapathCommand::SetAdvertisedEndpoints(endpoints) => {
-                self.advertised_endpoints = endpoints;
+                let mut merged = endpoints;
+                if let Some(report) = &self.last_stun_report {
+                    for &addr in &report.reflexive_addrs {
+                        if !merged.contains(&addr) {
+                            merged.push(addr);
+                        }
+                    }
+                }
+                self.advertised_endpoints = merged;
             }
             DatapathCommand::TriggerStunProbe => {
-                let endpoints: Vec<String> = self
-                    .stun_client
-                    .tracked_endpoints()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                let rmap = mesh_proto::netmap::RelayMap {
-                    endpoint_version: 0,
-                    control_tcp_endpoint: String::new(),
-                    relay_tcp_endpoint: String::new(),
-                    stun_udp_endpoints: endpoints,
-                };
-                self.trigger_stun_probe(&rmap).await;
+                self.reprobe_tracked_stun_endpoints().await;
             }
             DatapathCommand::SetPacketFilter(policy) => {
                 self.cryptokey.set_policy(policy);
@@ -616,6 +672,30 @@ impl DatapathEngine {
             DatapathCommand::InitiateHolePunch(peer_id) => {
                 let now_ms = self.clock.now_unix_ms();
                 self.initiate_hole_punch_for_peer(peer_id, now_ms).await;
+            }
+            DatapathCommand::SendPingProbe {
+                peer_id,
+                force_direct,
+                kick_hole_punch,
+                timeout_ms,
+                reply,
+            } => {
+                self.handle_send_ping_probe(SendPingProbeCmd {
+                    peer_id,
+                    force_direct,
+                    kick_hole_punch,
+                    timeout_ms,
+                    reply,
+                })
+                .await;
+            }
+            DatapathCommand::HandleRelayedDisco {
+                src_node_id,
+                verified_src_pubkey,
+                packet,
+            } => {
+                self.handle_relayed_disco_cmd(src_node_id, verified_src_pubkey, &packet)
+                    .await;
             }
             DatapathCommand::QueryStatus(reply) => {
                 let status = self.build_status_snapshot();
@@ -629,6 +709,226 @@ impl DatapathEngine {
         }
     }
 
+    async fn reprobe_tracked_stun_endpoints(&mut self) {
+        let endpoints: Vec<String> = self
+            .stun_client
+            .tracked_endpoints()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rmap = mesh_proto::netmap::RelayMap {
+            endpoint_version: 0,
+            control_tcp_endpoint: String::new(),
+            relay_tcp_endpoint: String::new(),
+            stun_udp_endpoints: endpoints,
+        };
+        self.trigger_stun_probe(&rmap).await;
+    }
+
+    async fn handle_disco_bytes(&mut self, disco_bytes: &[u8], ingress: IngressSource) {
+        let now_ms = self.clock.now_unix_ms();
+        let ctx = self.filter_context();
+        let excluded = self.stun_client.tracked_endpoints().to_vec();
+        let filter = DiscoFilterContext {
+            candidates: &ctx,
+            excluded_stun: &excluded,
+        };
+        let (event, matched_tx, replies) = self.disco.handle_incoming_tracked(
+            disco_bytes,
+            ingress,
+            &mut self.peer_map,
+            &filter,
+            now_ms,
+        );
+        if let Some(tx_id) = matched_tx {
+            self.resolve_ping_waiter(tx_id, &event);
+        }
+        for pkt in replies {
+            self.dispatch_send(pkt.target, &pkt.bytes).await;
+        }
+    }
+
+    async fn handle_relayed_disco_cmd(
+        &mut self,
+        src_node_id: NodeId,
+        verified_src_pubkey: PublicKey,
+        packet: &[u8],
+    ) {
+        if let Some(peer) = self.peer_map.get(&src_node_id)
+            && peer.node_pubkey != verified_src_pubkey
+        {
+            warn!(
+                component = "datapath.engine",
+                event = "control_relayed_disco_pubkey_mismatch",
+                %src_node_id,
+                "dropped CallMeMaybeRelay with mismatched source public key"
+            );
+            return;
+        }
+        if let DemuxPacket::Disco(disco_bytes) = demux_packet(packet) {
+            self.handle_disco_bytes(
+                disco_bytes,
+                IngressSource::Relay {
+                    verified_src_node_pubkey: verified_src_pubkey,
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn handle_send_ping_probe(&mut self, cmd: SendPingProbeCmd) {
+        let now_ms = self.clock.now_unix_ms();
+        let Some(peer) = self.peer_map.get(&cmd.peer_id) else {
+            send_ping_reply(
+                cmd.reply,
+                PingProbeOutcome {
+                    path: PingProbePath::Timeout,
+                    rtt_ms: None,
+                },
+            );
+            return;
+        };
+        let is_relay = matches!(peer.active_path, PeerActivePath::Relay);
+
+        if cmd.force_direct && is_relay {
+            if let Some(call_me) = self.disco.maybe_build_call_me_maybe(
+                &self.peer_map,
+                cmd.peer_id,
+                &self.advertised_endpoints,
+                now_ms,
+            ) {
+                self.dispatch_send(call_me.target, &call_me.bytes).await;
+            }
+        } else if !cmd.force_direct && cmd.kick_hole_punch && is_relay {
+            self.initiate_hole_punch_for_peer(cmd.peer_id, now_ms).await;
+        }
+
+        let probes = {
+            let ctx = self.filter_context();
+            let excluded = self.stun_client.tracked_endpoints().to_vec();
+            let filter = DiscoFilterContext {
+                candidates: &ctx,
+                excluded_stun: &excluded,
+            };
+            self.disco.build_interactive_probes(
+                &self.peer_map,
+                &filter,
+                InteractivePingRequest {
+                    peer_id: cmd.peer_id,
+                    force_direct: cmd.force_direct,
+                    now_ms,
+                    timeout_ms: cmd.timeout_ms.max(1),
+                },
+            )
+        };
+        if probes.is_empty() {
+            send_ping_reply(
+                cmd.reply,
+                PingProbeOutcome {
+                    path: PingProbePath::Timeout,
+                    rtt_ms: None,
+                },
+            );
+            return;
+        }
+
+        let started_at = tokio::time::Instant::now();
+        let expires_at = started_at + Duration::from_millis(cmd.timeout_ms.max(1));
+        let slot = Arc::new(std::sync::Mutex::new(Some(cmd.reply)));
+        for (tx_id, pkt) in probes {
+            self.pending_ping_waiters.insert(
+                tx_id,
+                PendingPingWaiter {
+                    started_at,
+                    expires_at,
+                    force_direct: cmd.force_direct,
+                    slot: Arc::clone(&slot),
+                },
+            );
+            self.dispatch_send(pkt.target, &pkt.bytes).await;
+        }
+    }
+
+    fn earliest_ping_waiter_expiry(&self) -> Option<tokio::time::Instant> {
+        self.pending_ping_waiters
+            .values()
+            .map(|waiter| waiter.expires_at)
+            .min()
+    }
+
+    fn resolve_ping_waiter(&mut self, tx_id: [u8; 12], event: &DiscoEvent) {
+        let Some(waiter) = self.pending_ping_waiters.remove(&tx_id) else {
+            return;
+        };
+        let path = match event {
+            DiscoEvent::DirectPathVerified { addr, .. } => PingProbePath::Direct { addr: *addr },
+            DiscoEvent::RelayRttMeasured { .. } if !waiter.force_direct => PingProbePath::Relay,
+            DiscoEvent::RelayRttMeasured { .. } => {
+                self.pending_ping_waiters.insert(tx_id, waiter);
+                return;
+            }
+            _ => return,
+        };
+        let rtt_ms = waiter.started_at.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(mut guard) = waiter.slot.lock()
+            && let Some(tx) = guard.take()
+        {
+            send_ping_reply(
+                tx,
+                PingProbeOutcome {
+                    path,
+                    rtt_ms: Some(rtt_ms),
+                },
+            );
+        }
+        self.pending_ping_waiters
+            .retain(|_, other| !Arc::ptr_eq(&other.slot, &waiter.slot));
+    }
+
+    fn expire_ping_waiters(&mut self) {
+        let now = tokio::time::Instant::now();
+        let expired: Vec<[u8; 12]> = self
+            .pending_ping_waiters
+            .iter()
+            .filter_map(|(&tx_id, w)| (w.expires_at <= now).then_some(tx_id))
+            .collect();
+        for tx_id in expired {
+            if let Some(waiter) = self.pending_ping_waiters.remove(&tx_id)
+                && let Ok(mut guard) = waiter.slot.lock()
+                && let Some(tx) = guard.take()
+            {
+                send_ping_reply(
+                    tx,
+                    PingProbeOutcome {
+                        path: PingProbePath::Timeout,
+                        rtt_ms: None,
+                    },
+                );
+            }
+        }
+    }
+
+    fn drain_ping_waiters_as_timeout(&mut self) {
+        let waiters: Vec<PendingPingWaiter> = self
+            .pending_ping_waiters
+            .drain()
+            .map(|(_, waiter)| waiter)
+            .collect();
+        for waiter in waiters {
+            if let Ok(mut guard) = waiter.slot.lock()
+                && let Some(tx) = guard.take()
+            {
+                send_ping_reply(
+                    tx,
+                    PingProbeOutcome {
+                        path: PingProbePath::Timeout,
+                        rtt_ms: None,
+                    },
+                );
+            }
+        }
+    }
+
     async fn process_rebind_command(&mut self, cmd: &RebindCommand) {
         match SocketRebinder::apply_command(
             &mut self.magic_socket,
@@ -636,19 +936,7 @@ impl DatapathEngine {
             self.config.socket_config.linux_fwmark,
         ) {
             Ok(RebindOutcome::Rebound { .. } | RebindOutcome::RefreshCandidatesRequested) => {
-                let endpoints: Vec<String> = self
-                    .stun_client
-                    .tracked_endpoints()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                let rmap = mesh_proto::netmap::RelayMap {
-                    endpoint_version: 0,
-                    control_tcp_endpoint: String::new(),
-                    relay_tcp_endpoint: String::new(),
-                    stun_udp_endpoints: endpoints,
-                };
-                self.trigger_stun_probe(&rmap).await;
+                self.reprobe_tracked_stun_endpoints().await;
             }
             Ok(RebindOutcome::WakeRelayRequested) => {}
             Err(err) => {
@@ -814,6 +1102,23 @@ impl DatapathEngine {
     }
 }
 
+async fn wait_optional_deadline(deadline: Option<tokio::time::Instant>) {
+    if let Some(target) = deadline {
+        tokio::time::sleep_until(target).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn send_ping_reply(tx: oneshot::Sender<PingProbeOutcome>, outcome: PingProbeOutcome) {
+    if tx.send(outcome).is_err() {
+        debug!(
+            component = "datapath.engine",
+            "ping probe waiter receiver closed"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -830,6 +1135,7 @@ mod tests {
     use mesh_core::NodeId;
     use mesh_core::clock::SystemClock;
     use mesh_core::{NodeName, PublicKey, SpkiPin};
+    use mesh_crypto::open_disco_packet;
     use mesh_net::tun::{FakeTunDevice, TunConfig};
     use mesh_proto::netmap::{CandidateEndpoint, CandidateSource, PeerEntry, PinSetDto, RelayMap};
     use mesh_proto::relay::RelayFrame;
@@ -1581,5 +1887,237 @@ mod tests {
             "expected >= 300 ms RTT, got {:?}",
             report.best_rtt_ms
         );
+    }
+
+    // Traces: BLK-W12-02
+    #[tokio::test]
+    async fn test_datapath_send_ping_probe_returns_timeout_when_peer_offline_despite_relay_connected()
+     {
+        // Arrange: Node A is connected to Blind Relay, but Node B never connects (offline peer).
+        let (kp_a, kp_b, dk_a, dk_b, id_a, id_b, ip_a, ip_b, cidr) = base_test_identity();
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let shutdown = CancellationToken::new();
+        let hub_addr =
+            spawn_two_peer_relay_hub(kp_a.public_key(), kp_b.public_key(), shutdown.clone()).await;
+        let node_a = spawn_test_node(TestNodeParams {
+            node_id: id_a,
+            tun_name: "mesh-ping-offline-a",
+            overlay_ip: ip_a,
+            cidr,
+            node_keypair: kp_a.clone_keypair(),
+            disco_keypair: dk_a.clone_keypair(),
+            hub_addr,
+            clock: Arc::clone(&clock),
+            disco_config: DiscoConfig::default(),
+            tick_interval: Duration::from_millis(50),
+            shutdown: shutdown.clone(),
+        })
+        .await;
+
+        let entry_b = mk_peer_entry(
+            id_b,
+            "offline-peer",
+            ip_b,
+            kp_b.public_key(),
+            dk_b.public_key(),
+            hub_addr,
+        );
+        node_a
+            .handle
+            .apply_netmap(mk_netmap(1, vec![entry_b], hub_addr))
+            .await
+            .expect("apply netmap");
+
+        let mut connected = false;
+        for _ in 0..30 {
+            if matches!(
+                node_a
+                    .handle
+                    .query_status()
+                    .await
+                    .expect("status")
+                    .relay_state,
+                RelayConnectionState::Connected
+            ) {
+                connected = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(connected);
+
+        // Act: probe offline peer while local Relay is Connected -> MUST timeout (100% loss).
+        let outcome = node_a
+            .handle
+            .send_ping_probe(id_b, false, false, 120)
+            .await
+            .expect("probe completes");
+
+        shutdown.cancel();
+        for t in node_a.tasks {
+            t.await.expect("node task exited");
+        }
+
+        // Assert
+        assert_eq!(outcome.path, PingProbePath::Timeout);
+        assert_eq!(outcome.rtt_ms, None);
+    }
+
+    // Traces: BLK-W12-02, BLK-W12-04
+    #[tokio::test]
+    async fn test_datapath_send_ping_probe_and_handle_relayed_disco_return_measured_rtt() {
+        // Arrange
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer udp");
+        let peer_udp_addr = peer_sock.local_addr().expect("peer addr");
+        let peer_id = NodeId::from_bytes([0x72; 16]);
+        let peer_kp = NodeKeypair::generate();
+        let peer_dk = DiscoKeypair::from_secret_bytes([0x52; 32]).expect("peer dk");
+        let local_kp = NodeKeypair::generate();
+        let local_dk = DiscoKeypair::generate();
+        let local_disco_pub = local_dk.public_key();
+        let peer_dk_responder = DiscoKeypair::from_secret_bytes([0x52; 32]).expect("peer dk resp");
+
+        let peer_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let mut saw_ping = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                let recv =
+                    tokio::time::timeout(Duration::from_millis(500), peer_sock.recv_from(&mut buf))
+                        .await;
+                let Ok(Ok((len, src_addr))) = recv else {
+                    if saw_ping {
+                        break;
+                    }
+                    continue;
+                };
+                if let Some(pkt) = buf.get(..len)
+                    && let Ok(opened) = open_disco_packet(pkt, &peer_dk_responder)
+                    && let Ok(mesh_proto::disco::DiscoBody::Ping) =
+                        mesh_proto::disco::DiscoBody::decode(opened.msg_type, &opened.body)
+                {
+                    saw_ping = true;
+                    let body = mesh_proto::disco::DiscoBody::Pong {
+                        observed_addr: src_addr,
+                    }
+                    .encode()
+                    .expect("encode pong");
+                    let pong = mesh_crypto::seal_disco_packet(
+                        &peer_dk_responder,
+                        &mesh_crypto::DiscoSealParams {
+                            recipient_pubkey: local_disco_pub,
+                            msg_type: mesh_proto::disco::DiscoBody::Pong {
+                                observed_addr: src_addr,
+                            }
+                            .msg_type() as u8,
+                            tx_id: opened.tx_id,
+                            sent_at_ms: 100_000,
+                            body: &body,
+                        },
+                    )
+                    .expect("seal pong");
+                    peer_sock.send_to(&pong, src_addr).await.expect("send pong");
+                }
+            }
+            saw_ping
+        });
+
+        let cidr = "10.100.0.0/16".parse().expect("cidr");
+        let overlay_ip = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 1)).expect("ip1");
+        let tun = Arc::new(FakeTunDevice::new(
+            TunConfig::with_default_mtu("utun-ping-live", overlay_ip, cidr).expect("tun cfg"),
+        ));
+        let mut engine = DatapathEngine::bind(
+            DatapathConfig {
+                local_node_id: NodeId::from_bytes([0x71; 16]),
+                local_overlay_ip: overlay_ip,
+                overlay_cidr: cidr,
+                node_keypair: local_kp,
+                disco_keypair: local_dk,
+                socket_config: MagicSocketConfig::default()
+                    .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                stun_config: StunClientConfig::default(),
+                disco_config: DiscoConfig::default(),
+                control_tcp_endpoint: None,
+                wg_timer_interval: Duration::from_millis(250),
+                disco_tick_interval: Duration::from_millis(250),
+            },
+            Arc::clone(&tun) as Arc<dyn TunDevice>,
+            Arc::new(SystemClock::new()),
+            None,
+        )
+        .await
+        .expect("bind engine");
+        engine.enable_loopback_disco_for_tests();
+        let handle = engine.handle();
+        let (_ev_tx, ev_rx) = mpsc::channel(8);
+        let (_reb_tx, reb_rx) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let run_shutdown = shutdown.clone();
+        let engine_task = tokio::spawn(async move {
+            engine.run(ev_rx, reb_rx, run_shutdown).await.expect("run");
+        });
+
+        let mut peer_entry = mk_peer_entry(
+            peer_id,
+            "live-peer",
+            OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 2)).expect("ip2"),
+            peer_kp.public_key(),
+            peer_dk.public_key(),
+            peer_udp_addr,
+        );
+        peer_entry.endpoints = vec![CandidateEndpoint {
+            addr: peer_udp_addr,
+            source: CandidateSource::Lan,
+        }];
+        handle
+            .apply_netmap(mk_netmap(1, vec![peer_entry], peer_udp_addr))
+            .await
+            .expect("apply netmap");
+
+        // Act 1: deliver Control CallMeMaybeRelay -> engine must respond with Direct UDP DiscoPing!
+        let call_me_body = mesh_proto::disco::DiscoBody::CallMeMaybe {
+            endpoints: vec![peer_udp_addr],
+        }
+        .encode()
+        .expect("call me");
+        let call_me_pkt = mesh_crypto::seal_disco_packet(
+            &peer_dk,
+            &mesh_crypto::DiscoSealParams {
+                recipient_pubkey: local_disco_pub,
+                msg_type: mesh_proto::disco::DiscoBody::CallMeMaybe {
+                    endpoints: vec![peer_udp_addr],
+                }
+                .msg_type() as u8,
+                tx_id: [0x33; 12],
+                sent_at_ms: 100_000,
+                body: &call_me_body,
+            },
+        )
+        .expect("seal call me");
+        handle
+            .handle_relayed_disco(peer_id, peer_kp.public_key(), Bytes::from(call_me_pkt))
+            .await
+            .expect("handle relayed disco");
+
+        // Act 2: send interactive direct probe and verify true measured Direct outcome!
+        let outcome = handle
+            .send_ping_probe(peer_id, true, false, 1500)
+            .await
+            .expect("probe completes");
+
+        shutdown.cancel();
+        engine_task.await.expect("engine exit");
+        let responder_saw_ping = peer_task.await.expect("peer responder exit");
+
+        // Assert
+        assert!(responder_saw_ping);
+        assert_eq!(
+            outcome.path,
+            PingProbePath::Direct {
+                addr: peer_udp_addr
+            }
+        );
+        assert!(outcome.rtt_ms.is_some());
     }
 }

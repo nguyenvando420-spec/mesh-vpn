@@ -13,7 +13,7 @@ use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -150,6 +150,7 @@ impl RelayMetrics {
 pub struct RelayClientHandle {
     inner: Arc<RelayQueueRegistry>,
     metrics: Arc<RelayMetrics>,
+    config_tx: Option<Arc<watch::Sender<RelayClientConfig>>>,
 }
 
 #[derive(Debug)]
@@ -181,6 +182,22 @@ impl RelayClientHandle {
         Self {
             inner: Arc::new(RelayQueueRegistry::new()),
             metrics: Arc::new(RelayMetrics::default()),
+            config_tx: None,
+        }
+    }
+
+    /// Atomically replaces the active Relay endpoint/TLS configuration and wakes any running
+    /// session or reconnect sleep to switch immediately (`HR-W12-01`).
+    pub fn update_config(&self, next: RelayClientConfig) {
+        if let Some(tx) = &self.config_tx
+            && let Err(err) = tx.send(next)
+        {
+            debug!(
+                component = "datapath.relay_client",
+                event = "relay_config_update_dropped",
+                error = %err,
+                "relay config update dropped because relay client stopped"
+            );
         }
     }
 
@@ -316,7 +333,7 @@ impl RelayConnector for TlsRelayConnector {
 
 /// Authenticated WebSocket Blind Relay client with reconnect backoff and graceful shutdown.
 pub struct RelayClient {
-    config: RelayClientConfig,
+    config_tx: Arc<watch::Sender<RelayClientConfig>>,
     node_keypair: NodeKeypair,
     disco_keypair: DiscoKeypair,
     handle: RelayClientHandle,
@@ -325,12 +342,10 @@ pub struct RelayClient {
 
 impl std::fmt::Debug for RelayClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cfg = self.config_tx.borrow();
         f.debug_struct("RelayClient")
-            .field("endpoint", &self.config.endpoint)
-            .field(
-                "require_challenge_auth",
-                &self.config.require_challenge_auth,
-            )
+            .field("endpoint", &cfg.endpoint)
+            .field("require_challenge_auth", &cfg.require_challenge_auth)
             .finish_non_exhaustive()
     }
 }
@@ -411,11 +426,17 @@ impl RelayClient {
         disco_keypair: DiscoKeypair,
         connector: Arc<dyn RelayConnector>,
     ) -> Self {
+        let (config_tx, _config_rx) = watch::channel(config);
+        let config_tx = Arc::new(config_tx);
         Self {
-            config,
+            config_tx: Arc::clone(&config_tx),
             node_keypair,
             disco_keypair,
-            handle: RelayClientHandle::new(),
+            handle: RelayClientHandle {
+                inner: Arc::new(RelayQueueRegistry::new()),
+                metrics: Arc::new(RelayMetrics::default()),
+                config_tx: Some(config_tx),
+            },
             connector,
         }
     }
@@ -450,6 +471,7 @@ impl RelayClient {
         Fut: Future<Output = ()>,
     {
         let mut backoffs = ReconnectBackoffs::new();
+        let mut config_rx = self.config_tx.subscribe();
 
         loop {
             if shutdown.is_cancelled() {
@@ -462,10 +484,13 @@ impl RelayClient {
             .await;
 
             match self
-                .run_single_session(clock, events_tx, shutdown, &mut backoffs)
+                .run_single_session(&mut config_rx, clock, events_tx, shutdown, &mut backoffs)
                 .await
             {
                 SessionExit::Shutdown => break,
+                SessionExit::ConfigUpdated => {
+                    backoffs.reset_all();
+                }
                 SessionExit::TerminalAuth(kind) => {
                     warn!(
                         component = "datapath.relay_client",
@@ -504,6 +529,9 @@ impl RelayClient {
                     );
                     tokio::select! {
                         () = shutdown.cancelled() => break,
+                        Ok(()) = config_rx.changed() => {
+                            backoffs.reset_all();
+                        }
                         () = sleeper(step) => {}
                     }
                 }
@@ -511,55 +539,46 @@ impl RelayClient {
         }
     }
 
+    async fn establish_ws_session(
+        &self,
+        session_cfg: &RelayClientConfig,
+        clock: &dyn Clock,
+    ) -> Result<WebSocket<BridgeStream>, SessionExit> {
+        let mut transport = self.connector.connect(session_cfg).await.map_err(|err| {
+            let tls_capped = is_tls_capped_error(&err);
+            SessionExit::Reconnect {
+                error: err,
+                tls_capped,
+            }
+        })?;
+
+        let headers = self
+            .prepare_auth_headers(&mut transport, session_cfg, clock)
+            .await
+            .map_err(classify_auth_or_ws_exit)?;
+
+        perform_ws_handshake(transport.stream, &session_cfg.endpoint, &headers)
+            .await
+            .map_err(classify_auth_or_ws_exit)
+    }
+
     async fn run_single_session(
         &self,
+        config_rx: &mut watch::Receiver<RelayClientConfig>,
         clock: &Arc<dyn Clock>,
         events_tx: &mpsc::Sender<RelayEvent>,
         shutdown: &CancellationToken,
         backoffs: &mut ReconnectBackoffs,
     ) -> SessionExit {
-        let mut transport = match self.connector.connect(&self.config).await {
-            Ok(t) => t,
-            Err(err) => {
-                let tls_capped = is_tls_capped_error(&err);
-                return SessionExit::Reconnect {
-                    error: err,
-                    tls_capped,
-                };
-            }
-        };
-
-        let headers = match self
-            .prepare_auth_headers(&mut transport, clock.as_ref())
-            .await
-        {
-            Ok(h) => h,
-            Err(err) => {
-                if err.kind().should_stop_auto_retry() {
-                    return SessionExit::TerminalAuth(err.kind());
-                }
-                let tls_capped = is_tls_capped_error(&err);
-                return SessionExit::Reconnect {
-                    error: err,
-                    tls_capped,
-                };
-            }
-        };
-
-        let mut ws =
-            match perform_ws_handshake(transport.stream, &self.config.endpoint, &headers).await {
+        let session_cfg = config_rx.borrow_and_update().clone();
+        let mut ws = tokio::select! {
+            () = shutdown.cancelled() => return SessionExit::Shutdown,
+            Ok(()) = config_rx.changed() => return SessionExit::ConfigUpdated,
+            res = self.establish_ws_session(&session_cfg, clock.as_ref()) => match res {
                 Ok(ws) => ws,
-                Err(err) => {
-                    if err.kind().should_stop_auto_retry() {
-                        return SessionExit::TerminalAuth(err.kind());
-                    }
-                    let tls_capped = is_tls_capped_error(&err);
-                    return SessionExit::Reconnect {
-                        error: err,
-                        tls_capped,
-                    };
-                }
-            };
+                Err(exit) => return exit,
+            },
+        };
 
         backoffs.reset_all();
         emit_relay_event(
@@ -570,12 +589,12 @@ impl RelayClient {
         info!(
             component = "datapath.relay_client",
             event = "relay_connected",
-            endpoint = %self.config.endpoint,
+            endpoint = %session_cfg.endpoint,
             "connected to Blind Relay WebSocket"
         );
 
         let result = self
-            .drive_ws_loop(&mut ws, clock.as_ref(), events_tx, shutdown)
+            .drive_ws_loop(&mut ws, clock.as_ref(), events_tx, shutdown, config_rx)
             .await;
         close_ws_gracefully(&mut ws).await;
         result
@@ -584,14 +603,15 @@ impl RelayClient {
     async fn prepare_auth_headers(
         &self,
         transport: &mut ConnectedRelayTransport,
+        session_cfg: &RelayClientConfig,
         _clock: &dyn Clock,
     ) -> AppResult<Vec<(String, String)>> {
-        if !self.config.require_challenge_auth {
+        if !session_cfg.require_challenge_auth {
             return Ok(Vec::new());
         }
         let challenge = execute_challenge_http(
             transport.stream.as_mut(),
-            &self.config,
+            session_cfg,
             self.node_keypair.public_key(),
             self.disco_keypair.public_key(),
         )
@@ -637,6 +657,7 @@ impl RelayClient {
         clock: &dyn Clock,
         events_tx: &mpsc::Sender<RelayEvent>,
         shutdown: &CancellationToken,
+        config_rx: &mut watch::Receiver<RelayClientConfig>,
     ) -> SessionExit {
         let mut keepalive_tick = tokio::time::interval(RELAY_KEEPALIVE_INTERVAL);
         keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -661,9 +682,8 @@ impl RelayClient {
 
             tokio::select! {
                 () = shutdown.cancelled() => return SessionExit::Shutdown,
-                () = self.handle.inner.wake.notified() => {
-                    // Drained at top of next loop iteration.
-                }
+                Ok(()) = config_rx.changed() => return SessionExit::ConfigUpdated,
+                () = self.handle.inner.wake.notified() => {}
                 _ = keepalive_tick.tick() => {
                     let frame = RelayFrame::KeepAlive { sent_at_ms: clock.now_unix_ms() };
                     if let Err(err) = send_relay_frame(ws, &frame).await {
@@ -827,8 +847,20 @@ impl RelayClient {
 
 enum SessionExit {
     Shutdown,
+    ConfigUpdated,
     TerminalAuth(ErrorKind),
     Reconnect { error: AppError, tls_capped: bool },
+}
+
+fn classify_auth_or_ws_exit(err: AppError) -> SessionExit {
+    if err.kind().should_stop_auto_retry() {
+        return SessionExit::TerminalAuth(err.kind());
+    }
+    let tls_capped = is_tls_capped_error(&err);
+    SessionExit::Reconnect {
+        error: err,
+        tls_capped,
+    }
 }
 
 /// Bridges synchronous `tungstenite::WebSocket<BridgeStream>` onto Tokio async I/O cleanly
@@ -938,11 +970,27 @@ async fn connect_bound_tcp(
     if_index: Option<u32>,
     fwmark: Option<u32>,
 ) -> AppResult<TcpStream> {
+    connect_bound_tcp_with_timeout(
+        addr,
+        if_index,
+        fwmark,
+        Duration::from_millis(CONNECT_TIMEOUT_MS),
+    )
+    .await
+}
+
+/// Opens a non-blocking TCP connection bound to the OS underlay interface (`if_index` / `fwmark`)
+/// with an explicit timeout budget, preventing routing-loop traversal across the overlay TUN.
+pub async fn connect_bound_tcp_with_timeout(
+    addr: SocketAddr,
+    if_index: Option<u32>,
+    fwmark: Option<u32>,
+    timeout: Duration,
+) -> AppResult<TcpStream> {
     let is_ipv6 = addr.is_ipv6();
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
-    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(|err| {
-        AppError::unavailable(format!("failed to create relay tcp socket: {err}"))
-    })?;
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|err| AppError::unavailable(format!("failed to create tcp socket: {err}")))?;
     sock.set_nonblocking(true)
         .map_err(|err| AppError::unavailable(format!("failed to set tcp nonblocking: {err}")))?;
     if let Err(err) = sock.set_nodelay(true) {
@@ -959,23 +1007,19 @@ async fn connect_bound_tcp(
         && err.raw_os_error() != Some(36)
         && err.raw_os_error() != Some(10035)
     {
-        return Err(AppError::unavailable(format!(
-            "relay tcp connect failed: {err}"
-        )));
+        return Err(AppError::unavailable(format!("tcp connect failed: {err}")));
     }
 
     let std_stream: std::net::TcpStream = sock.into();
     let stream = TcpStream::from_std(std_stream)
         .map_err(|err| AppError::unavailable(format!("failed to adopt tokio tcp stream: {err}")))?;
-    tokio::time::timeout(Duration::from_millis(CONNECT_TIMEOUT_MS), stream.writable())
+    tokio::time::timeout(timeout, stream.writable())
         .await
-        .map_err(|_| AppError::unavailable("relay tcp connect timed out"))?
-        .map_err(|err| AppError::unavailable(format!("relay tcp writable wait failed: {err}")))?;
+        .map_err(|_| AppError::unavailable("tcp connect timed out"))?
+        .map_err(|err| AppError::unavailable(format!("tcp writable wait failed: {err}")))?;
 
     if let Ok(Some(so_err)) = stream.take_error() {
-        return Err(AppError::unavailable(format!(
-            "relay tcp socket error: {so_err}"
-        )));
+        return Err(AppError::unavailable(format!("tcp socket error: {so_err}")));
     }
     Ok(stream)
 }
@@ -2294,5 +2338,139 @@ mod tests {
         assert_eq!(resp.challenge_nonce, "chunked-nonce");
         assert_eq!(resp.server_time_at_ms, 1_700_000_100_000);
         assert_eq!(resp.expires_at_ms, 1_700_000_160_000);
+    }
+
+    struct DynamicEndpointConnector;
+
+    impl RelayConnector for DynamicEndpointConnector {
+        fn connect<'a>(
+            &'a self,
+            config: &'a RelayClientConfig,
+        ) -> Pin<Box<dyn Future<Output = AppResult<ConnectedRelayTransport>> + Send + 'a>> {
+            let endpoint = config.endpoint.clone();
+            Box::pin(async move {
+                let addr: SocketAddr = endpoint
+                    .parse()
+                    .map_err(|e| AppError::invalid_argument(format!("bad test addr: {e}")))?;
+                let stream = connect_bound_tcp_with_timeout(
+                    addr,
+                    config.underlay_if_index,
+                    config.linux_fwmark,
+                    Duration::from_secs(2),
+                )
+                .await?;
+                Ok(ConnectedRelayTransport {
+                    stream: Box::new(stream),
+                    tls_exporter_binding: None,
+                })
+            })
+        }
+    }
+
+    // Traces: HR-W12-01
+    #[tokio::test]
+    async fn test_relay_client_live_config_update_reconnects_to_new_endpoint() {
+        // Arrange
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.expect("bind a");
+        let addr_a = listener_a.local_addr().expect("addr a");
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.expect("bind b");
+        let addr_b = listener_b.local_addr().expect("addr b");
+
+        let srv_a = tokio::spawn(async move {
+            let (tcp, _) = listener_a.accept().await.expect("accept a");
+            let std_tcp = tcp.into_std().expect("std tcp a");
+            std_tcp.set_nonblocking(false).expect("blocking a");
+            let _ws = tokio::task::spawn_blocking(move || accept(std_tcp).expect("ws a"))
+                .await
+                .expect("join a");
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        });
+        let srv_b = tokio::spawn(async move {
+            let (tcp, _) = listener_b.accept().await.expect("accept b");
+            let std_tcp = tcp.into_std().expect("std tcp b");
+            std_tcp.set_nonblocking(false).expect("blocking b");
+            let _ws = tokio::task::spawn_blocking(move || accept(std_tcp).expect("ws b"))
+                .await
+                .expect("join b");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let initial_cfg = RelayClientConfig {
+            endpoint: addr_a.to_string(),
+            server_name_override: None,
+            pin_set: None,
+            underlay_if_index: None,
+            linux_fwmark: None,
+            require_challenge_auth: false,
+            agent_version: "0.1.0-test".to_owned(),
+        };
+        let updated_cfg = RelayClientConfig {
+            endpoint: addr_b.to_string(),
+            ..initial_cfg.clone()
+        };
+        let client = RelayClient::with_connector(
+            initial_cfg,
+            NodeKeypair::generate(),
+            DiscoKeypair::generate(),
+            Arc::new(DynamicEndpointConnector),
+        );
+        let handle = client.handle();
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+        let shutdown = CancellationToken::new();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(1_700_000_000_000));
+        let task = tokio::spawn(client.run(clock, ev_tx, shutdown.clone()));
+
+        // Wait for initial connection to server A.
+        let mut connected_count = 0usize;
+        while connected_count == 0 {
+            match tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+                .await
+                .expect("wait connect a")
+            {
+                Some(RelayEvent::StateChanged(RelayConnectionState::Connected)) => {
+                    connected_count += 1;
+                }
+                Some(_) => {}
+                None => panic!("event channel closed unexpectedly"),
+            }
+        }
+
+        // Act: dynamically update Relay endpoint to server B without tearing down task.
+        handle.update_config(updated_cfg);
+
+        // Assert: second Connected event arrives from switching live to server B.
+        while connected_count < 2 {
+            match tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+                .await
+                .expect("wait connect b")
+            {
+                Some(RelayEvent::StateChanged(RelayConnectionState::Connected)) => {
+                    connected_count += 1;
+                }
+                Some(_) => {}
+                None => panic!("event channel closed before connecting to endpoint b"),
+            }
+        }
+
+        shutdown.cancel();
+        task.await.expect("relay task exits cleanly");
+        srv_a.abort();
+        srv_b.abort();
+    }
+
+    // Traces: HR-W12-04
+    #[tokio::test]
+    async fn test_connect_bound_tcp_with_timeout_respects_short_budget() {
+        // Arrange: TEST-NET-1 non-routable documentation IP triggers timeout/unreachable within budget.
+        let target: SocketAddr = "192.0.2.1:65432".parse().expect("valid addr");
+        let started = tokio::time::Instant::now();
+
+        // Act
+        let res =
+            connect_bound_tcp_with_timeout(target, None, None, Duration::from_millis(80)).await;
+
+        // Assert
+        assert!(res.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

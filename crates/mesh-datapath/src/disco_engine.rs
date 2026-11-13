@@ -127,6 +127,42 @@ pub enum DiscoEvent {
     },
 }
 
+/// Physical delivery path over which an interactive `mesh ping` `DiscoPong` returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingProbePath {
+    /// Received directly over peer UDP socket.
+    Direct {
+        /// Remote UDP address from which the matching `DiscoPong` arrived.
+        addr: SocketAddr,
+    },
+    /// Received via the Blind Relay WebSocket server.
+    Relay,
+    /// No matching `DiscoPong` arrived before the per-probe timeout elapsed.
+    Timeout,
+}
+
+/// Measured outcome of a single end-to-end encrypted `DiscoPing`/`DiscoPong` probe (`BLK-W12-02`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PingProbeOutcome {
+    /// Observed delivery path or timeout.
+    pub path: PingProbePath,
+    /// Monotonic round-trip time in milliseconds when a matching `DiscoPong` arrived.
+    pub rtt_ms: Option<f64>,
+}
+
+/// Parameters controlling an interactive end-to-end `mesh ping` probe (`BLK-W12-02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractivePingRequest {
+    /// Destination peer identifier.
+    pub peer_id: NodeId,
+    /// Probe peer's Direct UDP candidate endpoints even if currently active on Relay.
+    pub force_direct: bool,
+    /// Local UTC timestamp in milliseconds.
+    pub now_ms: u64,
+    /// Probe timeout budget in milliseconds.
+    pub timeout_ms: u64,
+}
+
 /// Metrics snapshot exposed for `mesh-server` / `/metrics` observability (`api-design.md §6.2`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiscoMetricsSnapshot {
@@ -183,6 +219,7 @@ struct PendingPing {
     expires_at_ms: u64,
     transport: ProbeTransport,
     counted_miss: bool,
+    count_toward_failover: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,6 +262,7 @@ struct PingParams {
     target: PeerSendTarget,
     now_ms: u64,
     timeout_ms: u64,
+    count_toward_failover: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -301,6 +339,108 @@ impl DiscoEngine {
         self.metrics.snapshot()
     }
 
+    /// Builds a rate-limited `CallMeMaybe` packet via Relay when `our_endpoints` is non-empty.
+    pub fn maybe_build_call_me_maybe(
+        &mut self,
+        peer_map: &PeerMap,
+        peer_id: NodeId,
+        our_endpoints: &[SocketAddr],
+        now_ms: u64,
+    ) -> Option<OutboundDiscoPacket> {
+        let peer = peer_map.get(&peer_id)?;
+        if our_endpoints.is_empty() || !self.allow_call_me_maybe(peer_id, now_ms) {
+            return None;
+        }
+        let bounded: Vec<SocketAddr> = our_endpoints
+            .iter()
+            .copied()
+            .take(MAX_DISCO_ENDPOINTS)
+            .collect();
+        self.seal_packet(
+            peer.disco_pubkey,
+            &DiscoBody::CallMeMaybe { endpoints: bounded },
+            random_bytes::<12>(),
+            now_ms,
+        )
+        .ok()
+        .map(|bytes| OutboundDiscoPacket {
+            peer_id,
+            target: PeerSendTarget::Relay(peer.node_pubkey),
+            bytes,
+        })
+    }
+
+    /// Builds encrypted `DiscoPing` packets with unique transaction IDs for interactive `mesh ping`
+    /// without altering background Direct->Relay 3-strike failover counters (`BLK-W12-02`).
+    pub fn build_interactive_probes(
+        &mut self,
+        peer_map: &PeerMap,
+        filter: &DiscoFilterContext<'_>,
+        req: InteractivePingRequest,
+    ) -> Vec<([u8; 12], OutboundDiscoPacket)> {
+        let Some(peer) = peer_map.get(&req.peer_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if let PeerActivePath::Direct { addr, source, .. } = &peer.active_path {
+            if self.is_endpoint_allowed(*addr, filter)
+                && let Some(built) = self.build_ping_with_tx(PingParams {
+                    peer_id: req.peer_id,
+                    recipient_disco_pubkey: peer.disco_pubkey,
+                    transport: ProbeTransport {
+                        addr: *addr,
+                        source: *source,
+                    },
+                    target: PeerSendTarget::Direct(*addr),
+                    now_ms: req.now_ms,
+                    timeout_ms: req.timeout_ms,
+                    count_toward_failover: false,
+                })
+            {
+                out.push(built);
+            }
+            return out;
+        }
+        if req.force_direct {
+            for ep in &peer.endpoints {
+                if !self.is_endpoint_allowed(ep.addr, filter) {
+                    continue;
+                }
+                if let Some(built) = self.build_ping_with_tx(PingParams {
+                    peer_id: req.peer_id,
+                    recipient_disco_pubkey: peer.disco_pubkey,
+                    transport: ProbeTransport {
+                        addr: ep.addr,
+                        source: ep.source,
+                    },
+                    target: PeerSendTarget::Direct(ep.addr),
+                    now_ms: req.now_ms,
+                    timeout_ms: req.timeout_ms,
+                    count_toward_failover: false,
+                }) {
+                    out.push(built);
+                }
+            }
+            return out;
+        }
+        let unspecified = SocketAddr::from((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+        if let Some(built) = self.build_ping_with_tx(PingParams {
+            peer_id: req.peer_id,
+            recipient_disco_pubkey: peer.disco_pubkey,
+            transport: ProbeTransport {
+                addr: unspecified,
+                source: CandidateSource::Reflexive,
+            },
+            target: PeerSendTarget::Relay(peer.node_pubkey),
+            now_ms: req.now_ms,
+            timeout_ms: req.timeout_ms,
+            count_toward_failover: false,
+        }) {
+            out.push(built);
+        }
+        out
+    }
+
     /// Initiates simultaneous NAT hole punching toward `peer_id` by generating encrypted
     /// `DiscoCallMeMaybe` (via Relay) and direct `DiscoPing` packets to valid endpoints.
     pub fn initiate_hole_punch(
@@ -316,24 +456,10 @@ impl DiscoEngine {
         };
 
         let mut packets = Vec::new();
-        if !our_endpoints.is_empty() && self.allow_call_me_maybe(peer_id, now_ms) {
-            let bounded: Vec<SocketAddr> = our_endpoints
-                .iter()
-                .copied()
-                .take(MAX_DISCO_ENDPOINTS)
-                .collect();
-            if let Ok(pkt) = self.seal_packet(
-                peer.disco_pubkey,
-                &DiscoBody::CallMeMaybe { endpoints: bounded },
-                random_bytes::<12>(),
-                now_ms,
-            ) {
-                packets.push(OutboundDiscoPacket {
-                    peer_id,
-                    target: PeerSendTarget::Relay(peer.node_pubkey),
-                    bytes: pkt,
-                });
-            }
+        if let Some(call_me) =
+            self.maybe_build_call_me_maybe(peer_map, peer_id, our_endpoints, now_ms)
+        {
+            packets.push(call_me);
         }
 
         let valid_targets: Vec<(SocketAddr, CandidateSource)> = peer
@@ -350,12 +476,65 @@ impl DiscoEngine {
                 target: PeerSendTarget::Direct(addr),
                 now_ms,
                 timeout_ms: self.config.probe_timeout_ms,
+                count_toward_failover: true,
             }) {
                 packets.push(ping);
             }
         }
 
         packets
+    }
+
+    /// Handles an incoming demultiplexed Disco packet and returns any authenticated Pong `tx_id`.
+    pub fn handle_incoming_tracked(
+        &mut self,
+        raw_packet: &[u8],
+        ingress: IngressSource,
+        peer_map: &mut PeerMap,
+        filter: &DiscoFilterContext<'_>,
+        now_ms: u64,
+    ) -> (DiscoEvent, Option<[u8; 12]>, Vec<OutboundDiscoPacket>) {
+        self.prune_expired_pings(now_ms);
+        let (peer_id, peer_node_pk, peer_disco_pk, tx_id, body) =
+            match self.authenticate_and_decode(raw_packet, ingress, peer_map) {
+                Ok(parsed) => parsed,
+                Err(reason) => return (DiscoEvent::Rejected { reason }, None, Vec::new()),
+            };
+
+        let peer = AuthenticatedPeerInfo {
+            peer_id,
+            node_pubkey: peer_node_pk,
+            disco_pubkey: peer_disco_pk,
+        };
+        match body {
+            DiscoBody::Ping => {
+                let (ev, pkts) = self.handle_ping(peer, tx_id, ingress, now_ms);
+                (ev, None, pkts)
+            }
+            DiscoBody::Pong { observed_addr: _ } => {
+                let (ev, pkts) = self.handle_pong(
+                    PongContext {
+                        peer_id,
+                        tx_id,
+                        ingress,
+                        now_ms,
+                    },
+                    peer_map,
+                    filter,
+                );
+                let matched_tx = matches!(
+                    ev,
+                    DiscoEvent::DirectPathVerified { .. } | DiscoEvent::RelayRttMeasured { .. }
+                )
+                .then_some(tx_id);
+                (ev, matched_tx, pkts)
+            }
+            DiscoBody::CallMeMaybe { endpoints } => {
+                let (ev, pkts) =
+                    self.handle_call_me_maybe(peer_id, peer_disco_pk, &endpoints, filter, now_ms);
+                (ev, None, pkts)
+            }
+        }
     }
 
     /// Handles an incoming demultiplexed Disco packet from either `DirectUdp` or `Relay` (`HR-G2-04`).
@@ -367,34 +546,9 @@ impl DiscoEngine {
         filter: &DiscoFilterContext<'_>,
         now_ms: u64,
     ) -> (DiscoEvent, Vec<OutboundDiscoPacket>) {
-        self.prune_expired_pings(now_ms);
-        let (peer_id, peer_node_pk, peer_disco_pk, tx_id, body) =
-            match self.authenticate_and_decode(raw_packet, ingress, peer_map) {
-                Ok(parsed) => parsed,
-                Err(reason) => return (DiscoEvent::Rejected { reason }, Vec::new()),
-            };
-
-        let peer = AuthenticatedPeerInfo {
-            peer_id,
-            node_pubkey: peer_node_pk,
-            disco_pubkey: peer_disco_pk,
-        };
-        match body {
-            DiscoBody::Ping => self.handle_ping(peer, tx_id, ingress, now_ms),
-            DiscoBody::Pong { observed_addr: _ } => self.handle_pong(
-                PongContext {
-                    peer_id,
-                    tx_id,
-                    ingress,
-                    now_ms,
-                },
-                peer_map,
-                filter,
-            ),
-            DiscoBody::CallMeMaybe { endpoints } => {
-                self.handle_call_me_maybe(peer_id, peer_disco_pk, &endpoints, filter, now_ms)
-            }
-        }
+        let (ev, _, pkts) =
+            self.handle_incoming_tracked(raw_packet, ingress, peer_map, filter, now_ms);
+        (ev, pkts)
     }
 
     fn authenticate_and_decode(
@@ -556,6 +710,7 @@ impl DiscoEngine {
             target: PeerSendTarget::Direct(target.addr),
             now_ms,
             timeout_ms,
+            count_toward_failover: true,
         }) {
             outbound.push(pkt);
         }
@@ -593,6 +748,7 @@ impl DiscoEngine {
                 target: PeerSendTarget::Direct(addr),
                 now_ms,
                 timeout_ms: self.config.probe_timeout_ms,
+                count_toward_failover: true,
             }) {
                 outbound.push(pkt);
             }
@@ -772,6 +928,7 @@ impl DiscoEngine {
                 target: PeerSendTarget::Direct(addr),
                 now_ms,
                 timeout_ms: self.config.probe_timeout_ms,
+                count_toward_failover: true,
             }) {
                 packets.push(pkt);
             }
@@ -790,7 +947,7 @@ impl DiscoEngine {
     fn check_probe_timeouts(&mut self, peer_map: &mut PeerMap, now_ms: u64) {
         let initial_backoff = self.initial_retry_backoff_ms();
         for pending in self.pending_pings.values_mut() {
-            if pending.counted_miss {
+            if !pending.count_toward_failover || pending.counted_miss {
                 continue;
             }
             if !matches!(pending.transport, ProbeTransport { .. }) {
@@ -846,6 +1003,10 @@ impl DiscoEngine {
     }
 
     fn build_ping(&mut self, req: PingParams) -> Option<OutboundDiscoPacket> {
+        self.build_ping_with_tx(req).map(|(_, pkt)| pkt)
+    }
+
+    fn build_ping_with_tx(&mut self, req: PingParams) -> Option<([u8; 12], OutboundDiscoPacket)> {
         let tx_id = random_bytes::<12>();
         let bytes = match self.seal_packet(
             req.recipient_disco_pubkey,
@@ -866,23 +1027,28 @@ impl DiscoEngine {
             }
         };
 
+        let ttl = DISCO_PING_TTL_MS.max(req.timeout_ms);
         self.pending_pings.insert(
             tx_id,
             PendingPing {
                 peer_id: req.peer_id,
                 sent_at_ms: req.now_ms,
                 timeout_ms: req.timeout_ms,
-                expires_at_ms: req.now_ms.saturating_add(DISCO_PING_TTL_MS),
+                expires_at_ms: req.now_ms.saturating_add(ttl),
                 transport: req.transport,
                 counted_miss: false,
+                count_toward_failover: req.count_toward_failover,
             },
         );
         self.metrics.pings_sent.fetch_add(1, Ordering::Relaxed);
-        Some(OutboundDiscoPacket {
-            peer_id: req.peer_id,
-            target: req.target,
-            bytes,
-        })
+        Some((
+            tx_id,
+            OutboundDiscoPacket {
+                peer_id: req.peer_id,
+                target: req.target,
+                bytes,
+            },
+        ))
     }
 
     fn seal_packet(
@@ -1274,5 +1440,100 @@ mod tests {
                 50_000,
             );
         }
+    }
+
+    // Traces: BLK-W12-02
+    #[test]
+    fn test_interactive_probes_do_not_trigger_direct_failover_and_track_pong_tx_id() {
+        // Arrange
+        let remote_ep: SocketAddr = "203.0.113.45:51820".parse().expect("ep");
+        let (mut map_a, mut disco_a, mut map_b, mut disco_b, id_a, id_b, _, _) =
+            setup_pair(remote_ep);
+        let ctx = test_filter_ctx();
+        let filter = DiscoFilterContext {
+            candidates: &ctx,
+            excluded_stun: &[],
+        };
+
+        // Promote B to Direct on A via normal hole punch.
+        let punch = disco_a.initiate_hole_punch(&map_a, id_b, &[], &filter, 1_000);
+        let ping_pkt = punch
+            .into_iter()
+            .find(|p| matches!(p.target, PeerSendTarget::Direct(_)))
+            .expect("direct punch");
+        let (_, pong_out) = disco_b.handle_incoming(
+            &ping_pkt.bytes,
+            IngressSource::DirectUdp(remote_ep),
+            &mut map_b,
+            &filter,
+            1_010,
+        );
+        let pong = pong_out.first().expect("pong");
+        let _ignored = disco_a.handle_incoming(
+            &pong.bytes,
+            IngressSource::DirectUdp(remote_ep),
+            &mut map_a,
+            &filter,
+            1_020,
+        );
+        assert!(matches!(
+            map_a.get(&id_b).expect("peer b").active_path,
+            PeerActivePath::Direct { .. }
+        ));
+
+        // Act 1: issue 5 timed-out interactive probes -> MUST NOT fail over Direct -> Relay.
+        for step in 0..5u64 {
+            let built = disco_a.build_interactive_probes(
+                &map_a,
+                &filter,
+                InteractivePingRequest {
+                    peer_id: id_b,
+                    force_direct: false,
+                    now_ms: 2_000 + step * 5_000,
+                    timeout_ms: 1_000,
+                },
+            );
+            assert_eq!(built.len(), 1);
+            let _ticks = disco_a.tick(&mut map_a, 3_500 + step * 5_000);
+        }
+        assert!(matches!(
+            map_a.get(&id_b).expect("peer b").active_path,
+            PeerActivePath::Direct { .. }
+        ));
+
+        // Act 2: build 1 interactive probe and deliver Pong -> handle_incoming_tracked returns Some(tx_id).
+        let live = disco_a.build_interactive_probes(
+            &map_a,
+            &filter,
+            InteractivePingRequest {
+                peer_id: id_b,
+                force_direct: false,
+                now_ms: 30_000,
+                timeout_ms: 1_000,
+            },
+        );
+        let (expected_tx_id, outbound_ping) = live.first().expect("live ping");
+        let (_, pong_pkts) = disco_b.handle_incoming(
+            &outbound_ping.bytes,
+            IngressSource::DirectUdp(remote_ep),
+            &mut map_b,
+            &filter,
+            30_010,
+        );
+        let (ev, matched_tx, _) = disco_a.handle_incoming_tracked(
+            &pong_pkts.first().expect("pong").bytes,
+            IngressSource::DirectUdp(remote_ep),
+            &mut map_a,
+            &filter,
+            30_025,
+        );
+
+        // Assert
+        assert!(matches!(
+            ev,
+            DiscoEvent::DirectPathVerified { peer_id, .. } if peer_id == id_b
+        ));
+        assert_eq!(matched_tx, Some(*expected_tx_id));
+        let _unused = id_a;
     }
 }
