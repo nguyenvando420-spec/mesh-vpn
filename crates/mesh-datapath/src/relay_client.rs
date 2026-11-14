@@ -5,12 +5,12 @@ use std::future::Future;
 use std::io::{self, ErrorKind as IoErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc, watch};
@@ -130,9 +130,24 @@ struct RelayMetrics {
     dropped_tail_packets: AtomicU64,
     throttled_notices: AtomicU64,
     reconnects: AtomicU64,
+    has_rtt: AtomicBool,
+    last_rtt_ms: AtomicU64,
 }
 
 impl RelayMetrics {
+    fn record_rtt_ms(&self, rtt_ms: u64) {
+        self.last_rtt_ms.store(rtt_ms, Ordering::Relaxed);
+        self.has_rtt.store(true, Ordering::Release);
+    }
+
+    fn last_rtt_ms(&self) -> Option<u64> {
+        if self.has_rtt.load(Ordering::Acquire) {
+            Some(self.last_rtt_ms.load(Ordering::Relaxed))
+        } else {
+            None
+        }
+    }
+
     fn snapshot(&self) -> RelayMetricsSnapshot {
         RelayMetricsSnapshot {
             tx_packets: self.tx_packets.load(Ordering::Relaxed),
@@ -245,6 +260,12 @@ impl RelayClientHandle {
     #[must_use]
     pub fn metrics_snapshot(&self) -> RelayMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Returns the most recently measured Blind Relay KeepAlive round-trip time in milliseconds.
+    #[must_use]
+    pub fn last_rtt_ms(&self) -> Option<u64> {
+        self.metrics.last_rtt_ms()
     }
 
     /// Immediately drops bounded TX queues for removed or revoked peers (`US-030`).
@@ -707,7 +728,7 @@ impl RelayClient {
         let heartbeat_timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
         let mut read_scratch = [0u8; MAX_FRAME_SIZE * 2];
 
-        if let Some(exit) = self.drain_ws_messages(ws, events_tx).await {
+        if let Some(exit) = self.drain_ws_messages(ws, clock, events_tx).await {
             return exit;
         }
 
@@ -757,7 +778,7 @@ impl RelayClient {
                             if let Some(bytes) = read_scratch.get(..n) {
                                 ws.get_mut().push_rx(bytes);
                             }
-                            if let Some(exit) = self.drain_ws_messages(ws, events_tx).await {
+                            if let Some(exit) = self.drain_ws_messages(ws, clock, events_tx).await {
                                 return exit;
                             }
                         }
@@ -797,12 +818,15 @@ impl RelayClient {
     async fn drain_ws_messages(
         &self,
         ws: &mut WebSocket<BridgeStream>,
+        clock: &dyn Clock,
         events_tx: &mpsc::Sender<RelayEvent>,
     ) -> Option<SessionExit> {
         loop {
             match ws.read() {
                 Ok(Message::Binary(bin)) => {
-                    let exit = self.handle_decoded_relay_frame(&bin, events_tx).await;
+                    let exit = self
+                        .handle_decoded_relay_frame(&bin, clock, events_tx)
+                        .await;
                     flush_ignored(ws.get_mut()).await;
                     if exit.is_some() {
                         return exit;
@@ -836,6 +860,7 @@ impl RelayClient {
     async fn handle_decoded_relay_frame(
         &self,
         raw: &[u8],
+        clock: &dyn Clock,
         events_tx: &mpsc::Sender<RelayEvent>,
     ) -> Option<SessionExit> {
         match RelayFrame::decode(raw) {
@@ -879,7 +904,12 @@ impl RelayClient {
                     RelayNoticeCode::Throttled => None,
                 }
             }
-            Ok(RelayFrame::KeepAlive { .. } | RelayFrame::ClientToPeerPacket { .. }) => None,
+            Ok(RelayFrame::KeepAlive { sent_at_ms }) => {
+                let rtt_ms = clock.now_unix_ms().saturating_sub(sent_at_ms);
+                self.handle.metrics.record_rtt_ms(rtt_ms);
+                None
+            }
+            Ok(RelayFrame::ClientToPeerPacket { .. }) => None,
             Err(err) => {
                 warn!(
                     component = "datapath.relay_client",
@@ -1043,6 +1073,12 @@ pub async fn connect_bound_tcp_with_timeout(
         .map_err(|err| AppError::unavailable(format!("failed to set tcp nonblocking: {err}")))?;
     if let Err(err) = sock.set_nodelay(true) {
         debug!(component = "datapath.relay_client", error = %err, "TCP_NODELAY ignored");
+    }
+    let tcp_keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(5))
+        .with_interval(Duration::from_secs(2));
+    if let Err(err) = sock.set_tcp_keepalive(&tcp_keepalive) {
+        debug!(component = "datapath.relay_client", error = %err, "TCP keepalive ignored");
     }
 
     if if_index.is_some() || fwmark.is_some() {
@@ -2722,5 +2758,103 @@ mod tests {
             stddev_s >= 5.0,
             "expected stddev >= 5 s for fleet-safe full jitter, got {stddev_s:.2} s"
         );
+    }
+
+    // Traces: US-025 AC2, US-028
+    #[tokio::test]
+    async fn test_relay_keepalive_echo_updates_last_rtt_ms() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0").await;
+        assert!(listener.is_ok());
+        let Ok(listener) = listener else {
+            return;
+        };
+        let addr_res = listener.local_addr();
+        assert!(addr_res.is_ok());
+        let Ok(addr) = addr_res else {
+            return;
+        };
+
+        let clock = Arc::new(FakeClock::new(100_000));
+        let server_clock = Arc::clone(&clock);
+        let server_task = tokio::spawn(async move {
+            let Ok((tcp_stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(std_stream) = tcp_stream.into_std() else {
+                return;
+            };
+            if std_stream.set_nonblocking(false).is_err() {
+                return;
+            }
+            if let Err(err) = tokio::task::spawn_blocking(move || {
+                let Ok(mut ws) = accept(std_stream) else {
+                    return;
+                };
+                while let Ok(msg) = ws.read() {
+                    if let Message::Binary(raw) = msg
+                        && let Ok(RelayFrame::KeepAlive { sent_at_ms }) = RelayFrame::decode(&raw)
+                    {
+                        server_clock.advance(23);
+                        let Ok(echo) = (RelayFrame::KeepAlive { sent_at_ms }).encode() else {
+                            return;
+                        };
+                        if ws.send(Message::Binary(echo)).is_err() {
+                            return;
+                        }
+                        break;
+                    }
+                }
+                while ws.read().is_ok() {}
+            })
+            .await
+            {
+                debug!(error = %err, "mock relay server blocking task failed");
+            }
+        });
+
+        let cfg = RelayClientConfig {
+            endpoint: addr.to_string(),
+            server_name_override: None,
+            pin_set: None,
+            underlay_if_index: None,
+            linux_fwmark: None,
+            require_challenge_auth: false,
+            agent_version: "0.1.0-rtt".to_owned(),
+        };
+        let client = RelayClient::with_connector(
+            cfg,
+            NodeKeypair::generate(),
+            DiscoKeypair::generate(),
+            Arc::new(PlainTcpConnector { addr }),
+        );
+        let handle = client.handle();
+        let clock_dyn: Arc<dyn Clock> = clock;
+        let (ev_tx, mut ev_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let client_task = tokio::spawn(client.run(clock_dyn, ev_tx, shutdown.clone()));
+
+        // Act
+        let mut observed_rtt = None;
+        for _ in 0..100 {
+            while ev_rx.try_recv().is_ok() {}
+            if let Some(rtt) = handle.last_rtt_ms() {
+                observed_rtt = Some(rtt);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), client_task)
+                .await
+                .is_ok()
+        );
+        server_task.abort();
+
+        // Assert
+        assert_eq!(observed_rtt, Some(23));
+        assert_eq!(handle.last_rtt_ms(), Some(23));
     }
 }

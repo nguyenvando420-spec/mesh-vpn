@@ -5,9 +5,9 @@
 ## Giai đoạn hiện tại
 
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
-- **Giai đoạn**: `Hoàn tất Gate 3 — Sẵn sàng triển khai thực địa theo Go-Live Checklist (v0.1.0)`
+- **Giai đoạn**: `Hoàn tất Chặng 2B — NAT/Chaos Lab (5/5 PASS), PERF-02 (0.0262% CPU PASS) & 34/36 SLO PASS; chờ quyết định người dùng tại Gate 3 (ký phần cứng vật lý / tag v0.1.0)`
 - **Sprint hiện tại**: `Sprint 2 (Hoàn tất 100%: 13 Must / 60 SP + 11 Should / 35 SP; lũy kế toàn dự án 62 Stories / 269 SP)`
-- **Bước tiếp theo**: `Người dùng tự rà soát các commit cục bộ trên nhánh main và thực hiện 3 mục nghiệm thu hạ tầng thực địa (PERF-02, PLAT-05, PLAT-06) theo go-live-checklist.md trước khi cắt băng Production`
+- **Bước tiếp theo**: `Chờ người dùng quyết định tại Gate 3: nghiệm thu 4 mục phần cứng vật lý (MacBook + Windows laptop theo go-live-checklist.md & hardware-sleep-wake-protocol.md) trước hoặc khi phát hành tag v0.1.0`
 
 ## Trạng thái Gate
 
@@ -15,13 +15,13 @@
 |---|---|---|---|
 | Gate 1 — Nghiên cứu & Backlog | ✅ Đã duyệt | 2026-11-12 | (1) Ưu tiên làm Client cho **macOS và Windows trước** (Server chạy trên Ubuntu Linux VPS + hỗ trợ Linux TUN cho VPS làm node & phòng lab NAT); (2) Tạm thời **kết nối trực tiếp bằng IP VPS** (chế độ Pin chứng chỉ/khóa `SEC-04c`) và **hỗ trợ đổi port TCP/UDP tùy ý** (không khóa cứng 443/3478); (3) Giữ các mặc định: chia **2 đợt bàn giao** (Milestone 1 → Milestone 2), tự định nghĩa giao thức, tên CLI **`mesh`** (`.mesh.internal`), quản trị CLI/SSH cục bộ. |
 | Gate 2 — Stack/Model, Code Format, Thiết kế & Sprint | ✅ Đã duyệt | 2026-11-13 | Người dùng duyệt gói Rust `1.94.1` v2.2 / Sprint Plan v1.2 kèm 2 mặc định khuyến nghị: (1) **`OQ-15` Mặc định A**: giữ **Sprint 1 = `38 Must / 174 SP`** & **Sprint 2 = `13 Must / 60 SP`** (+ `11 Should / 35 SP`); (2) **Chính sách lỗi phần cứng `EIO` kép**: compaction hợp nhất toàn bộ mục thu hồi chưa bền vững trong RAM (kể cả `ram_only`) trước khi gỡ `disk_degraded`; khi hết lease version đúng lúc cả 2 tầng đĩa lỗi `EIO`, vẫn cắt tức thì phiên Control/Relay của node bị thu hồi trong RAM và đóng stream buộc các peer xác thực lại (không phát version chưa lưu đĩa). |
-| Gate 3 — Sprint Review, QA/AI Eval & Release | ✅ Đã duyệt | 2026-11-14 | Người dùng duyệt Gate 3: nghiệm thu toàn bộ Sprint 1 + Sprint 2 (62 Stories / 269 SP, 308/308 tests, 33/36 SLO PASS) cùng 4 đánh đổi thiết kế; giữ nguyên các commit cục bộ trên nhánh main (chưa git push / chưa tạo tag v0.1.0) để tự rà soát và thực hiện 3 mục phần cứng/lab thực địa (PERF-02, PLAT-05, PLAT-06) theo Go-Live Checklist. |
+| Gate 3 — Sprint Review, QA/AI Eval & Release | ⏳ Chờ duyệt cắt băng `v0.1.0` (Chặng 2B Done) | 2026-11-14 | Chặng 2A + 2B hoàn tất: `62 Stories / 269 SP`, `5/5` Docker NAT/Chaos Lab (`chaos-report.json` PASS), `PERF-02` 5-min VPS soak (`0.0262%` CPU PASS), `34/36` SLO PASS (`0 pending_external_lab`, `2 hardware_signoff_required`), `Go-Live Checklist` `16/20` `[x]`, `scripts/check.ps1 -Cross` xanh 100%. Chưa tạo/push tag `v0.1.0` để chờ người dùng quyết định tại Gate 3 (nghiệm thu 4 mục phần cứng vật lý MacBook + Windows laptop). |
 
 ## Các Vai trò trong Team (13 Vai trò Chuẩn Plugin v3.1.0: Orchestrator + Swarm)
 
 | Vai trò | Model | conversationId / tên worker | Nhiệm vụ gần nhất | Trạng thái |
 |---|---|---|---|---|
-| agile-scrum-master (Nhạc trưởng 2 pha / Swarm Coordinator) | `gemini-pro-orchestrator` (Orchestrator Carbon) | Main Agent | Hoàn tất tổng kết Sprint Review/Retro, kiểm chứng `308/308` tests & `33/36` SLO PASS trên `main`, đóng Swarm và ghi nhận Gate 3 đã duyệt | ✅ Done (Gate 3 Approved) |
+| agile-scrum-master (Nhạc trưởng 2 pha / Swarm Coordinator) | `gemini-pro-orchestrator` (Orchestrator Carbon) | Main Agent | Hoàn tất Chặng 2B (live Docker NAT Chaos Lab 5/5 PASS, `PERF-02` PASS, `34/36` SLO PASS, `16/20` Go-Live Checklist, `check.ps1 -Cross` & push `main` + CI Gate 9/9) và trình Gate 3 hỏi ý kiến người dùng | ✅ Done (Chặng 2B Ready for Gate 3) |
 | agile-researcher | `claude-opus-5-5-high` (dự phòng: `gemini-4-argon-high`) | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | `claude-sonnet-5-5-high` (dự phòng: `gemini-4-carbon-high`) | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
 | agile-tech-lead | `gemini-4-argon-high` (dự phòng cho `claude-sonnet-5-5-high`) | 111ccb61-76da-4415-aa05-654afdb784c6 | Hoàn tất `scripts/check.ps1 -Cross` & `.gitignore` `*.o` | ✅ Done (`check.ps1 -Cross`) |
@@ -49,10 +49,11 @@
 - `Sprint 2 Independent QA (2026-11-14): agile-qa [PASS - ĐẠT DoD] (5 bộ test qa_sprint2_* mới, 62/62 Stories = 269 SP, cập nhật tổng 308/308 tests pass & 33/36 SLO PASS tại dod-verification.md).`
 - `Gate 3 Critique Vòng 1 (2026-11-14): agile-critic [REVISION REQUIRED] (0B / 4H HR-G3-01..04 / 4M MED-G3-01..04 / 2L LOW-G3-01..02) — Đã giao dev-fix-g3 & devops-fix-g3 xử lý trọn vẹn.`
 - `Gate 3 Critique Vòng 2 Cuối (2026-11-14): agile-critic [APPROVED FOR GATE] (10/10 CLOSED, 0B / 0H / 0M / 0L, 308/308 tests PASS qua check.ps1 -Cross, 33/36 SLO PASS, 15/15 .sh scripts PASS, 0 UTF-8 BOM / CRLF).`
+- `Chặng 2B Verification (2026-11-14): Live 5-scenario Docker NAT Chaos Lab (US-057, REL-01, US-074 AC8, REL-12, US-028) = 5/5 PASS (chaos-report.json); PERF-02 5m VPS idle soak = 0.0262% of 1 vCPU PASS (perf02-idle-cpu-soak.json); Full 36-SLO suite = 34/36 PASS, 0 FAIL, 0 pending_external_lab, 2 hardware_signoff_required (slo-verification-report.json/.md); Go-Live Checklist = 16/20 [x].`
 
 ## Việc còn dở / Vấn đề mở
 
-- ✅ **Đã hoàn tất 100% phạm vi phát triển & kiểm thử phần mềm (`Sprint 1` + `Sprint 2` = `62 User Stories / 269 SP`)** và sẵn sàng trình **Gate 3 (Sprint Review, QA & Go-Live Production)**.
-- ⏳ **3 Hạng mục Nghiệm thu Hạ tầng Ngoài Sandbox (giữ Fail-Closed minh bạch trong `slo-verification-report.md` trước khi cắt băng Go-Live thật)**:
-  1. `PERF-02` (`pending_external_lab`): Đo CPU VPS nhàn rỗi `< 2%` trong 5 phút và bộ 8 kịch bản chaos container (`lab/scenarios/run-all-chaos.sh`) trên Linux Docker host (`/dev/net/tun` + `NET_ADMIN`) hoặc GitHub Actions (`run_live_nat_lab = true`).
-  2. `PLAT-05` & `PLAT-06` (`hardware_signoff_required`): Thực thi biên bản `docs/06-operations/hardware-sleep-wake-protocol.md` (`sleep >= 4 phút`, `P95 <= 15 s`, 0 ghost adapter) và ký đủ 20 mục `docs/06-operations/go-live-checklist.md` trên MacBook 13+ và Laptop Windows 10/11 thật.
+- ✅ **Đã hoàn tất 100% phạm vi phát triển, kiểm thử phần mềm & Docker NAT/Chaos Lab (`Sprint 1` + `Sprint 2` = `62 User Stories / 269 SP`, `0 pending_external_lab`, `34/36` SLO PASS, `16/20` Go-Live Checklist `[x]`)**.
+- ⏳ **Chỉ còn 2 Hạng mục Phần cứng Vật lý ngoài Lab (`hardware_signoff_required` — `#11`, `#17`, `#18`, `#20` trên `go-live-checklist.md`) trước khi cắt băng `v0.1.0`**:
+  1. `PLAT-05` & `REL-07`: Chạy biên bản `docs/06-operations/hardware-sleep-wake-protocol.md` (`sleep >= 4 phút`, roaming Wi-Fi -> 4G, `P95 <= 15 s`, `0` ghost adapter) trên **MacBook + Laptop Windows 10/11 thật**.
+  2. `PLAT-06` & Windows Host Install: Chạy `sudo bash lab/macos/verify-macos-host.sh` trên macOS thật và kiểm chứng cài đặt dịch vụ Windows (`MeshVpnAgent` + SHA-256 `wintun.dll`) với quyền Admin thật.

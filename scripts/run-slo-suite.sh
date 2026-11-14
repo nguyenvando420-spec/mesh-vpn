@@ -11,6 +11,8 @@ cd "${REPO_ROOT}"
 OUTPUT_DIR="docs/05-quality-assurance"
 SKIP_STATIC_CHECKS=0
 WITH_DOCKER_LAB=0
+CHAOS_REPORT_JSON=""
+PERF02_JSON=""
 SIMULATE_FAIL=0
 
 usage() {
@@ -18,12 +20,14 @@ usage() {
 Usage: scripts/run-slo-suite.sh [OPTIONS]
 
 Options:
-  --output-dir <DIR>       Output directory for slo-verification-report.{json,md}
-                           (default: docs/05-quality-assurance)
-  --skip-static-checks     Skip scripts/check.sh pre-flight gate
-  --with-docker-lab        Run lab/scenarios/run-all-chaos.sh against Docker NAT lab
-  --simulate-fail          Inject synthetic failure and exit non-zero (US-058 AC3)
-  -h, --help               Show this help message
+  --output-dir <DIR>            Output directory for slo-verification-report.{json,md}
+                                (default: docs/05-quality-assurance)
+  --skip-static-checks          Skip scripts/check.sh pre-flight gate
+  --with-docker-lab             Run lab/scenarios/run-all-chaos.sh against Docker NAT lab
+  --chaos-report-json <PATH>    Validate pre-captured Docker NAT chaos JSON report
+  --perf02-json <PATH>          Validate pre-captured 5-minute PERF-02 soak telemetry JSON
+  --simulate-fail               Inject synthetic failure and exit non-zero (US-058 AC3)
+  -h, --help                    Show this help message
 EOF
 }
 
@@ -40,6 +44,14 @@ while [ "$#" -gt 0 ]; do
     --with-docker-lab)
       WITH_DOCKER_LAB=1
       shift
+      ;;
+    --chaos-report-json)
+      CHAOS_REPORT_JSON="${2:?--chaos-report-json requires a file path}"
+      shift 2
+      ;;
+    --perf02-json)
+      PERF02_JSON="${2:?--perf02-json requires a file path}"
+      shift 2
       ;;
     --simulate-fail)
       SIMULATE_FAIL=1
@@ -106,7 +118,7 @@ cargo test -p mesh --all-features 2>&1 | tee "${CLI_LOG}" || CLI_EXIT=$?
 
 echo "==> [3/5] Evaluating Docker NAT Chaos Lab..."
 CHAOS_STATUS="pending_external_lab"
-CHAOS_DETAILS="Not executed (--with-docker-lab omitted); Linux container NAT/chaos suite requires Docker + /dev/net/tun + NET_ADMIN."
+CHAOS_DETAILS="Not executed (--with-docker-lab and --chaos-report-json omitted); Linux container NAT/chaos suite requires Docker + /dev/net/tun + NET_ADMIN."
 if [ "${WITH_DOCKER_LAB}" -eq 1 ]; then
   CHAOS_RC=0
   "${REPO_ROOT}/lab/scenarios/run-all-chaos.sh" --report-json "${CHAOS_JSON}" || CHAOS_RC=$?
@@ -125,7 +137,10 @@ SLO_REPO_ROOT="${REPO_ROOT}" \
 SLO_OUTPUT_DIR="${OUTPUT_DIR}" \
 SLO_METRICS_DIR="${METRICS_DIR}" \
 SLO_LOG="${SLO_LOG}" \
+SLO_WITH_DOCKER_LAB="${WITH_DOCKER_LAB}" \
 SLO_CHAOS_JSON="${CHAOS_JSON}" \
+SLO_CHAOS_REPORT_JSON="${CHAOS_REPORT_JSON}" \
+SLO_PERF02_JSON="${PERF02_JSON}" \
 SLO_STATIC_STATUS="${STATIC_STATUS}" \
 SLO_STATIC_DETAILS="${STATIC_DETAILS}" \
 SLO_EXIT="${SLO_EXIT}" \
@@ -145,7 +160,10 @@ os.makedirs(output_dir, exist_ok=True)
 
 metrics_dir = os.environ["SLO_METRICS_DIR"]
 slo_log_path = os.environ["SLO_LOG"]
+with_docker_lab = int(os.environ.get("SLO_WITH_DOCKER_LAB", "0")) == 1
 chaos_json_path = os.environ["SLO_CHAOS_JSON"]
+chaos_report_arg = os.environ.get("SLO_CHAOS_REPORT_JSON", "").strip()
+perf02_json_arg = os.environ.get("SLO_PERF02_JSON", "").strip()
 static_status = os.environ["SLO_STATIC_STATUS"]
 static_details = os.environ["SLO_STATIC_DETAILS"]
 slo_exit = int(os.environ["SLO_EXIT"])
@@ -375,17 +393,60 @@ def measure_release_mesh_server_rss():
 
 measure_release_mesh_server_rss()
 
+REQUIRED_CHAOS_SCENARIOS = (
+    "us057_lab_smoke",
+    "rel01_kill_server_p2p_continuity",
+    "us074_live_migrate_endpoint_443_8443",
+    "rel12_backup_wipe_restore_pin",
+    "us028_udp_blocked_443_only",
+)
+
+def _resolve_input_path(path_arg):
+    if os.path.isabs(path_arg):
+        return path_arg
+    return os.path.join(repo_root, path_arg)
+
+def _is_num(val):
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
 chaos_obj = None
-if os.path.isfile(chaos_json_path):
-    try:
-        with open(chaos_json_path, "r", encoding="utf-8") as fh:
-            chaos_obj = json.load(fh)
-        if chaos_obj.get("overall") != "PASS":
-            chaos_status = "FAIL"
-            chaos_details = "lab/scenarios/run-all-chaos.sh reported overall=FAIL"
-    except Exception as exc:
+chaos_src = None
+if with_docker_lab:
+    if chaos_status == "PASS":
+        chaos_src = chaos_json_path
+elif chaos_report_arg:
+    chaos_src = _resolve_input_path(chaos_report_arg)
+    if not os.path.isfile(chaos_src):
         chaos_status = "FAIL"
-        chaos_details = f"Failed reading chaos-report.json: {exc}"
+        chaos_details = f"Chaos report JSON not found: {chaos_report_arg}"
+        chaos_src = None
+
+if chaos_src is not None and os.path.isfile(chaos_src):
+    try:
+        with open(chaos_src, "r", encoding="utf-8") as fh:
+            chaos_obj = json.load(fh)
+        scenarios = chaos_obj.get("scenarios") if isinstance(chaos_obj, dict) else None
+        bad_or_missing = []
+        for sc in REQUIRED_CHAOS_SCENARIOS:
+            sc_obj = scenarios.get(sc) if isinstance(scenarios, dict) else None
+            sc_st = sc_obj.get("status") if isinstance(sc_obj, dict) else None
+            if sc_st != "PASS":
+                bad_or_missing.append(f"{sc}={sc_st}")
+        overall_val = chaos_obj.get("overall") if isinstance(chaos_obj, dict) else None
+        if overall_val == "PASS" and not bad_or_missing:
+            chaos_status = "PASS"
+            if with_docker_lab:
+                chaos_details = "lab/scenarios/run-all-chaos.sh passed all 5 NAT/chaos scenarios"
+            else:
+                gen_at = chaos_obj.get("generated_at_utc") or "unknown"
+                chaos_details = f"Verified 5/5 Docker NAT/chaos scenarios via {chaos_report_arg} (generated_at_utc={gen_at})"
+        else:
+            chaos_status = "FAIL"
+            chaos_details = f"Chaos report validation failed (overall={overall_val}, bad_or_missing=[{', '.join(bad_or_missing)}])"
+    except Exception as exc:
+        chaos_obj = None
+        chaos_status = "FAIL"
+        chaos_details = f"Failed reading chaos report JSON ({chaos_src}): {exc}"
 
 required_empirical = [
     "PERF-01", "PERF-03", "PERF-04", "PERF-05", "PERF-06", "PERF-07", "PERF-08",
@@ -429,16 +490,78 @@ for cid in required_empirical:
             "details": details,
         })
 
-checks.append({
-    "id": "PERF-02",
-    "name": "Idle Control server CPU utilization (5-minute window)",
-    "measured": None,
-    "threshold": "< 2.0",
-    "unit": "% of 1 vCPU",
-    "status": "pending_external_lab",
-    "method": "docker_linux_vps_soak_pending",
-    "details": "Requires 5-minute Linux VPS / Docker /proc/stat idle soak telemetry; not fabricated in unit runs (US-058 AC2).",
-})
+if not perf02_json_arg:
+    checks.append({
+        "id": "PERF-02",
+        "name": "Idle Control server CPU utilization (5-minute window)",
+        "measured": None,
+        "threshold": "< 2.0",
+        "unit": "% of 1 vCPU",
+        "status": "pending_external_lab",
+        "method": "docker_linux_vps_soak_pending",
+        "details": "Requires 5-minute Linux VPS / Docker /proc/stat idle soak telemetry; not fabricated in unit runs (US-058 AC2).",
+    })
+else:
+    perf02_path = _resolve_input_path(perf02_json_arg)
+    if not os.path.isfile(perf02_path):
+        checks.append({
+            "id": "PERF-02",
+            "name": "Idle Control server CPU utilization (5-minute window)",
+            "measured": None,
+            "threshold": "< 2.0",
+            "unit": "% of 1 vCPU",
+            "status": "FAIL",
+            "method": "empirical_docker_linux_vps_proc_stat_5m",
+            "details": f"PERF-02 telemetry JSON not found: {perf02_json_arg}",
+        })
+    else:
+        try:
+            with open(perf02_path, "r", encoding="utf-8") as fh:
+                p2 = json.load(fh)
+            if not isinstance(p2, dict):
+                raise ValueError("JSON root must be an object")
+            id_val = p2.get("id")
+            same_pid = p2.get("same_pid")
+            conn_nodes = p2.get("connected_nodes")
+            win_secs = p2.get("window_secs")
+            cpu_pct = p2.get("measured_cpu_pct_1vcpu")
+            cgroup_pct = p2.get("container_cgroup_cpu_pct_1vcpu")
+            st_val = p2.get("status")
+            gen_utc = p2.get("generated_at_utc")
+            valid = (
+                (id_val is None or id_val == "PERF-02")
+                and (same_pid is True)
+                and (isinstance(conn_nodes, int) and not isinstance(conn_nodes, bool) and conn_nodes >= 5)
+                and (_is_num(win_secs) and float(win_secs) >= 300.0)
+                and _is_num(cpu_pct)
+                and float(cpu_pct) < 2.0
+                and st_val == "PASS"
+            )
+            checks.append({
+                "id": "PERF-02",
+                "name": "Idle Control server CPU utilization (5-minute window)",
+                "measured": float(cpu_pct) if _is_num(cpu_pct) else None,
+                "threshold": "< 2.0",
+                "unit": "% of 1 vCPU",
+                "status": "PASS" if valid else "FAIL",
+                "method": "empirical_docker_linux_vps_proc_stat_5m",
+                "details": (
+                    f"Empirical Linux VPS 5m idle soak (window={win_secs}s, connected_nodes={conn_nodes}, "
+                    f"same_pid={same_pid}, proc_cpu={cpu_pct}% of 1 vCPU, cgroup_cpu={cgroup_pct}%, "
+                    f"report_status={st_val}, generated_at_utc={gen_utc}, source={perf02_json_arg})"
+                ),
+            })
+        except Exception as exc:
+            checks.append({
+                "id": "PERF-02",
+                "name": "Idle Control server CPU utilization (5-minute window)",
+                "measured": None,
+                "threshold": "< 2.0",
+                "unit": "% of 1 vCPU",
+                "status": "FAIL",
+                "method": "empirical_docker_linux_vps_proc_stat_5m",
+                "details": f"Failed parsing PERF-02 telemetry JSON ({perf02_json_arg}): {exc}",
+            })
 
 cli_ok = (cli_exit == 0)
 ops_suffix = "; live container CLI ping/netcheck/status verified in Docker lab" if chaos_status == "PASS" else "; verified via integration & CLI/IPC suites (Docker lab pending_external_lab)"
@@ -595,7 +718,7 @@ lines.extend([
     "",
     "## Deviations, Assumptions & External Hardware Prerequisites (US-058 AC2 / GNFR-12)",
     "",
-    "- **No Fabricated Data**: Unexecuted Docker NAT chaos checks (`US-057`, `REL-01` container SIGKILL, `US-074 AC8` 443->8443 live migration, `REL-12` DB wipe/restore, `US-028` 10-min NAT flap) and 5-minute VPS CPU soak (`PERF-02`) remain explicitly marked `pending_external_lab` unless `--with-docker-lab` executes them.",
+    "- **No Fabricated Data**: Unexecuted Docker NAT chaos checks (`US-057`, `REL-01` container SIGKILL, `US-074 AC8` 443->8443 live migration, `REL-12` DB wipe/restore, `US-028` 10-min NAT flap) and 5-minute VPS CPU soak (`PERF-02`) remain explicitly marked `pending_external_lab` unless `--with-docker-lab` or verified telemetry JSON inputs (`--chaos-report-json` / `--perf02-json`) are provided.",
     "- **Physical Hardware Sign-off (`GNFR-12` / `US-036 AC2`)**: macOS `utun` / `launchd` / `LOCAL_PEERCRED` / Application Firewall (`PLAT-06`) and real MacBook + Windows laptop >=4m sleep/wake benchmarks (`PLAT-05`) require hardware execution and remain marked `hardware_signoff_required`.",
     "- **Debug vs Release Benchmark Baseline**: Rust `slo_wave2_suite` throughput & latency checks ran under Cargo test (`unoptimized + debuginfo`); release LTO binaries exceed these margins further.",
 ])

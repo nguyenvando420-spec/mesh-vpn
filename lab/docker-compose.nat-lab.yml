@@ -314,31 +314,41 @@ networks:
         - subnet: 172.28.0.0/24
   lan_1:
     driver: bridge
-    internal: true
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.enable_icc: "true"
     ipam:
       config:
         - subnet: 172.28.10.0/24
   lan_2:
     driver: bridge
-    internal: true
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.enable_icc: "true"
     ipam:
       config:
         - subnet: 172.28.20.0/24
   lan_3:
     driver: bridge
-    internal: true
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.enable_icc: "true"
     ipam:
       config:
         - subnet: 172.28.30.0/24
   lan_4:
     driver: bridge
-    internal: true
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.enable_icc: "true"
     ipam:
       config:
         - subnet: 172.28.40.0/24
   lan_5:
     driver: bridge
-    internal: true
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.enable_icc: "true"
     ipam:
       config:
         - subnet: 172.28.50.0/24

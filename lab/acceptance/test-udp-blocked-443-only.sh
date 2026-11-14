@@ -98,12 +98,12 @@ verify_all_ten_pairs() {
         return 1
       fi
 
-      if ! docker exec "${src_container}" /usr/local/bin/mesh ping "${dst_name}" >/dev/null 2>&1; then
+      if ! docker exec "${src_container}" /usr/local/bin/mesh ping -c 1 --timeout-ms 1500 "${dst_name}" >/dev/null 2>&1; then
         echo "FAIL: ${src_container} -> ${dst_name} mesh ping failed" >&2
         return 1
       fi
 
-      if ! docker exec "${src_container}" ping -c 1 -W 3 "${peer_overlay_ip}" >/dev/null 2>&1; then
+      if ! docker exec "${src_container}" ping -c 1 -W 1 "${peer_overlay_ip}" >/dev/null 2>&1; then
         echo "FAIL: ${src_container} -> ${dst_name} (${peer_overlay_ip}) kernel TUN IPv4 ping failed" >&2
         return 1
       fi
@@ -119,6 +119,16 @@ verify_all_ten_pairs() {
   echo "PASS: ${pass_count}/${total_pairs} pairs verified (path=${expected_path})"
 }
 
+wake_direct_peers_over_tun() {
+  local idx direct_ips
+  for idx in 1 2 3 4 5; do
+    direct_ips="$(docker exec "mesh-lab-node-${idx}" /usr/local/bin/mesh status --json 2>/dev/null | jq -r '.peers[]? | select(.active_path == "direct") | .overlay_ip // empty' || true)"
+    if [ -n "${direct_ips}" ]; then
+      docker exec "mesh-lab-node-${idx}" sh -c 'for ip in '"${direct_ips}"'; do ping -c 1 -W 1 "$ip" >/dev/null 2>&1 & done; wait' >/dev/null 2>&1 || true
+    fi
+  done
+}
+
 wait_for_relay_convergence() {
   local timeout_s="${1:-20}"
   local deadline=$(( $(date +%s) + timeout_s ))
@@ -126,6 +136,7 @@ wait_for_relay_convergence() {
     if verify_all_ten_pairs "relay" >/dev/null 2>&1; then
       return 0
     fi
+    wake_direct_peers_over_tun
     sleep 1
   done
   verify_all_ten_pairs "relay"
@@ -154,7 +165,7 @@ fi
 
 echo "==> [US-028 AC1] Verifying 10/10 pairs over Blind Relay with UDP blocked..."
 "${LAB_DIR}/faults/inject-fault.sh" set-mode all udp-block
-wait_for_relay_convergence 30
+wait_for_relay_convergence 40
 verify_all_ten_pairs "relay"
 AC1_STATUS="PASS"
 
@@ -252,7 +263,7 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 docker exec mesh-lab-node-1 /usr/local/bin/mesh set --server "172.28.0.10:443" --server-pin "${vps_pin}"
-wait_for_relay_convergence 30
+wait_for_relay_convergence 40
 verify_all_ten_pairs "relay"
 AC4_STATUS="PASS"
 

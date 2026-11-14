@@ -63,6 +63,11 @@ impl LinuxTunDevice {
     }
 
     fn from_owned_fd(actual_config: TunConfig, owned_fd: OwnedFd) -> AppResult<Self> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(AppError::unavailable(
+                "TUN device registration requires an active Tokio runtime reactor",
+            ));
+        }
         let tx_owned = owned_fd.try_clone().map_err(|err| {
             AppError::unavailable(format!(
                 "failed duplicating Linux TUN {} descriptor: {err}",

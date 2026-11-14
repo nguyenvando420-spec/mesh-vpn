@@ -40,3 +40,6 @@ coverage.*
 
 # Codex CLI JSONL execution logs
 *.log.jsonl
+
+# Docker NAT lab scratch artifacts
+/lab/.tmp/

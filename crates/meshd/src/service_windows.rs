@@ -201,7 +201,10 @@ fn run_scm_service(paths: DaemonRuntimePaths) -> AppResult<()> {
         .map_err(|err| AppError::internal(format!("failed building Tokio runtime: {err}")))?;
 
     let root_shutdown = CancellationToken::new();
-    let (monitor, power_tx) = create_platform_net_monitor();
+    let (monitor, power_tx) = {
+        let _rt_enter = runtime.enter();
+        create_platform_net_monitor()
+    };
 
     let handler_shutdown = root_shutdown.clone();
     let handler_power = power_tx;
@@ -223,7 +226,8 @@ fn run_scm_service(paths: DaemonRuntimePaths) -> AppResult<()> {
 
     let adapters =
         std::sync::Arc::new(ProductionPlatformAdapters::new(paths.wintun_sha256.clone()));
-    let supervisor =
+    let supervisor = {
+        let _rt_enter = runtime.enter();
         match DaemonSupervisor::boot(paths, std::sync::Arc::new(SystemClock::new()), adapters) {
             Ok(sup) => sup,
             Err(err) => {
@@ -236,7 +240,8 @@ fn run_scm_service(paths: DaemonRuntimePaths) -> AppResult<()> {
                 );
                 return Err(err);
             }
-        };
+        }
+    };
 
     status_handle
         .set_service_status(make_service_status(

@@ -5,8 +5,9 @@
     1. Runs scripts/check.ps1 unless -SkipStaticChecks is supplied.
     2. Runs crates/mesh-server and crates/mesh-datapath quantitative `slo_wave2_suite` tests
        plus `mesh` CLI unit checks (`OPS-02`/`OPS-03`) with MESH_SLO_METRICS_DIR telemetry capture.
-    3. Optionally invokes `lab/scenarios/run-all-chaos.sh` when -WithDockerLab is specified;
-       otherwise honestly marks Docker NAT Lab & physical hardware checks as
+    3. Optionally invokes `lab/scenarios/run-all-chaos.sh` when -WithDockerLab is specified,
+       or validates empirical pre-captured telemetry JSONs via -ChaosReportJson and
+       -Perf02Json; otherwise honestly marks Docker NAT Lab & physical hardware checks as
        `pending_external_lab` / `hardware_signoff_required` without fabricating results.
     4. Emits UTF-8 (no BOM), LF reports:
        <OutputDir>/slo-verification-report.json and <OutputDir>/slo-verification-report.md.
@@ -17,6 +18,8 @@ param(
     [string]$OutputDir = "docs/05-quality-assurance",
     [switch]$SkipStaticChecks,
     [switch]$WithDockerLab,
+    [string]$ChaosReportJson = "",
+    [string]$Perf02Json = "",
     [switch]$SimulateFail
 )
 
@@ -72,6 +75,34 @@ function Write-Utf8NoBomLf {
     }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText($Path, $lfContent, $utf8NoBom)
+}
+
+function Get-JsonProp {
+    param(
+        [AllowNull()][object]$Obj,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($null -eq $Obj) {
+        return $null
+    }
+    $matched = @($Obj.PSObject.Properties.Match($Name))
+    if ($matched.Count -eq 0) {
+        return $null
+    }
+    return $matched[0].Value
+}
+
+function Test-IsNumeric {
+    param([AllowNull()][object]$Value)
+    return (
+        $Value -is [byte] -or
+        $Value -is [int16] -or
+        $Value -is [int32] -or
+        $Value -is [int64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]
+    )
 }
 
 function Invoke-CargoCapture {
@@ -390,7 +421,15 @@ try {
     Write-Host "==> [3/5] Evaluating Docker NAT Chaos Lab..."
     $chaosStatus = "pending_external_lab"
     $chaosObj = $null
-    $chaosDetails = "Not executed (-WithDockerLab omitted); Linux container NAT/chaos suite requires Docker + /dev/net/tun + NET_ADMIN."
+    $chaosDetails = "Not executed (-WithDockerLab and -ChaosReportJson omitted); Linux container NAT/chaos suite requires Docker + /dev/net/tun + NET_ADMIN."
+    $requiredChaosScenarios = @(
+        "us057_lab_smoke",
+        "rel01_kill_server_p2p_continuity",
+        "us074_live_migrate_endpoint_443_8443",
+        "rel12_backup_wipe_restore_pin",
+        "us028_udp_blocked_443_only"
+    )
+    $chaosParseSource = $null
     if ($WithDockerLab) {
         $bashCmd = Get-Command bash -ErrorAction SilentlyContinue
         if ($null -eq $bashCmd) {
@@ -403,15 +442,57 @@ try {
             & $bashCmd.Source $chaosScript --report-json $ChaosTmpRel
             $chaosCode = $LASTEXITCODE
             $ErrorActionPreference = $prevPref
-            if (Test-Path $ChaosTmpJson) {
-                $chaosObj = Get-Content -Path $ChaosTmpJson -Raw -Encoding UTF8 | ConvertFrom-Json
-            }
-            if ($chaosCode -eq 0 -and $null -ne $chaosObj -and $chaosObj.overall -eq "PASS") {
-                $chaosStatus = "PASS"
-                $chaosDetails = "lab/scenarios/run-all-chaos.sh passed all 5 NAT/chaos scenarios"
-            } else {
+            if ($chaosCode -ne 0) {
                 $chaosStatus = "FAIL"
                 $chaosDetails = "lab/scenarios/run-all-chaos.sh failed (exit=$chaosCode)"
+            } elseif (-not (Test-Path -LiteralPath $ChaosTmpJson)) {
+                $chaosStatus = "FAIL"
+                $chaosDetails = "lab/scenarios/run-all-chaos.sh exited 0 but produced no chaos JSON report"
+            } else {
+                $chaosParseSource = $ChaosTmpJson
+            }
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($ChaosReportJson)) {
+        $resolvedChaosPath = if ([System.IO.Path]::IsPathRooted($ChaosReportJson)) { $ChaosReportJson } else { Join-Path $RepoRoot ($ChaosReportJson.Replace('/', '\')) }
+        if (-not (Test-Path -LiteralPath $resolvedChaosPath)) {
+            $chaosStatus = "FAIL"
+            $chaosDetails = "Chaos report JSON not found: $ChaosReportJson"
+        } else {
+            $chaosParseSource = $resolvedChaosPath
+        }
+    }
+
+    if ($null -ne $chaosParseSource) {
+        try {
+            $chaosObj = Get-Content -LiteralPath $chaosParseSource -Raw -Encoding UTF8 | ConvertFrom-Json
+        } catch {
+            $chaosObj = $null
+            $chaosStatus = "FAIL"
+            $chaosDetails = "Failed parsing chaos report JSON ($chaosParseSource): $_"
+        }
+        if ($null -ne $chaosObj) {
+            $overallVal = Get-JsonProp -Obj $chaosObj -Name "overall"
+            $scenariosVal = Get-JsonProp -Obj $chaosObj -Name "scenarios"
+            $genAtVal = Get-JsonProp -Obj $chaosObj -Name "generated_at_utc"
+            $missingOrFailed = @()
+            foreach ($scName in $requiredChaosScenarios) {
+                $scObj = Get-JsonProp -Obj $scenariosVal -Name $scName
+                $scStatus = Get-JsonProp -Obj $scObj -Name "status"
+                if ($scStatus -ne "PASS") {
+                    $missingOrFailed += "$scName=$scStatus"
+                }
+            }
+            if ($overallVal -eq "PASS" -and $missingOrFailed.Count -eq 0) {
+                $chaosStatus = "PASS"
+                if ($WithDockerLab) {
+                    $chaosDetails = "lab/scenarios/run-all-chaos.sh passed all 5 NAT/chaos scenarios"
+                } else {
+                    $genNote = if ([string]::IsNullOrWhiteSpace([string]$genAtVal)) { "unknown" } else { [string]$genAtVal }
+                    $chaosDetails = "Verified 5/5 Docker NAT/chaos scenarios via $ChaosReportJson (generated_at_utc=$genNote)"
+                }
+            } else {
+                $chaosStatus = "FAIL"
+                $chaosDetails = "Chaos report validation failed (overall=$overallVal, bad_or_missing=[$($missingOrFailed -join ', ')])"
             }
         }
     }
@@ -448,7 +529,7 @@ try {
     }
 
     # PERF-02: 5-minute Linux VPS idle CPU requires continuous container telemetry soak
-    $checks.Add([ordered]@{
+    $perf02Check = [ordered]@{
         id        = "PERF-02"
         name      = "Idle Control server CPU utilization (5-minute window)"
         measured  = $null
@@ -457,7 +538,56 @@ try {
         status    = "pending_external_lab"
         method    = "docker_linux_vps_soak_pending"
         details   = "Requires 5-minute Linux VPS / Docker /proc/stat idle soak telemetry; not fabricated in local Windows unit runs (US-058 AC2)."
-    })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Perf02Json)) {
+        $resolvedPerf02Path = if ([System.IO.Path]::IsPathRooted($Perf02Json)) { $Perf02Json } else { Join-Path $RepoRoot ($Perf02Json.Replace('/', '\')) }
+        if (-not (Test-Path -LiteralPath $resolvedPerf02Path)) {
+            $perf02Check.status = "FAIL"
+            $perf02Check.method = "empirical_docker_linux_vps_proc_stat_5m"
+            $perf02Check.details = "PERF-02 telemetry JSON not found: $Perf02Json"
+        } else {
+            $perf02Obj = $null
+            $parseErr = $null
+            try {
+                $perf02Obj = Get-Content -LiteralPath $resolvedPerf02Path -Raw -Encoding UTF8 | ConvertFrom-Json
+            } catch {
+                $parseErr = $_
+            }
+            if ($null -eq $perf02Obj) {
+                $perf02Check.status = "FAIL"
+                $perf02Check.method = "empirical_docker_linux_vps_proc_stat_5m"
+                $perf02Check.details = "Failed parsing PERF-02 telemetry JSON ($Perf02Json): $parseErr"
+            } else {
+                $idVal = Get-JsonProp -Obj $perf02Obj -Name "id"
+                $samePidVal = Get-JsonProp -Obj $perf02Obj -Name "same_pid"
+                $connVal = Get-JsonProp -Obj $perf02Obj -Name "connected_nodes"
+                $winVal = Get-JsonProp -Obj $perf02Obj -Name "window_secs"
+                $cpuVal = Get-JsonProp -Obj $perf02Obj -Name "measured_cpu_pct_1vcpu"
+                $cgroupCpuVal = Get-JsonProp -Obj $perf02Obj -Name "container_cgroup_cpu_pct_1vcpu"
+                $stVal = Get-JsonProp -Obj $perf02Obj -Name "status"
+                $genVal = Get-JsonProp -Obj $perf02Obj -Name "generated_at_utc"
+
+                $cpuNumeric = Test-IsNumeric -Value $cpuVal
+                $winNumeric = Test-IsNumeric -Value $winVal
+                $connNumeric = Test-IsNumeric -Value $connVal
+                $valid = (
+                    ($null -eq $idVal -or $idVal -eq "PERF-02") -and
+                    ($samePidVal -is [bool] -and $samePidVal) -and
+                    ($connNumeric -and [int]$connVal -ge 5) -and
+                    ($winNumeric -and [double]$winVal -ge 300.0) -and
+                    $cpuNumeric -and
+                    ([double]$cpuVal -lt 2.0) -and
+                    ($stVal -eq "PASS")
+                )
+                $perf02Check.measured = if ($cpuNumeric) { [double]$cpuVal } else { $null }
+                $perf02Check.status = if ($valid) { "PASS" } else { "FAIL" }
+                $perf02Check.method = "empirical_docker_linux_vps_proc_stat_5m"
+                $cgroupStr = if ($null -eq $cgroupCpuVal) { "N/A" } else { "$cgroupCpuVal" }
+                $perf02Check.details = "Empirical Linux VPS 5m idle soak (window=${winVal}s, connected_nodes=${connVal}, same_pid=${samePidVal}, proc_cpu=${cpuVal}% of 1 vCPU, cgroup_cpu=${cgroupStr}%, report_status=${stVal}, generated_at_utc=${genVal}, source=$Perf02Json)"
+            }
+        }
+    }
+    $checks.Add($perf02Check)
 
     # OPS-02 & OPS-03: CLI status / netcheck / ping verified via `mesh` crate tests (+ Docker lab if enabled)
     $cliOk = ($cliRes.ExitCode -eq 0)
@@ -555,7 +685,7 @@ try {
         docker_chaos_lab = [ordered]@{
             status    = $chaosStatus
             details   = $chaosDetails
-            scenarios = if ($null -ne $chaosObj) { $chaosObj.scenarios } else { $null }
+            scenarios = if ($null -ne $chaosObj) { Get-JsonProp -Obj $chaosObj -Name "scenarios" } else { $null }
         }
         release_binaries = $binaries
         checks           = $checks
@@ -600,7 +730,7 @@ try {
     [void]$md.AppendLine("")
     [void]$md.AppendLine("## Deviations, Assumptions & External Hardware Prerequisites (US-058 AC2 / GNFR-12)")
     [void]$md.AppendLine("")
-    [void]$md.AppendLine('- **No Fabricated Data**: Unexecuted Docker NAT chaos checks (`US-057`, `REL-01` container SIGKILL, `US-074 AC8` 443->8443 live migration, `REL-12` DB wipe/restore, `US-028` 10-min NAT flap) and 5-minute VPS CPU soak (`PERF-02`) remain explicitly marked `pending_external_lab` unless `-WithDockerLab` executes them.')
+    [void]$md.AppendLine('- **No Fabricated Data**: Unexecuted Docker NAT chaos checks (`US-057`, `REL-01` container SIGKILL, `US-074 AC8` 443->8443 live migration, `REL-12` DB wipe/restore, `US-028` 10-min NAT flap) and 5-minute VPS CPU soak (`PERF-02`) remain explicitly marked `pending_external_lab` unless `-WithDockerLab` or verified telemetry JSON inputs (`-ChaosReportJson` / `-Perf02Json`) are provided.')
     [void]$md.AppendLine('- **Physical Hardware Sign-off (`GNFR-12` / `US-036 AC2`)**: macOS `utun` / `launchd` / `LOCAL_PEERCRED` / Application Firewall (`PLAT-06`) and real MacBook + Windows laptop >=4m sleep/wake benchmarks (`PLAT-05`) cannot be simulated in headless Windows or Linux Docker runners and remain marked `hardware_signoff_required`.')
     [void]$md.AppendLine('- **Debug vs Release Benchmark Baseline**: Rust `slo_wave2_suite` throughput & latency checks ran under Cargo test (`unoptimized + debuginfo`); release LTO binaries exceed these margins further.')
     if ($SimulateFail) {

@@ -1,0 +1,16 @@
+{
+  "id": "PERF-02",
+  "generated_at_utc": "2026-11-14T12:03:12Z",
+  "container": "mesh-lab-vps",
+  "pid": 1,
+  "same_pid": true,
+  "connected_nodes": 5,
+  "window_secs": 305.0,
+  "proc_cpu_secs_delta": 0.08,
+  "measured_cpu_pct_1vcpu": 0.0262,
+  "container_cgroup_cpu_pct_1vcpu": 1.1207,
+  "threshold_pct_1vcpu": 2.0,
+  "unit": "% of 1 vCPU",
+  "status": "PASS",
+  "method": "empirical_docker_linux_vps_proc_stat_5m"
+}

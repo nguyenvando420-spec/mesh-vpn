@@ -266,6 +266,27 @@ bootstrap_nodes() {
       ' sh "${raw_key}" "${endpoint_host}:${endpoint_port}" "${pin}" "${node}"
     fi
   done
+
+  echo "==> Waiting for all 5 nodes to converge on /v1/netmap/stream (5 peers each, timeout 20s)..."
+  for idx in 1 2 3 4 5; do
+    local container="mesh-lab-node-${idx}"
+    local converged=0
+    for _ in $(seq 1 40); do
+      if docker exec "${container}" /usr/local/bin/mesh status --json 2>/dev/null \
+        | jq -e '.daemon_state == "connected" and .server_connection.control_connected == true and ((.peers | length) >= 5)' >/dev/null 2>&1; then
+        converged=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ "${converged}" -ne 1 ]; then
+      echo "ERROR: ${container} failed to converge on 5-node netmap within 20s." >&2
+      docker exec "${container}" /usr/local/bin/mesh status --json >&2 || true
+      docker exec "${container}" tail -n 60 /var/log/meshd/meshd.log >&2 || true
+      exit 1
+    fi
+  done
+  echo "    All 5 nodes connected and converged on 5-peer Netmap."
 }
 
 do_up() {

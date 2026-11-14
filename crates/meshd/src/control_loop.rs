@@ -304,7 +304,10 @@ impl DaemonRuntimeState {
                 g.bootstrap.clone(),
                 g.latest_netmap.clone(),
                 g.control_connected,
-                g.relay_rtt_ms,
+                g.relay_handle
+                    .as_ref()
+                    .and_then(RelayClientHandle::last_rtt_ms)
+                    .or(g.relay_rtt_ms),
                 g.last_error.clone(),
                 g.migration_pending_endpoint.clone(),
                 g.bound_physical_interface.clone(),
@@ -388,7 +391,13 @@ impl DaemonRuntimeState {
                 nat_classification_note: nat_note,
                 overlay_conflict_warning,
                 macos_firewall_warning,
-                candidates: local_candidates,
+                candidates: merge_local_and_reflexive_candidates(
+                    &local_candidates,
+                    dp_snapshot
+                        .as_ref()
+                        .and_then(|s| s.last_stun_report.as_ref())
+                        .map_or(&[], |r| r.reflexive_addrs.as_slice()),
+                ),
             },
             peers,
         }
@@ -923,6 +932,16 @@ where
                 return Ok(ws);
             }
             Err(HandshakeError::Interrupted(mut mid)) => {
+                mid.get_mut()
+                    .get_mut()
+                    .flush_tx_async()
+                    .await
+                    .map_err(|err| ControlSessionExit::Retry {
+                        err: AppError::unavailable(format!(
+                            "control WS handshake flush failed: {err}"
+                        )),
+                        tls_capped: false,
+                    })?;
                 let n = mid
                     .get_mut()
                     .get_mut()
@@ -961,6 +980,12 @@ where
     let mut hb_tick = tokio::time::interval(CONTROL_HEARTBEAT_INTERVAL);
     hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut ws_close_rx = ctx.state.subscribe_ws_close();
+    let mut stun_rx = {
+        let g = ctx.state.inner.read().await;
+        g.datapath_handle
+            .as_ref()
+            .map(DatapathHandle::subscribe_stun_reports)
+    };
     let mut last_rx = tokio::time::Instant::now();
     let idle_limit = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
     let mut scratch = [0_u8; 4096];
@@ -985,6 +1010,26 @@ where
                 if res.is_ok() && *ws_close_rx.borrow() {
                     close_ws_gracefully(ws).await;
                     return ControlSessionExit::Shutdown;
+                }
+            }
+            res = async {
+                match stun_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match res {
+                    Ok(()) => {
+                        if let Err(err) = send_endpoint_update_over_ws(ctx, ws).await {
+                            return ControlSessionExit::Retry {
+                                err,
+                                tls_capped: false,
+                            };
+                        }
+                    }
+                    Err(_) => {
+                        stun_rx = None;
+                    }
                 }
             }
             maybe_wake = ctx.wake_rx.recv() => {
@@ -3562,5 +3607,35 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING> mtu 1500
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn test_connect_control_ws_flushes_upgrade_request_and_completes_handshake() {
+        // Arrange: real duplex pair with a server expecting an HTTP WebSocket Upgrade request
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_task = tokio::spawn(async move {
+            let accepted = tokio_tungstenite::accept_async(server_io).await;
+            let ok = accepted.is_ok();
+            let _held = done_rx.await;
+            ok
+        });
+
+        // Act: upgrade `/v1/netmap/stream` through BridgeStream within 2s (fails if tx_buf hangs)
+        let client_res = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::connect_control_ws(
+                client_io,
+                "127.0.0.1:443",
+                "/v1/netmap/stream",
+                &[("x-mesh-challenge-id".to_owned(), "test-123".to_owned())],
+            ),
+        )
+        .await;
+
+        // Assert: upgrade completed cleanly on both client and server
+        assert!(matches!(client_res, Ok(Ok(_))));
+        assert!(done_tx.send(()).is_ok());
+        assert_eq!(server_task.await.ok(), Some(true));
     }
 }

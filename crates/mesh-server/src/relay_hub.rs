@@ -231,13 +231,26 @@ impl RelayHub {
             } => {
                 self.forward_client_packet(src_node_id, src_pubkey, dst_pubkey, ciphertext, now_ms)
             }
-            RelayFrame::KeepAlive { .. } => {
-                let registered = self
+            RelayFrame::KeepAlive { sent_at_ms } => {
+                let sender = self
                     .state
                     .lock()
-                    .map(|g| g.by_node_id.contains_key(&src_node_id))
-                    .unwrap_or(false);
-                if !registered {
+                    .ok()
+                    .and_then(|g| g.by_node_id.get(&src_node_id).map(|s| s.tx.clone()));
+                if let Some(src_tx) = sender {
+                    if let Ok(encoded) = (RelayFrame::KeepAlive { sent_at_ms }).encode()
+                        && let Err(err) = src_tx.try_send(encoded)
+                    {
+                        tracing::trace!(
+                            component = "relay_hub",
+                            event = "keepalive_echo_dropped",
+                            node_id = %src_node_id,
+                            error = %err,
+                            "dropped KeepAlive echo on busy or closed relay queue"
+                        );
+                    }
+                    RelayForwardOutcome::Forwarded
+                } else {
                     self.metrics
                         .dropped_unauthenticated_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -245,8 +258,6 @@ impl RelayHub {
                         .dropped_packets_total
                         .fetch_add(1, Ordering::Relaxed);
                     RelayForwardOutcome::Disconnect
-                } else {
-                    RelayForwardOutcome::Forwarded
                 }
             }
             RelayFrame::RelayToClientPacket { .. } | RelayFrame::ControlNotice { .. } => {
@@ -702,5 +713,65 @@ mod tests {
             hub.handle_inbound_frame(b_id, b_pk, &pkt, now + 5),
             RelayForwardOutcome::Disconnect
         );
+    }
+
+    // Traces: US-025 AC2, US-028
+    #[test]
+    fn test_relay_keepalive_echoes_frame_back_to_sender_and_rejects_unregistered() {
+        // Arrange
+        let dir = TempDir::new().ok();
+        assert!(dir.is_some());
+        let Some(dir) = dir else {
+            return;
+        };
+        let now = 1_762_958_200_000_u64;
+        let clock = Arc::new(FakeClock::new(now));
+        let store = ControlStore::open_with_clock(
+            ControlStoreConfig {
+                db_path: dir.path().join("control.redb"),
+                emergency_revocations_path: dir.path().join("emergency-revocations.bin"),
+            },
+            "10.100.0.0/24",
+            clock,
+        );
+        assert!(store.is_ok());
+        let Ok(store) = store else {
+            return;
+        };
+        let hub = RelayHub::new(Arc::new(store), 100_000_000, 200_000_000);
+
+        let a_id = NodeId::new_v7(now);
+        let a_pk_res = PublicKey::from_bytes([0x33_u8; 32]);
+        assert!(a_pk_res.is_ok());
+        let Ok(a_pk) = a_pk_res else {
+            return;
+        };
+        let mut a_sess = hub.register_session(a_id, a_pk, now);
+
+        let unreg_id = NodeId::new_v7(now + 1);
+        let unreg_pk_res = PublicKey::from_bytes([0x44_u8; 32]);
+        assert!(unreg_pk_res.is_ok());
+        let Ok(unreg_pk) = unreg_pk_res else {
+            return;
+        };
+
+        let ka_res = (RelayFrame::KeepAlive {
+            sent_at_ms: now + 123,
+        })
+        .encode();
+        assert!(ka_res.is_ok());
+        let Ok(ka_bytes) = ka_res else {
+            return;
+        };
+
+        // Act
+        let ok_outcome = hub.handle_inbound_frame(a_id, a_pk, &ka_bytes, now + 125);
+        let echoed = a_sess.rx.try_recv();
+        let reject_outcome = hub.handle_inbound_frame(unreg_id, unreg_pk, &ka_bytes, now + 125);
+
+        // Assert
+        assert_eq!(ok_outcome, RelayForwardOutcome::Forwarded);
+        assert_eq!(echoed.as_ref().ok(), Some(&ka_bytes));
+        assert_eq!(reject_outcome, RelayForwardOutcome::Disconnect);
     }
 }

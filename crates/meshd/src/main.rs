@@ -162,12 +162,11 @@ async fn wait_for_os_shutdown_signal(root_shutdown: CancellationToken) {
 
 fn run_foreground_daemon(paths: DaemonRuntimePaths) -> AppResult<()> {
     let runtime = build_daemon_runtime()?;
-    let adapters = Arc::new(ProductionPlatformAdapters::new(paths.wintun_sha256.clone()));
-    let supervisor = DaemonSupervisor::boot(paths, Arc::new(SystemClock::new()), adapters)?;
-    let (monitor, _power_tx) = create_platform_net_monitor();
-    let root_shutdown = CancellationToken::new();
-
     runtime.block_on(async move {
+        let adapters = Arc::new(ProductionPlatformAdapters::new(paths.wintun_sha256.clone()));
+        let supervisor = DaemonSupervisor::boot(paths, Arc::new(SystemClock::new()), adapters)?;
+        let (monitor, _power_tx) = create_platform_net_monitor();
+        let root_shutdown = CancellationToken::new();
         let signal_shutdown = root_shutdown.clone();
         let (run_res, ()) = tokio::join!(
             supervisor.run(monitor, root_shutdown.clone()),
@@ -306,5 +305,34 @@ mod tests {
         assert!(conflict.is_err());
         #[cfg(target_os = "windows")]
         assert_eq!(crate::service_windows::WINDOWS_SERVICE_NAME, "MeshVpnAgent");
+    }
+
+    #[test]
+    fn test_meshd_runtime_initializes_platform_monitor_from_sync_main_thread() {
+        // Arrange: start from a plain OS thread (no `#[tokio::test]` reactor on the caller thread)
+        let tmp = TempDir::new().expect("temp dir");
+        let paths = DaemonRuntimePaths::for_temp_dir(tmp.path(), "syncboot");
+        let runtime = super::build_daemon_runtime().expect("build daemon runtime");
+
+        // Act
+        let boot_res = runtime.block_on(async move {
+            let adapters = std::sync::Arc::new(super::ProductionPlatformAdapters::new(
+                paths.wintun_sha256.clone(),
+            ));
+            let supervisor = super::DaemonSupervisor::boot(
+                paths,
+                std::sync::Arc::new(mesh_core::clock::SystemClock::new()),
+                adapters,
+            );
+            let (_monitor, _power_tx) = super::create_platform_net_monitor();
+            supervisor
+        });
+
+        // Assert
+        assert!(
+            boot_res.is_ok(),
+            "supervisor boot inside runtime failed: {:?}",
+            boot_res.err()
+        );
     }
 }

@@ -98,6 +98,26 @@ wait_vps_ready() {
   return 1
 }
 
+wait_all_nodes_control_connected() {
+  local timeout_s="${1:-30}"
+  local idx connected_count
+  connected_count=0
+  for _ in $(seq 1 "${timeout_s}"); do
+    connected_count=0
+    for idx in 1 2 3 4 5; do
+      if [ "$(docker exec "mesh-lab-node-${idx}" /usr/local/bin/mesh status --json 2>/dev/null | jq -r '.server_connection.control_connected // false')" = "true" ]; then
+        connected_count=$((connected_count + 1))
+      fi
+    done
+    if [ "${connected_count}" -eq 5 ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: only ${connected_count}/5 nodes reconnected to control within ${timeout_s}s" >&2
+  return 1
+}
+
 write_report() {
   local finished_at_utc
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
@@ -153,6 +173,24 @@ t0="$(now_ms)"
 node2_ip="$(docker exec mesh-lab-node-1 /usr/local/bin/mesh status --json | jq -r '.peers[] | select(.name == "node-2") | .overlay_ip')"
 test -n "${node2_ip}"
 
+wait_all_nodes_control_connected 20
+rel01_direct=0
+for _ in $(seq 1 25); do
+  docker exec mesh-lab-node-1 /usr/local/bin/mesh ping -c 1 --timeout-ms 500 node-2 >/dev/null 2>&1 || true
+  docker exec mesh-lab-node-2 /usr/local/bin/mesh ping -c 1 --timeout-ms 500 node-1 >/dev/null 2>&1 || true
+  if [ "$(docker exec mesh-lab-node-1 /usr/local/bin/mesh status --json | jq -r '.peers[] | select(.name == "node-2") | .active_path')" = "direct" ] \
+    && [ "$(docker exec mesh-lab-node-2 /usr/local/bin/mesh status --json | jq -r '.peers[] | select(.name == "node-1") | .active_path')" = "direct" ] \
+    && docker exec mesh-lab-node-1 ping -c 2 -W 2 "${node2_ip}" >/dev/null 2>&1; then
+    rel01_direct=1
+    break
+  fi
+  sleep 1
+done
+if [ "${rel01_direct}" -ne 1 ]; then
+  echo "FAIL: node-1 <-> node-2 did not establish bidirectional direct path before kill-server" >&2
+  exit 1
+fi
+
 "${LAB_DIR}/faults/inject-fault.sh" kill-server
 if docker exec mesh-lab-vps curl -fsS --max-time 2 http://127.0.0.1:9091/readyz >/dev/null 2>&1; then
   echo "FAIL: mesh-lab-vps still responded after kill-server" >&2
@@ -161,6 +199,7 @@ fi
 docker exec mesh-lab-node-1 ping -c 3 -W 3 "${node2_ip}" >/dev/null
 docker compose -f "${COMPOSE_FILE}" up -d vps
 wait_vps_ready 30
+wait_all_nodes_control_connected 30
 t1="$(now_ms)"
 REL01_DURATION_MS=$((t1 - t0))
 REL01_STATUS="PASS"
@@ -189,6 +228,7 @@ if [ "${restored_ep}" != "172.28.0.10:443" ]; then
   echo "FAIL: expected restored control_tcp_endpoint 172.28.0.10:443, got '${restored_ep}'" >&2
   exit 1
 fi
+wait_all_nodes_control_connected 30
 t1="$(now_ms)"
 US074_DURATION_MS=$((t1 - t0))
 US074_STATUS="PASS"
@@ -228,7 +268,7 @@ if [ "${after_pin}" != "${orig_pin}" ]; then
   echo "FAIL: SPKI pin mismatch after restore (expected=${orig_pin}, got=${after_pin})" >&2
   exit 1
 fi
-sleep 2
+wait_all_nodes_control_connected 30
 docker exec mesh-lab-node-1 ping -c 2 -W 3 "${node2_ip}" >/dev/null
 t1="$(now_ms)"
 REL12_DURATION_MS=$((t1 - t0))

@@ -24,7 +24,7 @@ use rustls::ServerConfig as RustlsServerConfig;
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -38,6 +38,8 @@ use crate::stun_service::{StunServiceState, bind_stun_udp_socket, run_stun_socke
 
 const DEFAULT_MIGRATION_GRACE_SECS: u64 = 300;
 const MAX_MIGRATION_GRACE_SECS: u64 = 86_400;
+const RETIRE_REBIND_MAX_ATTEMPTS: usize = 25;
+const RETIRE_REBIND_BACKOFF: Duration = Duration::from_millis(15);
 
 #[derive(Debug)]
 struct ActivePortState {
@@ -49,6 +51,8 @@ struct ActivePortState {
     active_stun_cancel: CancellationToken,
     previous_tcp_cancel: Option<CancellationToken>,
     previous_stun_cancel: Option<CancellationToken>,
+    previous_tcp_port: Option<u16>,
+    previous_stun_port: Option<u16>,
     transition_deadline_at_ms: Option<u64>,
 }
 
@@ -131,6 +135,8 @@ impl ListenerSet {
                 active_stun_cancel: active_stun_cancel.clone(),
                 previous_tcp_cancel: None,
                 previous_stun_cancel: None,
+                previous_tcp_port: None,
+                previous_stun_port: None,
                 transition_deadline_at_ms: None,
             }),
         });
@@ -283,22 +289,48 @@ impl ListenerSet {
         let new_tcp_listener = if target_tcp_port == old_tcp_port {
             None
         } else {
+            let retired_prev =
+                if let Some(prev_cancel) = self.take_previous_tcp_if_port(target_tcp_port) {
+                    prev_cancel.cancel();
+                    true
+                } else {
+                    false
+                };
             let ip: IpAddr = self
                 .config
                 .control_bind_ip
                 .parse()
                 .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-            Some(bind_control_tcp_listener(SocketAddr::new(ip, target_tcp_port)).await?)
+            Some(
+                bind_control_tcp_listener_with_retire_retry(
+                    SocketAddr::new(ip, target_tcp_port),
+                    retired_prev,
+                )
+                .await?,
+            )
         };
         let new_udp_socket = if target_stun_port == old_stun_port {
             None
         } else {
+            let retired_prev =
+                if let Some(prev_cancel) = self.take_previous_stun_if_port(target_stun_port) {
+                    prev_cancel.cancel();
+                    true
+                } else {
+                    false
+                };
             let ip: IpAddr = self
                 .config
                 .stun_bind_ip
                 .parse()
                 .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-            Some(bind_stun_udp_socket(SocketAddr::new(ip, target_stun_port)).await?)
+            Some(
+                bind_stun_udp_socket_with_retire_retry(
+                    SocketAddr::new(ip, target_stun_port),
+                    retired_prev,
+                )
+                .await?,
+            )
         };
 
         // Update leaf certificate SANs reusing the active keypair BEFORE spawning any new TLS
@@ -319,6 +351,7 @@ impl ListenerSet {
                 if let Some(stale) = guard.previous_tcp_cancel.replace(prev_tcp) {
                     stale.cancel();
                 }
+                guard.previous_tcp_port = Some(old_tcp_port);
                 guard.active_tcp_cancel = new_cancel;
                 guard.control_tcp_port = target_tcp_port;
                 guard.tls_mode = target_tls_mode;
@@ -336,6 +369,7 @@ impl ListenerSet {
                 if let Some(stale) = guard.previous_stun_cancel.replace(prev_stun) {
                     stale.cancel();
                 }
+                guard.previous_stun_port = Some(old_stun_port);
                 guard.active_stun_cancel = new_cancel;
                 guard.stun_udp_port = target_stun_port;
             }
@@ -422,11 +456,35 @@ impl ListenerSet {
         if let Some(old_tcp) = guard.previous_tcp_cancel.take() {
             old_tcp.cancel();
         }
+        guard.previous_tcp_port = None;
         if let Some(old_stun) = guard.previous_stun_cancel.take() {
             old_stun.cancel();
         }
+        guard.previous_stun_port = None;
         guard.transition_deadline_at_ms = None;
         true
+    }
+
+    fn take_previous_tcp_if_port(&self, target_port: u16) -> Option<CancellationToken> {
+        let Ok(mut guard) = self.ports.lock() else {
+            return None;
+        };
+        if guard.previous_tcp_port == Some(target_port) {
+            guard.previous_tcp_port = None;
+            return guard.previous_tcp_cancel.take();
+        }
+        None
+    }
+
+    fn take_previous_stun_if_port(&self, target_port: u16) -> Option<CancellationToken> {
+        let Ok(mut guard) = self.ports.lock() else {
+            return None;
+        };
+        if guard.previous_stun_port == Some(target_port) {
+            guard.previous_stun_port = None;
+            return guard.previous_stun_cancel.take();
+        }
+        None
     }
 
     fn spawn_control_accept_loop(
@@ -499,6 +557,64 @@ async fn bind_control_tcp_listener(addr: SocketAddr) -> AppResult<TcpListener> {
     TcpListener::bind(addr).await.map_err(|err| {
         AppError::conflict(format!("port conflict or bind error on TCP {addr}: {err}"))
     })
+}
+
+async fn bind_control_tcp_listener_with_retire_retry(
+    addr: SocketAddr,
+    retired_previous: bool,
+) -> AppResult<TcpListener> {
+    let max_attempts = if retired_previous {
+        RETIRE_REBIND_MAX_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 1..=max_attempts {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err)
+                if retired_previous
+                    && attempt < max_attempts
+                    && err.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                sleep(RETIRE_REBIND_BACKOFF).await;
+            }
+            Err(err) => {
+                return Err(AppError::conflict(format!(
+                    "port conflict or bind error on TCP {addr}: {err}"
+                )));
+            }
+        }
+    }
+    bind_control_tcp_listener(addr).await
+}
+
+async fn bind_stun_udp_socket_with_retire_retry(
+    addr: SocketAddr,
+    retired_previous: bool,
+) -> AppResult<Arc<UdpSocket>> {
+    let max_attempts = if retired_previous {
+        RETIRE_REBIND_MAX_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 1..=max_attempts {
+        match UdpSocket::bind(addr).await {
+            Ok(sock) => return Ok(Arc::new(sock)),
+            Err(err)
+                if retired_previous
+                    && attempt < max_attempts
+                    && err.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                sleep(RETIRE_REBIND_BACKOFF).await;
+            }
+            Err(err) => {
+                return Err(AppError::conflict(format!(
+                    "failed binding UDP STUN socket on {addr}: {err}"
+                )));
+            }
+        }
+    }
+    bind_stun_udp_socket(addr).await
 }
 
 async fn serve_accepted_connection(
@@ -1058,5 +1174,113 @@ mod tests {
         shutdown.cancel();
         tracker.close();
         tracker.wait().await;
+    }
+
+    // Traces: US-074 AC8 / NAT Lab Chaos 3
+    #[tokio::test]
+    async fn test_migrate_endpoints_allows_immediate_rollback_to_previous_port_within_grace_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let clock = Arc::new(mesh_core::FakeClock::new(1_700_000_000_000));
+        let store = Arc::new(mesh_store::ControlStore::open_with_clock(
+            mesh_store::ControlStoreConfig {
+                db_path: dir.path().join("control.redb"),
+                emergency_revocations_path: dir.path().join("emergency-revocations.bin"),
+            },
+            "10.100.0.0/24",
+            Arc::clone(&clock) as Arc<dyn mesh_core::Clock>,
+        )?);
+        let _init_id = store.ensure_or_init_identity(&["127.0.0.1".to_owned()], 365)?;
+
+        let tcp_a = TcpListener::bind("127.0.0.1:0").await?;
+        let tcp_b = TcpListener::bind("127.0.0.1:0").await?;
+        let udp_a = UdpSocket::bind("127.0.0.1:0").await?;
+        let port_a = tcp_a.local_addr()?.port();
+        let port_b = tcp_b.local_addr()?.port();
+        let stun_a = udp_a.local_addr()?.port();
+        drop((tcp_a, tcp_b, udp_a));
+
+        let cfg = Arc::new(crate::config::ServerConfig {
+            control_bind_ip: "127.0.0.1".to_owned(),
+            stun_bind_ip: "127.0.0.1".to_owned(),
+            public_host: "127.0.0.1".to_owned(),
+            control_tcp_port: port_a,
+            stun_udp_port: stun_a,
+            trusted_proxies: vec!["127.0.0.1".parse()?],
+            ..crate::config::ServerConfig::default()
+        });
+        let acme = crate::acme::AcmeManager::initialize(&cfg, store.clone())?;
+        let netmap_hub = Arc::new(crate::netmap_hub::NetmapHub::new(
+            store.clone(),
+            cfg.public_control_endpoint(),
+            cfg.public_control_endpoint(),
+            vec![cfg.public_stun_endpoint()],
+            cfg.domain_suffix.clone(),
+        ));
+        let relay_hub = Arc::new(crate::relay_hub::RelayHub::new(
+            store.clone(),
+            cfg.relay_bytes_per_sec,
+            cfg.relay_global_bytes_per_sec,
+        ));
+        let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new(
+            crate::rate_limit::ClientIpExtractor::new(cfg.tls_mode, cfg.trusted_proxy_set()),
+        ));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let tracker = tokio_util::task::TaskTracker::new();
+        let ctrl_state = crate::control_handlers::ControlAppState {
+            config: cfg.clone(),
+            trusted_proxies: Arc::new(cfg.trusted_proxy_set()),
+            store: store.clone(),
+            rate_limiter,
+            challenges: Arc::new(crate::control_handlers::PendingChallengeStore::new()),
+            netmap_hub,
+            relay_hub,
+            ws_tracker: tracker.clone(),
+            shutdown: shutdown.clone(),
+        };
+        let listeners = super::ListenerSet::bind_and_start(ctrl_state, acme).await?;
+
+        // Act 1: migrate port_a -> port_b with a 60s dual-listener window
+        let fwd = listeners
+            .migrate_endpoints(
+                &mesh_proto::admin_ipc::MigrateEndpointRequest {
+                    tcp_port: Some(mesh_core::Port::from_u16(port_b)?),
+                    stun_port: None,
+                    host: None,
+                    tls_mode: None,
+                    transition_window_secs: Some(60),
+                    extend_window_secs: None,
+                },
+                "admin",
+            )
+            .await?;
+        assert_eq!(fwd.control_tcp_endpoint, format!("127.0.0.1:{port_b}"));
+        assert_eq!(listeners.active_ports().0, port_b);
+
+        // Act 2: immediately roll back port_b -> port_a within the active 60s window
+        let rollback = listeners
+            .migrate_endpoints(
+                &mesh_proto::admin_ipc::MigrateEndpointRequest {
+                    tcp_port: Some(mesh_core::Port::from_u16(port_a)?),
+                    stun_port: None,
+                    host: None,
+                    tls_mode: None,
+                    transition_window_secs: Some(5),
+                    extend_window_secs: None,
+                },
+                "admin",
+            )
+            .await?;
+
+        // Assert
+        assert_eq!(rollback.control_tcp_endpoint, format!("127.0.0.1:{port_a}"));
+        assert_eq!(listeners.active_ports().0, port_a);
+        let probe = tokio::net::TcpStream::connect(("127.0.0.1", port_a)).await?;
+        drop(probe);
+
+        shutdown.cancel();
+        tracker.close();
+        tracker.wait().await;
+        Ok(())
     }
 }

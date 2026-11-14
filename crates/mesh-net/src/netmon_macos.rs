@@ -90,6 +90,11 @@ impl MacOsNetMonitor {
     }
 
     fn ensure_fd(&self) -> AppResult<Arc<pipe::Receiver>> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(AppError::unavailable(
+                "PF_ROUTE monitor requires an active Tokio runtime reactor",
+            ));
+        }
         let owned = mesh_sys::netmon_macos::open_route_monitor_socket()?;
         let async_rx = Arc::new(
             pipe::Receiver::from_owned_fd_unchecked(owned).map_err(|err| {
@@ -228,6 +233,15 @@ mod tests {
         assert_eq!(first, Some(map_raw_event(RawNetEventKind::AddressChanged)));
         assert_eq!(guard.pending.len(), 1);
         assert_eq!(guard.pending.front(), Some(&NetEvent::RouteChanged));
+    }
+
+    #[test]
+    fn test_netmon_macos_start_without_runtime_returns_err_without_panic() {
+        // Arrange / Act: calling outside Tokio must fail cleanly with AppError, never panic.
+        let res = MacOsNetMonitor::start();
+
+        // Assert
+        assert!(res.is_err());
     }
 
     #[tokio::test]

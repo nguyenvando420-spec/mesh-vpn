@@ -23,7 +23,7 @@ const MIN_PING_COUNT: u16 = 1;
 const MAX_PING_COUNT: u16 = 64;
 const MIN_PING_TIMEOUT_MS: u64 = 200;
 const MAX_PING_TIMEOUT_MS: u64 = 15_000;
-const STUN_REFRESH_WAIT: Duration = Duration::from_millis(600);
+const STUN_REFRESH_WAIT: Duration = Duration::from_millis(1_200);
 const NETCHECK_TCP_TOTAL_BUDGET: Duration = Duration::from_millis(2_500);
 const NETCHECK_OVERALL_DEADLINE: Duration = Duration::from_secs(4);
 
@@ -105,7 +105,10 @@ impl PingProbe {
                 g.datapath_handle.clone(),
                 ctrl,
                 relay_ep,
-                g.relay_rtt_ms,
+                g.relay_handle
+                    .as_ref()
+                    .and_then(mesh_datapath::RelayClientHandle::last_rtt_ms)
+                    .or(g.relay_rtt_ms),
                 stuns,
                 g.underlay_if_index,
                 g.linux_fwmark,
@@ -242,6 +245,7 @@ async fn run_ephemeral_stun_probe(
 async fn refresh_stun_snapshot(
     handle: &DatapathHandle,
 ) -> Option<mesh_datapath::DatapathStatusSnapshot> {
+    let mut stun_rx = handle.subscribe_stun_reports();
     if let Err(err) = handle.send(DatapathCommand::TriggerStunProbe).await {
         debug!(
             component = "meshd.ping_probe",
@@ -249,9 +253,12 @@ async fn refresh_stun_snapshot(
             error = %err,
             "failed triggering STUN refresh via datapath handle"
         );
+        return None;
     }
-    tokio::time::sleep(STUN_REFRESH_WAIT).await;
-    handle.query_status().await.ok()
+    match tokio::time::timeout(STUN_REFRESH_WAIT, stun_rx.changed()).await {
+        Ok(Ok(())) => handle.query_status().await.ok(),
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 struct PingProbeTarget<'a> {

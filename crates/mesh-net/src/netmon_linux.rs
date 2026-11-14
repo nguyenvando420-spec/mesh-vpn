@@ -90,6 +90,11 @@ impl LinuxNetMonitor {
     }
 
     fn ensure_fd(&self) -> AppResult<Arc<pipe::Receiver>> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(AppError::unavailable(
+                "NETLINK_ROUTE monitor requires an active Tokio runtime reactor",
+            ));
+        }
         let owned = mesh_sys::netmon_linux::open_netlink_route_monitor()?;
         let async_rx = Arc::new(
             pipe::Receiver::from_owned_fd_unchecked(owned).map_err(|err| {
@@ -247,10 +252,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_netmon_linux_start_without_runtime_returns_err_without_panic() {
+        // Arrange / Act: calling outside Tokio must fail cleanly with AppError, never panic.
+        let res = LinuxNetMonitor::start();
+
+        // Assert
+        assert!(res.is_err());
+    }
+
     #[tokio::test]
     async fn test_netmon_linux_can_open_unprivileged_netlink_monitor() {
         // Arrange & Act & Assert: `AF_NETLINK` multicast listen does not require root on Linux.
         let res = LinuxNetMonitor::start();
-        assert!(res.is_ok() || res.is_err());
+        assert!(res.is_ok(), "failed opening Linux Netlink monitor: {res:?}");
     }
 }

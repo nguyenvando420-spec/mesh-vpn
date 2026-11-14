@@ -345,16 +345,34 @@ mod tests {
                     filter,
                     5_002,
                 );
-                for pong in replies {
-                    let (ev, _, _) = disco_a.handle_incoming_tracked(
-                        &pong.bytes,
+                let mut verified_a = false;
+                for reply in replies {
+                    let (ev, _, rev_replies) = disco_a.handle_incoming_tracked(
+                        &reply.bytes,
                         IngressSource::DirectUdp(b.wan_addr),
                         map_a,
                         filter,
                         5_004,
                     );
-                    assert!(matches!(ev, DiscoEvent::DirectPathVerified { .. }));
+                    assert!(matches!(
+                        ev,
+                        DiscoEvent::DirectPathVerified { .. } | DiscoEvent::RepliedPong { .. }
+                    ));
+                    if matches!(ev, DiscoEvent::DirectPathVerified { .. }) {
+                        verified_a = true;
+                    }
+                    for rev_pong in rev_replies {
+                        let (ev_b, _, _) = disco_b.handle_incoming_tracked(
+                            &rev_pong.bytes,
+                            IngressSource::DirectUdp(a.wan_addr),
+                            map_b,
+                            filter,
+                            5_006,
+                        );
+                        assert!(matches!(ev_b, DiscoEvent::DirectPathVerified { .. }));
+                    }
                 }
+                assert!(verified_a);
             }
         }
         t0.elapsed().as_secs_f64() * 1_000.0

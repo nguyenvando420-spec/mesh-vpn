@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -182,6 +182,15 @@ pub enum DatapathCommand {
 #[derive(Debug, Clone)]
 pub struct DatapathHandle {
     tx: mpsc::Sender<DatapathCommand>,
+    stun_report_tx: watch::Sender<Option<StunProbeReport>>,
+}
+
+impl DatapathHandle {
+    /// Subscribes to completed STUN probe reports published by [`DatapathEngine`].
+    #[must_use]
+    pub fn subscribe_stun_reports(&self) -> watch::Receiver<Option<StunProbeReport>> {
+        self.stun_report_tx.subscribe()
+    }
 }
 
 impl DatapathHandle {
@@ -314,6 +323,7 @@ pub struct DatapathEngine {
     cryptokey: CryptokeyValidator,
     stun_client: StunClient,
     last_stun_report: Option<StunProbeReport>,
+    stun_report_tx: watch::Sender<Option<StunProbeReport>>,
     disco: DiscoEngine,
     advertised_endpoints: Vec<SocketAddr>,
     pending_ping_waiters: HashMap<[u8; 12], PendingPingWaiter>,
@@ -354,6 +364,7 @@ impl DatapathEngine {
         );
         let stun_client = StunClient::new(config.stun_config.clone());
         let (cmd_tx, cmd_rx) = mpsc::channel(DATAPATH_COMMAND_CAPACITY);
+        let (stun_report_tx, _) = watch::channel(None);
 
         let local_addr = magic_socket.local_addr().ok();
         let advertised_endpoints = local_addr
@@ -369,6 +380,7 @@ impl DatapathEngine {
             cryptokey: CryptokeyValidator::new(),
             stun_client,
             last_stun_report: None,
+            stun_report_tx,
             disco,
             advertised_endpoints,
             pending_ping_waiters: HashMap::new(),
@@ -394,6 +406,7 @@ impl DatapathEngine {
     pub fn handle(&self) -> DatapathHandle {
         DatapathHandle {
             tx: self.cmd_tx.clone(),
+            stun_report_tx: self.stun_report_tx.clone(),
         }
     }
 
@@ -1296,6 +1309,8 @@ impl DatapathEngine {
                 self.advertised_endpoints.push(addr);
             }
         }
+        let prev_report = self.stun_report_tx.send_replace(Some(report.clone()));
+        drop(prev_report);
         self.last_stun_report = Some(report);
     }
 

@@ -222,12 +222,15 @@ struct PendingPing {
     count_toward_failover: bool,
 }
 
+const DISCO_REVERSE_PING_DEBOUNCE_MS: u64 = 500;
+
 #[derive(Debug, Clone, Default)]
 struct PeerDiscoTracker {
     missed_direct_pongs: u8,
     last_keepalive_sent_ms: u64,
     last_direct_probe_ms: u64,
     last_direct_pong_ms: u64,
+    last_reverse_ping_ms: u64,
     next_retry_at_ms: u64,
     backoff_ms: u64,
     call_me_maybe_window_start_ms: u64,
@@ -263,6 +266,13 @@ struct PingParams {
     now_ms: u64,
     timeout_ms: u64,
     count_toward_failover: bool,
+}
+
+struct IncomingPingMeta {
+    peer: AuthenticatedPeerInfo,
+    tx_id: [u8; 12],
+    ingress: IngressSource,
+    now_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -520,7 +530,16 @@ impl DiscoEngine {
         };
         match body {
             DiscoBody::Ping => {
-                let (ev, pkts) = self.handle_ping(peer, tx_id, ingress, now_ms);
+                let (ev, pkts) = self.handle_ping(
+                    IncomingPingMeta {
+                        peer,
+                        tx_id,
+                        ingress,
+                        now_ms,
+                    },
+                    peer_map,
+                    filter,
+                );
                 (ev, None, pkts)
             }
             DiscoBody::Pong { observed_addr: _ } => {
@@ -769,11 +788,16 @@ impl DiscoEngine {
 
     fn handle_ping(
         &mut self,
-        peer: AuthenticatedPeerInfo,
-        tx_id: [u8; 12],
-        ingress: IngressSource,
-        now_ms: u64,
+        meta: IncomingPingMeta,
+        peer_map: &PeerMap,
+        filter: &DiscoFilterContext<'_>,
     ) -> (DiscoEvent, Vec<OutboundDiscoPacket>) {
+        let IncomingPingMeta {
+            peer,
+            tx_id,
+            ingress,
+            now_ms,
+        } = meta;
         let (observed_addr, target) = match ingress {
             IngressSource::DirectUdp(addr) => (addr, PeerSendTarget::Direct(addr)),
             IngressSource::Relay { .. } => (
@@ -784,17 +808,53 @@ impl DiscoEngine {
 
         let body = DiscoBody::Pong { observed_addr };
         match self.seal_packet(peer.disco_pubkey, &body, tx_id, now_ms) {
-            Ok(bytes) => (
-                DiscoEvent::RepliedPong {
-                    peer_id: peer.peer_id,
-                    target,
-                },
-                vec![OutboundDiscoPacket {
+            Ok(bytes) => {
+                let mut pkts = vec![OutboundDiscoPacket {
                     peer_id: peer.peer_id,
                     target,
                     bytes,
-                }],
-            ),
+                }];
+                if let IngressSource::DirectUdp(addr) = ingress
+                    && self.is_endpoint_allowed(addr, filter)
+                    && peer_map
+                        .get(&peer.peer_id)
+                        .is_some_and(|s| matches!(s.active_path, PeerActivePath::Relay))
+                {
+                    let should_send_reverse = {
+                        let tracker = self.per_peer.entry(peer.peer_id).or_default();
+                        let ready = tracker.last_reverse_ping_ms == 0
+                            || now_ms.saturating_sub(tracker.last_reverse_ping_ms)
+                                >= DISCO_REVERSE_PING_DEBOUNCE_MS;
+                        if ready {
+                            tracker.last_reverse_ping_ms = now_ms.max(1);
+                        }
+                        ready
+                    };
+                    if should_send_reverse
+                        && let Some((_, reverse_ping)) = self.build_ping_with_tx(PingParams {
+                            peer_id: peer.peer_id,
+                            recipient_disco_pubkey: peer.disco_pubkey,
+                            transport: ProbeTransport {
+                                addr,
+                                source: classify_addr_source(addr),
+                            },
+                            target: PeerSendTarget::Direct(addr),
+                            now_ms,
+                            timeout_ms: DISCO_PROBE_TIMEOUT_MS,
+                            count_toward_failover: false,
+                        })
+                    {
+                        pkts.push(reverse_ping);
+                    }
+                }
+                (
+                    DiscoEvent::RepliedPong {
+                        peer_id: peer.peer_id,
+                        target,
+                    },
+                    pkts,
+                )
+            }
             Err(err) => {
                 warn!(
                     component = "datapath.disco_engine",
@@ -891,6 +951,11 @@ impl DiscoEngine {
                     );
                 }
 
+                for in_flight in self.pending_pings.values_mut() {
+                    if in_flight.peer_id == ctx.peer_id {
+                        in_flight.count_toward_failover = false;
+                    }
+                }
                 let tracker = self.per_peer.entry(ctx.peer_id).or_default();
                 tracker.missed_direct_pongs = 0;
                 tracker.backoff_ms = 0;
@@ -1621,5 +1686,350 @@ mod tests {
         // Assert
         assert!(!disco_a.per_peer.contains_key(&id_b));
         assert!(disco_a.pending_pings.is_empty());
+    }
+
+    // Traces: US-021 AC2, US-026
+    #[test]
+    fn test_simultaneous_hole_punch_early_drop_promotes_both_peers_via_reverse_ping() {
+        // Arrange
+        let nk_a = NodeKeypair::generate();
+        let nk_b = NodeKeypair::generate();
+        let dk_a = DiscoKeypair::generate();
+        let dk_b = DiscoKeypair::generate();
+        let id_a = NodeId::from_bytes([31u8; 16]);
+        let id_b = NodeId::from_bytes([32u8; 16]);
+        let ep_a: SocketAddr = "198.51.100.21:51820".parse().unwrap_or_else(|_| {
+            SocketAddr::from((IpAddr::V4(Ipv4Addr::new(198, 51, 100, 21)), 51820))
+        });
+        let ep_b: SocketAddr = "198.51.100.22:51820".parse().unwrap_or_else(|_| {
+            SocketAddr::from((IpAddr::V4(Ipv4Addr::new(198, 51, 100, 22)), 51820))
+        });
+
+        let relay_map = mesh_proto::netmap::RelayMap {
+            endpoint_version: 1,
+            control_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+            relay_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+            stun_udp_endpoints: vec![],
+        };
+        let pin_set = mesh_proto::netmap::PinSetDto {
+            active_pin: mesh_core::SpkiPin::from_sha256_bytes([1u8; 32]),
+            next_pin: None,
+        };
+        let Ok(overlay_cidr) = "10.100.0.0/16".parse() else {
+            return;
+        };
+        let Ok(name_a) = NodeName::parse("peer-a") else {
+            return;
+        };
+        let Ok(name_b) = NodeName::parse("peer-b") else {
+            return;
+        };
+        let Ok(ip_a) = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 1)) else {
+            return;
+        };
+        let Ok(ip_b) = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 2)) else {
+            return;
+        };
+
+        let mut map_a = PeerMap::new(id_a, nk_a.clone_keypair());
+        map_a.apply_diff(&NetmapSnapshot {
+            netmap_version: 1,
+            generated_at_ms: 1_000,
+            overlay_cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: relay_map.clone(),
+            pin_set: pin_set.clone(),
+            peers: vec![PeerEntry {
+                node_id: id_b,
+                name: name_b,
+                fqdn: "peer-b.mesh.internal".to_owned(),
+                overlay_ip: ip_b,
+                node_pubkey: nk_b.public_key(),
+                disco_pubkey: dk_b.public_key(),
+                endpoints: vec![CandidateEndpoint {
+                    addr: ep_b,
+                    source: CandidateSource::Reflexive,
+                }],
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            }],
+        });
+
+        let mut map_b = PeerMap::new(id_b, nk_b);
+        map_b.apply_diff(&NetmapSnapshot {
+            netmap_version: 1,
+            generated_at_ms: 1_000,
+            overlay_cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map,
+            pin_set,
+            peers: vec![PeerEntry {
+                node_id: id_a,
+                name: name_a,
+                fqdn: "peer-a.mesh.internal".to_owned(),
+                overlay_ip: ip_a,
+                node_pubkey: nk_a.public_key(),
+                disco_pubkey: dk_a.public_key(),
+                endpoints: vec![CandidateEndpoint {
+                    addr: ep_a,
+                    source: CandidateSource::Reflexive,
+                }],
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            }],
+        });
+
+        let mut disco_a = DiscoEngine::new(dk_a, DiscoConfig::default());
+        let mut disco_b = DiscoEngine::new(dk_b, DiscoConfig::default());
+        let cand_ctx = CandidateFilterContext {
+            overlay_cidr,
+            control_tcp_endpoint: None,
+            stun_udp_endpoint: None,
+        };
+        let filter = DiscoFilterContext {
+            candidates: &cand_ctx,
+            excluded_stun: &[],
+        };
+
+        // Act: Peer A's initial ping is dropped before B punches out; Peer B's ping reaches A
+        let _dropped = disco_a.build_interactive_probes(
+            &map_a,
+            &filter,
+            InteractivePingRequest {
+                peer_id: id_b,
+                force_direct: true,
+                now_ms: 1_000,
+                timeout_ms: 3_000,
+            },
+        );
+        let b_pings = disco_b.build_interactive_probes(
+            &map_b,
+            &filter,
+            InteractivePingRequest {
+                peer_id: id_a,
+                force_direct: true,
+                now_ms: 1_020,
+                timeout_ms: 3_000,
+            },
+        );
+        let Some(b_ping) = b_pings.first() else {
+            assert_eq!(b_pings.len(), 1);
+            return;
+        };
+
+        let (_, _, a_pkts) = disco_a.handle_incoming_tracked(
+            &b_ping.1.bytes,
+            IngressSource::DirectUdp(ep_b),
+            &mut map_a,
+            &filter,
+            1_030,
+        );
+        assert_eq!(a_pkts.len(), 2);
+        assert!(
+            a_pkts
+                .iter()
+                .all(|p| p.target == PeerSendTarget::Direct(ep_b))
+        );
+
+        // Second incoming direct Ping within < 500 ms while A is still on Relay must debounce reverse ping
+        let (_, _, debounced_pkts) = disco_a.handle_incoming_tracked(
+            &b_ping.1.bytes,
+            IngressSource::DirectUdp(ep_b),
+            &mut map_a,
+            &filter,
+            1_200,
+        );
+        assert_eq!(debounced_pkts.len(), 1);
+
+        // Feed A's [Pong, reverse Ping] to B -> promotes B to Direct and produces Pong from B
+        let Some(a_pong) = a_pkts.first() else {
+            return;
+        };
+        let Some(a_reverse_ping) = a_pkts.get(1) else {
+            return;
+        };
+        let (ev_b_pong, _, _) = disco_b.handle_incoming_tracked(
+            &a_pong.bytes,
+            IngressSource::DirectUdp(ep_a),
+            &mut map_b,
+            &filter,
+            1_040,
+        );
+        assert!(matches!(ev_b_pong, DiscoEvent::DirectPathVerified { .. }));
+        let (_, _, b_reverse_pong_pkts) = disco_b.handle_incoming_tracked(
+            &a_reverse_ping.bytes,
+            IngressSource::DirectUdp(ep_a),
+            &mut map_b,
+            &filter,
+            1_045,
+        );
+        let Some(b_reverse_pong) = b_reverse_pong_pkts.first() else {
+            assert_eq!(b_reverse_pong_pkts.len(), 1);
+            return;
+        };
+
+        // Feed B's Pong to A -> promotes A to Direct as well
+        let (ev_a_direct, _, _) = disco_a.handle_incoming_tracked(
+            &b_reverse_pong.bytes,
+            IngressSource::DirectUdp(ep_b),
+            &mut map_a,
+            &filter,
+            1_060,
+        );
+
+        // Assert
+        assert!(matches!(ev_a_direct, DiscoEvent::DirectPathVerified { .. }));
+        assert!(matches!(
+            map_a.get(&id_b).map(|s| &s.active_path),
+            Some(&PeerActivePath::Direct { addr, .. }) if addr == ep_b
+        ));
+        assert!(matches!(
+            map_b.get(&id_a).map(|s| &s.active_path),
+            Some(&PeerActivePath::Direct { addr, .. }) if addr == ep_a
+        ));
+    }
+
+    // Traces: REL-01 / NAT Lab Chaos 2
+    #[test]
+    fn test_pre_upgrade_unanswered_hole_punch_pings_do_not_trigger_spurious_failover()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Arrange
+        let nk_a = NodeKeypair::generate();
+        let nk_b = NodeKeypair::generate();
+        let dk_a = DiscoKeypair::generate();
+        let dk_b = DiscoKeypair::generate();
+        let id_a = NodeId::from_bytes([61u8; 16]);
+        let id_b = NodeId::from_bytes([62u8; 16]);
+        let ep_a: SocketAddr = "198.51.100.61:51820".parse()?;
+        let ep_b: SocketAddr = "203.0.113.62:51820".parse()?;
+        let overlay_cidr = OverlayCidr::parse("10.100.0.0/16")?;
+        let relay_map = RelayMap {
+            endpoint_version: 1,
+            control_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+            relay_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+            stun_udp_endpoints: vec![],
+        };
+        let pin_set = PinSetDto {
+            active_pin: SpkiPin::from_sha256_bytes([6u8; 32]),
+            next_pin: None,
+        };
+        let name_a = NodeName::parse("peer-a")?;
+        let name_b = NodeName::parse("peer-b")?;
+        let ip_a = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 1))?;
+        let ip_b = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 2))?;
+
+        let mut map_a = PeerMap::new(id_a, nk_a.clone_keypair());
+        map_a.apply_diff(&NetmapSnapshot {
+            netmap_version: 1,
+            generated_at_ms: 1_000,
+            overlay_cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: relay_map.clone(),
+            pin_set: pin_set.clone(),
+            peers: vec![PeerEntry {
+                node_id: id_b,
+                name: name_b,
+                fqdn: "peer-b.mesh.internal".to_owned(),
+                overlay_ip: ip_b,
+                node_pubkey: nk_b.public_key(),
+                disco_pubkey: dk_b.public_key(),
+                endpoints: vec![CandidateEndpoint {
+                    addr: ep_b,
+                    source: CandidateSource::Reflexive,
+                }],
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            }],
+        });
+
+        let mut map_b = PeerMap::new(id_b, nk_b);
+        map_b.apply_diff(&NetmapSnapshot {
+            netmap_version: 1,
+            generated_at_ms: 1_000,
+            overlay_cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map,
+            pin_set,
+            peers: vec![PeerEntry {
+                node_id: id_a,
+                name: name_a,
+                fqdn: "peer-a.mesh.internal".to_owned(),
+                overlay_ip: ip_a,
+                node_pubkey: nk_a.public_key(),
+                disco_pubkey: dk_a.public_key(),
+                endpoints: vec![CandidateEndpoint {
+                    addr: ep_a,
+                    source: CandidateSource::Reflexive,
+                }],
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            }],
+        });
+
+        let mut disco_a = DiscoEngine::new(dk_a, DiscoConfig::default());
+        let mut disco_b = DiscoEngine::new(dk_b, DiscoConfig::default());
+        let cand_ctx = CandidateFilterContext {
+            overlay_cidr,
+            control_tcp_endpoint: None,
+            stun_udp_endpoint: None,
+        };
+        let filter = DiscoFilterContext {
+            candidates: &cand_ctx,
+            excluded_stun: &[],
+        };
+
+        // Act 1: send 3 unanswered hole-punch pings while peer_b is still on Relay
+        for step in 0..3u64 {
+            let dropped =
+                disco_a.initiate_hole_punch(&map_a, id_b, &[], &filter, 1_000 + step * 100);
+            assert!(
+                dropped
+                    .iter()
+                    .any(|p| matches!(p.target, PeerSendTarget::Direct(addr) if addr == ep_b))
+            );
+        }
+
+        // Act 2: a 4th hole-punch ping succeeds and promotes peer_b to Direct at t=1_520
+        let punch = disco_a.initiate_hole_punch(&map_a, id_b, &[], &filter, 1_500);
+        let direct_ping = punch
+            .into_iter()
+            .find(|p| matches!(p.target, PeerSendTarget::Direct(addr) if addr == ep_b))
+            .ok_or("missing direct punch packet")?;
+        let (_, b_out) = disco_b.handle_incoming(
+            &direct_ping.bytes,
+            IngressSource::DirectUdp(ep_a),
+            &mut map_b,
+            &filter,
+            1_510,
+        );
+        let pong = b_out.first().ok_or("missing pong from disco_b")?;
+        let (ev, _) = disco_a.handle_incoming(
+            &pong.bytes,
+            IngressSource::DirectUdp(ep_b),
+            &mut map_a,
+            &filter,
+            1_520,
+        );
+        assert!(matches!(ev, DiscoEvent::DirectPathVerified { .. }));
+        assert!(matches!(
+            map_a.get(&id_b).map(|s| &s.active_path),
+            Some(&PeerActivePath::Direct { addr, .. }) if addr == ep_b
+        ));
+
+        // Act 3: advance past 3_000 ms timeout of the 3 unanswered pre-upgrade hole-punch pings
+        let events = disco_a.tick(&mut map_a, 4_600);
+
+        // Assert: peer stays Direct with zero spurious failovers
+        assert!(events.is_empty());
+        assert!(matches!(
+            map_a.get(&id_b).map(|s| &s.active_path),
+            Some(&PeerActivePath::Direct { addr, .. }) if addr == ep_b
+        ));
+        assert_eq!(disco_a.metrics_snapshot().direct_failovers, 0);
+        Ok(())
     }
 }

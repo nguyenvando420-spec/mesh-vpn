@@ -41,6 +41,8 @@ discover_interfaces() {
     ip addr replace "${SECONDARY_WAN_IP}/24" dev "${WAN_IF}" 2>/dev/null || true
   fi
 
+  ip route del default dev "${LAN_IF}" 2>/dev/null || true
+
   save_state
 }
 
@@ -128,10 +130,14 @@ start_rogue_tls_server() {
 reset_firewall_and_mtu() {
   stop_mitm_server
 
+  iptables -F INPUT
   iptables -F FORWARD
   iptables -P FORWARD DROP
   iptables -t nat -F PREROUTING
   iptables -t nat -F POSTROUTING
+  # Drop unsolicited inbound WAN UDP to router IP before nf_conntrack confirms an entry
+  # that would rewrite outbound SNAT source ports during simultaneous hole punching.
+  iptables -A INPUT -i "${WAN_IF}" -p udp -m conntrack --ctstate INVALID,NEW -j DROP
 
   ip link set dev "${WAN_IF}" mtu 1500 2>/dev/null || true
   ip link set dev "${LAN_IF}" mtu 1500 2>/dev/null || true
@@ -235,7 +241,7 @@ apply_mode() {
 
   CURRENT_MODE="${mode}"
   save_state
-  conntrack -F >/dev/null 2>&1 || true
+  conntrack -D -p udp >/dev/null 2>&1 || true
   echo "router mode applied: mode=${CURRENT_MODE} wan=${WAN_IF}(${ACTIVE_WAN_IP}) lan=${LAN_IF}"
 }
 
@@ -251,6 +257,7 @@ flap_ip() {
     ACTIVE_WAN_IP="${PRIMARY_WAN_IP}"
   fi
   save_state
+  conntrack -F >/dev/null 2>&1 || true
   apply_mode "${CURRENT_MODE}"
   echo "router NAT IP flapped to ${ACTIVE_WAN_IP} (conntrack flushed)"
 }

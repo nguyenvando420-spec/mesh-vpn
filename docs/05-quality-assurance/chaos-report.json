@@ -1,0 +1,13 @@
+{
+  "suite": "mesh-lab-all-chaos",
+  "generated_at_utc": "2026-11-14T11:57:18Z",
+  "flap_duration_secs": 30,
+  "overall": "PASS",
+  "scenarios": {
+    "us057_lab_smoke": { "status": "PASS", "duration_ms": 53068 },
+    "rel01_kill_server_p2p_continuity": { "status": "PASS", "duration_ms": 8496 },
+    "us074_live_migrate_endpoint_443_8443": { "status": "PASS", "duration_ms": 3987 },
+    "rel12_backup_wipe_restore_pin": { "status": "PASS", "duration_ms": 5838 },
+    "us028_udp_blocked_443_only": { "status": "PASS", "duration_ms": 109132 }
+  }
+}
