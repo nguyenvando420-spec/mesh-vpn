@@ -130,6 +130,40 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
 
+      - name: Run SLO verification suite (Unix - US-058)
+        if: matrix.platform != 'windows' && matrix.target != 'x86_64-apple-darwin'
+        run: bash scripts/run-slo-suite.sh --skip-static-checks --output-dir "$RUNNER_TEMP/slo-report"
+
+      - name: Verify SLO gate fails closed on --simulate-fail (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          set +e
+          bash scripts/run-slo-suite.sh --skip-static-checks --simulate-fail --output-dir "$RUNNER_TEMP/slo-fail-check"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "ERROR: run-slo-suite.sh --simulate-fail unexpectedly exited 0" >&2
+            exit 1
+          fi
+          echo "Verified fail-closed SLO gate exit code: $rc"
+
+      - name: Run SLO verification suite (Windows - US-058)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/run-slo-suite.ps1 -SkipStaticChecks -OutputDir "$env:RUNNER_TEMP\slo-report"
+
+      - name: Verify SLO gate fails closed on -SimulateFail (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $failDir = Join-Path $env:RUNNER_TEMP 'slo-fail-check'
+          & powershell -ExecutionPolicy Bypass -File scripts/run-slo-suite.ps1 -SkipStaticChecks -SimulateFail -OutputDir $failDir
+          $rc = $LASTEXITCODE
+          if ($rc -eq 0) {
+            throw "run-slo-suite.ps1 -SimulateFail unexpectedly exited 0"
+          }
+          Write-Output "Verified fail-closed SLO gate exit code: $rc"
+
       - name: Download & verify Wintun 0.14.1 and export MESH_WINTUN_SHA256 (Windows)
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -156,16 +190,14 @@ jobs:
             throw "Invalid computed wintun.dll SHA-256: $dllSha256"
           }
           Copy-Item -LiteralPath $dllPath -Destination (Join-Path $stageDir 'wintun.dll') -Force
-          $licenseFile = Get-ChildItem -Path (Join-Path $tmpDir 'wintun') -Filter 'LICENSE*' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($licenseFile) {
-            Copy-Item -LiteralPath $licenseFile.FullName -Destination (Join-Path $stageDir 'WINTUN-LICENSE.txt') -Force
+          $licenseFile = Get-ChildItem -Path $tmpDir -Filter 'LICENSE*' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $licenseFile) {
+            throw "LICENSE file not found inside wintun-0.14.1.zip"
           }
-          $readmeFile = Get-ChildItem -Path (Join-Path $tmpDir 'wintun') -Filter 'README*' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          Copy-Item -LiteralPath $licenseFile.FullName -Destination (Join-Path $stageDir 'WINTUN-LICENSE.txt') -Force
+          $readmeFile = Get-ChildItem -Path $tmpDir -Filter 'README*' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($readmeFile) {
             Copy-Item -LiteralPath $readmeFile.FullName -Destination (Join-Path $stageDir 'README-WINTUN.md') -Force
-            if (-not $licenseFile) {
-              Copy-Item -LiteralPath $readmeFile.FullName -Destination (Join-Path $stageDir 'WINTUN-LICENSE.txt') -Force
-            }
           }
           "MESH_WINTUN_SHA256=$dllSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "MESH_WINTUN_STAGE_DIR=$stageDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -211,10 +243,10 @@ jobs:
           done
 
           if [ "${{ matrix.platform }}" = "linux" ]; then
-            mkdir -p "$STAGE/scripts" "$STAGE/deploy/systemd"
-            cp scripts/install-server.sh "$STAGE/scripts/"
-            cp deploy/systemd/mesh-server.service "$STAGE/deploy/systemd/"
-            cp deploy/systemd/meshd.service "$STAGE/deploy/systemd/"
+            mkdir -p "$STAGE/scripts" "$STAGE/deploy/systemd" "$STAGE/deploy/linux-desktop"
+            cp scripts/install-linux.sh scripts/install-server.sh "$STAGE/scripts/"
+            cp deploy/systemd/* "$STAGE/deploy/systemd/"
+            cp deploy/linux-desktop/* "$STAGE/deploy/linux-desktop/"
           elif [ "${{ matrix.platform }}" = "macos" ]; then
             mkdir -p "$STAGE/scripts" "$STAGE/deploy/launchd"
             cp scripts/install-macos.sh "$STAGE/scripts/"
