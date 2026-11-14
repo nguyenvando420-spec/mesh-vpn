@@ -26,7 +26,8 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::WebSocket;
 
     use mesh_core::{
-        AppError, Clock as _, ErrorKind, FakeClock, KeyId, NodeName, SpkiPin, SystemClock,
+        AppError, Clock as _, ErrorKind, FakeClock, KeyId, NodeName, PublicKey, SpkiPin,
+        SystemClock,
     };
     use mesh_crypto::{
         DiscoKeypair, NodeKeypair, PinSet, PreAuthToken, ProofPayload, build_pinned_client_config,
@@ -117,6 +118,7 @@ mod tests {
     struct SpawnedServer {
         _dir: TempDir,
         _guard: ServerChildGuard,
+        pid: u32,
         ctrl_port: u16,
         obs_port: u16,
         state_dir: PathBuf,
@@ -304,12 +306,14 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn mesh-server");
+        let pid = child.id();
         let guard = ServerChildGuard { child: Some(child) };
         let boot_ms = wait_for_readyz(obs_port).await;
 
         SpawnedServer {
             _dir: dir,
             _guard: guard,
+            pid,
             ctrl_port,
             obs_port,
             state_dir,
@@ -792,29 +796,29 @@ mod tests {
             .text()
             .await
             .expect("text");
-        let rss_bytes = parse_prometheus_gauge(&metrics_text, "mesh_process_resident_memory_bytes")
-            .unwrap_or(0.0);
+        let prom_rss_bytes =
+            parse_prometheus_gauge(&metrics_text, "mesh_process_resident_memory_bytes")
+                .filter(|&bytes| bytes > 0.0);
+        let rss_bytes = prom_rss_bytes
+            .or_else(|| measure_process_rss_bytes(srv.pid).map(|bytes| bytes as f64))
+            .expect("live server RSS/WorkingSet bytes must be observable");
         let db_bytes = fs::metadata(srv.state_dir.join("control.redb"))
             .map(|m| m.len())
             .unwrap_or(0);
-        let measured_mb = if rss_bytes > 0.0 {
-            rss_bytes / (1024.0 * 1024.0)
-        } else {
-            (db_bytes as f64) / (1024.0 * 1024.0)
-        };
-        let detail = if rss_bytes > 0.0 {
-            format!("20-node live /metrics RSS={measured_mb:.2} MiB")
-        } else {
-            format!(
-                "non-Linux host (/proc RSS=0); 20-node redb footprint={measured_mb:.3} MiB (VPS RSS checked in Linux/Docker lab)"
-            )
-        };
+        let measured_mb = rss_bytes / (1024.0 * 1024.0);
+        let redb_mb = (db_bytes as f64) / (1024.0 * 1024.0);
+        let detail =
+            format!("20-node live process RSS={measured_mb:.2} MiB; control.redb={redb_mb:.3} MiB");
+        assert!(
+            measured_mb > 0.0 && measured_mb <= 128.0,
+            "PERF-01 live RSS {measured_mb:.2} MiB outside (0.0, 128.0]"
+        );
         emit_slo_metric(
             "PERF-01",
             "Idle 20-node control plane footprint",
             json!(measured_mb),
             ("<= 128.0", "MiB"),
-            measured_mb <= 128.0,
+            measured_mb > 0.0 && measured_mb <= 128.0,
             &detail,
         );
         emit_slo_metric(
@@ -825,6 +829,53 @@ mod tests {
             p95_ms <= 5000.0,
             "4 live TLS WebSocket subscribers observed netmap arrival with 20 peers",
         );
+    }
+
+    fn measure_process_rss_bytes(pid: u32) -> Option<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:")
+                    && let Some(kib_str) = rest.split_whitespace().next()
+                    && let Ok(kib) = kib_str.parse::<u64>()
+                {
+                    return Some(kib.saturating_mul(1024));
+                }
+            }
+            None
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let out = Command::new("/bin/ps")
+                .args(["-o", "rss=", "-p", &pid.to_string()])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let raw = String::from_utf8(out.stdout).ok()?;
+            let kib = raw.trim().parse::<u64>().ok()?;
+            Some(kib.saturating_mul(1024))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!("(Get-Process -Id {pid}).WorkingSet64");
+            let out = Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let raw = String::from_utf8(out.stdout).ok()?;
+            raw.trim().parse::<u64>().ok()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            let _ = pid;
+            None
+        }
     }
 
     struct RelayProbeIdentity {
@@ -838,34 +889,16 @@ mod tests {
         dkp_d: DiscoKeypair,
     }
 
-    fn execute_relay_hol_and_throttle_sync(
-        port: u16,
-        pin: SpkiPin,
-        ids: RelayProbeIdentity,
-    ) -> (f64, bool) {
-        let mut ws_a = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_a, &ids.dkp_a);
-        let mut ws_b = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_b, &ids.dkp_b);
-        let ws_c_paused = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_c, &ids.dkp_c);
-        let mut ws_d = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_d, &ids.dkp_d);
+    const PERF11_GOOD_FRAME_BYTES: usize = 1_200;
+    const PERF11_BURST_FRAMES: usize = 150;
+    const PERF11_PACED_BATCH_FRAMES: usize = 50;
+    const PERF11_PACED_BATCH_COUNT: usize = 41;
+    const PERF11_TOTAL_GOOD_FRAMES: usize =
+        PERF11_BURST_FRAMES + PERF11_PACED_BATCH_FRAMES * PERF11_PACED_BATCH_COUNT;
 
-        // Stream 1: saturate paused node_c & exceed 625KB 20 Mbps burst -> triggers Throttled
-        let flood_ct = Bytes::from(vec![0xaa_u8; 1_400]);
-        ws_a.get_mut()
-            .sock
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("set timeout");
-        for _ in 0..550 {
-            let frame = RelayFrame::ClientToPeerPacket {
-                dst_pubkey: ids.kp_c.public_key(),
-                ciphertext: flood_ct.clone(),
-            }
-            .encode()
-            .expect("encode flood");
-            ws_a.send(WsMessage::Binary(frame)).expect("send flood");
-        }
-        let mut got_throttle = false;
-        let deadline = Instant::now();
-        while deadline.elapsed() < Duration::from_secs(2) {
+    fn drain_ws_throttle_notices(ws_a: &mut WebSocket<PinnedTlsStream>) -> bool {
+        let mut throttled = false;
+        loop {
             match ws_a.read() {
                 Ok(WsMessage::Binary(raw)) => {
                     if matches!(
@@ -874,8 +907,7 @@ mod tests {
                             code: RelayNoticeCode::Throttled
                         })
                     ) {
-                        got_throttle = true;
-                        break;
+                        throttled = true;
                     }
                 }
                 Err(tungstenite::Error::Io(e))
@@ -889,34 +921,142 @@ mod tests {
                 _ => break,
             }
         }
+        throttled
+    }
 
-        // Stream 2: concurrent node_d -> node_b must proceed cleanly without HoL stall
-        let good_ct = Bytes::from(vec![0x55_u8; 1_200]);
-        let t0 = Instant::now();
-        for _ in 0..150 {
+    fn spawn_ws_a_saturation(
+        mut ws_a: WebSocket<PinnedTlsStream>,
+        dst_c_pk: PublicKey,
+        stop_flood: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || {
+            let flood_ct = Bytes::from(vec![0xaa_u8; 1_400]);
+            if ws_a
+                .get_mut()
+                .sock
+                .set_read_timeout(Some(Duration::from_millis(40)))
+                .is_err()
+            {
+                return false;
+            }
             let frame = RelayFrame::ClientToPeerPacket {
-                dst_pubkey: ids.kp_b.public_key(),
-                ciphertext: good_ct.clone(),
+                dst_pubkey: dst_c_pk,
+                ciphertext: flood_ct,
             }
             .encode()
-            .expect("encode good");
-            ws_d.send(WsMessage::Binary(frame)).expect("send good");
-        }
-        let mut rx_good = 0_usize;
-        while rx_good < 150 && t0.elapsed() < Duration::from_secs(4) {
-            if let Ok(WsMessage::Binary(raw)) = ws_b.read()
-                && let Ok(RelayFrame::RelayToClientPacket { src_pubkey, .. }) =
-                    RelayFrame::decode(&raw)
+            .expect("encode flood");
+            for _ in 0..550 {
+                if ws_a.send(WsMessage::Binary(frame.clone())).is_err() {
+                    break;
+                }
+            }
+            let mut got_throttle = drain_ws_throttle_notices(&mut ws_a);
+            let deadline = Instant::now();
+            while !stop_flood.load(Ordering::Relaxed) && deadline.elapsed() < Duration::from_secs(8)
             {
-                assert_eq!(src_pubkey, ids.kp_d.public_key());
-                rx_good += 1;
+                for _ in 0..128 {
+                    if ws_a.send(WsMessage::Binary(frame.clone())).is_err() {
+                        break;
+                    }
+                }
+                if drain_ws_throttle_notices(&mut ws_a) {
+                    got_throttle = true;
+                }
+            }
+            got_throttle
+        })
+    }
+
+    fn spawn_ws_b_reader(
+        mut ws_b: WebSocket<PinnedTlsStream>,
+        expected_src: PublicKey,
+        expected_frames: usize,
+    ) -> std::thread::JoinHandle<usize> {
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut rx_good = 0_usize;
+            while rx_good < expected_frames && start.elapsed() < Duration::from_secs(10) {
+                match ws_b.read() {
+                    Ok(WsMessage::Binary(raw)) => {
+                        if let Ok(RelayFrame::RelayToClientPacket { src_pubkey, .. }) =
+                            RelayFrame::decode(&raw)
+                        {
+                            assert_eq!(src_pubkey, expected_src);
+                            rx_good += 1;
+                        }
+                    }
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) | Ok(_) => break,
+                }
+            }
+            rx_good
+        })
+    }
+
+    fn execute_relay_hol_and_throttle_sync(
+        port: u16,
+        pin: SpkiPin,
+        ids: RelayProbeIdentity,
+        start_tx: tokio::sync::oneshot::Sender<()>,
+        mut tick_rx: tokio::sync::mpsc::Receiver<()>,
+    ) -> (f64, bool) {
+        let ws_a = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_a, &ids.dkp_a);
+        let ws_b = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_b, &ids.dkp_b);
+        let ws_c_paused = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_c, &ids.dkp_c);
+        let mut ws_d = connect_signed_ws_sync(port, pin, "/v1/relay", &ids.kp_d, &ids.dkp_d);
+
+        let stop_flood = Arc::new(AtomicBool::new(false));
+        let flood_handle =
+            spawn_ws_a_saturation(ws_a, ids.kp_c.public_key(), Arc::clone(&stop_flood));
+        let reader_handle =
+            spawn_ws_b_reader(ws_b, ids.kp_d.public_key(), PERF11_TOTAL_GOOD_FRAMES);
+
+        let good_ct = Bytes::from(vec![0x55_u8; PERF11_GOOD_FRAME_BYTES]);
+        let good_frame = RelayFrame::ClientToPeerPacket {
+            dst_pubkey: ids.kp_b.public_key(),
+            ciphertext: good_ct,
+        }
+        .encode()
+        .expect("encode good");
+
+        let t0 = Instant::now();
+        for _ in 0..PERF11_BURST_FRAMES {
+            ws_d.send(WsMessage::Binary(good_frame.clone()))
+                .expect("send initial good burst");
+        }
+        assert!(start_tx.send(()).is_ok(), "signal relay pacer start");
+        for _ in 0..PERF11_PACED_BATCH_COUNT {
+            assert!(
+                tick_rx.blocking_recv().is_some(),
+                "relay pacer exited early"
+            );
+            for _ in 0..PERF11_PACED_BATCH_FRAMES {
+                ws_d.send(WsMessage::Binary(good_frame.clone()))
+                    .expect("send paced good batch");
             }
         }
+
+        let rx_good = reader_handle.join().expect("join ws_b reader");
+        let elapsed = t0.elapsed();
+        stop_flood.store(true, Ordering::SeqCst);
+        let got_throttle = flood_handle.join().expect("join ws_a saturation");
         assert_eq!(
-            rx_good, 150,
-            "concurrent non-congested relay stream lost frames"
+            rx_good, PERF11_TOTAL_GOOD_FRAMES,
+            "concurrent non-congested relay stream lost frames ({rx_good}/{PERF11_TOTAL_GOOD_FRAMES})"
         );
-        let mbps = ((rx_good * 1_200 * 8) as f64) / (t0.elapsed().as_secs_f64() * 1_000_000.0);
+        let total_bytes = rx_good * PERF11_GOOD_FRAME_BYTES;
+        assert!(
+            total_bytes > 625_000,
+            "PERF-11 payload {total_bytes} B did not exceed 625 KB initial burst"
+        );
+        let mbps = ((total_bytes * 8) as f64) / (elapsed.as_secs_f64() * 1_000_000.0);
         drop(ws_c_paused);
         (mbps, got_throttle)
     }
@@ -942,17 +1082,42 @@ mod tests {
             dkp_d: n_d.disco_kp.clone_keypair(),
         };
 
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (tick_tx, tick_rx) = tokio::sync::mpsc::channel(16);
+        let pacer = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            for _ in 0..PERF11_PACED_BATCH_COUNT {
+                tokio::time::sleep(Duration::from_millis(36)).await;
+                if tick_tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         // Act
         let (good_mbps, got_throttle) = tokio::task::spawn_blocking(move || {
-            execute_relay_hol_and_throttle_sync(port, pin, ids)
+            execute_relay_hol_and_throttle_sync(port, pin, ids, start_tx, tick_rx)
         })
         .await
         .expect("relay task");
+        pacer.await.expect("pacer task");
 
         // Assert
         assert!(
             got_throttle,
             "20 Mbps TokenBucket did not emit Throttled notice"
+        );
+        assert!(
+            good_mbps >= 2.0,
+            "sustained non-congested relay throughput {good_mbps:.2} Mbps < 2.0 Mbps"
+        );
+        let detail = format!(
+            "stream a->c saturated mpsc(256)+20Mbps throttle while d->b received {}/{} frames ({:.2} MB > 625 KB burst) at {good_mbps:.2} Mbps",
+            PERF11_TOTAL_GOOD_FRAMES,
+            PERF11_TOTAL_GOOD_FRAMES,
+            ((PERF11_TOTAL_GOOD_FRAMES * PERF11_GOOD_FRAME_BYTES) as f64) / 1_000_000.0,
         );
         emit_slo_metric(
             "PERF-11",
@@ -960,7 +1125,7 @@ mod tests {
             json!(good_mbps),
             (">= 2.0", "Mbps"),
             good_mbps >= 2.0 && got_throttle,
-            "stream a->c saturated mpsc(256)+20Mbps throttle while d->b received 150/150 frames cleanly",
+            &detail,
         );
         emit_slo_metric(
             "SEC-07",

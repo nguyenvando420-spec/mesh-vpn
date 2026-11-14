@@ -597,7 +597,7 @@ mod tests {
             details: "CancellationToken closed TUN and stopped DatapathEngine within 5s budget",
         });
         emit_metric(MetricSpec {
-            id: "PERF-11",
+            id: "PERF-11-QUEUE",
             name: "Client Blind Relay mpsc(256) HoL isolation & 20 Mbps constant",
             measured: format!("{good_ok}"),
             threshold: "== 128",
@@ -658,6 +658,55 @@ mod tests {
         (antiloop_ok, applied_ok)
     }
 
+    fn measure_self_rss_mib() -> f64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(status) = fs::read_to_string("/proc/self/status") {
+                for line in status.lines() {
+                    if let Some(rest) = line.strip_prefix("VmRSS:")
+                        && let Some(kib_str) = rest.split_whitespace().next()
+                        && let Ok(kib) = kib_str.parse::<u64>()
+                    {
+                        return (kib as f64) / 1024.0;
+                    }
+                }
+            }
+            0.0
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let pid = std::process::id().to_string();
+            if let Ok(out) = std::process::Command::new("/bin/ps")
+                .args(["-o", "rss=", "-p", &pid])
+                .output()
+                && out.status.success()
+                && let Ok(raw) = String::from_utf8(out.stdout)
+                && let Ok(kib) = raw.trim().parse::<u64>()
+            {
+                return (kib as f64) / 1024.0;
+            }
+            0.0
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let script = format!("(Get-Process -Id {}).WorkingSet64", std::process::id());
+            if let Ok(out) = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                && out.status.success()
+                && let Ok(raw) = String::from_utf8(out.stdout)
+                && let Ok(bytes) = raw.trim().parse::<u64>()
+            {
+                return (bytes as f64) / (1024.0 * 1024.0);
+            }
+            0.0
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            0.0
+        }
+    }
+
     #[test]
     fn test_slo_datapath_footprint_perf09_antiloop_rel09_cryptokey_sec11_hosts_plat04() {
         // Arrange: 20-peer PeerMap + static PacketBuffers + secret redaction
@@ -670,6 +719,7 @@ mod tests {
         let diff = map.apply_diff(&make_snapshot(5, peers));
         assert_eq!(diff.added, 20);
         assert_eq!(map.len(), 20);
+        let packet_buffers: [PacketBuffer; 4] = [[0_u8; MAGIC_SOCKET_BUFFER_SIZE]; 4];
 
         let cidr = "100.115.0.0/16".parse::<OverlayCidr>().expect("cidr");
         let secret = Secret::new([0x7b_u8; 32]);
@@ -686,22 +736,31 @@ mod tests {
             && validator.metrics_snapshot().spoofed_packets_dropped == 1;
         let (rel09_ok, plat04_ok) = verify_antiloop_and_hosts(cidr);
 
-        // Estimate bounded static datapath structs + 4 static PacketBuffers (MiB)
-        let bytes = map.len() * std::mem::size_of::<mesh_datapath::PeerSession>()
-            + 4 * std::mem::size_of::<PacketBuffer>()
+        // Measure live process RSS/WorkingSet while holding PeerMap(20) + 4 x PacketBuffer(2048)
+        let struct_bytes = map.len() * std::mem::size_of::<mesh_datapath::PeerSession>()
+            + std::mem::size_of_val(&packet_buffers)
             + std::mem::size_of::<PeerMap>();
-        let mib = (bytes as f64) / (1024.0 * 1024.0);
+        let struct_mib = (struct_bytes as f64) / (1024.0 * 1024.0);
+        let rss_mib = measure_self_rss_mib();
+        std::hint::black_box((map.len(), packet_buffers[0][0]));
 
         // Assert & Emit
-        assert!(mib < 64.0 && sec01_ok && sec11_ok && rel09_ok && plat04_ok);
+        assert!(
+            rss_mib > 0.0 && rss_mib <= 50.0,
+            "live datapath RSS {rss_mib:.2} MiB outside (0.0, 50.0]"
+        );
+        assert!(struct_mib < 5.0 && sec01_ok && sec11_ok && rel09_ok && plat04_ok);
+        let details = format!(
+            "live process RSS={rss_mib:.2} MiB; bounded PeerMap(20)+4xPacketBuffer(2048) struct_mib={struct_mib:.6} MiB"
+        );
         emit_metric(MetricSpec {
             id: "PERF-09",
             name: "Idle datapath in-memory bounded footprint (20 peers + 4x2KB bufs)",
-            measured: format!("{mib:.6}"),
-            threshold: "<= 64.0",
+            measured: format!("{rss_mib:.2}"),
+            threshold: "<= 50.0",
             unit: "MiB",
-            passed: mib <= 64.0,
-            details: "bounded PeerMap(20) + static 2048B PacketBuffers (daemon RSS verified in Linux lab)",
+            passed: rss_mib > 0.0 && rss_mib <= 50.0 && struct_mib < 5.0,
+            details: &details,
         });
         emit_metric(MetricSpec {
             id: "SEC-01",

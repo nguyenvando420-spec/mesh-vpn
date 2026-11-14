@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
+
 DAEMON_DIR="/usr/local/libexec/mesh"
 DAEMON_BIN="${DAEMON_DIR}/meshd"
 CLI_BIN="/usr/local/bin/mesh"
@@ -156,7 +159,19 @@ do_install() {
   meshd_src="${FROM_DIR}/meshd"
   mesh_src="${FROM_DIR}/mesh"
   if [ -z "${PLIST_SRC}" ]; then
-    PLIST_SRC="${FROM_DIR}/deploy/launchd/internal.mesh.meshd.plist"
+    for candidate in \
+      "${FROM_DIR}/internal.mesh.meshd.plist" \
+      "${FROM_DIR}/deploy/launchd/internal.mesh.meshd.plist" \
+      "${SCRIPT_DIR}/internal.mesh.meshd.plist" \
+      "${REPO_ROOT}/deploy/launchd/internal.mesh.meshd.plist"; do
+      if [ -f "${candidate}" ]; then
+        PLIST_SRC="${candidate}"
+        break
+      fi
+    done
+    if [ -z "${PLIST_SRC}" ]; then
+      PLIST_SRC="${FROM_DIR}/deploy/launchd/internal.mesh.meshd.plist"
+    fi
   fi
   if [ -z "${CHECKSUMS_FILE}" ] && [ -f "${FROM_DIR}/SHA256SUMS" ]; then
     CHECKSUMS_FILE="${FROM_DIR}/SHA256SUMS"

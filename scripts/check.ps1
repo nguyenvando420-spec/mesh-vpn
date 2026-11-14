@@ -48,28 +48,36 @@ try {
 
     Write-Host "==> [2/5] Enforcing static repository & security rules..." -ForegroundColor Cyan
 
-    # 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF) across text files
-    $TextExtensions = @(".rs", ".toml", ".md", ".ps1", ".sh", ".json", ".yml", ".yaml", ".editorconfig", ".gitattributes", ".gitignore")
+    # 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF) and LF line endings across text files
+    $TextExtensions = @(".rs", ".toml", ".md", ".ps1", ".sh", ".json", ".yml", ".yaml", ".plist", ".service", ".editorconfig", ".gitattributes", ".gitignore")
     $AllFiles = Get-ChildItem -Path $RepoRoot -Recurse -File -Force | Where-Object {
         $_.FullName -notlike "*\.git\*" -and
         $_.FullName -notlike "*\target\*" -and
-        $_.FullName -notlike "*\docs\04-sprint-management\*"
+        $_.FullName -notlike "*\lab\.tmp\*"
     }
 
     $BomFailures = @()
+    $CrlfFailures = @()
     foreach ($file in $AllFiles) {
         $ext = $file.Extension.ToLowerInvariant()
         if ($TextExtensions -contains $ext -or $TextExtensions -contains $file.Name.ToLowerInvariant()) {
-            if ($file.Length -ge 3) {
-                $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
-                if ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-                    $BomFailures += $file.FullName
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+                $BomFailures += $file.FullName
+            }
+            if ($ext -ne ".ps1" -and $ext -ne ".bat" -and $ext -ne ".cmd") {
+                if ([System.Array]::IndexOf($bytes, [byte]0x0D) -ge 0) {
+                    $CrlfFailures += $file.FullName
                 }
             }
         }
     }
     if ($BomFailures.Count -gt 0) {
         Write-Error "UTF-8 BOM detected in files (must be UTF-8 without BOM):`n  $($BomFailures -join "`n  ")"
+        exit 1
+    }
+    if ($CrlfFailures.Count -gt 0) {
+        Write-Error "CRLF/CR line endings detected in files (must be LF):`n  $($CrlfFailures -join "`n  ")"
         exit 1
     }
 

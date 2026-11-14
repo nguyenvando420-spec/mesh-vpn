@@ -240,7 +240,9 @@ Create your first pre-auth key (as root or member of mesh-admin):
     -d '{"ttl_secs":3600,"reusable":false,"max_uses":1,"is_ephemeral":false,"ephemeral_timeout_secs":null,"target_node":null}' \\
     http://localhost/v1/admin/preauth-keys
 
-Client join command template:
-  mesh up --server https://${PUBLIC_HOST}:${TCP_PORT} --server-pin ${ACTIVE_PIN} --authkey-file /run/mesh/preauth.key
+Client join command template (pass pre-auth key via stdin or a chmod 0600 --authkey-file ./preauth.key):
+  printf '%s\n' '<PREAUTH_KEY>' | sudo mesh up --server ${PUBLIC_HOST}:${TCP_PORT} --server-pin ${ACTIVE_PIN} --authkey-stdin
+  # Or using a protected 0600 key file (e.g., Windows/macOS):
+  # mesh up --server ${PUBLIC_HOST}:${TCP_PORT} --server-pin ${ACTIVE_PIN} --authkey-file ./preauth.key
 ====================================================================
 EOF

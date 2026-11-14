@@ -20,6 +20,8 @@ CI job `release-build-matrix` (`.github/workflows/ci.yml`) builds and packages t
 | `x86_64-pc-windows-gnu` | Workspace `--all-targets` compile check | Ensures MinGW toolchain compatibility in CI (`check-windows` / matrix) | Compile Check |
 
 > **Note on macOS Packaging:** MVP (`0.1.0`) distributes tarballs + `SHA256SUMS` via `scripts/install-macos.sh`. Signed & Apple-notarized `.pkg` installers are scoped for Phase 2+. Never disable Gatekeeper (`spctl --master-disable`).
+>
+> **Note on Windows `MESH_WINTUN_SHA256` Compile-Time Pin:** `meshd.exe` embeds the verified `wintun.dll` SHA-256 at compile time (`option_env!("MESH_WINTUN_SHA256")`). CI sets this automatically in `release-build-matrix`; for manual Windows release builds run `$env:MESH_WINTUN_SHA256 = (Get-FileHash .\dist\wintun.dll -Algorithm SHA256).Hash.ToLowerInvariant()` prior to `cargo build --release` (otherwise `mesh up` fails closed with `PermissionDenied`).
 
 ---
 

@@ -131,7 +131,7 @@ SLO_CHAOS_STATUS="${CHAOS_STATUS}" \
 SLO_CHAOS_DETAILS="${CHAOS_DETAILS}" \
 SLO_SIMULATE_FAIL="${SIMULATE_FAIL}" \
 "${PYTHON_BIN}" - <<'PY'
-import glob, json, os, platform, re, sys
+import glob, json, os, platform, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
 from datetime import datetime, timezone
 
 repo_root = os.environ["SLO_REPO_ROOT"]
@@ -176,6 +176,127 @@ if os.path.isfile(slo_log_path):
                 except Exception as exc:
                     print(f"WARN: failed parsing SLO_METRIC line: {exc}", file=sys.stderr)
 
+def _free_port(sock_type):
+    with socket.socket(socket.AF_INET, sock_type) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+def measure_release_mesh_server_rss():
+    target_root = os.path.join(repo_root, "target")
+    if not os.path.isdir(target_root):
+        return
+    server_bin = None
+    for root, _dirs, files in os.walk(target_root):
+        if os.path.basename(root) == "release":
+            for cand_name in ("mesh-server", "mesh-server.exe"):
+                cand_path = os.path.join(root, cand_name)
+                if os.path.isfile(cand_path) and os.access(cand_path, os.X_OK):
+                    server_bin = cand_path
+                    break
+        if server_bin:
+            break
+    if not server_bin:
+        return
+
+    srv_tmp = tempfile.mkdtemp(prefix="mesh-srv-rss-")
+    state_dir = os.path.join(srv_tmp, "state")
+    run_dir = os.path.join(srv_tmp, "run")
+    proc = None
+    ready = False
+    rss_mib = None
+    err_msg = ""
+    stderr_log = os.path.join(srv_tmp, "stderr.log")
+    stderr_fh = None
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        os.makedirs(run_dir, mode=0o700, exist_ok=True)
+        ctrl_port = _free_port(socket.SOCK_STREAM)
+        obs_port = _free_port(socket.SOCK_STREAM)
+        while obs_port == ctrl_port:
+            obs_port = _free_port(socket.SOCK_STREAM)
+        stun_port = _free_port(socket.SOCK_DGRAM)
+        cfg_path = os.path.join(srv_tmp, "server.toml")
+        toml_body = "\n".join([
+            'control_bind_ip = "127.0.0.1"',
+            f"control_tcp_port = {ctrl_port}",
+            'stun_bind_ip = "127.0.0.1"',
+            f"stun_udp_port = {stun_port}",
+            f'obs_bind_addr = "127.0.0.1:{obs_port}"',
+            'public_host = "127.0.0.1"',
+            f'state_dir = "{state_dir.replace(os.sep, "/")}"',
+            f'admin_socket_path = "{os.path.join(run_dir, "admin.sock").replace(os.sep, "/")}"',
+            'admin_group_name = "nonexistent-slo-admin-grp"',
+            'tls_mode = "ip_pinned"',
+            "",
+        ])
+        with open(cfg_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(toml_body)
+        stderr_fh = open(stderr_log, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            [server_bin, "--config", cfg_path],
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_fh,
+            text=True,
+        )
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                err_msg = f"process exited early with code {proc.returncode}"
+                break
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{obs_port}/readyz", timeout=1.0) as resp:
+                    if resp.status == 200:
+                        ready = True
+                        break
+            except Exception:
+                time.sleep(0.15)
+        if ready and proc.poll() is None:
+            ps_out = subprocess.check_output(
+                ["ps", "-o", "rss=", "-p", str(proc.pid)],
+                text=True,
+            ).strip()
+            rss_kib = int(ps_out.splitlines()[0].strip())
+            rss_mib = round(rss_kib / 1024.0, 3)
+        elif not err_msg:
+            err_msg = "/readyz did not become healthy within 10s"
+    except Exception as exc:
+        err_msg = str(exc)
+    finally:
+        if stderr_fh is not None:
+            stderr_fh.close()
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5.0)
+        shutil.rmtree(srv_tmp, ignore_errors=True)
+
+    rel_bin = os.path.relpath(server_bin, repo_root).replace(os.sep, "/")
+    passed = ready and (rss_mib is not None) and (rss_mib <= 128.0)
+    details = (
+        f"Release binary {rel_bin} live ps RSS={rss_mib} MiB at /readyz 200 OK"
+        if ready and rss_mib is not None
+        else f"Release binary {rel_bin} RSS probe failed: {err_msg}"
+    )
+    rec = {
+        "id": "PERF-01",
+        "name": "Idle Control server memory footprint (release binary RSS)",
+        "measured": rss_mib if (ready and rss_mib is not None) else None,
+        "threshold": "<= 128.0",
+        "unit": "MiB",
+        "status": "PASS" if passed else "FAIL",
+        "method": "empirical_release_process_rss",
+        "details": details,
+    }
+    with open(os.path.join(metrics_dir, "server-PERF-01.json"), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(rec, fh)
+        fh.write("\n")
+    raw_map["server-PERF-01"] = rec
+
+measure_release_mesh_server_rss()
+
 chaos_obj = None
 if os.path.isfile(chaos_json_path):
     try:
@@ -190,7 +311,7 @@ if os.path.isfile(chaos_json_path):
 
 required_empirical = [
     "PERF-01", "PERF-03", "PERF-04", "PERF-05", "PERF-06", "PERF-07", "PERF-08",
-    "PERF-09", "PERF-10", "PERF-11", "PERF-12",
+    "PERF-09", "PERF-10", "PERF-11", "PERF-11-QUEUE", "PERF-12",
     "SEC-01", "SEC-03", "SEC-04", "SEC-05", "SEC-06", "SEC-07", "SEC-08", "SEC-11", "SEC-14", "SEC-15",
     "REL-01", "REL-06", "REL-08", "REL-09", "REL-10", "REL-12",
     "PLAT-04", "OPS-05", "OPS-06",
@@ -242,7 +363,7 @@ checks.append({
 })
 
 cli_ok = (cli_exit == 0)
-ops_suffix = "; live container CLI ping/netcheck/status verified in Docker lab" if chaos_status == "PASS" else "; live OS tunnel/IPC round-trip checked in Docker lab"
+ops_suffix = "; live container CLI ping/netcheck/status verified in Docker lab" if chaos_status == "PASS" else "; verified via integration & CLI/IPC suites (Docker lab pending_external_lab)"
 checks.append({
     "id": "OPS-02",
     "name": "Diagnostic `mesh status` output (IP:port, pin/CA, utun/adapter)",
@@ -384,7 +505,7 @@ for c in checks:
         f"| {c['id']} | {nm} | {mstr} | {c['threshold']} | {c['unit']} | **{c['status']}** | `{c['method']}` | {det} |"
     )
 
-lines.extend(["", "## Release Binary Sizes (`target/**/release/)", ""])
+lines.extend(["", "## Release Binary Sizes (`target/**/release/`)", ""])
 if not binaries:
     lines.append("- `not_built_in_target`: No release binaries found under `target/**/release/` during this test run.")
 else:

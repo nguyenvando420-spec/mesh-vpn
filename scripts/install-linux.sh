@@ -93,17 +93,45 @@ resolve_artifact() {
 }
 
 resolve_unit_src() {
-  if [ -n "${UNIT_SRC}" ] && [ -f "${UNIT_SRC}" ]; then
-    printf '%s' "${UNIT_SRC}"
-    return 0
+  if [ -n "${UNIT_SRC}" ]; then
+    if [ -f "${UNIT_SRC}" ]; then
+      printf '%s' "${UNIT_SRC}"
+      return 0
+    fi
+    return 1
+  fi
+  if [ -n "${FROM_DIR}" ]; then
+    for candidate in \
+      "${FROM_DIR}/deploy/systemd/meshd.service" \
+      "${FROM_DIR}/meshd.service"; do
+      if [ -f "${candidate}" ]; then
+        printf '%s' "${candidate}"
+        return 0
+      fi
+    done
   fi
   for candidate in \
-    "${FROM_DIR}/deploy/linux-desktop/meshd-desktop.service" \
-    "${FROM_DIR}/meshd-desktop.service" \
-    "${SCRIPT_DIR}/meshd-desktop.service" \
-    "${REPO_ROOT}/deploy/linux-desktop/meshd-desktop.service" \
+    "${SCRIPT_DIR}/meshd.service" \
     "${REPO_ROOT}/deploy/systemd/meshd.service"; do
-    if [ -n "${candidate}" ] && [ -f "${candidate}" ]; then
+    if [ -f "${candidate}" ]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  if [ -n "${FROM_DIR}" ]; then
+    for candidate in \
+      "${FROM_DIR}/deploy/linux-desktop/meshd-desktop.service" \
+      "${FROM_DIR}/meshd-desktop.service"; do
+      if [ -f "${candidate}" ]; then
+        printf '%s' "${candidate}"
+        return 0
+      fi
+    done
+  fi
+  for candidate in \
+    "${SCRIPT_DIR}/meshd-desktop.service" \
+    "${REPO_ROOT}/deploy/linux-desktop/meshd-desktop.service"; do
+    if [ -f "${candidate}" ]; then
       printf '%s' "${candidate}"
       return 0
     fi
@@ -224,7 +252,7 @@ do_install() {
     exit 1
   }
   unit_src="$(resolve_unit_src)" || {
-    echo "error: systemd desktop unit 'meshd-desktop.service' not found." >&2
+    echo "error: systemd unit 'meshd.service' (or '--unit' target) not found." >&2
     exit 1
   }
 

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use mesh_core::defaults::DEFAULT_OVERLAY_CIDR;
 use mesh_core::{
     AppError, AppResult, Clock, KeyId, NodeId, NodeName, OverlayCidr, OverlayIp, PublicKey,
-    SystemClock,
+    SpkiPin, SystemClock,
 };
 use mesh_proto::admin_ipc::PersistenceTier;
 use mesh_proto::netmap::CandidateEndpoint;
@@ -1263,6 +1263,59 @@ impl ControlStore {
         })
     }
 
+    /// Performs a cold/offline restore from a verified `.redb` snapshot + `.sha256` sidecar
+    /// before opening the live store or binding listeners (`HR-G3-04`, `US-045`).
+    pub fn restore_offline_with_clock(
+        config: ControlStoreConfig,
+        clock: Arc<dyn Clock>,
+        snapshot_path: &Path,
+        min_required_snapshot_version: Option<u64>,
+        allow_pin_change: bool,
+    ) -> AppResult<RestoreOutcome> {
+        let (existing_db_wm, expected_published_pin) = read_existing_db_baseline(&config.db_path);
+        let emerg_disk_min =
+            crate::revoked_ram::read_slot_min_netmap_version(&config.emergency_revocations_path)
+                .unwrap_or(0);
+        let min_netmap_version = existing_db_wm.max(emerg_disk_min).max(clock.now_unix_ms());
+
+        if let Some(parent) = config.db_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                AppError::unavailable(format!("failed creating db directory: {err}"))
+            })?;
+            restrict_dir_0700(parent)?;
+        }
+        if let Some(emerg_parent) = config.emergency_revocations_path.parent() {
+            fs::create_dir_all(emerg_parent).map_err(|err| {
+                AppError::unavailable(format!("failed creating emergency directory: {err}"))
+            })?;
+            restrict_dir_0700(emerg_parent)?;
+        }
+
+        let options = RestoreOptions {
+            snapshot_path: snapshot_path.to_path_buf(),
+            target_db_path: config.db_path.clone(),
+            target_emergency_path: config.emergency_revocations_path.clone(),
+            expected_published_pin,
+            allow_pin_change,
+            verify_sha256: true,
+            min_netmap_version,
+            min_required_snapshot_version,
+        };
+
+        let staged = BackupManager::prepare_staged_restore(&options)?;
+        BackupManager::swap_and_verify_staged_db(&staged.staged_path, &config.db_path)?;
+        BackupManager::reset_emergency_file_after_restore(
+            &config.emergency_revocations_path,
+            staged.new_netmap_watermark,
+        )?;
+
+        Ok(RestoreOutcome {
+            verified_sha256_hex: staged.verified_sha256_hex,
+            restored_spki_pin: staged.restored_spki_pin,
+            new_netmap_watermark: staged.new_netmap_watermark,
+        })
+    }
+
     fn revoke_or_expire_node_with_hook<F>(
         &self,
         node_id: NodeId,
@@ -1586,6 +1639,26 @@ fn read_stored_watermark(db: &Database) -> AppResult<u64> {
         None => 0,
     };
     Ok(val)
+}
+
+fn read_existing_db_baseline(db_path: &Path) -> (u64, Option<SpkiPin>) {
+    if !db_path.exists() {
+        return (0, None);
+    }
+    let Ok(db) = Database::open(db_path) else {
+        return (0, None);
+    };
+    let readable = db
+        .begin_read()
+        .map_err(|e| map_store_err("begin read existing db baseline", e))
+        .and_then(|rtx| verify_all_tables_readable(&rtx));
+    let wm_res = read_stored_watermark(&db);
+    let id_res = IdentityRepository::load_active_opt(&db);
+    drop(db);
+    match (readable, wm_res, id_res) {
+        (Ok(()), Ok(wm), Ok(id_opt)) => (wm, id_opt.map(|rec| rec.spki_pin)),
+        _ => (0, None),
+    }
 }
 
 fn allocate_boot_lease(db: &Database, min_floor: u64) -> AppResult<(u64, u64)> {
@@ -2496,5 +2569,60 @@ mod tests {
             .expect_err("unknown node fails");
         assert_eq!(err.kind(), mesh_core::ErrorKind::NotFound);
         assert!(!store.is_node_revoked_ram(ghost_id));
+    }
+
+    #[test]
+    fn test_restore_offline_with_clock_enforces_pin_presence_and_recovers_corrupt_db() {
+        // Arrange (`HR-G3-04`)
+        let dir = TempDir::new().expect("tempdir");
+        let src_cfg = ControlStoreConfig {
+            db_path: dir.path().join("src/control.redb"),
+            emergency_revocations_path: dir.path().join("src/emergency-revocations.bin"),
+        };
+        let src_backup_dir = dir.path().join("src/backups");
+        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
+        let src_store = ControlStore::open_with_clock(
+            src_cfg,
+            DEFAULT_OVERLAY_CIDR,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .expect("open source store");
+        let artifact = src_store
+            .create_backup(&src_backup_dir, "test")
+            .expect("create backup without server_identity");
+        drop(src_store);
+
+        let dst_cfg = ControlStoreConfig {
+            db_path: dir.path().join("dst/control.redb"),
+            emergency_revocations_path: dir.path().join("dst/emergency-revocations.bin"),
+        };
+
+        // Act 1: even on empty state_dir, snapshot lacking server_identity fails closed when !allow_pin_change
+        let refused = ControlStore::restore_offline_with_clock(
+            dst_cfg.clone(),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            &artifact.snapshot_path,
+            None,
+            false,
+        )
+        .expect_err("snapshot without server_identity must fail closed without allow_pin_change");
+
+        // Act 2: corrupt target db + allow_pin_change recovers cleanly and advances watermark >= +1_000_000
+        fs::create_dir_all(dst_cfg.db_path.parent().expect("dst parent")).expect("mkdir dst");
+        fs::write(&dst_cfg.db_path, b"corrupt").expect("write corrupt db");
+        let outcome = ControlStore::restore_offline_with_clock(
+            dst_cfg.clone(),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            &artifact.snapshot_path,
+            None,
+            true,
+        )
+        .expect("offline restore over corrupt db with allow_pin_change");
+
+        // Assert
+        assert_eq!(refused.kind(), mesh_core::ErrorKind::Conflict);
+        assert!(outcome.new_netmap_watermark >= 1_700_001_000_000);
+        let reopened = ControlStore::open(dst_cfg).expect("reopen restored store");
+        assert!(reopened.current_netmap_version() >= outcome.new_netmap_watermark);
     }
 }

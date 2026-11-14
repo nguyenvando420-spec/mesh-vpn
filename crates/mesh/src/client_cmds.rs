@@ -406,6 +406,12 @@ pub(crate) fn validate_server_and_policy(
 }
 
 fn split_endpoint_host_and_port(input: &str) -> AppResult<(String, Option<Port>)> {
+    if input.contains("://") {
+        return Err(AppError::invalid_argument(
+            "server endpoint must be <host:port> without URL scheme (omit https:// or http://)",
+        ));
+    }
+
     if let Some(rest) = input.strip_prefix('[') {
         let Some((host, suffix)) = rest.split_once(']') else {
             return Err(AppError::invalid_argument(
@@ -964,5 +970,82 @@ mod tests {
         };
         assert!(steps.iter().any(|s| s.contains("mesh0")));
         assert!(steps.iter().any(|s| s.contains("100.115.0.0/16")));
+    }
+
+    #[tokio::test]
+    async fn test_up_and_set_reject_server_url_scheme_https() {
+        // Arrange (`HR-G3-02`)
+        use clap::Parser as _;
+
+        use crate::cli::{Cli, TopCommand};
+
+        let pin = format!("sha256:{}", "a".repeat(64));
+        let dispatch_cfg = ClientDispatchConfig {
+            json: false,
+            ro_ipc_override: None,
+            admin_ipc_override: Some("unused-admin-ipc".to_owned()),
+        };
+
+        let up_parsed = Cli::try_parse_from([
+            "mesh",
+            "up",
+            "--server",
+            "https://203.0.113.10:443",
+            "--server-pin",
+            &pin,
+        ]);
+        assert!(up_parsed.is_ok());
+        let Ok(Cli {
+            command: TopCommand::Client(up_cmd),
+            ..
+        }) = up_parsed
+        else {
+            return;
+        };
+
+        let set_parsed = Cli::try_parse_from([
+            "mesh",
+            "set",
+            "--server",
+            "https://203.0.113.10:443",
+            "--server-pin",
+            &pin,
+        ]);
+        assert!(set_parsed.is_ok());
+        let Ok(Cli {
+            command: TopCommand::Client(set_cmd),
+            ..
+        }) = set_parsed
+        else {
+            return;
+        };
+
+        // Act
+        let up_res = super::handle_client_command(&up_cmd, &dispatch_cfg).await;
+        let set_res = super::handle_client_command(&set_cmd, &dispatch_cfg).await;
+        let http_res =
+            validate_server_and_policy("http://203.0.113.10:443", None, Some(&pin), false);
+
+        // Assert
+        assert!(up_res.is_err());
+        assert!(set_res.is_err());
+        assert!(http_res.is_err());
+        let Err(up_err) = up_res else {
+            return;
+        };
+        let Err(set_err) = set_res else {
+            return;
+        };
+        let Err(http_err) = http_res else {
+            return;
+        };
+        assert_eq!(up_err.kind(), ErrorKind::InvalidArgument);
+        assert!(up_err.to_string().contains("without URL scheme"));
+        assert!(!up_err.to_string().contains("[https://"));
+        assert_eq!(set_err.kind(), ErrorKind::InvalidArgument);
+        assert!(set_err.to_string().contains("without URL scheme"));
+        assert!(!set_err.to_string().contains("[https://"));
+        assert_eq!(http_err.kind(), ErrorKind::InvalidArgument);
+        assert!(http_err.to_string().contains("without URL scheme"));
     }
 }

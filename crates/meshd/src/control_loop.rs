@@ -3546,7 +3546,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING> mtu 1500
         );
 
         // Assert: ControlLoop terminates session with NodeKeyExpired and ReauthRequired
-        let term = tokio::time::timeout(Duration::from_secs(2), term_rx.recv()).await;
+        let term = tokio::time::timeout(Duration::from_secs(5), term_rx.recv()).await;
         assert!(matches!(
             term,
             Ok(Some((

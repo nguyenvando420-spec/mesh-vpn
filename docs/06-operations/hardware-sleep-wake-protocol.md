@@ -29,6 +29,7 @@ Execute on at least one device from each platform family prior to `0.1.0` Go-Liv
 1. Ensure `meshd` is installed via the production installer:
    - macOS: `sudo sh scripts/install-macos.sh --from ./dist --sha256-file ./dist/SHA256SUMS`
    - Windows (Admin PowerShell): `powershell -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -SourceDir .\dist -WintunSha256File .\dist\wintun.dll.sha256`
+   - **Note for local Windows builds (`cargo build --release`):** CI release artifacts pre-bake `MESH_WINTUN_SHA256`, whereas local Windows source builds MUST export `$env:MESH_WINTUN_SHA256 = (Get-FileHash .\dist\wintun.dll -Algorithm SHA256).Hash.ToLowerInvariant()` prior to `cargo build --release` (otherwise `mesh up` rejects `wintun.dll` fail-closed at runtime).
 2. Join the test mesh with an active reachable peer (e.g., `vps.mesh.internal` or another online peer):
    ```bash
    mesh status

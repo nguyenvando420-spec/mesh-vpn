@@ -31,7 +31,6 @@ $ChaosTmpRel = "lab/.tmp/chaos-run-" + [Guid]::NewGuid().ToString("N") + ".json"
 $ChaosTmpJson = Join-Path $RepoRoot ($ChaosTmpRel.Replace('/', '\'))
 
 function Configure-RustToolchainAndPath {
-    $env:CARGO_INCREMENTAL = "0"
     $sdkPaths = @(
         (Join-Path $env:USERPROFILE "sdk\bin"),
         (Join-Path $env:USERPROFILE "sdk\zig"),
@@ -61,7 +60,7 @@ function Configure-RustToolchainAndPath {
 function Write-Utf8NoBomLf {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Content
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Content
     )
     $parent = Split-Path -Parent $Path
     if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path $parent)) {
@@ -77,7 +76,7 @@ function Write-Utf8NoBomLf {
 
 function Invoke-CargoCapture {
     param(
-        [Parameter(Mandatory = $true)][string]$ToolchainFlag,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ToolchainFlag,
         [Parameter(Mandatory = $true)][string[]]$CargoArgs
     )
     $allArgs = @()
@@ -103,7 +102,7 @@ function Invoke-CargoCapture {
 function Collect-MetricsMap {
     param(
         [Parameter(Mandatory = $true)][string]$Dir,
-        [Parameter(Mandatory = $true)][string[]]$StdoutLines
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$StdoutLines
     )
     $map = [ordered]@{}
     if (Test-Path $Dir) {
@@ -197,6 +196,158 @@ function Get-ReleaseBinarySizes {
     return @($found)
 }
 
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return [int]([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function Get-FreeUdpPort {
+    $ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Loopback, 0)
+    $udp = [System.Net.Sockets.UdpClient]::new($ep)
+    try {
+        return [int]([System.Net.IPEndPoint]$udp.Client.LocalEndPoint).Port
+    } finally {
+        $udp.Close()
+    }
+}
+
+function Measure-ReleaseMeshServerRss {
+    param([Parameter(Mandatory = $true)][string]$OutMetricsDir)
+
+    $targetRoot = Join-Path $RepoRoot "target"
+    if (-not (Test-Path $targetRoot)) {
+        return
+    }
+    $releaseDirs = @(Get-ChildItem -Path $targetRoot -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "release" })
+    $serverBin = $null
+    foreach ($rdir in $releaseDirs) {
+        foreach ($candName in @("mesh-server.exe", "mesh-server")) {
+            $candPath = Join-Path $rdir.FullName $candName
+            if (Test-Path $candPath -PathType Leaf) {
+                $serverBin = Get-Item -Path $candPath
+                break
+            }
+        }
+        if ($null -ne $serverBin) {
+            break
+        }
+    }
+    if ($null -eq $serverBin) {
+        return
+    }
+
+    $srvTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mesh-srv-rss-" + [Guid]::NewGuid().ToString("N"))
+    $stateDir = Join-Path $srvTmp "state"
+    $runDir = Join-Path $srvTmp "run"
+    $cfgPath = Join-Path $srvTmp "server.toml"
+    $stdoutLog = Join-Path $srvTmp "stdout.log"
+    $stderrLog = Join-Path $srvTmp "stderr.log"
+    $proc = $null
+    $ready = $false
+    $wsBytes = [int64]0
+    $rssMiB = 0.0
+    $errMsg = ""
+
+    try {
+        New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+
+        $ctrlPort = Get-FreeTcpPort
+        $obsPort = Get-FreeTcpPort
+        while ($obsPort -eq $ctrlPort) {
+            $obsPort = Get-FreeTcpPort
+        }
+        $stunPort = Get-FreeUdpPort
+
+        $tomlLines = @(
+            'control_bind_ip = "127.0.0.1"',
+            "control_tcp_port = $ctrlPort",
+            'stun_bind_ip = "127.0.0.1"',
+            "stun_udp_port = $stunPort",
+            "obs_bind_addr = `"127.0.0.1:$obsPort`"",
+            'public_host = "127.0.0.1"',
+            "state_dir = `"$($stateDir.Replace('\', '/'))`"",
+            "admin_socket_path = `"$((Join-Path $runDir 'admin.sock').Replace('\', '/'))`"",
+            'admin_group_name = "nonexistent-slo-admin-grp"',
+            'tls_mode = "ip_pinned"'
+        )
+        Write-Utf8NoBomLf -Path $cfgPath -Content ($tomlLines -join "`n")
+
+        $proc = Start-Process -FilePath $serverBin.FullName `
+            -ArgumentList @("--config", $cfgPath) `
+            -PassThru `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog
+
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline) {
+            if ($proc.HasExited) {
+                $errMsg = "process exited early with code $($proc.ExitCode)"
+                break
+            }
+            try {
+                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$obsPort/readyz" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                if ($resp.StatusCode -eq 200) {
+                    $ready = $true
+                    break
+                }
+            } catch {
+                Start-Sleep -Milliseconds 150
+            }
+        }
+
+        if ($ready -and -not $proc.HasExited) {
+            $procInfo = Get-Process -Id $proc.Id -ErrorAction Stop
+            $wsBytes = [int64]$procInfo.WorkingSet64
+            $rssMiB = [Math]::Round($wsBytes / 1MB, 3)
+        } elseif ([string]::IsNullOrWhiteSpace($errMsg)) {
+            $errMsg = "/readyz did not become healthy within 10s"
+        }
+    } catch {
+        $errMsg = $_.Exception.Message
+    } finally {
+        if ($null -ne $proc) {
+            try {
+                if (-not $proc.HasExited) {
+                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                    [void]$proc.WaitForExit(5000)
+                }
+            } catch {
+                # Best-effort cleanup
+            }
+        }
+        if (Test-Path $srvTmp) {
+            Remove-Item -Path $srvTmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $relBinPath = $serverBin.FullName.Substring($RepoRoot.Length + 1).Replace('\', '/')
+    $passed = $ready -and ($wsBytes -gt 0) -and ($rssMiB -le 128.0)
+    $details = if ($ready -and ($wsBytes -gt 0)) {
+        "Release binary $relBinPath live WorkingSet64=$rssMiB MiB ($wsBytes B) at /readyz 200 OK"
+    } else {
+        "Release binary $relBinPath RSS probe failed: $errMsg"
+    }
+    $rec = [ordered]@{
+        id        = "PERF-01"
+        name      = "Idle Control server memory footprint (release binary WorkingSet64)"
+        measured  = if ($ready -and ($wsBytes -gt 0)) { $rssMiB } else { $null }
+        threshold = "<= 128.0"
+        unit      = "MiB"
+        status    = if ($passed) { "PASS" } else { "FAIL" }
+        method    = "empirical_release_process_rss"
+        details   = $details
+    }
+    $outFile = Join-Path $OutMetricsDir "server-PERF-01.json"
+    Write-Utf8NoBomLf -Path $outFile -Content ($rec | ConvertTo-Json -Depth 4)
+}
+
 try {
     New-Item -ItemType Directory -Path $MetricsDir -Force | Out-Null
     $toolchainFlag = Configure-RustToolchainAndPath
@@ -233,6 +384,7 @@ try {
     )
     $cliRes.Lines | ForEach-Object { Write-Host $_ }
 
+    Measure-ReleaseMeshServerRss -OutMetricsDir $MetricsDir
     $rawMetrics = Collect-MetricsMap -Dir $MetricsDir -StdoutLines $sloRes.Lines
 
     Write-Host "==> [3/5] Evaluating Docker NAT Chaos Lab..."
@@ -267,7 +419,7 @@ try {
     Write-Host "==> [4/5] Assembling comprehensive US-058 SLO matrix..."
     $requiredEmpirical = @(
         "PERF-01", "PERF-03", "PERF-04", "PERF-05", "PERF-06", "PERF-07", "PERF-08",
-        "PERF-09", "PERF-10", "PERF-11", "PERF-12",
+        "PERF-09", "PERF-10", "PERF-11", "PERF-11-QUEUE", "PERF-12",
         "SEC-01", "SEC-03", "SEC-04", "SEC-05", "SEC-06", "SEC-07", "SEC-08", "SEC-11", "SEC-14", "SEC-15",
         "REL-01", "REL-06", "REL-08", "REL-09", "REL-10", "REL-12",
         "PLAT-04", "OPS-05", "OPS-06"
@@ -309,7 +461,7 @@ try {
 
     # OPS-02 & OPS-03: CLI status / netcheck / ping verified via `mesh` crate tests (+ Docker lab if enabled)
     $cliOk = ($cliRes.ExitCode -eq 0)
-    $opsSuffix = if ($chaosStatus -eq "PASS") { "; live container CLI ping/netcheck/status verified in Docker lab" } else { "; live OS tunnel/IPC round-trip checked in Docker lab" }
+    $opsSuffix = if ($chaosStatus -eq "PASS") { "; live container CLI ping/netcheck/status verified in Docker lab" } else { "; verified via integration & CLI/IPC suites (Docker lab pending_external_lab)" }
     $checks.Add([ordered]@{
         id        = "OPS-02"
         name      = "Diagnostic `mesh status` output (IP:port, pin/CA, utun/adapter)"
@@ -374,7 +526,7 @@ try {
 
     $overallFail = ($staticStatus -eq "FAIL") -or ($sloRes.ExitCode -ne 0) -or ($cliRes.ExitCode -ne 0) -or ($chaosStatus -eq "FAIL") -or ($failedCount -gt 0) -or $SimulateFail
     $overallStatus = if ($overallFail) { "FAIL" } else { "PASS" }
-    $binaries = Get-ReleaseBinarySizes
+    $binaries = @(Get-ReleaseBinarySizes)
 
     $resolvedOutDir = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $RepoRoot $OutputDir }
     $reportJsonPath = Join-Path $resolvedOutDir "slo-verification-report.json"
@@ -419,8 +571,8 @@ try {
     [void]$md.AppendLine("- **Generated At (UTC)**: $($reportObj.generated_at_utc)")
     [void]$md.AppendLine("- **Host / Toolchain**: $($reportObj.host_os) ($($reportObj.host_arch)) / Rust ``$toolchainDisplay``")
     [void]$md.AppendLine("- **Overall Automated Status**: **$overallStatus**")
-    [void]$md.AppendLine("- **Static & Cargo Gate (`scripts/check.ps1`)**: ``$staticStatus`` - $staticDetails")
-    [void]$md.AppendLine("- **Docker NAT & Chaos Lab (`lab/scenarios/run-all-chaos.sh`)**: ``$chaosStatus`` - $chaosDetails")
+    [void]$md.AppendLine("- **Static & Cargo Gate (``scripts/check.ps1``)**: ``$staticStatus`` - $staticDetails")
+    [void]$md.AppendLine("- **Docker NAT & Chaos Lab (``lab/scenarios/run-all-chaos.sh``)**: ``$chaosStatus`` - $chaosDetails")
     [void]$md.AppendLine("- **Counts**: $passedCount PASS / $failedCount FAIL / $pendingLabCount pending_external_lab / $hwSignoffCount hardware_signoff_required")
     [void]$md.AppendLine("")
     [void]$md.AppendLine("## Quantitative NFR & SLO Matrix")
@@ -434,7 +586,7 @@ try {
         [void]$md.AppendLine("| $($c.id) | $safeName | $mStr | $($c.threshold) | $($c.unit) | **$($c.status)** | ``$($c.method)`` | $safeDetails |")
     }
     [void]$md.AppendLine("")
-    [void]$md.AppendLine("## Release Binary Sizes (`target/**/release/`)")
+    [void]$md.AppendLine('## Release Binary Sizes (`target/**/release/`)')
     [void]$md.AppendLine("")
     if ($binaries.Count -eq 0) {
         [void]$md.AppendLine("- ``not_built_in_target``: No release binaries found under ``target/**/release/`` during this test run.")
@@ -448,9 +600,9 @@ try {
     [void]$md.AppendLine("")
     [void]$md.AppendLine("## Deviations, Assumptions & External Hardware Prerequisites (US-058 AC2 / GNFR-12)")
     [void]$md.AppendLine("")
-    [void]$md.AppendLine("- **No Fabricated Data**: Unexecuted Docker NAT chaos checks (`US-057`, `REL-01` container SIGKILL, `US-074 AC8` 443->8443 live migration, `REL-12` DB wipe/restore, `US-028` 10-min NAT flap) and 5-minute VPS CPU soak (`PERF-02`) remain explicitly marked ``pending_external_lab`` unless ``-WithDockerLab`` executes them.")
-    [void]$md.AppendLine("- **Physical Hardware Sign-off (`GNFR-12` / `US-036 AC2`)**: macOS ``utun`` / ``launchd`` / ``LOCAL_PEERCRED`` / Application Firewall (``PLAT-06``) and real MacBook + Windows laptop >=4m sleep/wake benchmarks (``PLAT-05``) cannot be simulated in headless Windows or Linux Docker runners and remain marked ``hardware_signoff_required``.")
-    [void]$md.AppendLine("- **Debug vs Release Benchmark Baseline**: Rust `slo_wave2_suite` throughput & latency checks ran under Cargo test (`unoptimized + debuginfo`); release LTO binaries exceed these margins further.")
+    [void]$md.AppendLine('- **No Fabricated Data**: Unexecuted Docker NAT chaos checks (`US-057`, `REL-01` container SIGKILL, `US-074 AC8` 443->8443 live migration, `REL-12` DB wipe/restore, `US-028` 10-min NAT flap) and 5-minute VPS CPU soak (`PERF-02`) remain explicitly marked `pending_external_lab` unless `-WithDockerLab` executes them.')
+    [void]$md.AppendLine('- **Physical Hardware Sign-off (`GNFR-12` / `US-036 AC2`)**: macOS `utun` / `launchd` / `LOCAL_PEERCRED` / Application Firewall (`PLAT-06`) and real MacBook + Windows laptop >=4m sleep/wake benchmarks (`PLAT-05`) cannot be simulated in headless Windows or Linux Docker runners and remain marked `hardware_signoff_required`.')
+    [void]$md.AppendLine('- **Debug vs Release Benchmark Baseline**: Rust `slo_wave2_suite` throughput & latency checks ran under Cargo test (`unoptimized + debuginfo`); release LTO binaries exceed these margins further.')
     if ($SimulateFail) {
         [void]$md.AppendLine("- **Simulated Failure**: ``-SimulateFail`` was enabled; synthetic failure ``US058-SIMULATE-FAIL`` forced overall ``FAIL`` and non-zero exit (US-058 AC3).")
     }

@@ -191,6 +191,12 @@ mesh preauthkey create --ttl 1h --for alice-mbp
 
 ### 2.3 Windows 10 / 11 (`x86_64-pc-windows-msvc`)
 
+> **Local Windows Build Requirement (`MESH_WINTUN_SHA256`):** CI release artifacts already bake the verified `wintun.dll` SHA-256 into `meshd.exe` at compile time (`option_env!("MESH_WINTUN_SHA256")`). If you compile locally on Windows before installing, you **must** export `$env:MESH_WINTUN_SHA256` before `cargo build --release` (otherwise `mesh up` fails closed with `PermissionDenied: "wintun.dll SHA-256 pin is required at compile time (MESH_WINTUN_SHA256)"`):
+> ```powershell
+> $env:MESH_WINTUN_SHA256 = (Get-FileHash .\dist\wintun.dll -Algorithm SHA256).Hash.ToLowerInvariant()
+> cargo build --release --locked --bin mesh --bin meshd
+> ```
+
 1. Open an **Administrator PowerShell** session. Ensure `meshd.exe`, `mesh.exe`, `wintun.dll`, `WINTUN-LICENSE.txt`, and `wintun.dll.sha256` are in `.\dist\`:
    ```powershell
    powershell -ExecutionPolicy Bypass -File scripts/install-windows.ps1 `
@@ -380,19 +386,42 @@ Pick **one** encrypted off-site mechanism via cron/systemd timer after `mesh ser
 
 Execute periodically on staging (or during disaster recovery on a replacement VPS):
 
+#### Path A — Cold / Offline Disaster Recovery (Corrupted `control.redb` or Replacement VPS)
+
+**IMPORTANT:** Do **not** run `systemctl start mesh-server` before restoring when `control.redb` is corrupted or missing on a new VPS (starting on a corrupted DB exits before opening `/run/mesh-server/admin.sock`, and starting on an empty VPS creates a temporary `Pin_TEMP` that conflicts with the backup's `server_identity`):
+
 ```bash
-# 1. If encrypted off-VPS, decrypt locally into /var/lib/mesh/backups/ and verify checksum:
-age -d -i /root/backup-identity.key -o /var/lib/mesh/backups/restore.redb restore.redb.age
-sha256sum /var/lib/mesh/backups/restore.redb   # Compare with recorded .sha256
+# 1. Keep mesh-server STOPPED during offline cold restore:
+sudo systemctl stop mesh-server || true
 
-# 2. Ensure mesh-server is RUNNING (`mesh server restore` sends POST /v1/admin/restore over /run/mesh-server/admin.sock):
-#    Running `mesh-server` hot-restores control.redb, reloads ACME/server identity, drops live streams to force clean re-auth,
-#    and advances netmap_version_watermark (+1,000,000).
+# 2. Decrypt BOTH restore.redb and its companion restore.redb.sha256 into /var/lib/mesh/backups/,
+#    enforce strict mesh:mesh 0600 ownership, and verify checksum:
+sudo age -d -i /root/backup-identity.key -o /var/lib/mesh/backups/restore.redb restore.redb.age
+sudo cp restore.redb.sha256 /var/lib/mesh/backups/restore.redb.sha256
+# (If the .sha256 sidecar was also encrypted, decrypt it to /var/lib/mesh/backups/restore.redb.sha256)
+sudo chown mesh:mesh /var/lib/mesh/backups/restore.redb /var/lib/mesh/backups/restore.redb.sha256
+sudo chmod 0600 /var/lib/mesh/backups/restore.redb /var/lib/mesh/backups/restore.redb.sha256
+(cd /var/lib/mesh/backups && sudo -u mesh sha256sum -c restore.redb.sha256)
+
+# 3. Run offline cold restore as user `mesh` (advances netmap_version_watermark by +1,000,000):
+sudo -u mesh /usr/local/bin/mesh-server \
+  --config /etc/mesh/server.toml \
+  --restore-from /var/lib/mesh/backups/restore.redb
+# Pass `--min-netmap-version <N>` if restoring an older snapshot with a known prior netmap_version.
+
+# 4. Start mesh-server and validate RTO + watermark jump:
 sudo systemctl start mesh-server
-mesh server restore /var/lib/mesh/backups/restore.redb
+mesh server status
+mesh node list
+curl -fsS http://127.0.0.1:9091/readyz
+```
 
-# 3. Optionally restart cleanly after restore and validate RTO + watermark jump:
-sudo systemctl restart mesh-server
+#### Path B — Hot Restore Drill (Daemon Already Running Healthy Over UDS)
+
+When `mesh-server` is already running cleanly with the same `server_identity` and `/run/mesh-server/admin.sock` active, use `mesh server restore` over UDS (ensure both `<SNAPSHOT>.redb` and `<SNAPSHOT>.redb.sha256` are owned by `mesh:mesh` with mode `0600`):
+
+```bash
+mesh server restore /var/lib/mesh/backups/restore.redb --min-netmap-version <N>
 mesh server status
 mesh node list
 curl -fsS http://127.0.0.1:9091/readyz

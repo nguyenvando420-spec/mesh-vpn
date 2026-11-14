@@ -12,15 +12,16 @@ pub mod rate_limit;
 pub mod relay_hub;
 pub mod stun_service;
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use mesh_core::defaults::GRACEFUL_SHUTDOWN_BUDGET_MS;
-use mesh_core::{AppResult, LoggingConfig, init_json_logging};
-use mesh_store::{ControlStore, ControlStoreConfig};
+use mesh_core::{AppError, AppResult, Clock, LoggingConfig, SystemClock, init_json_logging};
+use mesh_store::{ControlStore, ControlStoreConfig, RestoreOutcome};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -53,6 +54,15 @@ struct ServerCliArgs {
     /// Validate configuration invariants and exit cleanly without binding sockets.
     #[arg(long)]
     check_config: bool,
+    /// Perform an offline/cold restore from a verified `.redb` snapshot (with `.sha256` sidecar) and exit.
+    #[arg(long, value_name = "PATH", conflicts_with = "check_config")]
+    restore_from: Option<PathBuf>,
+    /// Require restored snapshot watermark to be at least `<U64>` (fail closed if older).
+    #[arg(long, value_name = "U64", requires = "restore_from")]
+    min_netmap_version: Option<u64>,
+    /// Explicitly allow changing the active SPKI pin (or restoring a snapshot lacking `server_identity`).
+    #[arg(long, requires = "restore_from")]
+    allow_pin_change: bool,
 }
 
 fn main() -> ExitCode {
@@ -86,6 +96,15 @@ fn main() -> ExitCode {
         }
     };
 
+    if let Some(snapshot_path) = &args.restore_from {
+        return handle_offline_restore_cli(
+            &cfg,
+            snapshot_path,
+            args.min_netmap_version,
+            args.allow_pin_change,
+        );
+    }
+
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_stack_size(512 * 1024)
@@ -106,6 +125,99 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn handle_offline_restore_cli(
+    cfg: &ServerConfig,
+    snapshot_path: &Path,
+    min_required_snapshot_version: Option<u64>,
+    allow_pin_change: bool,
+) -> ExitCode {
+    match run_offline_restore_with_clock(
+        cfg,
+        Arc::new(SystemClock::new()),
+        snapshot_path,
+        min_required_snapshot_version,
+        allow_pin_change,
+    ) {
+        Ok(outcome) => {
+            let pin_label = outcome
+                .restored_spki_pin
+                .map_or_else(|| "none".to_owned(), |pin| pin.to_string());
+            tracing::info!(
+                component = "mesh-server",
+                event = "offline_restore_completed",
+                state_dir = %cfg.state_dir.display(),
+                restored_spki_pin = %pin_label,
+                new_netmap_watermark = outcome.new_netmap_watermark,
+                verified_sha256_hex = %outcome.verified_sha256_hex,
+                "offline restore completed cleanly"
+            );
+            match format_offline_restore_json(cfg, &outcome).and_then(|s| write_stdout_line(&s)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    tracing::error!(
+                        component = "mesh-server",
+                        event = "offline_restore_output_failed",
+                        error = %err
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                component = "mesh-server",
+                event = "offline_restore_failed",
+                state_dir = %cfg.state_dir.display(),
+                error = %err,
+                "offline restore failed"
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_offline_restore_with_clock(
+    cfg: &ServerConfig,
+    clock: Arc<dyn Clock>,
+    snapshot_path: &Path,
+    min_required_snapshot_version: Option<u64>,
+    allow_pin_change: bool,
+) -> AppResult<RestoreOutcome> {
+    let store_cfg = ControlStoreConfig {
+        db_path: cfg.db_path(),
+        emergency_revocations_path: cfg.emergency_revocations_path(),
+    };
+    ControlStore::restore_offline_with_clock(
+        store_cfg,
+        clock,
+        snapshot_path,
+        min_required_snapshot_version,
+        allow_pin_change,
+    )
+}
+
+fn format_offline_restore_json(cfg: &ServerConfig, outcome: &RestoreOutcome) -> AppResult<String> {
+    let payload = serde_json::json!({
+        "status": "restored",
+        "state_dir": cfg.state_dir,
+        "db_path": cfg.db_path(),
+        "verified_sha256_hex": outcome.verified_sha256_hex,
+        "restored_spki_pin": outcome.restored_spki_pin.map(|pin| pin.to_string()),
+        "new_netmap_watermark": outcome.new_netmap_watermark,
+    });
+    serde_json::to_string(&payload).map_err(|err| {
+        AppError::internal(format!("failed serializing offline restore JSON: {err}"))
+    })
+}
+
+fn write_stdout_line(line: &str) -> AppResult<()> {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    writeln!(handle, "{line}")
+        .and_then(|()| handle.flush())
+        .map_err(|err| AppError::internal(format!("failed writing stdout: {err}")))
 }
 
 async fn run_server(cfg: ServerConfig) -> AppResult<()> {
@@ -434,5 +546,225 @@ mod tests {
         shutdown.cancel();
         tracker.close();
         tracker.wait().await;
+    }
+
+    fn init_server_state_with_identity(
+        state_dir: &std::path::Path,
+        clock: Arc<FakeClock>,
+    ) -> (ServerConfig, mesh_core::SpkiPin, u64) {
+        let cfg = ServerConfig {
+            state_dir: state_dir.to_path_buf(),
+            ..ServerConfig::default()
+        };
+        let store = Arc::new(
+            ControlStore::open_with_clock(
+                ControlStoreConfig {
+                    db_path: cfg.db_path(),
+                    emergency_revocations_path: cfg.emergency_revocations_path(),
+                },
+                &cfg.overlay_cidr,
+                Arc::clone(&clock) as Arc<dyn mesh_core::Clock>,
+            )
+            .expect("open control store"),
+        );
+        let _acme = AcmeManager::initialize(&cfg, Arc::clone(&store)).expect("init identity");
+        let pin = store.load_active_identity().expect("active id").spki_pin;
+        let wm = store.current_netmap_version();
+        drop(store);
+        (cfg, pin, wm)
+    }
+
+    #[test]
+    fn test_cli_offline_restore_flags_require_restore_from() {
+        // Arrange & Act (`HR-G3-04`)
+        use clap::Parser as _;
+
+        let missing_base_ver =
+            super::ServerCliArgs::try_parse_from(["mesh-server", "--min-netmap-version", "42"]);
+        let missing_base_pin =
+            super::ServerCliArgs::try_parse_from(["mesh-server", "--allow-pin-change"]);
+        let valid_args = super::ServerCliArgs::try_parse_from([
+            "mesh-server",
+            "--state-dir",
+            "/tmp/mesh-state",
+            "--restore-from",
+            "/tmp/snap.redb",
+            "--min-netmap-version",
+            "100",
+            "--allow-pin-change",
+        ]);
+
+        // Assert
+        assert!(missing_base_ver.is_err());
+        assert!(missing_base_pin.is_err());
+        let parsed = valid_args.expect("valid offline restore flags");
+        assert_eq!(
+            parsed.restore_from,
+            Some(std::path::PathBuf::from("/tmp/snap.redb"))
+        );
+        assert_eq!(parsed.min_netmap_version, Some(100));
+        assert!(parsed.allow_pin_change);
+    }
+
+    fn create_prod_backup(
+        base_dir: &std::path::Path,
+        base_ms: u64,
+    ) -> (mesh_core::SpkiPin, u64, mesh_store::BackupArtifact) {
+        let prod_clock = Arc::new(FakeClock::new(base_ms));
+        let prod_dir = base_dir.join("prod");
+        let (prod_cfg, pin_prod, src_wm) =
+            init_server_state_with_identity(&prod_dir, Arc::clone(&prod_clock));
+        let store_prod = ControlStore::open_with_clock(
+            ControlStoreConfig {
+                db_path: prod_cfg.db_path(),
+                emergency_revocations_path: prod_cfg.emergency_revocations_path(),
+            },
+            &prod_cfg.overlay_cidr,
+            Arc::clone(&prod_clock) as Arc<dyn mesh_core::Clock>,
+        )
+        .expect("reopen prod store");
+        let backup_dir = base_dir.join("backups");
+        let artifact = store_prod
+            .create_backup(&backup_dir, "operator")
+            .expect("create prod backup");
+        drop(store_prod);
+        (pin_prod, src_wm, artifact)
+    }
+
+    #[test]
+    fn test_offline_restore_empty_state_dir_and_corrupt_redb() {
+        // Arrange (`HR-G3-04`)
+        let dir = TempDir::new().expect("tempdir");
+        let base_ms = 1_750_000_000_000_u64;
+        let (pin_prod, src_wm, artifact) = create_prod_backup(dir.path(), base_ms);
+
+        // Act 1: empty state_dir succeeds preserving Pin_PROD and emits non-secret JSON
+        let empty_cfg = ServerConfig {
+            state_dir: dir.path().join("empty-target"),
+            ..ServerConfig::default()
+        };
+        let empty_outcome = super::run_offline_restore_with_clock(
+            &empty_cfg,
+            Arc::new(FakeClock::new(base_ms + 500)),
+            &artifact.snapshot_path,
+            Some(src_wm),
+            false,
+        )
+        .expect("restore onto empty state_dir");
+        let empty_json =
+            super::format_offline_restore_json(&empty_cfg, &empty_outcome).expect("format json");
+
+        // Assert 1
+        assert_eq!(empty_outcome.restored_spki_pin, Some(pin_prod));
+        assert!(empty_json.contains(&pin_prod.to_string()));
+        assert!(!empty_json.contains("BEGIN PRIVATE KEY"));
+        let reopened_empty = ControlStore::open(ControlStoreConfig {
+            db_path: empty_cfg.db_path(),
+            emergency_revocations_path: empty_cfg.emergency_revocations_path(),
+        })
+        .expect("open restored empty store");
+        assert_eq!(
+            reopened_empty
+                .load_active_identity()
+                .expect("restored id")
+                .spki_pin,
+            pin_prod
+        );
+        drop(reopened_empty);
+
+        // Act 2: corrupt control.redb overwritten cleanly & watermark advances >= +1_000_000
+        let corrupt_cfg = ServerConfig {
+            state_dir: dir.path().join("corrupt-target"),
+            ..ServerConfig::default()
+        };
+        std::fs::create_dir_all(&corrupt_cfg.state_dir).expect("mkdir corrupt state_dir");
+        std::fs::write(corrupt_cfg.db_path(), b"corrupt").expect("write corrupt redb");
+        let corrupt_clock_ms = base_ms + 2_000;
+        let corrupt_outcome = super::run_offline_restore_with_clock(
+            &corrupt_cfg,
+            Arc::new(FakeClock::new(corrupt_clock_ms)),
+            &artifact.snapshot_path,
+            None,
+            false,
+        )
+        .expect("restore over corrupt redb");
+
+        // Assert 2
+        assert_eq!(corrupt_outcome.restored_spki_pin, Some(pin_prod));
+        assert!(corrupt_outcome.new_netmap_watermark >= src_wm.max(corrupt_clock_ms) + 1_000_000);
+        let reopened_corrupt = ControlStore::open(ControlStoreConfig {
+            db_path: corrupt_cfg.db_path(),
+            emergency_revocations_path: corrupt_cfg.emergency_revocations_path(),
+        })
+        .expect("open restored corrupt store");
+        assert_eq!(
+            reopened_corrupt
+                .load_active_identity()
+                .expect("restored corrupt id")
+                .spki_pin,
+            pin_prod
+        );
+    }
+
+    #[test]
+    fn test_offline_restore_rejects_bad_sha256_and_mismatched_pin_without_override() {
+        // Arrange (`HR-G3-04`)
+        let dir = TempDir::new().expect("tempdir");
+        let base_ms = 1_750_000_000_000_u64;
+        let (pin_prod, _src_wm, artifact) = create_prod_backup(dir.path(), base_ms);
+
+        // Act 1: tampered .sha256 sidecar fails closed without creating control.redb
+        let bad_snap = dir.path().join("bad-copy.redb");
+        let mut bad_sha_os = bad_snap.as_os_str().to_os_string();
+        bad_sha_os.push(".sha256");
+        std::fs::copy(&artifact.snapshot_path, &bad_snap).expect("copy snap");
+        std::fs::write(
+            std::path::PathBuf::from(bad_sha_os),
+            format!("{}  bad-copy.redb\n", "0".repeat(64)),
+        )
+        .expect("write bad sha256");
+        let bad_sha_cfg = ServerConfig {
+            state_dir: dir.path().join("bad-sha-target"),
+            ..ServerConfig::default()
+        };
+        let bad_sha_res = super::run_offline_restore_with_clock(
+            &bad_sha_cfg,
+            Arc::new(FakeClock::new(base_ms + 3_000)),
+            &bad_snap,
+            None,
+            false,
+        );
+
+        // Assert 1
+        assert!(bad_sha_res.is_err());
+        assert!(!bad_sha_cfg.db_path().exists());
+
+        // Act 2: healthy existing DB with different pin fails closed unless --allow-pin-change
+        let other_dir = dir.path().join("healthy-other-pin");
+        let (other_cfg, pin_other, _) =
+            init_server_state_with_identity(&other_dir, Arc::new(FakeClock::new(base_ms + 4_000)));
+        assert_ne!(pin_other, pin_prod);
+        let pin_mismatch_err = super::run_offline_restore_with_clock(
+            &other_cfg,
+            Arc::new(FakeClock::new(base_ms + 5_000)),
+            &artifact.snapshot_path,
+            None,
+            false,
+        )
+        .expect_err("different active pin must fail closed without --allow-pin-change");
+
+        // Assert 2a: refused cleanly
+        assert_eq!(pin_mismatch_err.kind(), mesh_core::ErrorKind::Conflict);
+
+        // Act 2b: with --allow-pin-change, pin rotation succeeds cleanly
+        let allowed_outcome = super::run_offline_restore_with_clock(
+            &other_cfg,
+            Arc::new(FakeClock::new(base_ms + 6_000)),
+            &artifact.snapshot_path,
+            None,
+            true,
+        )
+        .expect("offline restore with --allow-pin-change");
+        assert_eq!(allowed_outcome.restored_spki_pin, Some(pin_prod));
     }
 }

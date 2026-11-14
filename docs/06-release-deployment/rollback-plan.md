@@ -48,25 +48,47 @@ mesh server status
 
 ### Case B — Full State + Binary Rollback (If `control.redb` Needs Restoration)
 
-Use only if `control.redb` failed integrity or needs restoration from the pre-upgrade `mesh server backup` snapshot. Existing clients reconnect with **0 re-registration** and **0 re-pinning** because `server_identity` is restored and `netmap_version_watermark` advances by `+1_000_000`:
+Use only if `control.redb` failed integrity, needs restoration on a replacement VPS, or must roll back to the pre-upgrade `mesh server backup` snapshot. Existing clients reconnect with **0 re-registration** and **0 re-pinning** because `server_identity` is restored and `netmap_version_watermark` advances by `+1_000_000`:
+
+#### Path 1 — Cold / Offline Restore (`control.redb` Corrupted or Replacement VPS)
+
+**CRITICAL:** Do **not** run `systemctl start mesh-server` before restoring when `control.redb` is corrupted or absent (starting on a corrupt DB fails before UDS opens; starting on a fresh VPS generates a conflicting `Pin_TEMP`). Keep `mesh-server` stopped and restore offline as `mesh`:
 
 ```bash
-# 1. Stop service briefly while swapping binaries:
-sudo systemctl stop mesh-server
-
-# 2. Restore previous binaries:
+# 1. Keep mesh-server stopped while swapping binaries (if rolling back binaries):
+sudo systemctl stop mesh-server || true
 sudo install -m 0755 /var/lib/mesh/rollback-bin/mesh-server /usr/local/bin/mesh-server
 sudo install -m 0755 /var/lib/mesh/rollback-bin/mesh /usr/local/bin/mesh
 
-# 3. Start mesh-server so /run/mesh-server/admin.sock is listening (mesh server restore uses IPC POST /v1/admin/restore),
-#    verify SHA-256 of the pre-upgrade backup, and hot-restore with --min-netmap-version if needed:
+# 2. Place/decrypt BOTH restore.redb and its companion restore.redb.sha256 sidecar,
+#    enforce strict mesh:mesh 0600 ownership, and verify checksum:
+sudo chown mesh:mesh /var/lib/mesh/backups/restore.redb /var/lib/mesh/backups/restore.redb.sha256
+sudo chmod 0600 /var/lib/mesh/backups/restore.redb /var/lib/mesh/backups/restore.redb.sha256
+(cd /var/lib/mesh/backups && sudo -u mesh sha256sum -c restore.redb.sha256)
+
+# 3. Execute offline cold restore as user `mesh` (omit --min-netmap-version if unknown):
+sudo -u mesh /usr/local/bin/mesh-server \
+  --config /etc/mesh/server.toml \
+  --restore-from /var/lib/mesh/backups/restore.redb \
+  --min-netmap-version <PRIOR_NETMAP_VERSION>
+
+# 4. Start mesh-server cleanly and verify:
 sudo systemctl start mesh-server
+curl -fsS http://127.0.0.1:9091/readyz
+mesh server status
+mesh node list
+```
+
+#### Path 2 — Hot Restore (Only When `mesh-server` Is Running Healthy With Same Identity)
+
+When `mesh-server` is already running cleanly with `/run/mesh-server/admin.sock` open and the same `server_identity`:
+
+```bash
 PRE_BACKUP="/var/lib/mesh/backups/<PRE_UPGRADE_TIMESTAMP>.redb"
-sha256sum -c "${PRE_BACKUP}.sha256"
+(cd /var/lib/mesh/backups && sudo -u mesh sha256sum -c "$(basename "$PRE_BACKUP").sha256")
 mesh server restore "$PRE_BACKUP" --min-netmap-version <PRIOR_NETMAP_VERSION>
 
-# 4. Optionally restart cleanly after restore and verify:
-sudo systemctl restart mesh-server
+# Verify readiness and watermark jump:
 curl -fsS http://127.0.0.1:9091/readyz
 mesh server status
 mesh node list

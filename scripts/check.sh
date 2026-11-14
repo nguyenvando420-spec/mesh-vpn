@@ -33,17 +33,30 @@ cargo --version
 
 echo "==> [2/5] Enforcing static repository & security rules..."
 
-# 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF) per file using FNR == 1 (POSIX awk compatible across gawk, mawk, BSD awk)
+# 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF) and LF line endings (POSIX awk compatible across gawk, mawk, BSD awk)
 BOM_FILES=$(find . -type f \
   -not -path './.git/*' \
   -not -path './target/*' \
-  -not -path './docs/04-sprint-management/*' \
-  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
+  -not -path './lab/.tmp/*' \
+  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
   -exec awk 'BEGIN { bom = sprintf("%c%c%c", 239, 187, 191) } FNR == 1 && index($0, bom) == 1 { print FILENAME }' {} +)
 
 if [ -n "$BOM_FILES" ]; then
   echo "ERROR: UTF-8 BOM detected in files (must be UTF-8 without BOM):" >&2
   echo "$BOM_FILES" >&2
+  exit 1
+fi
+
+CRLF_FILES=$(find . -type f \
+  -not -path './.git/*' \
+  -not -path './target/*' \
+  -not -path './lab/.tmp/*' \
+  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
+  -exec awk 'BEGIN { cr = sprintf("%c", 13) } index($0, cr) > 0 { if (!seen[FILENAME]++) print FILENAME }' {} +)
+
+if [ -n "$CRLF_FILES" ]; then
+  echo "ERROR: CRLF/CR line endings detected in files (must be LF):" >&2
+  echo "$CRLF_FILES" >&2
   exit 1
 fi
 
