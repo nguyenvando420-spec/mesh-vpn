@@ -5,9 +5,9 @@
 ## Giai đoạn hiện tại
 
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
-- **Giai đoạn**: `6 - Release & Production Readiness (Sẵn sàng trình duyệt Gate 3)`
+- **Giai đoạn**: `Hoàn tất Gate 3 — Sẵn sàng triển khai thực địa theo Go-Live Checklist (v0.1.0)`
 - **Sprint hiện tại**: `Sprint 2 (Hoàn tất 100%: 13 Must / 60 SP + 11 Should / 35 SP; lũy kế toàn dự án 62 Stories / 269 SP)`
-- **Bước tiếp theo**: `Trình người dùng phê duyệt Gate 3 (Sprint Review, QA & Go-Live Production)`
+- **Bước tiếp theo**: `Người dùng tự rà soát các commit cục bộ trên nhánh main và thực hiện 3 mục nghiệm thu hạ tầng thực địa (PERF-02, PLAT-05, PLAT-06) theo go-live-checklist.md trước khi cắt băng Production`
 
 ## Trạng thái Gate
 
@@ -15,13 +15,13 @@
 |---|---|---|---|
 | Gate 1 — Nghiên cứu & Backlog | ✅ Đã duyệt | 2026-11-12 | (1) Ưu tiên làm Client cho **macOS và Windows trước** (Server chạy trên Ubuntu Linux VPS + hỗ trợ Linux TUN cho VPS làm node & phòng lab NAT); (2) Tạm thời **kết nối trực tiếp bằng IP VPS** (chế độ Pin chứng chỉ/khóa `SEC-04c`) và **hỗ trợ đổi port TCP/UDP tùy ý** (không khóa cứng 443/3478); (3) Giữ các mặc định: chia **2 đợt bàn giao** (Milestone 1 → Milestone 2), tự định nghĩa giao thức, tên CLI **`mesh`** (`.mesh.internal`), quản trị CLI/SSH cục bộ. |
 | Gate 2 — Stack/Model, Code Format, Thiết kế & Sprint | ✅ Đã duyệt | 2026-11-13 | Người dùng duyệt gói Rust `1.94.1` v2.2 / Sprint Plan v1.2 kèm 2 mặc định khuyến nghị: (1) **`OQ-15` Mặc định A**: giữ **Sprint 1 = `38 Must / 174 SP`** & **Sprint 2 = `13 Must / 60 SP`** (+ `11 Should / 35 SP`); (2) **Chính sách lỗi phần cứng `EIO` kép**: compaction hợp nhất toàn bộ mục thu hồi chưa bền vững trong RAM (kể cả `ram_only`) trước khi gỡ `disk_degraded`; khi hết lease version đúng lúc cả 2 tầng đĩa lỗi `EIO`, vẫn cắt tức thì phiên Control/Relay của node bị thu hồi trong RAM và đóng stream buộc các peer xác thực lại (không phát version chưa lưu đĩa). |
-| Gate 3 — Sprint Review, QA/AI Eval & Release | 🟡 Sẵn sàng trình duyệt | | Chờ người dùng phê duyệt kết quả Sprint 1 + Sprint 2 (`308/308` tests, `33/36` SLO PASS, `[PASS - ĐẠT DoD]`, `[APPROVED FOR GATE]`). |
+| Gate 3 — Sprint Review, QA/AI Eval & Release | ✅ Đã duyệt | 2026-11-14 | Người dùng duyệt Gate 3: nghiệm thu toàn bộ Sprint 1 + Sprint 2 (62 Stories / 269 SP, 308/308 tests, 33/36 SLO PASS) cùng 4 đánh đổi thiết kế; giữ nguyên các commit cục bộ trên nhánh main (chưa git push / chưa tạo tag v0.1.0) để tự rà soát và thực hiện 3 mục phần cứng/lab thực địa (PERF-02, PLAT-05, PLAT-06) theo Go-Live Checklist. |
 
 ## Các Vai trò trong Team (13 Vai trò Chuẩn Plugin v3.1.0: Orchestrator + Swarm)
 
 | Vai trò | Model | conversationId / tên worker | Nhiệm vụ gần nhất | Trạng thái |
 |---|---|---|---|---|
-| agile-scrum-master (Nhạc trưởng 2 pha / Swarm Coordinator) | `gemini-pro-orchestrator` (Orchestrator Carbon) | Main Agent | Hoàn tất tổng kết Sprint Review/Retro, kiểm chứng `308/308` tests & `33/36` SLO PASS trên `main`, đóng Swarm trình Gate 3 | 🟢 Active |
+| agile-scrum-master (Nhạc trưởng 2 pha / Swarm Coordinator) | `gemini-pro-orchestrator` (Orchestrator Carbon) | Main Agent | Hoàn tất tổng kết Sprint Review/Retro, kiểm chứng `308/308` tests & `33/36` SLO PASS trên `main`, đóng Swarm và ghi nhận Gate 3 đã duyệt | ✅ Done (Gate 3 Approved) |
 | agile-researcher | `claude-opus-5-5-high` (dự phòng: `gemini-4-argon-high`) | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | `claude-sonnet-5-5-high` (dự phòng: `gemini-4-carbon-high`) | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
 | agile-tech-lead | `gemini-4-argon-high` (dự phòng cho `claude-sonnet-5-5-high`) | 111ccb61-76da-4415-aa05-654afdb784c6 | Hoàn tất `scripts/check.ps1 -Cross` & `.gitignore` `*.o` | ✅ Done (`check.ps1 -Cross`) |
