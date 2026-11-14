@@ -235,21 +235,39 @@ check_gatekeeper_posture() {
 }
 
 check_hosts_symlink_integrity() {
-  if [ ! -L /etc/hosts ]; then
-    log_fail "/etc/hosts is NOT a symlink (must remain symlink to /private/etc/hosts)"
+  if [ -L /etc/hosts ]; then
+    local target
+    target="$(readlink /etc/hosts)"
+    case "$target" in
+      private/etc/hosts|/private/etc/hosts)
+        log_pass "/etc/hosts symlink intact -> $target"
+        ;;
+      *)
+        log_fail "/etc/hosts points to unexpected target: $target"
+        return
+        ;;
+    esac
+  elif [ -L /etc ]; then
+    local etc_target
+    etc_target="$(readlink /etc)"
+    case "$etc_target" in
+      private/etc|/private/etc)
+        if [ -f /private/etc/hosts ]; then
+          log_pass "/etc symlink intact (-> $etc_target) and /private/etc/hosts regular file verified"
+        else
+          log_fail "/private/etc/hosts missing regular file"
+          return
+        fi
+        ;;
+      *)
+        log_fail "/etc points to unexpected target: $etc_target"
+        return
+        ;;
+    esac
+  else
+    log_fail "Neither /etc/hosts nor /etc is a symlink to /private/etc"
     return
   fi
-
-  local target
-  target="$(readlink /etc/hosts)"
-  case "$target" in
-    private/etc/hosts|/private/etc/hosts)
-      log_pass "/etc/hosts symlink intact -> $target"
-      ;;
-    *)
-      log_fail "/etc/hosts points to unexpected target: $target"
-      ;;
-  esac
 
   if [ -f /private/etc/hosts ]; then
     local info uid gid mode
@@ -266,12 +284,14 @@ check_hosts_symlink_integrity() {
 }
 
 capture_baseline_snapshot() {
-  local snapshot_dir
-  snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/mesh-macos-baseline.XXXXXX")"
+  local tmp_base snapshot_dir
+  tmp_base="${TMPDIR:-/tmp}"
+  tmp_base="${tmp_base%/}"
+  snapshot_dir="$(mktemp -d "${tmp_base}/mesh-macos-baseline.XXXXXX")"
   ifconfig -l >"$snapshot_dir/ifconfig_l.txt" 2>/dev/null || true
   scutil --dns >"$snapshot_dir/scutil_dns.txt" 2>/dev/null || true
   ls -la /etc/resolver >"$snapshot_dir/etc_resolver.txt" 2>/dev/null || true
-  log_info "Captured baseline host snapshot in $snapshot_dir"
+  log_info "Captured baseline host snapshot in $snapshot_dir" >&2
   printf '%s\n' "$snapshot_dir"
 }
 
@@ -518,10 +538,11 @@ PY
   check_hosts_symlink_integrity
 }
 
+BASELINE_DIR=""
+
 main() {
-  local baseline_dir
-  baseline_dir="$(capture_baseline_snapshot)"
-  trap 'rm -rf "$baseline_dir"' EXIT
+  BASELINE_DIR="$(capture_baseline_snapshot)"
+  trap '[ -n "${BASELINE_DIR:-}" ] && rm -rf "${BASELINE_DIR}"' EXIT
 
   check_darwin_platform
   check_gatekeeper_posture
@@ -530,7 +551,7 @@ main() {
   if check_installed_artifacts; then
     if [ "$MODE" = "ipc" ] || [ "$MODE" = "full" ]; then
       check_ipc_and_rbac
-      check_utun_and_ledger "$baseline_dir"
+      check_utun_and_ledger "$BASELINE_DIR"
       check_dns_resolution
     fi
     if [ "$MODE" = "full" ]; then
