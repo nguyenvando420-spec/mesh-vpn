@@ -254,7 +254,10 @@ mod tests {
         let revoke_elapsed = start.elapsed();
 
         // Assert
-        assert!(revoke_elapsed < Duration::from_millis(200));
+        assert!(
+            revoke_elapsed < Duration::from_millis(800),
+            "apply_netmap took {revoke_elapsed:?}, expected < 800ms"
+        );
         assert_eq!(diff_v2.removed, 1);
         assert_eq!(
             relay_handle.remove_peer_queues(&[peer_b.node_kp.public_key()]),

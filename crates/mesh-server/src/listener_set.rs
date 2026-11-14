@@ -24,6 +24,7 @@ use rustls::ServerConfig as RustlsServerConfig;
 use serde_json::json;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
@@ -38,8 +39,15 @@ use crate::stun_service::{StunServiceState, bind_stun_udp_socket, run_stun_socke
 
 const DEFAULT_MIGRATION_GRACE_SECS: u64 = 300;
 const MAX_MIGRATION_GRACE_SECS: u64 = 86_400;
-const RETIRE_REBIND_MAX_ATTEMPTS: usize = 25;
-const RETIRE_REBIND_BACKOFF: Duration = Duration::from_millis(15);
+const RETIRE_REBIND_MAX_ATTEMPTS: usize = 40;
+const RETIRE_REBIND_BACKOFF: Duration = Duration::from_millis(25);
+
+#[derive(Debug)]
+struct RetiredSocketHandle {
+    port: u16,
+    cancel: CancellationToken,
+    dropped_rx: Option<oneshot::Receiver<()>>,
+}
 
 #[derive(Debug)]
 struct ActivePortState {
@@ -48,11 +56,11 @@ struct ActivePortState {
     tls_mode: TlsMode,
     public_host: String,
     active_tcp_cancel: CancellationToken,
+    active_tcp_dropped_rx: Option<oneshot::Receiver<()>>,
     active_stun_cancel: CancellationToken,
-    previous_tcp_cancel: Option<CancellationToken>,
-    previous_stun_cancel: Option<CancellationToken>,
-    previous_tcp_port: Option<u16>,
-    previous_stun_port: Option<u16>,
+    active_stun_dropped_rx: Option<oneshot::Receiver<()>>,
+    previous_tcp: Option<RetiredSocketHandle>,
+    previous_stun: Option<RetiredSocketHandle>,
     transition_deadline_at_ms: Option<u64>,
 }
 
@@ -132,17 +140,22 @@ impl ListenerSet {
                 tls_mode: config.tls_mode,
                 public_host: config.public_host.clone(),
                 active_tcp_cancel: active_tcp_cancel.clone(),
+                active_tcp_dropped_rx: None,
                 active_stun_cancel: active_stun_cancel.clone(),
-                previous_tcp_cancel: None,
-                previous_stun_cancel: None,
-                previous_tcp_port: None,
-                previous_stun_port: None,
+                active_stun_dropped_rx: None,
+                previous_tcp: None,
+                previous_stun: None,
                 transition_deadline_at_ms: None,
             }),
         });
 
-        set.spawn_control_accept_loop(tcp_listener, active_tcp_cancel, config.tls_mode)?;
-        set.spawn_stun_loop(udp_socket, active_stun_cancel);
+        let tcp_dropped_rx =
+            set.spawn_control_accept_loop(tcp_listener, active_tcp_cancel, config.tls_mode)?;
+        let stun_dropped_rx = set.spawn_stun_loop(udp_socket, active_stun_cancel);
+        if let Ok(mut guard) = set.ports.lock() {
+            guard.active_tcp_dropped_rx = Some(tcp_dropped_rx);
+            guard.active_stun_dropped_rx = Some(stun_dropped_rx);
+        }
         Ok(set)
     }
 
@@ -289,13 +302,16 @@ impl ListenerSet {
         let new_tcp_listener = if target_tcp_port == old_tcp_port {
             None
         } else {
-            let retired_prev =
-                if let Some(prev_cancel) = self.take_previous_tcp_if_port(target_tcp_port) {
-                    prev_cancel.cancel();
-                    true
-                } else {
-                    false
-                };
+            let retired_prev = if let Some(prev) = self.take_previous_tcp_if_port(target_tcp_port) {
+                prev.cancel.cancel();
+                if let Some(rx) = prev.dropped_rx {
+                    drop(timeout(Duration::from_secs(2), rx).await);
+                }
+                tokio::task::yield_now().await;
+                true
+            } else {
+                false
+            };
             let ip: IpAddr = self
                 .config
                 .control_bind_ip
@@ -312,13 +328,17 @@ impl ListenerSet {
         let new_udp_socket = if target_stun_port == old_stun_port {
             None
         } else {
-            let retired_prev =
-                if let Some(prev_cancel) = self.take_previous_stun_if_port(target_stun_port) {
-                    prev_cancel.cancel();
-                    true
-                } else {
-                    false
-                };
+            let retired_prev = if let Some(prev) = self.take_previous_stun_if_port(target_stun_port)
+            {
+                prev.cancel.cancel();
+                if let Some(rx) = prev.dropped_rx {
+                    drop(timeout(Duration::from_secs(2), rx).await);
+                }
+                tokio::task::yield_now().await;
+                true
+            } else {
+                false
+            };
             let ip: IpAddr = self
                 .config
                 .stun_bind_ip
@@ -345,14 +365,18 @@ impl ListenerSet {
 
         if let Some(listener) = new_tcp_listener {
             let new_cancel = self.shutdown.child_token();
-            self.spawn_control_accept_loop(listener, new_cancel.clone(), target_tls_mode)?;
+            let new_dropped_rx =
+                self.spawn_control_accept_loop(listener, new_cancel.clone(), target_tls_mode)?;
             if let Ok(mut guard) = self.ports.lock() {
-                let prev_tcp = guard.active_tcp_cancel.clone();
-                if let Some(stale) = guard.previous_tcp_cancel.replace(prev_tcp) {
-                    stale.cancel();
+                let prev_cancel = std::mem::replace(&mut guard.active_tcp_cancel, new_cancel);
+                let prev_dropped_rx = guard.active_tcp_dropped_rx.replace(new_dropped_rx);
+                if let Some(stale) = guard.previous_tcp.replace(RetiredSocketHandle {
+                    port: old_tcp_port,
+                    cancel: prev_cancel,
+                    dropped_rx: prev_dropped_rx,
+                }) {
+                    stale.cancel.cancel();
                 }
-                guard.previous_tcp_port = Some(old_tcp_port);
-                guard.active_tcp_cancel = new_cancel;
                 guard.control_tcp_port = target_tcp_port;
                 guard.tls_mode = target_tls_mode;
                 guard.public_host = new_host.to_owned();
@@ -363,14 +387,17 @@ impl ListenerSet {
         }
         if let Some(sock) = new_udp_socket {
             let new_cancel = self.shutdown.child_token();
-            self.spawn_stun_loop(sock, new_cancel.clone());
+            let new_dropped_rx = self.spawn_stun_loop(sock, new_cancel.clone());
             if let Ok(mut guard) = self.ports.lock() {
-                let prev_stun = guard.active_stun_cancel.clone();
-                if let Some(stale) = guard.previous_stun_cancel.replace(prev_stun) {
-                    stale.cancel();
+                let prev_cancel = std::mem::replace(&mut guard.active_stun_cancel, new_cancel);
+                let prev_dropped_rx = guard.active_stun_dropped_rx.replace(new_dropped_rx);
+                if let Some(stale) = guard.previous_stun.replace(RetiredSocketHandle {
+                    port: old_stun_port,
+                    cancel: prev_cancel,
+                    dropped_rx: prev_dropped_rx,
+                }) {
+                    stale.cancel.cancel();
                 }
-                guard.previous_stun_port = Some(old_stun_port);
-                guard.active_stun_cancel = new_cancel;
                 guard.stun_udp_port = target_stun_port;
             }
         }
@@ -453,36 +480,40 @@ impl ListenerSet {
         if now_ms < deadline_ms && !all_acked {
             return false;
         }
-        if let Some(old_tcp) = guard.previous_tcp_cancel.take() {
-            old_tcp.cancel();
+        if let Some(old_tcp) = guard.previous_tcp.take() {
+            old_tcp.cancel.cancel();
         }
-        guard.previous_tcp_port = None;
-        if let Some(old_stun) = guard.previous_stun_cancel.take() {
-            old_stun.cancel();
+        if let Some(old_stun) = guard.previous_stun.take() {
+            old_stun.cancel.cancel();
         }
-        guard.previous_stun_port = None;
         guard.transition_deadline_at_ms = None;
         true
     }
 
-    fn take_previous_tcp_if_port(&self, target_port: u16) -> Option<CancellationToken> {
+    fn take_previous_tcp_if_port(&self, target_port: u16) -> Option<RetiredSocketHandle> {
         let Ok(mut guard) = self.ports.lock() else {
             return None;
         };
-        if guard.previous_tcp_port == Some(target_port) {
-            guard.previous_tcp_port = None;
-            return guard.previous_tcp_cancel.take();
+        if guard
+            .previous_tcp
+            .as_ref()
+            .is_some_and(|prev| prev.port == target_port)
+        {
+            return guard.previous_tcp.take();
         }
         None
     }
 
-    fn take_previous_stun_if_port(&self, target_port: u16) -> Option<CancellationToken> {
+    fn take_previous_stun_if_port(&self, target_port: u16) -> Option<RetiredSocketHandle> {
         let Ok(mut guard) = self.ports.lock() else {
             return None;
         };
-        if guard.previous_stun_port == Some(target_port) {
-            guard.previous_stun_port = None;
-            return guard.previous_stun_cancel.take();
+        if guard
+            .previous_stun
+            .as_ref()
+            .is_some_and(|prev| prev.port == target_port)
+        {
+            return guard.previous_stun.take();
         }
         None
     }
@@ -492,7 +523,7 @@ impl ListenerSet {
         listener: TcpListener,
         cancel: CancellationToken,
         tls_mode: TlsMode,
-    ) -> AppResult<()> {
+    ) -> AppResult<oneshot::Receiver<()>> {
         let tls_acceptor = if tls_mode == TlsMode::ReverseProxy {
             None
         } else {
@@ -502,6 +533,7 @@ impl ListenerSet {
 
         let router = self.router.clone();
         let tracker = self.tracker.clone();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
         self.control_healthy.store(true, Ordering::SeqCst);
 
         self.tracker.spawn(async move {
@@ -539,17 +571,38 @@ impl ListenerSet {
                     }
                 }
             }
+            drop(listener);
+            if dropped_tx.send(()).is_err() {
+                tracing::trace!(
+                    component = "listener_set",
+                    event = "tcp_listener_dropped_no_waiter",
+                    "Control TCP listener dropped without active retirement waiter"
+                );
+            }
         });
-        Ok(())
+        Ok(dropped_rx)
     }
 
-    fn spawn_stun_loop(&self, socket: Arc<UdpSocket>, cancel: CancellationToken) {
+    fn spawn_stun_loop(
+        &self,
+        socket: Arc<UdpSocket>,
+        cancel: CancellationToken,
+    ) -> oneshot::Receiver<()> {
         let clock: Arc<dyn Clock> = Arc::new(mesh_core::SystemClock::new());
         let pps = self.config.stun_pps_limit_per_ip;
         let stun_state = Arc::clone(&self.stun_state);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
         self.tracker.spawn(async move {
             run_stun_socket_loop(socket, pps, clock, stun_state, cancel).await;
+            if dropped_tx.send(()).is_err() {
+                tracing::trace!(
+                    component = "listener_set",
+                    event = "stun_socket_dropped_no_waiter",
+                    "STUN UDP socket dropped without active retirement waiter"
+                );
+            }
         });
+        dropped_rx
     }
 }
 
@@ -574,7 +627,10 @@ async fn bind_control_tcp_listener_with_retire_retry(
             Err(err)
                 if retired_previous
                     && attempt < max_attempts
-                    && err.kind() == std::io::ErrorKind::AddrInUse =>
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) =>
             {
                 sleep(RETIRE_REBIND_BACKOFF).await;
             }
@@ -603,7 +659,10 @@ async fn bind_stun_udp_socket_with_retire_retry(
             Err(err)
                 if retired_previous
                     && attempt < max_attempts
-                    && err.kind() == std::io::ErrorKind::AddrInUse =>
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) =>
             {
                 sleep(RETIRE_REBIND_BACKOFF).await;
             }
@@ -1192,20 +1251,12 @@ mod tests {
         )?);
         let _init_id = store.ensure_or_init_identity(&["127.0.0.1".to_owned()], 365)?;
 
-        let tcp_a = TcpListener::bind("127.0.0.1:0").await?;
-        let tcp_b = TcpListener::bind("127.0.0.1:0").await?;
-        let udp_a = UdpSocket::bind("127.0.0.1:0").await?;
-        let port_a = tcp_a.local_addr()?.port();
-        let port_b = tcp_b.local_addr()?.port();
-        let stun_a = udp_a.local_addr()?.port();
-        drop((tcp_a, tcp_b, udp_a));
-
         let cfg = Arc::new(crate::config::ServerConfig {
             control_bind_ip: "127.0.0.1".to_owned(),
             stun_bind_ip: "127.0.0.1".to_owned(),
             public_host: "127.0.0.1".to_owned(),
-            control_tcp_port: port_a,
-            stun_udp_port: stun_a,
+            control_tcp_port: 0,
+            stun_udp_port: 0,
             trusted_proxies: vec!["127.0.0.1".parse()?],
             ..crate::config::ServerConfig::default()
         });
@@ -1239,21 +1290,45 @@ mod tests {
             shutdown: shutdown.clone(),
         };
         let listeners = super::ListenerSet::bind_and_start(ctrl_state, acme).await?;
+        let port_a = listeners.active_ports().0;
+        assert_ne!(port_a, 0);
 
         // Act 1: migrate port_a -> port_b with a 60s dual-listener window
-        let fwd = listeners
-            .migrate_endpoints(
-                &mesh_proto::admin_ipc::MigrateEndpointRequest {
-                    tcp_port: Some(mesh_core::Port::from_u16(port_b)?),
-                    stun_port: None,
-                    host: None,
-                    tls_mode: None,
-                    transition_window_secs: Some(60),
-                    extend_window_secs: None,
-                },
-                "admin",
-            )
-            .await?;
+        let mut fwd_opt = None;
+        let mut port_b = 0;
+        for attempt in 0..5 {
+            let tcp_b = TcpListener::bind("127.0.0.1:0").await?;
+            let candidate = tcp_b.local_addr()?.port();
+            drop(tcp_b);
+            if candidate == port_a {
+                continue;
+            }
+            match listeners
+                .migrate_endpoints(
+                    &mesh_proto::admin_ipc::MigrateEndpointRequest {
+                        tcp_port: Some(mesh_core::Port::from_u16(candidate)?),
+                        stun_port: None,
+                        host: None,
+                        tls_mode: None,
+                        transition_window_secs: Some(60),
+                        extend_window_secs: None,
+                    },
+                    "admin",
+                )
+                .await
+            {
+                Ok(resp) => {
+                    port_b = candidate;
+                    fwd_opt = Some(resp);
+                    break;
+                }
+                Err(err) if attempt < 4 && err.kind() == mesh_core::ErrorKind::Conflict => {
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let fwd = fwd_opt.ok_or("failed allocating and migrating to free ephemeral port_b")?;
         assert_eq!(fwd.control_tcp_endpoint, format!("127.0.0.1:{port_b}"));
         assert_eq!(listeners.active_ports().0, port_b);
 

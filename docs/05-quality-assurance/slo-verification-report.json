@@ -1,7 +1,7 @@
 {
     "schema_version":  1,
     "story":  "US-058",
-    "generated_at_utc":  "2026-11-14T12:12:17Z",
+    "generated_at_utc":  "2026-11-14T13:11:50Z",
     "host_os":  "Microsoft Windows 10.0.26300",
     "host_arch":  "X64",
     "toolchain":  "1.94.1-x86_64-pc-windows-gnu",
@@ -54,14 +54,14 @@
                              {
                                  "binary":  "meshd.exe",
                                  "path":  "target/release/meshd.exe",
-                                 "size_bytes":  6170624,
-                                 "size_mib":  5.885
+                                 "size_bytes":  6167552,
+                                 "size_mib":  5.882
                              },
                              {
                                  "binary":  "mesh-server.exe",
                                  "path":  "target/release/mesh-server.exe",
-                                 "size_bytes":  8426496,
-                                 "size_mib":  8.036
+                                 "size_bytes":  8429056,
+                                 "size_mib":  8.039
                              },
                              {
                                  "binary":  "mesh-server",
@@ -74,42 +74,42 @@
                    {
                        "id":  "PERF-01",
                        "name":  "Idle Control server memory footprint (release binary WorkingSet64)",
-                       "measured":  10.07,
+                       "measured":  9.992,
                        "threshold":  "\u003c= 128.0",
                        "unit":  "MiB",
                        "status":  "PASS",
                        "method":  "empirical_release_process_rss",
-                       "details":  "[empirical_release_process_rss] Release binary target/release/mesh-server.exe live WorkingSet64=10.07 MiB (10559488 B) at /readyz 200 OK (measured=10.07 MiB)"
+                       "details":  "[empirical_release_process_rss] Release binary target/release/mesh-server.exe live WorkingSet64=9.992 MiB (10477568 B) at /readyz 200 OK (measured=9.992 MiB)"
                    },
                    {
                        "id":  "PERF-03",
                        "name":  "WireGuard encrypt+decrypt + cryptokey P95 latency (MTU 1280)",
-                       "measured":  0.0077,
+                       "measured":  0.0079,
                        "threshold":  "\u003c= 2.0",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_datapath_slo",
-                       "details":  "[empirical_rust_datapath_slo] 1000 MTU-1280 BoringTun ChaCha20Poly1305 encap+decap frames (measured=0.0077 ms)"
+                       "details":  "[empirical_rust_datapath_slo] 1000 MTU-1280 BoringTun ChaCha20Poly1305 encap+decap frames (measured=0.0079 ms)"
                    },
                    {
                        "id":  "PERF-04",
                        "name":  "In-memory userspace WireGuard throughput (\u003e=70% of 300 Mbps)",
-                       "measured":  2295.26,
+                       "measured":  2306.68,
                        "threshold":  "\u003e= 210.0",
                        "unit":  "Mbps",
                        "status":  "PASS",
                        "method":  "empirical_rust_datapath_slo",
-                       "details":  "[empirical_rust_datapath_slo] 2500 x 1280B PeerMap encrypt+decrypt pipeline (measured=2295.26 Mbps)"
+                       "details":  "[empirical_rust_datapath_slo] 2500 x 1280B PeerMap encrypt+decrypt pipeline (measured=2306.68 Mbps)"
                    },
                    {
                        "id":  "PERF-05",
                        "name":  "Initial packet via Relay (\u003c=1s) \u0026 Disco Direct upgrade (\u003c=5s)",
-                       "measured":  3.807,
+                       "measured":  3.805,
                        "threshold":  "\u003c= 5000.0",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_datapath_slo",
-                       "details":  "[empirical_rust_datapath_slo] verified Relay first packet \u003c1s then DirectUdp DiscoPong promotion \u003c5s (measured=3.807 ms)"
+                       "details":  "[empirical_rust_datapath_slo] verified Relay first packet \u003c1s then DirectUdp DiscoPong promotion \u003c5s (measured=3.805 ms)"
                    },
                    {
                        "id":  "PERF-06",
@@ -124,32 +124,32 @@
                    {
                        "id":  "PERF-07",
                        "name":  "Clock-jump (+240s) detection \u0026 socket rebind recovery",
-                       "measured":  0.013,
+                       "measured":  0.012,
                        "threshold":  "\u003c= 15000.0",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_datapath_slo",
-                       "details":  "[empirical_rust_datapath_slo] ClockJumpDetector(+240s) + SocketRebinder::rebind_socket completed (measured=0.013 ms)"
+                       "details":  "[empirical_rust_datapath_slo] ClockJumpDetector(+240s) + SocketRebinder::rebind_socket completed (measured=0.012 ms)"
                    },
                    {
                        "id":  "PERF-08",
                        "name":  "Netmap snapshot broadcast P95 across live TLS WS streams (20 nodes)",
-                       "measured":  14.5609,
+                       "measured":  15.7366,
                        "threshold":  "\u003c= 5000.0",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_server_slo",
-                       "details":  "[empirical_rust_server_slo] 4 live TLS WebSocket subscribers observed netmap arrival with 20 peers (measured=14.5609 ms)"
+                       "details":  "[empirical_rust_server_slo] 4 live TLS WebSocket subscribers observed netmap arrival with 20 peers (measured=15.7366 ms)"
                    },
                    {
                        "id":  "PERF-09",
                        "name":  "Idle datapath in-memory bounded footprint (20 peers + 4x2KB bufs)",
-                       "measured":  12.53,
+                       "measured":  12.36,
                        "threshold":  "\u003c= 50.0",
                        "unit":  "MiB",
                        "status":  "PASS",
                        "method":  "empirical_rust_datapath_slo",
-                       "details":  "[empirical_rust_datapath_slo] live process RSS=12.53 MiB; bounded PeerMap(20)+4xPacketBuffer(2048) struct_mib=0.224770 MiB (measured=12.53 MiB)"
+                       "details":  "[empirical_rust_datapath_slo] live process RSS=12.36 MiB; bounded PeerMap(20)+4xPacketBuffer(2048) struct_mib=0.224770 MiB (measured=12.36 MiB)"
                    },
                    {
                        "id":  "PERF-10",
@@ -164,12 +164,12 @@
                    {
                        "id":  "PERF-11",
                        "name":  "Live Blind Relay 20 Mbps TokenBucket \u0026 \u003e=2-stream HoL isolation",
-                       "measured":  10.860302570497865,
+                       "measured":  10.771256107473063,
                        "threshold":  "\u003e= 2.0",
                        "unit":  "Mbps",
                        "status":  "PASS",
                        "method":  "empirical_rust_server_slo",
-                       "details":  "[empirical_rust_server_slo] stream a-\u003ec saturated mpsc(256)+20Mbps throttle while d-\u003eb received 2200/2200 frames (2.64 MB \u003e 625 KB burst) at 10.86 Mbps (measured=10.860302570497865 Mbps)"
+                       "details":  "[empirical_rust_server_slo] stream a-\u003ec saturated mpsc(256)+20Mbps throttle while d-\u003eb received 2200/2200 frames (2.64 MB \u003e 625 KB burst) at 10.77 Mbps (measured=10.771256107473063 Mbps)"
                    },
                    {
                        "id":  "PERF-11-QUEUE",
@@ -184,12 +184,12 @@
                    {
                        "id":  "PERF-12",
                        "name":  "Control server startup-to-ready latency",
-                       "measured":  465.51759999999996,
+                       "measured":  455.3722,
                        "threshold":  "\u003c= 5000",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_server_slo",
-                       "details":  "[empirical_rust_server_slo] live mesh-server readiness convergence (measured=465.51759999999996 ms)"
+                       "details":  "[empirical_rust_server_slo] live mesh-server readiness convergence (measured=455.3722 ms)"
                    },
                    {
                        "id":  "SEC-01",
@@ -254,12 +254,12 @@
                    {
                        "id":  "SEC-08",
                        "name":  "Instant RAM node revocation latency under Dual-EIO",
-                       "measured":  0.0648,
+                       "measured":  0.07669999999999999,
                        "threshold":  "\u003c 100.0",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_server_slo",
-                       "details":  "[empirical_rust_server_slo] 25 nodes revoked in PersistenceTier::RamOnly with redb+slot EIO active (measured=0.0648 ms)"
+                       "details":  "[empirical_rust_server_slo] 25 nodes revoked in PersistenceTier::RamOnly with redb+slot EIO active (measured=0.07669999999999999 ms)"
                    },
                    {
                        "id":  "SEC-11",
@@ -314,12 +314,12 @@
                    {
                        "id":  "REL-08",
                        "name":  "Graceful DatapathEngine \u0026 FakeTunDevice shutdown",
-                       "measured":  30.187,
+                       "measured":  0.437,
                        "threshold":  "\u003c= 5000.0",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_datapath_slo",
-                       "details":  "[empirical_rust_datapath_slo] CancellationToken closed TUN and stopped DatapathEngine within 5s budget (measured=30.187 ms)"
+                       "details":  "[empirical_rust_datapath_slo] CancellationToken closed TUN and stopped DatapathEngine within 5s budget (measured=0.437 ms)"
                    },
                    {
                        "id":  "REL-09",
@@ -344,12 +344,12 @@
                    {
                        "id":  "REL-12",
                        "name":  "Hot atomic backup + .sha256 verify + restore preserving SPKI pin",
-                       "measured":  492.089,
+                       "measured":  508.59849999999994,
                        "threshold":  "\u003c= 5000.0",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_server_slo",
-                       "details":  "[empirical_rust_server_slo] verified atomic MVCC backup, SHA-256 check, anti-rollback guard, and identical SPKI pin (measured=492.089 ms); verified live in Docker NAT Chaos Lab"
+                       "details":  "[empirical_rust_server_slo] verified atomic MVCC backup, SHA-256 check, anti-rollback guard, and identical SPKI pin (measured=508.59849999999994 ms); verified live in Docker NAT Chaos Lab"
                    },
                    {
                        "id":  "PLAT-04",
@@ -364,12 +364,12 @@
                    {
                        "id":  "OPS-05",
                        "name":  "Server startup --check-config \u0026 /healthz+/readyz readiness",
-                       "measured":  465.51759999999996,
+                       "measured":  455.3722,
                        "threshold":  "\u003c= 5000",
                        "unit":  "ms",
                        "status":  "PASS",
                        "method":  "empirical_rust_server_slo",
-                       "details":  "[empirical_rust_server_slo] live mesh-server --check-config \u0026 HTTP /readyz probe (measured=465.51759999999996 ms)"
+                       "details":  "[empirical_rust_server_slo] live mesh-server --check-config \u0026 HTTP /readyz probe (measured=455.3722 ms)"
                    },
                    {
                        "id":  "OPS-06",

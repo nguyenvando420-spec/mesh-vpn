@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc, watch};
@@ -1074,12 +1074,6 @@ pub async fn connect_bound_tcp_with_timeout(
     if let Err(err) = sock.set_nodelay(true) {
         debug!(component = "datapath.relay_client", error = %err, "TCP_NODELAY ignored");
     }
-    let tcp_keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(5))
-        .with_interval(Duration::from_secs(2));
-    if let Err(err) = sock.set_tcp_keepalive(&tcp_keepalive) {
-        debug!(component = "datapath.relay_client", error = %err, "TCP keepalive ignored");
-    }
 
     if if_index.is_some() || fwmark.is_some() {
         bind_underlay_socket2(&sock, is_ipv6, if_index, fwmark)?;
@@ -1104,6 +1098,12 @@ pub async fn connect_bound_tcp_with_timeout(
 
     if let Ok(Some(so_err)) = stream.take_error() {
         return Err(AppError::unavailable(format!("tcp socket error: {so_err}")));
+    }
+    let tcp_keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(5))
+        .with_interval(Duration::from_secs(2));
+    if let Err(err) = SockRef::from(&stream).set_tcp_keepalive(&tcp_keepalive) {
+        debug!(component = "datapath.relay_client", error = %err, "TCP keepalive ignored");
     }
     Ok(stream)
 }
@@ -2761,7 +2761,7 @@ mod tests {
     }
 
     // Traces: US-025 AC2, US-028
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_relay_keepalive_echo_updates_last_rtt_ms() {
         // Arrange
         let listener = TcpListener::bind("127.0.0.1:0").await;
@@ -2802,6 +2802,9 @@ mod tests {
                         if ws.send(Message::Binary(echo)).is_err() {
                             return;
                         }
+                        if ws.flush().is_err() {
+                            return;
+                        }
                         break;
                     }
                 }
@@ -2836,7 +2839,8 @@ mod tests {
 
         // Act
         let mut observed_rtt = None;
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
             while ev_rx.try_recv().is_ok() {}
             if let Some(rtt) = handle.last_rtt_ms() {
                 observed_rtt = Some(rtt);
@@ -2851,7 +2855,11 @@ mod tests {
                 .await
                 .is_ok()
         );
-        server_task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), server_task)
+                .await
+                .is_ok()
+        );
 
         // Assert
         assert_eq!(observed_rtt, Some(23));

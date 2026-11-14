@@ -256,8 +256,7 @@ async fn refresh_stun_snapshot(
         return None;
     }
     match tokio::time::timeout(STUN_REFRESH_WAIT, stun_rx.changed()).await {
-        Ok(Ok(())) => handle.query_status().await.ok(),
-        Ok(Err(_)) | Err(_) => None,
+        Ok(Ok(())) | Ok(Err(_)) | Err(_) => handle.query_status().await.ok(),
     }
 }
 

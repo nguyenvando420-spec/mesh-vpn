@@ -316,9 +316,8 @@ mod tests {
 
         // Act
         let boot_res = runtime.block_on(async move {
-            let adapters = std::sync::Arc::new(super::ProductionPlatformAdapters::new(
-                paths.wintun_sha256.clone(),
-            ));
+            let adapters =
+                std::sync::Arc::new(crate::supervisor::InMemoryPlatformAdapters::default());
             let supervisor = super::DaemonSupervisor::boot(
                 paths,
                 std::sync::Arc::new(mesh_core::clock::SystemClock::new()),
