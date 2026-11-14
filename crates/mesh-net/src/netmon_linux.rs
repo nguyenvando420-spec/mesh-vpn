@@ -247,8 +247,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_netmon_linux_can_open_unprivileged_netlink_monitor() {
+    #[tokio::test]
+    async fn test_netmon_linux_can_open_unprivileged_netlink_monitor() {
         // Arrange & Act & Assert: `AF_NETLINK` multicast listen does not require root on Linux.
         let res = LinuxNetMonitor::start();
         assert!(res.is_ok() || res.is_err());

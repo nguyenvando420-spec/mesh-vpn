@@ -258,7 +258,7 @@ impl DaemonRuntimePaths {
             wintun_sha256: None,
             tun_mtu: DEFAULT_TUN_MTU,
             underlay_if_index: None,
-            linux_fwmark: default_linux_fwmark(),
+            linux_fwmark: None,
             agent_version: format!("{DAEMON_BINARY_NAME}/{}", env!("CARGO_PKG_VERSION")),
             hosts_path_override: Some(base_dir.join("hosts")),
         }

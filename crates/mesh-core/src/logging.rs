@@ -278,7 +278,7 @@ impl BoundedRotatingWriter {
         Ok(writer)
     }
 
-    fn rotate_and_prune(state: &mut RotatingState) -> io::Result<()> {
+    fn rotate_only(state: &mut RotatingState) -> io::Result<()> {
         state.current_file.flush()?;
         state.rotation_seq = state.rotation_seq.saturating_add(1);
         let active = state.dir.join(format!("{}.log", state.file_prefix));
@@ -295,7 +295,7 @@ impl BoundedRotatingWriter {
             .truncate(true)
             .open(&active)?;
         state.current_bytes = 0;
-        prune_rotated_logs(&state.dir, &state.file_prefix, state.max_total_bytes)
+        Ok(())
     }
 }
 
@@ -325,7 +325,12 @@ fn discover_max_rotation_seq(dir: &Path, prefix: &str) -> io::Result<u64> {
     Ok(max_seq)
 }
 
-fn prune_rotated_logs(dir: &Path, prefix: &str, max_total_bytes: u64) -> io::Result<()> {
+fn prune_rotated_logs(
+    dir: &Path,
+    prefix: &str,
+    tracked_active_bytes: u64,
+    max_total_bytes: u64,
+) -> io::Result<()> {
     let active_name = format!("{prefix}.log");
     let mut active_size = 0_u64;
     let mut rotated_files: Vec<(u64, String, PathBuf, u64)> = Vec::new();
@@ -344,6 +349,7 @@ fn prune_rotated_logs(dir: &Path, prefix: &str, max_total_bytes: u64) -> io::Res
         }
     }
 
+    active_size = active_size.max(tracked_active_bytes);
     rotated_files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let mut total_size = active_size.saturating_add(
         rotated_files
@@ -370,10 +376,16 @@ impl io::Write for BoundedRotatingWriter {
         if state.current_bytes > 0
             && state.current_bytes.saturating_add(incoming) > state.max_file_bytes
         {
-            Self::rotate_and_prune(&mut state)?;
+            Self::rotate_only(&mut state)?;
         }
         state.current_file.write_all(buf)?;
         state.current_bytes = state.current_bytes.saturating_add(incoming);
+        prune_rotated_logs(
+            &state.dir,
+            &state.file_prefix,
+            state.current_bytes,
+            state.max_total_bytes,
+        )?;
         Ok(buf.len())
     }
 
@@ -506,6 +518,7 @@ mod tests {
             assert!(writer.write_all(&payload).is_ok());
         }
         assert!(writer.flush().is_ok());
+        drop(writer);
 
         // Assert
         let total: u64 = fs::read_dir(tmp.path())

@@ -131,7 +131,7 @@ SLO_CHAOS_STATUS="${CHAOS_STATUS}" \
 SLO_CHAOS_DETAILS="${CHAOS_DETAILS}" \
 SLO_SIMULATE_FAIL="${SIMULATE_FAIL}" \
 "${PYTHON_BIN}" - <<'PY'
-import glob, json, os, platform, re, shutil, socket, subprocess, sys, tempfile, time, urllib.request
+import glob, json, os, platform, re, shutil, socket, stat, subprocess, sys, tempfile, time, urllib.request
 from datetime import datetime, timezone
 
 repo_root = os.environ["SLO_REPO_ROOT"]
@@ -181,6 +181,64 @@ def _free_port(sock_type):
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
+def _ancestors_secure_linux(path, euid):
+    if not os.path.isdir(path):
+        return False
+
+    def _check_chain(target_path):
+        cur = os.path.abspath(target_path)
+        parts = []
+        while True:
+            parts.append(cur)
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        for p in reversed(parts):
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):
+                if st.st_uid != 0:
+                    return False
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                return False
+            if st.st_uid not in (0, euid):
+                return False
+            if (stat.S_IMODE(st.st_mode) & 0o022) != 0:
+                return False
+        return True
+
+    try:
+        return _check_chain(path) and _check_chain(os.path.realpath(path))
+    except OSError:
+        return False
+
+def _make_secure_server_sock_tmpdir():
+    if not sys.platform.startswith("linux"):
+        return tempfile.mkdtemp(prefix="mesh-srv-sock-")
+    euid = os.geteuid()
+    candidates = [
+        os.environ.get("XDG_RUNTIME_DIR"),
+        f"/run/user/{euid}",
+        "/run" if euid == 0 else None,
+        os.path.expanduser("~"),
+        repo_root,
+    ]
+    for base in candidates:
+        if not base or not _ancestors_secure_linux(base, euid):
+            continue
+        td = None
+        try:
+            td = tempfile.mkdtemp(prefix=".ms-rss-", dir=base)
+            os.chmod(td, 0o700)
+            if len(os.path.join(td, "run", "admin.sock")) < 100:
+                return td
+        except OSError:
+            pass
+        if td is not None:
+            shutil.rmtree(td, ignore_errors=True)
+    raise RuntimeError("no non-world-writable Linux directory found for mesh-server admin.sock")
+
 def measure_release_mesh_server_rss():
     target_root = os.path.join(repo_root, "target")
     if not os.path.isdir(target_root):
@@ -199,8 +257,8 @@ def measure_release_mesh_server_rss():
         return
 
     srv_tmp = tempfile.mkdtemp(prefix="mesh-srv-rss-")
+    sock_tmp = None
     state_dir = os.path.join(srv_tmp, "state")
-    run_dir = os.path.join(srv_tmp, "run")
     proc = None
     ready = False
     rss_mib = None
@@ -208,6 +266,8 @@ def measure_release_mesh_server_rss():
     stderr_log = os.path.join(srv_tmp, "stderr.log")
     stderr_fh = None
     try:
+        sock_tmp = _make_secure_server_sock_tmpdir()
+        run_dir = os.path.join(sock_tmp, "run")
         os.makedirs(state_dir, mode=0o700, exist_ok=True)
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         ctrl_port = _free_port(socket.SOCK_STREAM)
@@ -241,7 +301,20 @@ def measure_release_mesh_server_rss():
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                err_msg = f"process exited early with code {proc.returncode}"
+                stderr_fh.flush()
+                tail = ""
+                try:
+                    with open(stderr_log, "r", encoding="utf-8", errors="replace") as err_f:
+                        lines = [ln.strip() for ln in err_f if ln.strip()]
+                        if lines:
+                            tail = lines[-1]
+                except OSError:
+                    pass
+                err_msg = (
+                    f"process exited early with code {proc.returncode}: {tail}"
+                    if tail
+                    else f"process exited early with code {proc.returncode}"
+                )
                 break
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{obs_port}/readyz", timeout=1.0) as resp:
@@ -272,6 +345,8 @@ def measure_release_mesh_server_rss():
                 proc.kill()
                 proc.wait(timeout=5.0)
         shutil.rmtree(srv_tmp, ignore_errors=True)
+        if sock_tmp is not None:
+            shutil.rmtree(sock_tmp, ignore_errors=True)
 
     rel_bin = os.path.relpath(server_bin, repo_root).replace(os.sep, "/")
     passed = ready and (rss_mib is not None) and (rss_mib <= 128.0)

@@ -116,8 +116,9 @@ mod tests {
     }
 
     struct SpawnedServer {
-        _dir: TempDir,
         _guard: ServerChildGuard,
+        _dir: TempDir,
+        _sock_dir: TempDir,
         pid: u32,
         ctrl_port: u16,
         obs_port: u16,
@@ -131,6 +132,51 @@ mod tests {
     struct SeededNode {
         node_kp: NodeKeypair,
         disco_kp: DiscoKeypair,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_socket_base_candidates(euid: u32) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+            out.push(PathBuf::from(xdg));
+        }
+        out.push(PathBuf::from(format!("/run/user/{euid}")));
+        if euid == 0 {
+            out.push(PathBuf::from("/run"));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            out.push(PathBuf::from(home));
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            out.push(cwd);
+        }
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_secure_admin_socket_dir() -> TempDir {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let euid = fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
+        let policy = mesh_net::ipc_linux::server_runtime_dir_policy(euid, None);
+        for base in linux_socket_base_candidates(euid) {
+            if let Ok(td) = tempfile::Builder::new().prefix(".ms-").tempdir_in(&base) {
+                let chmod_ok = fs::set_permissions(td.path(), fs::Permissions::from_mode(0o700));
+                let run_dir = td.path().join("run");
+                if chmod_ok.is_ok()
+                    && mesh_sys::fs_unix::prepare_secure_runtime_dir(&run_dir, policy).is_ok()
+                    && run_dir.join("admin.sock").as_os_str().len() < 100
+                {
+                    return td;
+                }
+            }
+        }
+        panic!("no non-world-writable Linux directory found for mesh-server admin.sock");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn create_secure_admin_socket_dir() -> TempDir {
+        TempDir::new().expect("admin socket tempdir")
     }
 
     fn alloc_tcp_port() -> u16 {
@@ -265,9 +311,10 @@ mod tests {
 
     async fn spawn_server_with_seeded_nodes(seed_count: usize) -> SpawnedServer {
         let dir = TempDir::new().expect("server tempdir");
+        let sock_dir = create_secure_admin_socket_dir();
         let state_dir = dir.path().join("state");
         fs::create_dir_all(&state_dir).expect("create state dir");
-        let admin_sock = dir.path().join("run").join("admin.sock");
+        let admin_sock = sock_dir.path().join("run").join("admin.sock");
         let cfg_path = dir.path().join("server.toml");
         let (ctrl_port, stun_port, obs_port) =
             (alloc_tcp_port(), alloc_udp_port(), alloc_tcp_port());
@@ -311,8 +358,9 @@ mod tests {
         let boot_ms = wait_for_readyz(obs_port).await;
 
         SpawnedServer {
-            _dir: dir,
             _guard: guard,
+            _dir: dir,
+            _sock_dir: sock_dir,
             pid,
             ctrl_port,
             obs_port,

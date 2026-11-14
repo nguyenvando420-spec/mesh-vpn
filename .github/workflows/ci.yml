@@ -189,7 +189,7 @@ jobs:
           bash lab/macos/verify-macos-host.sh --ci-dry-run
 
       - name: Run SLO verification suite (US-058)
-        run: sh scripts/run-slo-suite.sh --skip-static-checks --output-dir target/slo-macos
+        run: bash scripts/run-slo-suite.sh --skip-static-checks --output-dir target/slo-macos
 
       - name: Upload macOS SLO verification report
         if: always()
@@ -256,8 +256,11 @@ jobs:
         shell: pwsh
         run: |
           $failDir = Join-Path $env:RUNNER_TEMP 'slo-fail-check'
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
           & powershell -ExecutionPolicy Bypass -File scripts/run-slo-suite.ps1 -SkipStaticChecks -SimulateFail -OutputDir $failDir
           $rc = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
           if ($rc -eq 0) {
             throw "run-slo-suite.ps1 -SimulateFail unexpectedly exited 0"
           }

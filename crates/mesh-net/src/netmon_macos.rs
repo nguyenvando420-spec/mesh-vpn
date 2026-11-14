@@ -230,8 +230,8 @@ mod tests {
         assert_eq!(guard.pending.front(), Some(&NetEvent::RouteChanged));
     }
 
-    #[test]
-    fn test_netmon_macos_can_open_pf_route_monitor() {
+    #[tokio::test]
+    async fn test_netmon_macos_can_open_pf_route_monitor() {
         // Arrange & Act
         let res = MacOsNetMonitor::start();
 
