@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn test_fs_unix_world_writable_tmp_ancestor_rejected() {
         // Arrange: `/tmp` has sticky world-writable mode (`01777`), so root-mode verification rejects it.
-        let dir = tempdir().expect("create tempdir");
+        let dir = tempfile::tempdir_in("/tmp").expect("create tempdir in /tmp");
         let leaf = dir.path().join("meshd");
         std::fs::create_dir(&leaf).expect("create leaf");
         std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o700))

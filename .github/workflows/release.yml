@@ -165,6 +165,7 @@ jobs:
           if ($rc -eq 0) {
             throw "run-slo-suite.ps1 -SimulateFail unexpectedly exited 0"
           }
+          $global:LASTEXITCODE = 0
           Write-Output "Verified fail-closed SLO gate exit code: $rc"
 
       - name: Download & verify Wintun 0.14.1 and export MESH_WINTUN_SHA256 (Windows)

@@ -67,15 +67,18 @@ else
   exit 1
 fi
 
-METRICS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mesh-slo-metrics.XXXXXX")"
-SLO_LOG="$(mktemp "${TMPDIR:-/tmp}/mesh-slo-cargo.XXXXXX.log")"
-CLI_LOG="$(mktemp "${TMPDIR:-/tmp}/mesh-cli-cargo.XXXXXX.log")"
-CHAOS_JSON="$(mktemp "${TMPDIR:-/tmp}/mesh-chaos.XXXXXX.json")"
-rm -f "${CHAOS_JSON}"
+TMP_BASE="${TMPDIR:-/tmp}"
+TMP_BASE="${TMP_BASE%/}"
+SLO_TMP_ROOT="$(mktemp -d "${TMP_BASE}/mesh-slo.XXXXXX")"
+METRICS_DIR="${SLO_TMP_ROOT}/metrics"
+mkdir -p "${METRICS_DIR}"
+SLO_LOG="${SLO_TMP_ROOT}/cargo-slo.log"
+CLI_LOG="${SLO_TMP_ROOT}/cargo-cli.log"
+CHAOS_JSON="${SLO_TMP_ROOT}/chaos.json"
 
 cleanup() {
   unset MESH_SLO_METRICS_DIR || true
-  rm -rf "${METRICS_DIR}" "${SLO_LOG}" "${CLI_LOG}" "${CHAOS_JSON}" || true
+  rm -rf "${SLO_TMP_ROOT}" || true
 }
 trap cleanup EXIT
 
@@ -246,7 +249,7 @@ def measure_release_mesh_server_rss():
     server_bin = None
     for root, _dirs, files in os.walk(target_root):
         if os.path.basename(root) == "release":
-            for cand_name in ("mesh-server", "mesh-server.exe"):
+            for cand_name in ("mesh-server",):
                 cand_path = os.path.join(root, cand_name)
                 if os.path.isfile(cand_path) and os.access(cand_path, os.X_OK):
                     server_bin = cand_path

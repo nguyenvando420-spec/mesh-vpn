@@ -264,6 +264,7 @@ jobs:
           if ($rc -eq 0) {
             throw "run-slo-suite.ps1 -SimulateFail unexpectedly exited 0"
           }
+          $global:LASTEXITCODE = 0
           Write-Output "Verified fail-closed SLO gate exit code: $rc"
 
       - name: Upload Windows SLO verification report
