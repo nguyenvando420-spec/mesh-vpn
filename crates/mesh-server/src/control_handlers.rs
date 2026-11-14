@@ -266,6 +266,30 @@ async fn handle_auth_challenge(
     }
 }
 
+fn active_public_host(state: &ControlAppState) -> String {
+    let (_, ctrl_ep, _) = state.netmap_hub.current_endpoints();
+    let trimmed = ctrl_ep.trim();
+    if trimmed.is_empty() {
+        return state.config.public_host.clone();
+    }
+    if let Ok(sock) = trimmed.parse::<std::net::SocketAddr>() {
+        return sock.ip().to_string();
+    }
+    if let Some(after_bracket) = trimmed.strip_prefix('[')
+        && let Some((host, _)) = after_bracket.split_once(']')
+        && !host.is_empty()
+    {
+        return host.to_owned();
+    }
+    if let Some((host, port_str)) = trimmed.rsplit_once(':')
+        && port_str.parse::<u16>().is_ok()
+        && !host.is_empty()
+    {
+        return host.to_owned();
+    }
+    trimmed.to_owned()
+}
+
 async fn handle_register_node(
     State(state): State<ControlAppState>,
     req: Request<Body>,
@@ -361,6 +385,7 @@ async fn handle_register_node(
         );
     }
 
+    let active_host = active_public_host(&state);
     let token_hash = sha256_digest(parsed.preauth_key.trim().as_bytes());
     let reg_outcome = state.store.register_node(&RegisterNodeInput {
         pubkey: parsed.node_pubkey,
@@ -368,7 +393,7 @@ async fn handle_register_node(
         previous_node_pubkey: parsed.previous_node_pubkey,
         requested_name: parsed.node_name.clone(),
         preauth_token_hash: token_hash,
-        public_control_host: &state.config.public_host,
+        public_control_host: &active_host,
         domain_suffix: &state.config.domain_suffix,
         os_arch: &auth.client_os_arch,
         agent_version: &auth.agent_version,
@@ -3025,5 +3050,95 @@ mod tests {
         )
         .await;
         assert_eq!(pinned_locked_st, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn alloc_loopback_tcp_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral tcp");
+        probe.local_addr().expect("tcp local addr").port()
+    }
+
+    fn alloc_loopback_udp_port() -> u16 {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral udp");
+        probe.local_addr().expect("udp local addr").port()
+    }
+
+    #[tokio::test]
+    async fn test_register_node_rejects_live_migrated_public_host() {
+        // Arrange
+        let dir = TempDir::new().expect("tempdir");
+        let now_ms = SystemClock::new().now_unix_ms();
+        let (mut state, raw_token) = test_state(&dir, now_ms);
+        let mut cfg = (*state.config).clone();
+        cfg.control_bind_ip = "127.0.0.1".to_owned();
+        cfg.control_tcp_port = alloc_loopback_tcp_port();
+        cfg.stun_bind_ip = "127.0.0.1".to_owned();
+        cfg.stun_udp_port = alloc_loopback_udp_port();
+        cfg.public_host = "boot-vps".to_owned();
+        let cfg = Arc::new(cfg);
+        state.config = Arc::clone(&cfg);
+        state.netmap_hub = Arc::new(NetmapHub::new(
+            state.store.clone(),
+            cfg.public_control_endpoint(),
+            cfg.public_control_endpoint(),
+            vec![cfg.public_stun_endpoint()],
+            cfg.domain_suffix.clone(),
+        ));
+        let acme =
+            crate::acme::AcmeManager::initialize(&cfg, state.store.clone()).expect("init acme");
+        let router = build_control_router(state.clone());
+        let listeners = crate::listener_set::ListenerSet::bind_and_start(state.clone(), acme)
+            .await
+            .expect("bind listeners");
+
+        // Act: live endpoint migration shifts `public_host` from `boot-vps` to `migrated-vps`
+        let next_tcp = mesh_core::Port::from_u16(alloc_loopback_tcp_port()).expect("valid port");
+        let migrated = listeners
+            .migrate_endpoints(
+                &mesh_proto::admin_ipc::MigrateEndpointRequest {
+                    host: Some("migrated-vps".to_owned()),
+                    tcp_port: Some(next_tcp),
+                    stun_port: None,
+                    tls_mode: None,
+                    transition_window_secs: Some(30),
+                    extend_window_secs: None,
+                },
+                "admin",
+            )
+            .await
+            .expect("migrate endpoints");
+        assert!(migrated.control_tcp_endpoint.starts_with("migrated-vps:"));
+        assert_eq!(listeners.active_public_host(), "migrated-vps");
+
+        let node_kp = NodeKeypair::generate();
+        let disco_kp = DiscoKeypair::generate();
+        let conn_ctx = ConnectionTlsContext {
+            peer_addr: "127.0.0.1:41000".parse().expect("peer addr"),
+            tls_exporter_b64: Some("exporter-migrated-host".to_owned()),
+            listener_tls_mode: TlsMode::IpPinned,
+        };
+        let client = TestSignedClient {
+            router: &router,
+            conn_ctx: &conn_ctx,
+            node_kp: &node_kp,
+            disco_kp: &disco_kp,
+            now_ms,
+        };
+        let body = serde_json::to_vec(&RegisterNodeRequest {
+            node_pubkey: node_kp.public_key(),
+            disco_pubkey: disco_kp.public_key(),
+            preauth_key: raw_token,
+            node_name: NodeName::parse("migrated-vps").expect("node name"),
+            previous_node_pubkey: None,
+        })
+        .expect("reg body");
+        let (st, resp_bytes) = send_signed_post(&client, "/v1/nodes/register", body, 0).await;
+
+        // Assert
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(resp_bytes).expect("utf8");
+        assert!(text.contains("collides with control server public host"));
+        state.shutdown.cancel();
+        state.ws_tracker.close();
+        state.ws_tracker.wait().await;
     }
 }
