@@ -1,0 +1,408 @@
+{
+    "schema_version":  1,
+    "story":  "US-058",
+    "generated_at_utc":  "2026-11-14T04:36:09Z",
+    "host_os":  "Microsoft Windows 10.0.26300",
+    "host_arch":  "X64",
+    "toolchain":  "1.94.1-x86_64-pc-windows-gnu",
+    "simulated_fail":  false,
+    "overall_status":  "PASS",
+    "summary":  {
+                    "total":  36,
+                    "passed":  33,
+                    "failed":  0,
+                    "pending_external_lab":  1,
+                    "hardware_signoff_required":  2
+                },
+    "static_checks":  {
+                          "status":  "SKIPPED",
+                          "details":  "Skipped via -SkipStaticChecks"
+                      },
+    "docker_chaos_lab":  {
+                             "status":  "pending_external_lab",
+                             "details":  "Not executed (-WithDockerLab omitted); Linux container NAT/chaos suite requires Docker + /dev/net/tun + NET_ADMIN.",
+                             "scenarios":  null
+                         },
+    "release_binaries":  [
+                             {
+                                 "binary":  "mesh.exe",
+                                 "path":  "target/release/mesh.exe",
+                                 "size_bytes":  1850368,
+                                 "size_mib":  1.765
+                             },
+                             {
+                                 "binary":  "meshd.exe",
+                                 "path":  "target/release/meshd.exe",
+                                 "size_bytes":  6156288,
+                                 "size_mib":  5.871
+                             },
+                             {
+                                 "binary":  "mesh-server.exe",
+                                 "path":  "target/release/mesh-server.exe",
+                                 "size_bytes":  8421888,
+                                 "size_mib":  8.032
+                             }
+                         ],
+    "checks":  [
+                   {
+                       "id":  "PERF-01",
+                       "name":  "Idle Control server memory footprint (release binary WorkingSet64)",
+                       "measured":  10.5,
+                       "threshold":  "\u003c= 128.0",
+                       "unit":  "MiB",
+                       "status":  "PASS",
+                       "method":  "empirical_release_process_rss",
+                       "details":  "[empirical_release_process_rss] Release binary target/release/mesh-server.exe live WorkingSet64=10.5 MiB (11010048 B) at /readyz 200 OK (measured=10.5 MiB)"
+                   },
+                   {
+                       "id":  "PERF-03",
+                       "name":  "WireGuard encrypt+decrypt + cryptokey P95 latency (MTU 1280)",
+                       "measured":  0.0044,
+                       "threshold":  "\u003c= 2.0",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] 1000 MTU-1280 BoringTun ChaCha20Poly1305 encap+decap frames (measured=0.0044 ms)"
+                   },
+                   {
+                       "id":  "PERF-04",
+                       "name":  "In-memory userspace WireGuard throughput (\u003e=70% of 300 Mbps)",
+                       "measured":  1978.47,
+                       "threshold":  "\u003e= 210.0",
+                       "unit":  "Mbps",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] 2500 x 1280B PeerMap encrypt+decrypt pipeline (measured=1978.47 Mbps)"
+                   },
+                   {
+                       "id":  "PERF-05",
+                       "name":  "Initial packet via Relay (\u003c=1s) \u0026 Disco Direct upgrade (\u003c=5s)",
+                       "measured":  2.242,
+                       "threshold":  "\u003c= 5000.0",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] verified Relay first packet \u003c1s then DirectUdp DiscoPong promotion \u003c5s (measured=2.242 ms)"
+                   },
+                   {
+                       "id":  "PERF-06",
+                       "name":  "Direct -\u003e Relay 3-strike failover convergence",
+                       "measured":  9300,
+                       "threshold":  "\u003c= 10000",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] 3 missed 3.1s probes triggered direct_failovers=1 within 9300ms \u003c= 10s SLO (measured=9300 ms)"
+                   },
+                   {
+                       "id":  "PERF-07",
+                       "name":  "Clock-jump (+240s) detection \u0026 socket rebind recovery",
+                       "measured":  0.012,
+                       "threshold":  "\u003c= 15000.0",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] ClockJumpDetector(+240s) + SocketRebinder::rebind_socket completed (measured=0.012 ms)"
+                   },
+                   {
+                       "id":  "PERF-08",
+                       "name":  "Netmap snapshot broadcast P95 across live TLS WS streams (20 nodes)",
+                       "measured":  14.9918,
+                       "threshold":  "\u003c= 5000.0",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] 4 live TLS WebSocket subscribers observed netmap arrival with 20 peers (measured=14.9918 ms)"
+                   },
+                   {
+                       "id":  "PERF-09",
+                       "name":  "Idle datapath in-memory bounded footprint (20 peers + 4x2KB bufs)",
+                       "measured":  12.54,
+                       "threshold":  "\u003c= 50.0",
+                       "unit":  "MiB",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] live process RSS=12.54 MiB; bounded PeerMap(20)+4xPacketBuffer(2048) struct_mib=0.224770 MiB (measured=12.54 MiB)"
+                   },
+                   {
+                       "id":  "PERF-10",
+                       "name":  "Idle background keepalive \u0026 heartbeat rate",
+                       "measured":  0,
+                       "threshold":  "\u003c= 1024",
+                       "unit":  "B/s",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] idle peer past 180s window emitted 0 B/s Disco keepalives (measured=0 B/s)"
+                   },
+                   {
+                       "id":  "PERF-11",
+                       "name":  "Live Blind Relay 20 Mbps TokenBucket \u0026 \u003e=2-stream HoL isolation",
+                       "measured":  10.76964349573449,
+                       "threshold":  "\u003e= 2.0",
+                       "unit":  "Mbps",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] stream a-\u003ec saturated mpsc(256)+20Mbps throttle while d-\u003eb received 2200/2200 frames (2.64 MB \u003e 625 KB burst) at 10.77 Mbps (measured=10.76964349573449 Mbps)"
+                   },
+                   {
+                       "id":  "PERF-11-QUEUE",
+                       "name":  "Client Blind Relay mpsc(256) HoL isolation \u0026 20 Mbps constant",
+                       "measured":  128,
+                       "threshold":  "== 128",
+                       "unit":  "frames",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] saturated peer dropped tail at mpsc(256) with 0 HoL impact on peer B (measured=128 frames)"
+                   },
+                   {
+                       "id":  "PERF-12",
+                       "name":  "Control server startup-to-ready latency",
+                       "measured":  454.5504,
+                       "threshold":  "\u003c= 5000",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] live mesh-server readiness convergence (measured=454.5504 ms)"
+                   },
+                   {
+                       "id":  "SEC-01",
+                       "name":  "Zero plaintext key material in datapath Debug outputs",
+                       "measured":  0,
+                       "threshold":  "== 0",
+                       "unit":  "leaks",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] Secret\u003cT\u003e \u0026 NodeKeypair Debug verified to emit [REDACTED] (measured=0 leaks); [empirical_rust_server_slo] verified store debug dump \u0026 token strings (measured=0 leaks)"
+                   },
+                   {
+                       "id":  "SEC-03",
+                       "name":  "Pre-Auth Key SHA-256 non-plaintext \u0026 single-use enforcement",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] one-time token rejected on replay \u0026 absent from store debug/DB (measured=1 pass)"
+                   },
+                   {
+                       "id":  "SEC-04",
+                       "name":  "IP+SPKI pin fail-closed TLS verification",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] live TLS handshake accepted valid SPKI pin and rejected rogue pin (measured=1 pass)"
+                   },
+                   {
+                       "id":  "SEC-05",
+                       "name":  "Canonical unauthenticated wire error message",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] wire ErrorResponse message strictly equals `authentication failed` (measured=1 pass)"
+                   },
+                   {
+                       "id":  "SEC-06",
+                       "name":  "Configurable minimal listener surface \u0026 zero-hardcoded-port boot",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] ephemeral loopback Control/Relay/STUN ports operational (measured=1 pass)"
+                   },
+                   {
+                       "id":  "SEC-07",
+                       "name":  "Blind Relay authenticated src_pubkey stamping \u0026 20 Mbps throttle",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] verified RelayNoticeCode::Throttled emitted \u0026 src_pubkey verified (measured=1 pass)"
+                   },
+                   {
+                       "id":  "SEC-08",
+                       "name":  "Instant RAM node revocation latency under Dual-EIO",
+                       "measured":  0.25520000000000004,
+                       "threshold":  "\u003c 100.0",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] 25 nodes revoked in PersistenceTier::RamOnly with redb+slot EIO active (measured=0.25520000000000004 ms)"
+                   },
+                   {
+                       "id":  "SEC-11",
+                       "name":  "WireGuard strict /32 inner source IP cryptokey enforcement",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] CryptokeyValidator dropped spoofed inner source IP with counter increment (measured=1 pass)"
+                   },
+                   {
+                       "id":  "SEC-14",
+                       "name":  "Obs TCP /metrics \u0026 /readyz strict Admin route isolation",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] GET /v1/admin/server/status on obs TCP returned 404 Not Found (measured=1 pass)"
+                   },
+                   {
+                       "id":  "SEC-15",
+                       "name":  "Non-disruptive cert/endpoint rotation preserving SPKI pin",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] reissue_cert_same_key kept identical active SPKI SHA-256 pin (measured=1 pass)"
+                   },
+                   {
+                       "id":  "REL-01",
+                       "name":  "Control outage cached PeerMap data-plane continuity",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] cached PeerMap encrypted/decrypted packets without live Control stream (measured=1 pass)"
+                   },
+                   {
+                       "id":  "REL-06",
+                       "name":  "UDP-blocked / Relay-only forwarding path",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] PeerMap routed traffic via Blind Relay on initial connect \u0026 post-failover (measured=1 pass)"
+                   },
+                   {
+                       "id":  "REL-08",
+                       "name":  "Graceful DatapathEngine \u0026 FakeTunDevice shutdown",
+                       "measured":  31.061,
+                       "threshold":  "\u003c= 5000.0",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] CancellationToken closed TUN and stopped DatapathEngine within 5s budget (measured=31.061 ms)"
+                   },
+                   {
+                       "id":  "REL-09",
+                       "name":  "Routing-loop guard rejecting virtual NIC / overlay / STUN candidates",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] CandidateFilterContext rejected utun3, overlay CIDR, and STUN endpoint (measured=1 pass)"
+                   },
+                   {
+                       "id":  "REL-10",
+                       "name":  "Overlay MTU 1280 framing \u0026 fragmentation-free encapsulation headroom",
+                       "measured":  1312,
+                       "threshold":  "\u003c= 1480",
+                       "unit":  "bytes",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] validated MTU 1280 BoringTun ciphertext \u003c= RELAY_MAX_CIPHERTEXT_BYTES (measured=1312 bytes)"
+                   },
+                   {
+                       "id":  "REL-12",
+                       "name":  "Hot atomic backup + .sha256 verify + restore preserving SPKI pin",
+                       "measured":  490.9052,
+                       "threshold":  "\u003c= 5000.0",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] verified atomic MVCC backup, SHA-256 check, anti-rollback guard, and identical SPKI pin (measured=490.9052 ms)"
+                   },
+                   {
+                       "id":  "PLAT-04",
+                       "name":  "Safe managed # BEGIN mesh hosts block \u0026 public_host collision rejection",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_datapath_slo",
+                       "details":  "[empirical_rust_datapath_slo] FakeHostsEditor preserved CRLF lines/comments and rejected public_host collision (measured=1 pass)"
+                   },
+                   {
+                       "id":  "OPS-05",
+                       "name":  "Server startup --check-config \u0026 /healthz+/readyz readiness",
+                       "measured":  454.5504,
+                       "threshold":  "\u003c= 5000",
+                       "unit":  "ms",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] live mesh-server --check-config \u0026 HTTP /readyz probe (measured=454.5504 ms)"
+                   },
+                   {
+                       "id":  "OPS-06",
+                       "name":  "Prometheus /metrics exposition and zero-secret guard",
+                       "measured":  3332,
+                       "threshold":  "\u003e= 100",
+                       "unit":  "bytes",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_server_slo",
+                       "details":  "[empirical_rust_server_slo] live /metrics scrape on loopback obs port (measured=3332 bytes)"
+                   },
+                   {
+                       "id":  "PERF-02",
+                       "name":  "Idle Control server CPU utilization (5-minute window)",
+                       "measured":  null,
+                       "threshold":  "\u003c 2.0",
+                       "unit":  "% of 1 vCPU",
+                       "status":  "pending_external_lab",
+                       "method":  "docker_linux_vps_soak_pending",
+                       "details":  "Requires 5-minute Linux VPS / Docker /proc/stat idle soak telemetry; not fabricated in local Windows unit runs (US-058 AC2)."
+                   },
+                   {
+                       "id":  "OPS-02",
+                       "name":  "Diagnostic mesh status output (IP:port, pin/CA, utun/adapter)",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_cli_suite",
+                       "details":  "cargo test -p mesh --all-features exit=0; verified via integration \u0026 CLI/IPC suites (Docker lab pending_external_lab)"
+                   },
+                   {
+                       "id":  "OPS-03",
+                       "name":  "Diagnostic mesh netcheck \u0026 mesh ping CLI contract",
+                       "measured":  1,
+                       "threshold":  "== 1",
+                       "unit":  "pass",
+                       "status":  "PASS",
+                       "method":  "empirical_rust_cli_suite",
+                       "details":  "cargo test -p mesh --all-features exit=0; verified via integration \u0026 CLI/IPC suites (Docker lab pending_external_lab)"
+                   },
+                   {
+                       "id":  "PLAT-05",
+                       "name":  "Windows 10/11 \u0026 Linux roaming + physical sleep-wake \u003e= 4 min",
+                       "measured":  null,
+                       "threshold":  "P95 \u003c= 15.0",
+                       "unit":  "s",
+                       "status":  "hardware_signoff_required",
+                       "method":  "physical_hardware_sleep_signoff",
+                       "details":  "Simulated +240s jump \u0026 socket rebind verified in PERF-07. Physical Windows laptop \u003e=4m hardware sleep requires manual sign-off (US-036 AC2, GNFR-12)."
+                   },
+                   {
+                       "id":  "PLAT-06",
+                       "name":  "macOS 13+ arm64/amd64 utun, launchd, LOCAL_PEERCRED, App Firewall \u0026 sleep-wake",
+                       "measured":  null,
+                       "threshold":  "100% AC PASS",
+                       "unit":  "checklist",
+                       "status":  "hardware_signoff_required",
+                       "method":  "apple_hardware_signoff",
+                       "details":  "Cannot execute on Windows or Linux Docker per GNFR-12 / US-058 AC1; requires Apple Silicon \u0026 Intel macOS hardware sign-off."
+                   }
+               ]
+}
