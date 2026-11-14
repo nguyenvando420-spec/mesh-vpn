@@ -126,6 +126,29 @@ jobs:
       - name: Run scripts/check.sh
         run: sh scripts/check.sh
 
+      - name: Run SLO verification suite (US-058)
+        run: bash scripts/run-slo-suite.sh --skip-static-checks --output-dir "$RUNNER_TEMP/slo-report"
+
+      - name: Verify SLO CI gate fails closed on --simulate-fail
+        run: |
+          set +e
+          bash scripts/run-slo-suite.sh --skip-static-checks --simulate-fail --output-dir "$RUNNER_TEMP/slo-fail-check"
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "ERROR: run-slo-suite.sh --simulate-fail unexpectedly exited 0" >&2
+            exit 1
+          fi
+          echo "Verified fail-closed SLO gate exit code: $rc"
+
+      - name: Upload Linux SLO verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slo-report-linux
+          path: ${{ runner.temp }}/slo-report/*
+          if-no-files-found: ignore
+
   check-macos:
     name: Check macOS arm64 (scripts/check.sh & verify-macos-host)
     runs-on: macos-latest
@@ -210,6 +233,29 @@ jobs:
       - name: Run scripts/check.ps1
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
+
+      - name: Run SLO verification suite (US-058)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/run-slo-suite.ps1 -SkipStaticChecks -OutputDir "$env:RUNNER_TEMP\slo-report"
+
+      - name: Verify SLO CI gate fails closed on -SimulateFail
+        shell: pwsh
+        run: |
+          $failDir = Join-Path $env:RUNNER_TEMP 'slo-fail-check'
+          & powershell -ExecutionPolicy Bypass -File scripts/run-slo-suite.ps1 -SkipStaticChecks -SimulateFail -OutputDir $failDir
+          $rc = $LASTEXITCODE
+          if ($rc -eq 0) {
+            throw "run-slo-suite.ps1 -SimulateFail unexpectedly exited 0"
+          }
+          Write-Output "Verified fail-closed SLO gate exit code: $rc"
+
+      - name: Upload Windows SLO verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slo-report-windows
+          path: ${{ runner.temp }}/slo-report/*
+          if-no-files-found: ignore
 
   release-build-matrix:
     name: Build 4-Target Release Matrix (${{ matrix.target }})
@@ -373,6 +419,18 @@ jobs:
           US028_FLAP_DURATION_SECS: ${{ inputs.flap_duration_secs || '90' }}
         run: |
           bash lab/acceptance/test-udp-blocked-443-only.sh --flap-duration "$US028_FLAP_DURATION_SECS"
+
+      - name: Run Full NAT Chaos & Roaming Acceptance Suite (opt-in / manual)
+        if: >-
+          (github.event_name == 'workflow_dispatch' && inputs.run_live_nat_lab == true) ||
+          vars.ENABLE_LIVE_NAT_LAB == 'true'
+        env:
+          US028_FLAP_DURATION_SECS: ${{ inputs.flap_duration_secs || '90' }}
+        run: |
+          mkdir -p lab/.tmp
+          bash lab/scenarios/run-all-chaos.sh \
+            --report-json "lab/.tmp/chaos-acceptance-report.json" \
+            --flap-duration "$US028_FLAP_DURATION_SECS"
 
       - name: Upload US-028 Acceptance Reports
         if: always() && ((github.event_name == 'workflow_dispatch' && inputs.run_live_nat_lab == true) || vars.ENABLE_LIVE_NAT_LAB == 'true')
