@@ -343,7 +343,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release-dist
-          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
@@ -352,6 +352,7 @@ jobs:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: Mesh VPN ${{ inputs.tag || github.ref_name }}
           draft: ${{ inputs.draft == true }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           generate_release_notes: true
           files: |
             release-dist/*.tar.gz

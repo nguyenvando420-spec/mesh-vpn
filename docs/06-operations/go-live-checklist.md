@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run-slo-suite.ps1 -OutputDir do
 ## 3. Go-Live Sign-Off Block
 
 - **Target Version:** `0.1.0`
-- **CI Run URL / Commit SHA:** `______________________________________________`
+- **CI Run URL / Commit SHA:** https://github.com/nguyenvando420-spec/mesh-vpn/actions/runs/43599467828 (`a42ce23` — 9/9 green; pre-release `v0.1.0-rc1` cut for physical hardware sign-off)
 - **SLO Report Verified (`slo-verification-report.json`):** `[x] YES (34/36 PASS, 0 pending_external_lab; PLAT-05 & PLAT-06 awaiting physical laptop sign-off)`
 - **Physical Hardware Protocol Signed (`hardware-sleep-wake-protocol.md`):** `[ ] YES  [ ] NO`
 - **Engineering Lead / Tech Lead:** `____________________` Date: `____________`

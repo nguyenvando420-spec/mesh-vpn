@@ -5,9 +5,9 @@
 ## Giai đoạn hiện tại
 
 - **Thư mục gốc dự án**: `D:\Project\Idea\mesh-vpn`
-- **Giai đoạn**: `Hoàn tất Chặng 2B — NAT/Chaos Lab (5/5 PASS), PERF-02 (0.0262% CPU PASS) & 34/36 SLO PASS; chờ quyết định người dùng tại Gate 3 (ký phần cứng vật lý / tag v0.1.0)`
+- **Giai đoạn**: `Gate 3 Pre-release (v0.1.0-rc1) — Đóng gói bản cài 4 nền tảng & mesh-server OCI phục vụ nghiệm thu 4 mục phần cứng vật lý (MacBook + Laptop Windows); giữ tag GA v0.1.0 tới khi đủ 20/20 Go-Live Checklist`
 - **Sprint hiện tại**: `Sprint 2 (Hoàn tất 100%: 13 Must / 60 SP + 11 Should / 35 SP; lũy kế toàn dự án 62 Stories / 269 SP)`
-- **Bước tiếp theo**: `Chờ người dùng quyết định tại Gate 3: nghiệm thu 4 mục phần cứng vật lý (MacBook + Windows laptop theo go-live-checklist.md & hardware-sleep-wake-protocol.md) trước hoặc khi phát hành tag v0.1.0`
+- **Bước tiếp theo**: `Người dùng tải gói cài từ GitHub Pre-release v0.1.0-rc1 để nghiệm thu 4 mục phần cứng vật lý (#11, #17, #18, #20 trên go-live-checklist.md theo hardware-sleep-wake-protocol.md & lab/macos/verify-macos-host.sh), sau đó gắn tag chính thức v0.1.0`
 
 ## Trạng thái Gate
 
@@ -15,13 +15,13 @@
 |---|---|---|---|
 | Gate 1 — Nghiên cứu & Backlog | ✅ Đã duyệt | 2026-11-12 | (1) Ưu tiên làm Client cho **macOS và Windows trước** (Server chạy trên Ubuntu Linux VPS + hỗ trợ Linux TUN cho VPS làm node & phòng lab NAT); (2) Tạm thời **kết nối trực tiếp bằng IP VPS** (chế độ Pin chứng chỉ/khóa `SEC-04c`) và **hỗ trợ đổi port TCP/UDP tùy ý** (không khóa cứng 443/3478); (3) Giữ các mặc định: chia **2 đợt bàn giao** (Milestone 1 → Milestone 2), tự định nghĩa giao thức, tên CLI **`mesh`** (`.mesh.internal`), quản trị CLI/SSH cục bộ. |
 | Gate 2 — Stack/Model, Code Format, Thiết kế & Sprint | ✅ Đã duyệt | 2026-11-13 | Người dùng duyệt gói Rust `1.94.1` v2.2 / Sprint Plan v1.2 kèm 2 mặc định khuyến nghị: (1) **`OQ-15` Mặc định A**: giữ **Sprint 1 = `38 Must / 174 SP`** & **Sprint 2 = `13 Must / 60 SP`** (+ `11 Should / 35 SP`); (2) **Chính sách lỗi phần cứng `EIO` kép**: compaction hợp nhất toàn bộ mục thu hồi chưa bền vững trong RAM (kể cả `ram_only`) trước khi gỡ `disk_degraded`; khi hết lease version đúng lúc cả 2 tầng đĩa lỗi `EIO`, vẫn cắt tức thì phiên Control/Relay của node bị thu hồi trong RAM và đóng stream buộc các peer xác thực lại (không phát version chưa lưu đĩa). |
-| Gate 3 — Sprint Review, QA/AI Eval & Release | ⏳ Chờ duyệt cắt băng `v0.1.0` (Chặng 2B Done) | 2026-11-14 | Chặng 2A + 2B hoàn tất: `62 Stories / 269 SP`, `5/5` Docker NAT/Chaos Lab (`chaos-report.json` PASS), `PERF-02` 5-min VPS soak (`0.0262%` CPU PASS), `34/36` SLO PASS (`0 pending_external_lab`, `2 hardware_signoff_required`), `Go-Live Checklist` `16/20` `[x]`, `scripts/check.ps1 -Cross` xanh 100%. Chưa tạo/push tag `v0.1.0` để chờ người dùng quyết định tại Gate 3 (nghiệm thu 4 mục phần cứng vật lý MacBook + Windows laptop). |
+| Gate 3 — Sprint Review, QA/AI Eval & Release | 🟡 Đã duyệt Pre-release `v0.1.0-rc1` (chờ ký phần cứng trước `v0.1.0`) | 2026-11-15 | Chặng 2A + 2B hoàn tất: `62 Stories / 269 SP`, `5/5` Docker NAT/Chaos Lab (`chaos-report.json` PASS), `PERF-02` 5-min VPS soak (`0.0262%` CPU PASS), `34/36` SLO PASS (`0 pending_external_lab`, `2 hardware_signoff_required`), `Go-Live Checklist` `16/20` `[x]`, `CI Gate` `a42ce23` xanh `9/9`. Tại Gate 3 (`2026-11-15`), người dùng chọn phát hành **pre-release `v0.1.0-rc1`** (gói cài 4 nền tảng + `mesh-server` OCI + `SHA256SUMS`) để nghiệm thu 4 mục phần cứng vật lý MacBook & Windows (`#11, #17, #18, #20`) và chỉ gắn tag chính thức `v0.1.0` sau khi đủ `20/20`. |
 
 ## Các Vai trò trong Team (13 Vai trò Chuẩn Plugin v3.1.0: Orchestrator + Swarm)
 
 | Vai trò | Model | conversationId / tên worker | Nhiệm vụ gần nhất | Trạng thái |
 |---|---|---|---|---|
-| agile-scrum-master (Nhạc trưởng 2 pha / Swarm Coordinator) | `gemini-pro-orchestrator` (Orchestrator Carbon) | Main Agent | Hoàn tất Chặng 2B (live Docker NAT Chaos Lab 5/5 PASS, `PERF-02` PASS, `34/36` SLO PASS, `16/20` Go-Live Checklist, `check.ps1 -Cross` & push `main` + CI Gate 9/9) và trình Gate 3 hỏi ý kiến người dùng | ✅ Done (Chặng 2B Ready for Gate 3) |
+| agile-scrum-master (Nhạc trưởng 2 pha / Swarm Coordinator) | `gemini-pro-orchestrator` (Orchestrator Carbon) | Main Agent | Hoàn tất Chặng 2B, sửa CI Gate xanh `9/9` (`a42ce23`) và thực thi quyết định Gate 3 của người dùng: cắt pre-release `v0.1.0-rc1` (giữ `v0.1.0` chờ ký phần cứng) | ✅ Done (`v0.1.0-rc1` Released) |
 | agile-researcher | `claude-opus-5-5-high` (dự phòng: `gemini-4-argon-high`) | dae2b634-a323-4894-9519-7698811e921b | Hoàn tất đồng bộ v1.2 `production-readiness-requirements.md` (macOS P0 `PLAT-06`, IP+Pin `SEC-04c`, custom port & `SEC-15`) | ✅ Done (v1.2) |
 | agile-po-ba | `claude-sonnet-5-5-high` (dự phòng: `gemini-4-carbon-high`) | 61249fa4-f35a-4f0e-9bd0-eaec4d8d4074 | Hoàn tất đồng bộ v1.2 `product-backlog.md` (997 dòng, 51 Must = 234 SP), `charter`, `vision`, `personas` | ✅ Done (v1.2) |
 | agile-tech-lead | `gemini-4-argon-high` (dự phòng cho `claude-sonnet-5-5-high`) | 111ccb61-76da-4415-aa05-654afdb784c6 | Hoàn tất `scripts/check.ps1 -Cross` & `.gitignore` `*.o` | ✅ Done (`check.ps1 -Cross`) |
