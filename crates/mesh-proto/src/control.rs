@@ -21,7 +21,7 @@ pub const HEADER_BOX_NONCE: &str = "x-mesh-box-nonce";
 /// Header name carrying base64-encoded sealed `ProofPayload`.
 pub const HEADER_AUTH_PROOF: &str = "x-mesh-auth-proof";
 
-/// Client OS tag (`OPS-10`, `US-050 AC1`).
+/// Client OS tag (`OPS-10`, `US-050 AC1`, `US-075`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetOs {
@@ -31,6 +31,10 @@ pub enum TargetOs {
     Windows,
     /// Linux (Ubuntu/Debian/etc.).
     Linux,
+    /// Android 10+ (`API 29+`).
+    Android,
+    /// iOS 15+.
+    Ios,
 }
 
 /// Client CPU architecture tag (`OPS-10`, `US-050 AC1`).
@@ -271,5 +275,20 @@ mod tests {
         // Act & Assert
         let parsed: Result<UpdateEndpointsRequest, _> = serde_json::from_str(unknown_endpoint_json);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn test_target_os_serializes_android_and_ios_lowercase() {
+        // Arrange & Act
+        let android_json = serde_json::to_string(&TargetOs::Android);
+        let ios_json = serde_json::to_string(&TargetOs::Ios);
+        let parsed_android: Result<TargetOs, _> = serde_json::from_str("\"android\"");
+        let parsed_ios: Result<TargetOs, _> = serde_json::from_str("\"ios\"");
+
+        // Assert
+        assert_eq!(android_json.ok().as_deref(), Some("\"android\""));
+        assert_eq!(ios_json.ok().as_deref(), Some("\"ios\""));
+        assert_eq!(parsed_android.ok(), Some(TargetOs::Android));
+        assert_eq!(parsed_ios.ok(), Some(TargetOs::Ios));
     }
 }

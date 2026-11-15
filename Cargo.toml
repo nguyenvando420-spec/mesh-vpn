@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "tools/uniffi-bindgen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -44,6 +44,7 @@ mesh-proto = { path = "crates/mesh-proto", version = "0.1.0" }
 mesh-net = { path = "crates/mesh-net", version = "0.1.0" }
 mesh-store = { path = "crates/mesh-store", version = "0.1.0" }
 mesh-datapath = { path = "crates/mesh-datapath", version = "0.1.0" }
+mesh-client = { path = "crates/mesh-client", version = "0.1.0" }
 
 # Async runtime & utilities
 tokio = { version = "1.44", features = ["full"] }
@@ -104,8 +105,13 @@ socket2 = "0.5"
 
 # OS FFI & service bindings
 libc = "0.2"
+jni = { version = "0.21", default-features = false }
 windows-sys = "0.59"
 windows-service = "0.7"
+
+# Mobile FFI & platform TLS
+uniffi = "0.29.5"
+rustls-platform-verifier = "0.6"
 
 # Dev / test dependencies
 proptest = "1.6"

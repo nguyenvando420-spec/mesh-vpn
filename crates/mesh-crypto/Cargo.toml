@@ -9,6 +9,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["desktop-certs", "certgen"]
+desktop-certs = ["dep:rustls-native-certs"]
+certgen = ["dep:rcgen"]
+mobile-platform-verifier = ["dep:rustls-platform-verifier", "dep:mesh-sys"]
+
 [dependencies]
 mesh-core.workspace = true
 base64.workspace = true
@@ -16,10 +22,10 @@ chacha20poly1305.workspace = true
 crypto_box.workspace = true
 data-encoding.workspace = true
 rand.workspace = true
-rcgen.workspace = true
+rcgen = { workspace = true, optional = true }
 ring.workspace = true
 rustls.workspace = true
-rustls-native-certs.workspace = true
+rustls-native-certs = { workspace = true, optional = true }
 rustls-pki-types.workspace = true
 rustls-webpki.workspace = true
 serde.workspace = true
@@ -30,6 +36,10 @@ tracing.workspace = true
 x25519-dalek.workspace = true
 x509-cert.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+mesh-sys = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

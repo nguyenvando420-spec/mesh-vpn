@@ -9,6 +9,11 @@ targets = [
     { triple = "x86_64-unknown-linux-musl" },
     { triple = "aarch64-apple-darwin" },
     { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-linux-android" },
+    { triple = "x86_64-linux-android" },
+    { triple = "aarch64-apple-ios" },
+    { triple = "aarch64-apple-ios-sim" },
+    { triple = "x86_64-apple-ios" },
 ]
 all-features = true
 
@@ -42,15 +47,62 @@ allow = [
 [licenses.private]
 ignore = true
 
+# Narrow MPL-2.0 exceptions strictly for UniFFI 0.29.5 crates present in Cargo.lock (ADR-013).
+# MPL-2.0 remains globally banned; adding or keeping unused exceptions triggers warnings.
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi_bindgen"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi_core"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi_internal_macros"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi_macros"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi_meta"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi_pipeline"
+
+[[licenses.exceptions]]
+allow = ["MPL-2.0"]
+crate = "uniffi_udl"
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
 
-# Explicitly banned crates (Tech Stack Decision §7.2)
+# Explicitly banned crates (Tech Stack Decision §7.2, Mobile ADR-013 / ADR-014)
 deny = [
     # Copyleft / MPL-2.0 WireGuard fork
     { name = "gotatun", reason = "Uses MPL-2.0 license; use defguard_boringtun (BSD-3-Clause) instead" },
+    # Android ndk-context is banned (BLK-MOB-G2-01 / ADR-014); pass Application Context via explicit JNI in mesh-sys
+    { name = "ndk-context", reason = "Banned by ADR-014 (BLK-MOB-G2-01); pass Context via mesh-sys JNI init_hosted" },
+    # JNI may only be depended on directly by crates/mesh-sys (and rustls-platform-verifier on Android)
+    { name = "jni", wrappers = ["mesh-sys", "rustls-platform-verifier"], reason = "JNI FFI must remain isolated inside crates/mesh-sys (IG-MOB-G2-01)" },
+    # UniFFI crates may only be used by mesh-mobile-ffi and mesh-uniffi-bindgen (ADR-013)
+    { name = "uniffi", wrappers = ["mesh-mobile-ffi", "mesh-uniffi-bindgen"], reason = "UniFFI is restricted to the FFI boundary and bindgen tool (ADR-013)" },
+    { name = "uniffi_bindgen", wrappers = ["uniffi"], reason = "UniFFI internals are restricted to UniFFI crates (ADR-013)" },
+    { name = "uniffi_core", wrappers = ["uniffi"], reason = "UniFFI internals are restricted to UniFFI crates (ADR-013)" },
+    { name = "uniffi_internal_macros", wrappers = ["uniffi_bindgen", "uniffi_meta", "uniffi_pipeline"], reason = "UniFFI internals are restricted to UniFFI crates (ADR-013)" },
+    { name = "uniffi_macros", wrappers = ["uniffi"], reason = "UniFFI internals are restricted to UniFFI crates (ADR-013)" },
+    { name = "uniffi_meta", wrappers = ["uniffi_bindgen", "uniffi_macros", "uniffi_udl"], reason = "UniFFI internals are restricted to UniFFI crates (ADR-013)" },
+    { name = "uniffi_pipeline", wrappers = ["uniffi", "uniffi_bindgen", "uniffi_meta"], reason = "UniFFI internals are restricted to UniFFI crates (ADR-013)" },
+    { name = "uniffi_udl", wrappers = ["uniffi_bindgen"], reason = "UniFFI internals are restricted to UniFFI crates (ADR-013)" },
     # C-library wrappers that break Pure-Rust / Zero-C cross-compilation
     { name = "openssl", reason = "C OpenSSL is banned; use rustls (Pure-Rust / ring)" },
     { name = "openssl-sys", reason = "C OpenSSL FFI is banned; use rustls" },
@@ -77,8 +129,8 @@ deny = [
     { name = "sea-orm", reason = "Use pure-Rust redb (ADR-005)" },
     { name = "env_logger", reason = "Use tracing + tracing-subscriber for structured JSON logging" },
     { name = "log4rs", reason = "Use tracing + tracing-subscriber for structured JSON logging" },
-    # Loose error handling
-    { name = "anyhow", reason = "Use thiserror and mesh_core::error::AppError for typed error handling" },
+    # Loose error handling (narrow wrapper exception solely for transitive UniFFI 0.29.5 tooling)
+    { name = "anyhow", wrappers = ["uniffi", "uniffi_bindgen", "uniffi_core", "uniffi_internal_macros", "uniffi_meta", "uniffi_pipeline", "uniffi_udl"], reason = "Use thiserror and mesh_core::error::AppError for typed error handling" },
     { name = "eyre", reason = "Use thiserror and mesh_core::error::AppError for typed error handling" },
 ]
 

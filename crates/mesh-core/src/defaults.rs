@@ -136,3 +136,15 @@ pub const fn default_control_port() -> Port {
 pub const fn default_stun_port() -> Port {
     Port::from_non_zero(DEFAULT_STUN_NONZERO)
 }
+
+/// Maximum WebSocket control frame size accepted on mobile targets (256 KiB, `ADR-016`).
+pub const DEFAULT_MOBILE_MAX_WS_FRAME_BYTES: usize = 262_144;
+
+/// Idle debounce window in milliseconds before mobile enters `IdleAware` coalescing (`ADR-016`).
+pub const DEFAULT_IDLE_ENTRY_WINDOW_MS: u64 = 10_000;
+
+/// Coalesced heartbeat interval in milliseconds when mobile `IdleAware` power saving is active.
+pub const DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS: u64 = 45_000;
+
+/// Maximum streamed mobile bugreport archive size in bytes (1 MiB, `ADR-016`).
+pub const DEFAULT_MOBILE_MAX_BUGREPORT_BYTES: usize = 1_048_576;

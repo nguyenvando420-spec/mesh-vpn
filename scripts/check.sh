@@ -38,7 +38,12 @@ BOM_FILES=$(find . -type f \
   -not -path './.git/*' \
   -not -path './target/*' \
   -not -path './lab/.tmp/*' \
-  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
+  -not -path './mobile/android/.gradle/*' \
+  -not -path './mobile/android/build/*' \
+  -not -path './mobile/android/*/build/*' \
+  -not -path './mobile/ios/.build/*' \
+  -not -path './mobile/ios/DerivedData/*' \
+  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.xml' -o -name '*.pbxproj' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
   -exec awk 'BEGIN { bom = sprintf("%c%c%c", 239, 187, 191) } FNR == 1 && index($0, bom) == 1 { print FILENAME }' {} +)
 
 if [ -n "$BOM_FILES" ]; then
@@ -51,7 +56,12 @@ CRLF_FILES=$(find . -type f \
   -not -path './.git/*' \
   -not -path './target/*' \
   -not -path './lab/.tmp/*' \
-  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
+  -not -path './mobile/android/.gradle/*' \
+  -not -path './mobile/android/build/*' \
+  -not -path './mobile/android/*/build/*' \
+  -not -path './mobile/ios/.build/*' \
+  -not -path './mobile/ios/DerivedData/*' \
+  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.xml' -o -name '*.pbxproj' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
   -exec awk 'BEGIN { cr = sprintf("%c", 13) } index($0, cr) > 0 { if (!seen[FILENAME]++) print FILENAME }' {} +)
 
 if [ -n "$CRLF_FILES" ]; then
@@ -60,10 +70,15 @@ if [ -n "$CRLF_FILES" ]; then
   exit 1
 fi
 
-# 2b. Rust source code static invariants (when crates/ exists)
-if [ -d "crates" ]; then
-  # Rule: unsafe is forbidden outside crates/mesh-sys/
-  UNSAFE_HITS=$(find crates -type f -name '*.rs' -not -path 'crates/mesh-sys/*' \
+# 2b. Rust source code static invariants (crates/ and tools/)
+RUST_DIRS=""
+[ -d "crates" ] && RUST_DIRS="crates"
+[ -d "tools" ] && RUST_DIRS="$RUST_DIRS tools"
+
+if [ -n "$RUST_DIRS" ]; then
+  # Rule: unsafe is forbidden outside crates/mesh-sys/ (including crates/mesh-mobile-ffi/ and tools/)
+  # shellcheck disable=SC2086
+  UNSAFE_HITS=$(find $RUST_DIRS -type f -name '*.rs' -not -path 'crates/mesh-sys/*' \
     -exec grep -HnE '(^[[:space:]]*(pub[[:space:]]+)?unsafe[[:space:]]+(fn|trait|impl)[^a-zA-Z0-9_]|unsafe[[:space:]]*\{)' {} + || true)
   if [ -n "$UNSAFE_HITS" ]; then
     echo "ERROR: Forbidden 'unsafe' usage outside crates/mesh-sys/:" >&2
@@ -72,7 +87,8 @@ if [ -d "crates" ]; then
   fi
 
   # Rule: .expose_secret() restricted to mesh-crypto, mesh-datapath, mesh-net, mesh
-  EXPOSE_HITS=$(find crates -type f -name '*.rs' \
+  # shellcheck disable=SC2086
+  EXPOSE_HITS=$(find $RUST_DIRS -type f -name '*.rs' \
     -not -path 'crates/mesh-crypto/*' \
     -not -path 'crates/mesh-datapath/*' \
     -not -path 'crates/mesh-net/*' \
@@ -85,13 +101,35 @@ if [ -d "crates" ]; then
   fi
 
   # Rule: GNFR-11 no hardcoded :443 or :3478 outside crates/mesh-core and tests (resets in_test per file at FNR == 1)
-  PORT_HITS=$(find crates -type f -name '*.rs' \
+  # shellcheck disable=SC2086
+  PORT_HITS=$(find $RUST_DIRS -type f -name '*.rs' \
     -not -path 'crates/mesh-core/*' \
     -not -path '*/tests/*' \
     -exec awk 'FNR == 1 { in_test = 0 } /#\[cfg\(test\)\]/ { in_test = 1 } !in_test && /:(443|3478)([^0-9]|$)/ { print FILENAME ":" FNR ":" $0 }' {} + || true)
   if [ -n "$PORT_HITS" ]; then
     echo "ERROR: Hardcoded default port ':443' or ':3478' outside crates/mesh-core (GNFR-11):" >&2
     echo "$PORT_HITS" >&2
+    exit 1
+  fi
+fi
+
+# 2c. Mobile source & config hygiene (when mobile/ exists)
+if [ -d "mobile" ]; then
+  FORBIDDEN_MOBILE=$(find mobile -type f \
+    -not -path '*/.gradle/*' \
+    -not -path '*/build/*' \
+    -not -path '*/.build/*' \
+    -not -path '*/DerivedData/*' \
+    \( -name '*.jks' -o -name '*.keystore' -o -name '*.p12' -o -name '*.mobileprovision' -o -name '*.apk' -o -name '*.aab' -o -name '*.ipa' \) || true)
+  if [ -n "$FORBIDDEN_MOBILE" ]; then
+    echo "ERROR: Forbidden mobile binary/signing artifact in repository:" >&2
+    echo "$FORBIDDEN_MOBILE" >&2
+    exit 1
+  fi
+  ATS_HITS=$(find mobile -type f -name '*.plist' -exec grep -Hn 'NSAllowsArbitraryLoads' {} + || true)
+  if [ -n "$ATS_HITS" ]; then
+    echo "ERROR: Forbidden ATS bypass 'NSAllowsArbitraryLoads' in plist:" >&2
+    echo "$ATS_HITS" >&2
     exit 1
   fi
 fi
@@ -116,8 +154,8 @@ cargo deny check advisories bans licenses sources
 if [ "$CROSS" -eq 1 ]; then
   echo "==> [Cross] Checking cross-compilation targets..."
   for target in x86_64-unknown-linux-musl aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-gnu; do
-    echo "    cargo check --workspace --target $target"
-    cargo check --workspace --target "$target"
+    echo "    cargo check --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --target $target"
+    cargo check --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --target "$target"
   done
 fi
 

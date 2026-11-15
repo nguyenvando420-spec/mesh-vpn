@@ -1,0 +1,30 @@
+[package]
+name = "mesh-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["desktop-os"]
+desktop-os = ["mesh-net/desktop-os", "mesh-datapath/desktop-os", "mesh-crypto/desktop-certs"]
+
+[dependencies]
+mesh-core.workspace = true
+mesh-crypto = { path = "../mesh-crypto", version = "0.1.0", default-features = false }
+mesh-proto.workspace = true
+mesh-net = { path = "../mesh-net", version = "0.1.0", default-features = false }
+mesh-datapath = { path = "../mesh-datapath", version = "0.1.0", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

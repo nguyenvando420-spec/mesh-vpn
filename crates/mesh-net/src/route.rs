@@ -305,6 +305,28 @@ pub fn bind_underlay_udp_socket(
         )
         .map_err(AppError::from)
     }
+    #[cfg(target_os = "android")]
+    {
+        // Android anti-routing-loop delegates socket protection to `VpnService.protect(fd)`
+        // via `SocketProtector` rather than `SO_MARK`.
+        let _unused = (socket, is_ipv6, physical_if_index, fwmark);
+        Ok(())
+    }
+    #[cfg(target_os = "ios")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let _unused = fwmark;
+        if let Some(if_index) = physical_if_index {
+            mesh_sys::socket_ios::bind_socket_to_interface_index(
+                socket.as_raw_fd(),
+                is_ipv6,
+                if_index,
+            )
+            .map_err(AppError::from)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Applies OS-specific anti-routing-loop underlay binding directly to a `socket2::Socket` prior
@@ -357,6 +379,26 @@ pub fn bind_underlay_socket2(
         )
         .map_err(AppError::from)
     }
+    #[cfg(target_os = "android")]
+    {
+        let _unused = (socket, is_ipv6, physical_if_index, fwmark);
+        Ok(())
+    }
+    #[cfg(target_os = "ios")]
+    {
+        use std::os::fd::AsRawFd as _;
+        let _unused = fwmark;
+        if let Some(if_index) = physical_if_index {
+            mesh_sys::socket_ios::bind_socket_to_interface_index(
+                socket.as_raw_fd(),
+                is_ipv6,
+                if_index,
+            )
+            .map_err(AppError::from)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Disables forced IPv4 Don't Fragment (`DF=0`) on a Tokio UDP socket via `mesh-sys` (`BLK-03`).
@@ -378,6 +420,17 @@ pub fn disable_udp_dont_fragment(socket: &tokio::net::UdpSocket) -> AppResult<()
         use std::os::windows::io::AsRawSocket as _;
         mesh_sys::socket_windows::disable_ipv4_dont_fragment(socket.as_raw_socket())
             .map_err(AppError::from)
+    }
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd as _;
+        mesh_sys::socket_android::disable_ipv4_dont_fragment(socket.as_raw_fd())
+            .map_err(AppError::from)
+    }
+    #[cfg(target_os = "ios")]
+    {
+        use std::os::fd::AsRawFd as _;
+        mesh_sys::socket_ios::disable_ipv4_dont_fragment(socket.as_raw_fd()).map_err(AppError::from)
     }
 }
 

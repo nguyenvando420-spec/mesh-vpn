@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 /// Current schema version for `keys.json`.
 pub const KEYSTORE_SCHEMA_VERSION: u32 = 1;
 
+/// Magic header for DEK-sealed mobile identities (`"MSH1"`).
+pub const SEALED_IDENTITY_MAGIC: [u8; 4] = *b"MSH1";
+
+/// AEAD additional authenticated data bound to DEK-sealed mobile identities.
+pub const SEALED_IDENTITY_AAD: &[u8] = b"mesh-identity-v1";
+
 /// Loaded client cryptographic identity protected in memory by `mesh_crypto::Secret`.
 pub struct StoredNodeIdentity {
     /// Assigned server node identifier (`None` prior to initial registration).
@@ -34,6 +40,42 @@ impl fmt::Debug for StoredNodeIdentity {
             .field("disco_secret", &"[REDACTED]")
             .field("created_at_ms", &self.created_at_ms)
             .finish()
+    }
+}
+
+impl StoredNodeIdentity {
+    /// Seals this identity with a 32-byte hardware-wrapped DEK (`"MSH1" || nonce[12] || ct_and_tag`)
+    /// bound to AAD `"mesh-identity-v1"` (`IG-MOB-G2-02`).
+    pub fn seal_with_dek(&self, dek: &[u8; 32]) -> AppResult<Vec<u8>> {
+        if dek == &[0_u8; 32] {
+            return Err(AppError::invalid_argument(
+                "identity DEK must not be all zeros",
+            ));
+        }
+        let _identity = self;
+        Err(AppError::unavailable(
+            "identity DEK sealing awaits Wave A.1 mesh-crypto AEAD implementation",
+        ))
+    }
+
+    /// Unseals an encrypted `"MSH1" || nonce[12] || ct_and_tag` blob using the 32-byte DEK
+    /// (`IG-MOB-G2-02`).
+    pub fn unseal_with_dek(ciphertext: &[u8], dek: &[u8; 32]) -> AppResult<Self> {
+        if dek == &[0_u8; 32] {
+            return Err(AppError::invalid_argument(
+                "identity DEK must not be all zeros",
+            ));
+        }
+        if ciphertext.len() < SEALED_IDENTITY_MAGIC.len() + 12 + 16
+            || !ciphertext.starts_with(&SEALED_IDENTITY_MAGIC)
+        {
+            return Err(AppError::invalid_argument(
+                "invalid sealed identity blob header or length",
+            ));
+        }
+        Err(AppError::unavailable(
+            "identity DEK unsealing awaits Wave A.1 mesh-crypto AEAD implementation",
+        ))
     }
 }
 
@@ -398,5 +440,26 @@ mod tests {
 
         let preserved = fs::read(&corrupt_path).unwrap_or_default();
         assert_eq!(preserved.as_slice(), corrupt_bytes);
+    }
+
+    #[test]
+    fn test_keystore_dek_stub_rejects_zero_dek_and_bad_header() {
+        // Arrange
+        let zero_dek = [0_u8; 32];
+        let nonzero_dek = [0x42_u8; 32];
+        let node = mesh_crypto::NodeKeypair::generate();
+        let disco = mesh_crypto::DiscoKeypair::generate();
+        let identity = super::StoredNodeIdentity {
+            node_id: None,
+            node_keypair: node,
+            disco_keypair: disco,
+            created_at_ms: 1_700_000_000_000,
+        };
+
+        // Act & Assert
+        assert!(identity.seal_with_dek(&zero_dek).is_err());
+        assert!(identity.seal_with_dek(&nonzero_dek).is_err());
+        assert!(super::StoredNodeIdentity::unseal_with_dek(b"BAD!", &nonzero_dek).is_err());
+        assert!(super::StoredNodeIdentity::unseal_with_dek(&[0_u8; 32], &zero_dek).is_err());
     }
 }

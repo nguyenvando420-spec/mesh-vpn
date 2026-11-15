@@ -1760,6 +1760,8 @@ const fn os_label(os: TargetOs) -> &'static str {
         TargetOs::Darwin => "darwin",
         TargetOs::Windows => "windows",
         TargetOs::Linux => "linux",
+        TargetOs::Android => "android",
+        TargetOs::Ios => "ios",
     }
 }
 
@@ -1823,7 +1825,7 @@ mod tests {
 
     use super::{
         ConnectionTlsContext, ControlAppState, MAX_PENDING_CHALLENGES, PendingChallengeStore,
-        build_control_router,
+        build_control_router, os_label,
     };
     use crate::config::{ServerConfig, TlsMode};
     use crate::netmap_hub::NetmapHub;
@@ -3140,5 +3142,138 @@ mod tests {
         state.shutdown.cancel();
         state.ws_tracker.close();
         state.ws_tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn test_control_registers_android_ios_and_linux_preserving_redb_v1() {
+        // Arrange
+        assert_eq!(os_label(TargetOs::Android), "android");
+        assert_eq!(os_label(TargetOs::Ios), "ios");
+        assert_eq!(mesh_store::SCHEMA_VERSION, 1);
+
+        let dir = TempDir::new().expect("tempdir");
+        let now_ms = SystemClock::new().now_unix_ms();
+        let (state, _single_token) = test_state(&dir, now_ms);
+        let router = build_control_router(state.clone());
+        let reusable_raw = "mpk_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned();
+        state
+            .store
+            .create_preauth_key(
+                &CreatePreAuthKeyInput {
+                    key_id: KeyId::new_v7(now_ms + 1),
+                    token_hash: sha256_digest(reusable_raw.as_bytes()),
+                    label: Some("mobile-compat".to_owned()),
+                    bound_node_name: None,
+                    reusable: true,
+                    max_uses: Some(4),
+                    ephemeral: false,
+                    ephemeral_timeout_secs: None,
+                    ttl_secs: 3_600,
+                    now_unix_ms: now_ms,
+                },
+                "admin",
+            )
+            .expect("mint reusable key");
+
+        let conn_ctx = ConnectionTlsContext {
+            peer_addr: "198.51.100.77:51000".parse().expect("addr"),
+            tls_exporter_b64: Some(BASE64_STANDARD.encode([0x55_u8; 32])),
+            listener_tls_mode: TlsMode::IpPinned,
+        };
+
+        // Act: Register one Android node, one iOS node, and one legacy Linux v0.1.0-rc1 node
+        for (idx, (os, arch, name)) in [
+            (TargetOs::Android, TargetArch::Arm64, "pixel-mobile"),
+            (TargetOs::Ios, TargetArch::Arm64, "iphone-mobile"),
+            (TargetOs::Linux, TargetArch::Amd64, "legacy-linux"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let node_kp = NodeKeypair::generate();
+            let disco_kp = DiscoKeypair::generate();
+            let ch_body = serde_json::to_vec(&ChallengeRequest {
+                node_pubkey: node_kp.public_key(),
+                disco_pubkey: disco_kp.public_key(),
+                protocol_version: 1,
+                agent_version: "0.2.0".to_owned(),
+                os,
+                arch,
+            })
+            .expect("ch body");
+            let ch_req = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/auth/challenge")
+                .header("content-type", "application/json")
+                .body(Body::from(ch_body))
+                .expect("ch req");
+            let (ch_status, ch_bytes) =
+                send_router_req(router.clone(), conn_ctx.clone(), ch_req).await;
+            assert_eq!(ch_status, StatusCode::OK);
+            let ch: ChallengeResponse = serde_json::from_slice(&ch_bytes).expect("ch");
+
+            let reg_body = serde_json::to_vec(&RegisterNodeRequest {
+                node_pubkey: node_kp.public_key(),
+                disco_pubkey: disco_kp.public_key(),
+                preauth_key: reusable_raw.clone(),
+                node_name: NodeName::parse(name).expect("name"),
+                previous_node_pubkey: None,
+            })
+            .expect("reg body");
+            let proof = ProofPayload {
+                challenge_id: ch.challenge_id,
+                challenge_nonce: ch.challenge_nonce,
+                method: "POST".to_owned(),
+                path: "/v1/nodes/register".to_owned(),
+                body_sha256: sha256_hex(&reg_body),
+                node_pubkey: node_kp.public_key(),
+                disco_pubkey: disco_kp.public_key(),
+                timestamp_at_ms: now_ms + u64::try_from(idx).unwrap_or(0),
+                tls_exporter_binding: BASE64_STANDARD.encode([0x55_u8; 32]),
+            };
+            let sealed = seal_proof(&proof, &ch.server_eph_pubkey, &node_kp).expect("seal");
+            let reg_req = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/nodes/register")
+                .header(HEADER_CHALLENGE_ID, ch.challenge_id.to_string())
+                .header(
+                    HEADER_NODE_PUBKEY,
+                    BASE64_STANDARD.encode(node_kp.public_key().as_bytes()),
+                )
+                .header(HEADER_BOX_NONCE, BASE64_STANDARD.encode(sealed.box_nonce))
+                .header(
+                    HEADER_AUTH_PROOF,
+                    BASE64_STANDARD.encode(&sealed.ciphertext),
+                )
+                .body(Body::from(reg_body))
+                .expect("reg req");
+            let (reg_status, reg_bytes) =
+                send_router_req(router.clone(), conn_ctx.clone(), reg_req).await;
+            assert_eq!(reg_status, StatusCode::OK);
+            let reg_resp: RegisterNodeResponse =
+                serde_json::from_slice(&reg_bytes).expect("decode reg");
+            assert_eq!(reg_resp.netmap.peers.len(), idx + 1);
+        }
+
+        // Assert: Verify redb SCHEMA_VERSION = 1 store preserves all 3 os_arch triplets cleanly
+        let stored_nodes = state.store.list_nodes().expect("list nodes");
+        assert_eq!(stored_nodes.len(), 3);
+        let os_arch_values: Vec<String> = stored_nodes.into_iter().map(|n| n.os_arch).collect();
+        assert!(os_arch_values.contains(&"android/arm64".to_owned()));
+        assert!(os_arch_values.contains(&"ios/arm64".to_owned()));
+        assert!(os_arch_values.contains(&"linux/amd64".to_owned()));
+
+        drop(router);
+        drop(state);
+        let reopened = ControlStore::open_with_clock(
+            ControlStoreConfig {
+                db_path: dir.path().join("control.redb"),
+                emergency_revocations_path: dir.path().join("emergency-revocations.bin"),
+            },
+            "10.100.0.0/24",
+            Arc::new(FakeClock::new(now_ms + 1_000)),
+        )
+        .expect("reopen SCHEMA_VERSION=1 store");
+        assert_eq!(reopened.list_nodes().expect("reopened list").len(), 3);
     }
 }

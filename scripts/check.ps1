@@ -49,11 +49,16 @@ try {
     Write-Host "==> [2/5] Enforcing static repository & security rules..." -ForegroundColor Cyan
 
     # 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF) and LF line endings across text files
-    $TextExtensions = @(".rs", ".toml", ".md", ".ps1", ".sh", ".json", ".yml", ".yaml", ".plist", ".service", ".editorconfig", ".gitattributes", ".gitignore")
+    $TextExtensions = @(".rs", ".toml", ".md", ".ps1", ".sh", ".json", ".yml", ".yaml", ".plist", ".service", ".kt", ".kts", ".swift", ".xml", ".pbxproj", ".editorconfig", ".gitattributes", ".gitignore")
     $AllFiles = Get-ChildItem -Path $RepoRoot -Recurse -File -Force | Where-Object {
         $_.FullName -notlike "*\.git\*" -and
         $_.FullName -notlike "*\target\*" -and
-        $_.FullName -notlike "*\lab\.tmp\*"
+        $_.FullName -notlike "*\lab\.tmp\*" -and
+        $_.FullName -notlike "*\mobile\android\.gradle\*" -and
+        $_.FullName -notlike "*\mobile\android\build\*" -and
+        $_.FullName -notlike "*\mobile\android\*\build\*" -and
+        $_.FullName -notlike "*\mobile\ios\.build\*" -and
+        $_.FullName -notlike "*\mobile\ios\DerivedData\*"
     }
 
     $BomFailures = @()
@@ -81,15 +86,15 @@ try {
         exit 1
     }
 
-    # 2b. Rust source code static invariants (when crates/ exists)
-    $CratesDir = Join-Path $RepoRoot "crates"
-    if (Test-Path $CratesDir) {
-        $RsFiles = Get-ChildItem -Path $CratesDir -Recurse -Filter "*.rs" -File
+    # 2b. Rust source code static invariants (crates/ and tools/)
+    $RustScanDirs = @("crates", "tools") | ForEach-Object { Join-Path $RepoRoot $_ } | Where-Object { Test-Path $_ }
+    if ($RustScanDirs.Count -gt 0) {
+        $RsFiles = Get-ChildItem -Path $RustScanDirs -Recurse -Filter "*.rs" -File
         foreach ($rs in $RsFiles) {
             $rel = $rs.FullName.Substring($RepoRoot.Length + 1).Replace("\", "/")
             $content = Get-Content -Path $rs.FullName -Raw
 
-            # Rule: unsafe is forbidden outside crates/mesh-sys/
+            # Rule: unsafe is forbidden outside crates/mesh-sys/ (including crates/mesh-mobile-ffi/ and tools/)
             if ($rel -notlike "crates/mesh-sys/*") {
                 if ($content -match "(?m)^\s*(pub\s+)?unsafe\s+(fn|trait|impl)\b|\bunsafe\s*\{") {
                     Write-Error "Forbidden 'unsafe' usage outside crates/mesh-sys/: $rel"
@@ -113,6 +118,33 @@ try {
                 $nonTestPart = ($content -split "#\[cfg\(test\)\]")[0]
                 if ($nonTestPart -match ":(443|3478)\b") {
                     Write-Error "Hardcoded default port ':443' or ':3478' outside crates/mesh-core (GNFR-11): $rel"
+                    exit 1
+                }
+            }
+        }
+    }
+
+    # 2c. Mobile source & config hygiene (when mobile/ exists)
+    $MobileDir = Join-Path $RepoRoot "mobile"
+    if (Test-Path $MobileDir) {
+        $ForbiddenMobileExts = @(".jks", ".keystore", ".p12", ".mobileprovision", ".apk", ".aab", ".ipa")
+        $MobileFiles = Get-ChildItem -Path $MobileDir -Recurse -File -Force | Where-Object {
+            $_.FullName -notlike "*\.gradle\*" -and
+            $_.FullName -notlike "*\build\*" -and
+            $_.FullName -notlike "*\.build\*" -and
+            $_.FullName -notlike "*\DerivedData\*"
+        }
+        foreach ($mf in $MobileFiles) {
+            $rel = $mf.FullName.Substring($RepoRoot.Length + 1).Replace("\", "/")
+            $ext = $mf.Extension.ToLowerInvariant()
+            if ($ForbiddenMobileExts -contains $ext) {
+                Write-Error "Forbidden mobile binary/signing artifact in repository: $rel"
+                exit 1
+            }
+            if ($ext -eq ".plist") {
+                $plistRaw = Get-Content -Path $mf.FullName -Raw
+                if ($plistRaw -match "NSAllowsArbitraryLoads") {
+                    Write-Error "Forbidden ATS bypass 'NSAllowsArbitraryLoads' in plist: $rel"
                     exit 1
                 }
             }
@@ -218,15 +250,15 @@ try {
         foreach ($t in $CrossTargets) {
             if ($t -eq "x86_64-unknown-linux-musl") {
                 if ($hasZigbuild) {
-                    Write-Host "    cargo zigbuild --workspace --target $t"
-                    & cargo @CargoToolchainArgs zigbuild --workspace --target $t
+                    Write-Host "    cargo zigbuild --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --target $t"
+                    & cargo @CargoToolchainArgs zigbuild --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --target $t
                     if ($LASTEXITCODE -ne 0) {
                         Write-Error "Cross-link (cargo zigbuild) failed for target $t"
                         exit 1
                     }
                 }
-                Write-Host "    cargo clippy --workspace --all-targets --all-features --target $t -- -D warnings"
-                & cargo @CargoToolchainArgs clippy --workspace --all-targets --all-features --target $t -- -D warnings
+                Write-Host "    cargo clippy --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --all-targets --all-features --target $t -- -D warnings"
+                & cargo @CargoToolchainArgs clippy --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --all-targets --all-features --target $t -- -D warnings
                 if ($LASTEXITCODE -ne 0) {
                     Write-Error "Cross-clippy failed for target $t"
                     exit 1
@@ -234,8 +266,8 @@ try {
             }
             elseif ($t -like "*-apple-darwin") {
                 if ($hasZigbuild -and $hasAppleSdk) {
-                    Write-Host "    cargo zigbuild --workspace --target $t"
-                    & cargo @CargoToolchainArgs zigbuild --workspace --target $t
+                    Write-Host "    cargo zigbuild --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --target $t"
+                    & cargo @CargoToolchainArgs zigbuild --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --target $t
                     if ($LASTEXITCODE -ne 0) {
                         Write-Error "Cross-link (cargo zigbuild) failed for target $t"
                         exit 1
@@ -244,8 +276,8 @@ try {
                 else {
                     Write-Host "    [Cross] SDKROOT not set for $t; running full clippy --all-targets --all-features (-D warnings) cross-check" -ForegroundColor Yellow
                 }
-                Write-Host "    cargo clippy --workspace --all-targets --all-features --target $t -- -D warnings"
-                & cargo @CargoToolchainArgs clippy --workspace --all-targets --all-features --target $t -- -D warnings
+                Write-Host "    cargo clippy --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --all-targets --all-features --target $t -- -D warnings"
+                & cargo @CargoToolchainArgs clippy --workspace --exclude mesh-mobile-ffi --exclude mesh-uniffi-bindgen --all-targets --all-features --target $t -- -D warnings
                 if ($LASTEXITCODE -ne 0) {
                     Write-Error "Cross-clippy failed for target $t"
                     exit 1

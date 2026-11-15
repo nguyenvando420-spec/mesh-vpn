@@ -43,3 +43,22 @@ coverage.*
 
 # Docker NAT lab scratch artifacts
 /lab/.tmp/
+
+# Mobile build artifacts, local paths & signing secrets (Android / iOS)
+/mobile/android/.gradle/
+/mobile/android/build/
+/mobile/android/*/build/
+/mobile/android/local.properties
+/mobile/ios/.build/
+/mobile/ios/DerivedData/
+/mobile/ios/build/
+*.apk
+*.aab
+*.jks
+*.keystore
+*.ipa
+*.xcframework/
+*.xcarchive/
+*.mobileprovision
+*.p12
+*.mobile/generated/

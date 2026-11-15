@@ -1,0 +1,50 @@
+# crates/mesh-mobile-ffi/Cargo.toml — UniFFI 0.29.5 boundary for Android & iOS (ADR-014, IG-MOB-G2-01)
+[package]
+name = "mesh-mobile-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+# Do NOT set `[lints] workspace = true` here to avoid E0453 with UniFFI scaffolding's generated
+# `#[unsafe(no_mangle)]` items. `scripts/check.{ps1,sh}` independently bans hand-written `unsafe`
+# across `crates/mesh-mobile-ffi/src/*.rs`.
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+let_underscore_must_use = "deny"
+await_holding_lock = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+
+[dependencies]
+mesh-core.workspace = true
+mesh-crypto = { path = "../mesh-crypto", version = "0.1.0", default-features = false, features = ["mobile-platform-verifier"] }
+mesh-proto.workspace = true
+mesh-sys.workspace = true
+mesh-net = { path = "../mesh-net", version = "0.1.0", default-features = false }
+mesh-datapath = { path = "../mesh-datapath", version = "0.1.0", default-features = false }
+mesh-client = { path = "../mesh-client", version = "0.1.0", default-features = false }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uniffi = { workspace = true, features = ["tokio"] }
+zeroize.workspace = true

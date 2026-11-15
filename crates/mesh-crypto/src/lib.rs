@@ -4,6 +4,7 @@
 //! verification logic outside this boundary.
 
 pub mod auth_box;
+#[cfg(feature = "certgen")]
 pub mod certgen;
 pub mod disco_box;
 pub mod hash;
@@ -14,6 +15,7 @@ pub mod tlspin;
 pub use auth_box::{
     ExpectedProofClaims, ProofPayload, SealedAuthProof, open_proof, seal_proof, verify_proof_claims,
 };
+#[cfg(feature = "certgen")]
 pub use certgen::{
     GeneratedAcmeCsr, GeneratedTlsIdentity, build_rustls_server_config_from_der,
     build_rustls_server_config_from_pem, build_tls_alpn_certified_key_from_der,

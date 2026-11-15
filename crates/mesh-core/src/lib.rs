@@ -7,6 +7,7 @@ pub mod clock;
 pub mod defaults;
 pub mod error;
 pub mod logging;
+pub mod mobile_uri;
 pub mod types;
 
 pub use backoff::{BackoffConfig, ExponentialBackoff};
@@ -15,5 +16,9 @@ pub use error::{AppError, AppResult, ErrorEnvelope, ErrorKind, ErrorResponse};
 pub use logging::{
     BoundedRotatingWriter, LogGuard, LoggingConfig, MeshJsonFormatter, SharedLogWriter,
     init_json_logging,
+};
+pub use mobile_uri::{
+    MAX_MOBILE_JOIN_URI_LEN, MOBILE_JOIN_URI_HOST, MOBILE_JOIN_URI_SCHEME, MOBILE_JOIN_URI_VERSION,
+    MOBILE_SYSTEM_CA_PIN, MobileJoinTlsAuth, MobileJoinUri, format_join_uri, parse_join_uri,
 };
 pub use types::{KeyId, NodeId, NodeName, OverlayCidr, OverlayIp, Port, PublicKey, SpkiPin};

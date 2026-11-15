@@ -6,6 +6,12 @@ pub mod error;
 #[cfg(unix)]
 pub mod fs_unix;
 
+#[cfg(target_os = "android")]
+pub mod jni_android;
+#[cfg(target_os = "android")]
+pub mod socket_android;
+#[cfg(target_os = "ios")]
+pub mod socket_ios;
 #[cfg(target_os = "linux")]
 pub mod socket_linux;
 #[cfg(target_os = "macos")]
@@ -13,12 +19,16 @@ pub mod socket_macos;
 #[cfg(target_os = "windows")]
 pub mod socket_windows;
 
+#[cfg(target_os = "android")]
+pub mod tun_android;
 #[cfg(target_os = "linux")]
 pub mod tun_linux;
 #[cfg(target_os = "macos")]
 pub mod tun_macos;
 #[cfg(target_os = "windows")]
 pub mod tun_windows;
+
+pub mod memory_ios;
 
 #[cfg(target_os = "linux")]
 pub mod ipc_linux;
