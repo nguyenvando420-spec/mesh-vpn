@@ -233,6 +233,12 @@ pub fn query_os_primary_physical_interface() -> AppResult<PhysicalInterface> {
     {
         crate::netmon_windows::query_primary_physical_interface()
     }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Err(AppError::unavailable(
+            "OS physical interface inspection is provided by the mobile host callback on this platform",
+        ))
+    }
 }
 
 /// Lists all current OS interface addresses and CIDR prefixes (`US-036`, `US-037`).
@@ -248,6 +254,12 @@ pub fn list_os_interface_subnets() -> AppResult<Vec<InterfaceSubnetSnapshot>> {
     #[cfg(target_os = "windows")]
     {
         crate::netmon_windows::list_interface_subnets()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Err(AppError::unavailable(
+            "OS interface subnet listing is provided by the mobile host callback on this platform",
+        ))
     }
 }
 
@@ -498,5 +510,33 @@ mod tests {
 
         // Assert
         assert_eq!(ready, Some(eth));
+    }
+
+    #[test]
+    fn test_netmon_unavailable_formats_platform_error() {
+        // Arrange & Act
+        let err = super::netmon_unavailable("android");
+
+        // Assert
+        assert_eq!(err.kind(), mesh_core::ErrorKind::Unavailable);
+        assert!(err.public_message().contains("android"));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn test_netmon_mobile_fallback_returns_unavailable() {
+        // Arrange & Act
+        let iface_res = super::query_os_primary_physical_interface();
+        let subnets_res = super::list_os_interface_subnets();
+
+        // Assert
+        assert_eq!(
+            iface_res.err().map(|err| err.kind()),
+            Some(mesh_core::ErrorKind::Unavailable)
+        );
+        assert_eq!(
+            subnets_res.err().map(|err| err.kind()),
+            Some(mesh_core::ErrorKind::Unavailable)
+        );
     }
 }

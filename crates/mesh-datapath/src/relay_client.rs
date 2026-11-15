@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{self, ErrorKind as IoErrorKind, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,8 @@ use tracing::{debug, info, warn};
 use mesh_core::backoff::{BackoffConfig, ExponentialBackoff};
 use mesh_core::clock::Clock;
 use mesh_core::defaults::{
-    CONNECT_TIMEOUT_MS, HEARTBEAT_TIMEOUT_MS, MAX_FRAME_SIZE, RELAY_QUEUE_CAPACITY,
+    CONNECT_TIMEOUT_MS, DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS, HEARTBEAT_TIMEOUT_MS,
+    MAX_FRAME_SIZE, RELAY_QUEUE_CAPACITY,
 };
 use mesh_core::{AppError, AppResult, ErrorKind, NodeId, PublicKey};
 use mesh_crypto::{
@@ -36,18 +37,98 @@ use mesh_crypto::{
     build_system_ca_client_config, classify_rustls_error, extract_tls_exporter_binding, seal_proof,
     sha256_hex,
 };
-use mesh_net::bind_underlay_socket2;
+use mesh_net::{
+    Nat64Prefix, Nat64Synthesizer, NoopSocketProtector, SocketProtector, bind_underlay_socket2,
+};
 use mesh_proto::control::{
     ChallengeResponse, HEADER_AUTH_PROOF, HEADER_BOX_NONCE, HEADER_CHALLENGE_ID, HEADER_NODE_PUBKEY,
 };
 use mesh_proto::netmap::PinSetDto;
 use mesh_proto::relay::{RELAY_MAX_CIPHERTEXT_BYTES, RelayFrame, RelayNoticeCode};
 
+use crate::magic_socket::protect_socket2;
+
 const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 const OUTBOUND_BATCH_SIZE: usize = 32;
 const MAX_CHALLENGE_HTTP_RESPONSE_BYTES: usize = 16 * 1024;
 const WS_PATH_RELAY: &str = "/v1/relay";
 const HTTP_PATH_CHALLENGE: &str = "/v1/auth/challenge";
+const PROTOCOL_INCOMPATIBLE_ERR_PREFIX: &str = "protocol incompatible (agent upgrade required)";
+const MAX_ERROR_JSON_DEPTH: usize = 8;
+
+/// Scheduling mode governing periodic data-plane timers and Blind Relay keepalive cadence (`US-077`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimerMode {
+    /// Desktop low-latency scheduling: `250 ms` engine ticks and `25 s` relay keepalives.
+    #[default]
+    Responsive,
+    /// Battery-conscious mobile scheduling: suspends idle polling after
+    /// `DEFAULT_IDLE_ENTRY_WINDOW_MS` and coalesces relay keepalives to
+    /// `DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS` (`45 s`).
+    IdleAware,
+}
+
+#[must_use]
+pub(crate) fn keepalive_interval_for_mode(mode: TimerMode) -> Duration {
+    match mode {
+        TimerMode::Responsive => RELAY_KEEPALIVE_INTERVAL,
+        TimerMode::IdleAware => Duration::from_millis(DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS),
+    }
+}
+
+/// Optional mobile runtime controls passed when creating [`RelayClient`] (`US-077`).
+#[derive(Clone)]
+pub struct RelayClientOptions {
+    /// Fail-closed OS socket protector invoked prior to TCP `connect()` or TLS handshake.
+    pub socket_protector: Arc<dyn SocketProtector>,
+    /// Initial active NAT64 RFC 6052 prefix (`None` when network is IPv4-capable or native IPv6).
+    pub nat64_prefix: Option<Nat64Prefix>,
+    /// Initial keepalive timer cadence mode (`Responsive` default).
+    pub timer_mode: TimerMode,
+}
+
+impl std::fmt::Debug for RelayClientOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayClientOptions")
+            .field("socket_protector", &"<dyn SocketProtector>")
+            .field("nat64_prefix", &self.nat64_prefix)
+            .field("timer_mode", &self.timer_mode)
+            .finish()
+    }
+}
+
+impl Default for RelayClientOptions {
+    fn default() -> Self {
+        Self {
+            socket_protector: Arc::new(NoopSocketProtector),
+            nat64_prefix: None,
+            timer_mode: TimerMode::Responsive,
+        }
+    }
+}
+
+impl RelayClientOptions {
+    /// Attaches a fail-closed OS [`SocketProtector`].
+    #[must_use]
+    pub fn with_socket_protector(mut self, protector: Arc<dyn SocketProtector>) -> Self {
+        self.socket_protector = protector;
+        self
+    }
+
+    /// Configures an active NAT64 synthesis prefix.
+    #[must_use]
+    pub fn with_nat64_prefix(mut self, nat64_prefix: Option<Nat64Prefix>) -> Self {
+        self.nat64_prefix = nat64_prefix;
+        self
+    }
+
+    /// Configures the initial [`TimerMode`].
+    #[must_use]
+    pub fn with_timer_mode(mut self, timer_mode: TimerMode) -> Self {
+        self.timer_mode = timer_mode;
+        self
+    }
+}
 
 /// Connection lifecycle state reported by [`RelayClient`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +247,8 @@ pub struct RelayClientHandle {
     inner: Arc<RelayQueueRegistry>,
     metrics: Arc<RelayMetrics>,
     config_tx: Option<Arc<watch::Sender<RelayClientConfig>>>,
+    nat64_tx: Option<Arc<watch::Sender<Option<Nat64Prefix>>>>,
+    timer_mode_tx: Option<Arc<watch::Sender<TimerMode>>>,
 }
 
 #[derive(Debug)]
@@ -200,6 +283,41 @@ impl RelayClientHandle {
             inner: Arc::new(RelayQueueRegistry::new()),
             metrics: Arc::new(RelayMetrics::default()),
             config_tx: None,
+            nat64_tx: None,
+            timer_mode_tx: None,
+        }
+    }
+
+    /// Atomically updates the active NAT64 synthesis prefix and wakes any sleeping backoff
+    /// (`US-077`).
+    pub fn set_nat64_prefix(&self, prefix: Option<Nat64Prefix>) {
+        if let Some(tx) = &self.nat64_tx {
+            let changed = *tx.borrow() != prefix;
+            if let Err(err) = tx.send(prefix) {
+                debug!(
+                    component = "datapath.relay_client",
+                    event = "relay_nat64_update_dropped",
+                    error = %err,
+                    "NAT64 prefix update dropped because relay client stopped"
+                );
+            } else if changed {
+                self.inner.backoff_wake.notify_one();
+            }
+        }
+    }
+
+    /// Updates the Blind Relay keepalive [`TimerMode`] dynamically without tearing down the active
+    /// WebSocket (`US-077`).
+    pub fn set_timer_mode(&self, mode: TimerMode) {
+        if let Some(tx) = &self.timer_mode_tx
+            && let Err(err) = tx.send(mode)
+        {
+            debug!(
+                component = "datapath.relay_client",
+                event = "relay_timer_mode_update_dropped",
+                error = %err,
+                "timer mode update dropped because relay client stopped"
+            );
         }
     }
 
@@ -381,9 +499,41 @@ impl RelayConnector for TlsRelayConnector {
     }
 }
 
+/// Mobile-aware TLS 1.3 connector enforcing fail-closed [`SocketProtector`] and RFC 6052 NAT64
+/// synthesis while preserving original logical `ServerName` for certificate verification (`US-077`).
+#[derive(Clone)]
+pub struct ProtectedRelayConnector {
+    socket_protector: Arc<dyn SocketProtector>,
+    nat64_rx: watch::Receiver<Option<Nat64Prefix>>,
+}
+
+impl std::fmt::Debug for ProtectedRelayConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtectedRelayConnector")
+            .field("socket_protector", &"<dyn SocketProtector>")
+            .field("nat64_prefix", &*self.nat64_rx.borrow())
+            .finish()
+    }
+}
+
+impl RelayConnector for ProtectedRelayConnector {
+    fn connect<'a>(
+        &'a self,
+        config: &'a RelayClientConfig,
+    ) -> Pin<Box<dyn Future<Output = AppResult<ConnectedRelayTransport>> + Send + 'a>> {
+        let prefix = *self.nat64_rx.borrow();
+        Box::pin(connect_tls_transport_with_options(
+            config,
+            self.socket_protector.as_ref(),
+            prefix,
+        ))
+    }
+}
+
 /// Authenticated WebSocket Blind Relay client with reconnect backoff and graceful shutdown.
 pub struct RelayClient {
     config_tx: Arc<watch::Sender<RelayClientConfig>>,
+    timer_mode_tx: Arc<watch::Sender<TimerMode>>,
     node_keypair: NodeKeypair,
     disco_keypair: DiscoKeypair,
     handle: RelayClientHandle,
@@ -465,12 +615,47 @@ impl RelayClient {
         node_keypair: NodeKeypair,
         disco_keypair: DiscoKeypair,
     ) -> Self {
-        Self::with_connector(
+        Self::with_options(
             config,
             node_keypair,
             disco_keypair,
-            Arc::new(TlsRelayConnector),
+            RelayClientOptions::default(),
         )
+    }
+
+    /// Creates a production `RelayClient` wired with fail-closed [`SocketProtector`], optional
+    /// NAT64 synthesis prefix, and initial [`TimerMode`] (`US-077`).
+    #[must_use]
+    pub fn with_options(
+        config: RelayClientConfig,
+        node_keypair: NodeKeypair,
+        disco_keypair: DiscoKeypair,
+        options: RelayClientOptions,
+    ) -> Self {
+        let (config_tx, _config_rx) = watch::channel(config);
+        let config_tx = Arc::new(config_tx);
+        let (nat64_tx, nat64_rx) = watch::channel(options.nat64_prefix);
+        let nat64_tx = Arc::new(nat64_tx);
+        let (timer_mode_tx, _timer_mode_rx) = watch::channel(options.timer_mode);
+        let timer_mode_tx = Arc::new(timer_mode_tx);
+        let connector: Arc<dyn RelayConnector> = Arc::new(ProtectedRelayConnector {
+            socket_protector: options.socket_protector,
+            nat64_rx,
+        });
+        Self {
+            config_tx: Arc::clone(&config_tx),
+            timer_mode_tx: Arc::clone(&timer_mode_tx),
+            node_keypair,
+            disco_keypair,
+            handle: RelayClientHandle {
+                inner: Arc::new(RelayQueueRegistry::new()),
+                metrics: Arc::new(RelayMetrics::default()),
+                config_tx: Some(config_tx),
+                nat64_tx: Some(nat64_tx),
+                timer_mode_tx: Some(timer_mode_tx),
+            },
+            connector,
+        }
     }
 
     /// Creates a `RelayClient` with a custom [`RelayConnector`] (useful for deterministic tests).
@@ -481,16 +666,41 @@ impl RelayClient {
         disco_keypair: DiscoKeypair,
         connector: Arc<dyn RelayConnector>,
     ) -> Self {
+        Self::with_connector_and_timer_mode(
+            config,
+            node_keypair,
+            disco_keypair,
+            connector,
+            TimerMode::Responsive,
+        )
+    }
+
+    /// Creates a `RelayClient` with a custom [`RelayConnector`] and explicit [`TimerMode`] (`US-077`).
+    #[must_use]
+    pub fn with_connector_and_timer_mode(
+        config: RelayClientConfig,
+        node_keypair: NodeKeypair,
+        disco_keypair: DiscoKeypair,
+        connector: Arc<dyn RelayConnector>,
+        timer_mode: TimerMode,
+    ) -> Self {
         let (config_tx, _config_rx) = watch::channel(config);
         let config_tx = Arc::new(config_tx);
+        let (nat64_tx, _nat64_rx) = watch::channel(None);
+        let nat64_tx = Arc::new(nat64_tx);
+        let (timer_mode_tx, _timer_mode_rx) = watch::channel(timer_mode);
+        let timer_mode_tx = Arc::new(timer_mode_tx);
         Self {
             config_tx: Arc::clone(&config_tx),
+            timer_mode_tx: Arc::clone(&timer_mode_tx),
             node_keypair,
             disco_keypair,
             handle: RelayClientHandle {
                 inner: Arc::new(RelayQueueRegistry::new()),
                 metrics: Arc::new(RelayMetrics::default()),
                 config_tx: Some(config_tx),
+                nat64_tx: Some(nat64_tx),
+                timer_mode_tx: Some(timer_mode_tx),
             },
             connector,
         }
@@ -608,6 +818,9 @@ impl RelayClient {
         clock: &dyn Clock,
     ) -> Result<WebSocket<BridgeStream>, SessionExit> {
         let mut transport = self.connector.connect(session_cfg).await.map_err(|err| {
+            if err.kind().should_stop_auto_retry() || is_protocol_incompatible_error(&err) {
+                return SessionExit::TerminalAuth(err.kind());
+            }
             let tls_capped = is_tls_capped_error(&err);
             SessionExit::Reconnect {
                 error: err,
@@ -722,9 +935,9 @@ impl RelayClient {
         shutdown: &CancellationToken,
         config_rx: &mut watch::Receiver<RelayClientConfig>,
     ) -> SessionExit {
-        let mut keepalive_tick = tokio::time::interval(RELAY_KEEPALIVE_INTERVAL);
-        keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_rx_instant = tokio::time::Instant::now();
+        let mut timer_mode_rx = self.timer_mode_tx.subscribe();
+        let initial_mode = *timer_mode_rx.borrow_and_update();
+        let mut timers = WsLoopTimers::new(initial_mode);
         let heartbeat_timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
         let mut read_scratch = [0u8; MAX_FRAME_SIZE * 2];
 
@@ -734,63 +947,70 @@ impl RelayClient {
 
         loop {
             if let Err(err) = self.flush_outbound_batch(ws).await {
-                return SessionExit::Reconnect {
-                    error: err,
-                    tls_capped: false,
-                };
+                return reconnect_exit(err);
             }
 
-            let idle_deadline = tokio::time::sleep_until(last_rx_instant + heartbeat_timeout);
+            let idle_deadline =
+                tokio::time::sleep_until(timers.last_rx_instant + heartbeat_timeout);
+            let keepalive_deadline = tokio::time::sleep_until(timers.next_keepalive_at);
             tokio::pin!(idle_deadline);
+            tokio::pin!(keepalive_deadline);
 
             tokio::select! {
                 () = shutdown.cancelled() => return SessionExit::Shutdown,
                 Ok(()) = config_rx.changed() => return SessionExit::ConfigUpdated,
+                Ok(()) = timer_mode_rx.changed() => {
+                    timers.set_mode(*timer_mode_rx.borrow_and_update());
+                }
                 () = self.handle.inner.wake.notified() => {}
                 () = self.handle.inner.backoff_wake.notified() => {
-                    let frame = RelayFrame::KeepAlive { sent_at_ms: clock.now_unix_ms() };
-                    if let Err(err) = send_relay_frame(ws, &frame).await {
-                        return SessionExit::Reconnect { error: err, tls_capped: false };
+                    if let Err(err) = send_keepalive_frame(ws, clock).await {
+                        return reconnect_exit(err);
                     }
+                    timers.schedule_next_keepalive();
                 }
-                _ = keepalive_tick.tick() => {
-                    let frame = RelayFrame::KeepAlive { sent_at_ms: clock.now_unix_ms() };
-                    if let Err(err) = send_relay_frame(ws, &frame).await {
-                        return SessionExit::Reconnect { error: err, tls_capped: false };
+                () = &mut keepalive_deadline => {
+                    if let Err(err) = send_keepalive_frame(ws, clock).await {
+                        return reconnect_exit(err);
                     }
+                    timers.schedule_next_keepalive();
                 }
                 () = &mut idle_deadline => {
-                    return SessionExit::Reconnect {
-                        error: AppError::unavailable("relay heartbeat timeout exceeded (60 s)"),
-                        tls_capped: false,
-                    };
+                    return reconnect_exit(AppError::unavailable(
+                        "relay heartbeat timeout exceeded (60 s)",
+                    ));
                 }
                 read_res = ws.get_mut().async_stream.read(&mut read_scratch) => {
-                    match read_res {
-                        Ok(0) => {
-                            return SessionExit::Reconnect {
-                                error: AppError::unavailable("relay WebSocket EOF"),
-                                tls_capped: false,
-                            };
-                        }
-                        Ok(n) => {
-                            last_rx_instant = tokio::time::Instant::now();
-                            if let Some(bytes) = read_scratch.get(..n) {
-                                ws.get_mut().push_rx(bytes);
-                            }
-                            if let Some(exit) = self.drain_ws_messages(ws, clock, events_tx).await {
-                                return exit;
-                            }
-                        }
-                        Err(err) => {
-                            return SessionExit::Reconnect {
-                                error: AppError::unavailable(format!("relay read error: {err}")),
-                                tls_capped: false,
-                            };
-                        }
+                    let chunk_res = read_res.map(|n| read_scratch.get(..n).unwrap_or_default());
+                    if let Some(exit) = self
+                        .handle_ws_read_result(chunk_res, ws, clock, events_tx, &mut timers)
+                        .await
+                    {
+                        return exit;
                     }
                 }
             }
+        }
+    }
+
+    async fn handle_ws_read_result(
+        &self,
+        chunk_res: io::Result<&[u8]>,
+        ws: &mut WebSocket<BridgeStream>,
+        clock: &dyn Clock,
+        events_tx: &mpsc::Sender<RelayEvent>,
+        timers: &mut WsLoopTimers,
+    ) -> Option<SessionExit> {
+        match chunk_res {
+            Ok([]) => Some(reconnect_exit(AppError::unavailable("relay WebSocket EOF"))),
+            Ok(bytes) => {
+                timers.record_rx();
+                ws.get_mut().push_rx(bytes);
+                self.drain_ws_messages(ws, clock, events_tx).await
+            }
+            Err(err) => Some(reconnect_exit(AppError::unavailable(format!(
+                "relay read error: {err}"
+            )))),
         }
     }
 
@@ -930,8 +1150,74 @@ enum SessionExit {
     Reconnect { error: AppError, tls_capped: bool },
 }
 
+struct WsLoopTimers {
+    mode: TimerMode,
+    last_rx_instant: tokio::time::Instant,
+    next_keepalive_at: tokio::time::Instant,
+}
+
+impl WsLoopTimers {
+    fn new(mode: TimerMode) -> Self {
+        let now = tokio::time::Instant::now();
+        let next_keepalive_at = match mode {
+            TimerMode::Responsive => now,
+            TimerMode::IdleAware => now + keepalive_interval_for_mode(mode),
+        };
+        Self {
+            mode,
+            last_rx_instant: now,
+            next_keepalive_at,
+        }
+    }
+
+    fn set_mode(&mut self, mode: TimerMode) {
+        self.mode = mode;
+        self.schedule_next_keepalive();
+    }
+
+    fn schedule_next_keepalive(&mut self) {
+        self.next_keepalive_at =
+            tokio::time::Instant::now() + keepalive_interval_for_mode(self.mode);
+    }
+
+    fn record_rx(&mut self) {
+        let now = tokio::time::Instant::now();
+        self.last_rx_instant = now;
+        if self.mode == TimerMode::IdleAware {
+            // Receiving bytes resets keepalive cadence in IdleAware mode (`45 s`), saving
+            // radio wakeups during active bursts while still probing before `60 s` expiry.
+            self.next_keepalive_at = now + keepalive_interval_for_mode(self.mode);
+        }
+    }
+}
+
+const fn reconnect_exit(error: AppError) -> SessionExit {
+    SessionExit::Reconnect {
+        error,
+        tls_capped: false,
+    }
+}
+
+async fn send_keepalive_frame(
+    ws: &mut WebSocket<BridgeStream>,
+    clock: &dyn Clock,
+) -> AppResult<()> {
+    let frame = RelayFrame::KeepAlive {
+        sent_at_ms: clock.now_unix_ms(),
+    };
+    send_relay_frame(ws, &frame).await
+}
+
+/// Returns `true` when `err` represents an HTTP `400` protocol-incompatibility rejection over an
+/// already authenticated TLS channel (`US-077`), signalling callers to halt reconnect loops.
+#[must_use]
+pub fn is_protocol_incompatible_error(err: &AppError) -> bool {
+    err.kind() == ErrorKind::InvalidArgument
+        && err.to_string().contains(PROTOCOL_INCOMPATIBLE_ERR_PREFIX)
+}
+
 fn classify_auth_or_ws_exit(err: AppError) -> SessionExit {
-    if err.kind().should_stop_auto_retry() {
+    if err.kind().should_stop_auto_retry() || is_protocol_incompatible_error(&err) {
         return SessionExit::TerminalAuth(err.kind());
     }
     let tls_capped = is_tls_capped_error(&err);
@@ -995,20 +1281,82 @@ impl Write for BridgeStream {
     }
 }
 
-async fn connect_tls_transport(config: &RelayClientConfig) -> AppResult<ConnectedRelayTransport> {
-    let (host, port) = split_host_port(&config.endpoint)?;
-    let target_addrs = tokio::time::timeout(
+/// Synthesizes IPv4 Blind Relay TCP endpoints into RFC 6052 IPv6 targets when an active
+/// NAT64 prefix is configured (`US-077`), ordering native IPv6 endpoints ahead of synthesized IPv6.
+#[must_use]
+pub fn resolve_relay_target_addrs<I>(
+    resolved: I,
+    nat64_prefix: Option<Nat64Prefix>,
+) -> Vec<SocketAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let mut v6 = Vec::new();
+    let mut rest = Vec::new();
+    let synth = nat64_prefix.map(Nat64Synthesizer::new);
+    for addr in resolved {
+        match (addr, synth) {
+            (SocketAddr::V6(_), _) => {
+                if !v6.contains(&addr) {
+                    v6.push(addr);
+                }
+            }
+            (SocketAddr::V4(v4), Some(s)) => {
+                let mapped = SocketAddr::V6(s.synthesize_sockaddr(v4));
+                if !rest.contains(&mapped) {
+                    rest.push(mapped);
+                }
+            }
+            (SocketAddr::V4(_), None) => {
+                if !rest.contains(&addr) {
+                    rest.push(addr);
+                }
+            }
+        }
+    }
+    v6.extend(rest);
+    v6
+}
+
+async fn resolve_endpoint_socket_addrs(host: &str, port: u16) -> AppResult<Vec<SocketAddr>> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let resolved = tokio::time::timeout(
         Duration::from_millis(CONNECT_TIMEOUT_MS),
         tokio::net::lookup_host((host, port)),
     )
     .await
     .map_err(|_| AppError::unavailable("timed out resolving Blind Relay hostname"))?
     .map_err(|err| AppError::unavailable(format!("DNS resolution failed for relay: {err}")))?;
+    Ok(resolved.collect())
+}
+
+async fn connect_tls_transport(config: &RelayClientConfig) -> AppResult<ConnectedRelayTransport> {
+    connect_tls_transport_with_options(config, &NoopSocketProtector, None).await
+}
+
+async fn connect_tls_transport_with_options(
+    config: &RelayClientConfig,
+    protector: &dyn SocketProtector,
+    nat64_prefix: Option<Nat64Prefix>,
+) -> AppResult<ConnectedRelayTransport> {
+    let (host, port) = split_host_port(&config.endpoint)?;
+    let raw_addrs = resolve_endpoint_socket_addrs(host, port).await?;
+    let target_addrs = resolve_relay_target_addrs(raw_addrs, nat64_prefix);
 
     let mut tcp_stream = None;
     let mut last_err = AppError::unavailable("no IP addresses resolved for Blind Relay");
     for addr in target_addrs {
-        match connect_bound_tcp(addr, config.underlay_if_index, config.linux_fwmark).await {
+        match connect_bound_tcp_with_protector(
+            addr,
+            config.underlay_if_index,
+            config.linux_fwmark,
+            Duration::from_millis(CONNECT_TIMEOUT_MS),
+            protector,
+        )
+        .await
+        {
             Ok(stream) => {
                 tcp_stream = Some(stream);
                 break;
@@ -1043,20 +1391,6 @@ async fn connect_tls_transport(config: &RelayClientConfig) -> AppResult<Connecte
     })
 }
 
-async fn connect_bound_tcp(
-    addr: SocketAddr,
-    if_index: Option<u32>,
-    fwmark: Option<u32>,
-) -> AppResult<TcpStream> {
-    connect_bound_tcp_with_timeout(
-        addr,
-        if_index,
-        fwmark,
-        Duration::from_millis(CONNECT_TIMEOUT_MS),
-    )
-    .await
-}
-
 /// Opens a non-blocking TCP connection bound to the OS underlay interface (`if_index` / `fwmark`)
 /// with an explicit timeout budget, preventing routing-loop traversal across the overlay TUN.
 pub async fn connect_bound_tcp_with_timeout(
@@ -1064,6 +1398,18 @@ pub async fn connect_bound_tcp_with_timeout(
     if_index: Option<u32>,
     fwmark: Option<u32>,
     timeout: Duration,
+) -> AppResult<TcpStream> {
+    connect_bound_tcp_with_protector(addr, if_index, fwmark, timeout, &NoopSocketProtector).await
+}
+
+/// Opens a non-blocking TCP connection guarded fail-closed by `protector` before underlay binding
+/// or `connect()` (`US-077`), transmitting zero bytes if socket protection fails.
+pub async fn connect_bound_tcp_with_protector(
+    addr: SocketAddr,
+    if_index: Option<u32>,
+    fwmark: Option<u32>,
+    timeout: Duration,
+    protector: &dyn SocketProtector,
 ) -> AppResult<TcpStream> {
     let is_ipv6 = addr.is_ipv6();
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
@@ -1074,6 +1420,10 @@ pub async fn connect_bound_tcp_with_timeout(
     if let Err(err) = sock.set_nodelay(true) {
         debug!(component = "datapath.relay_client", error = %err, "TCP_NODELAY ignored");
     }
+
+    // Protect before underlay binding and connect() so any OS protection failure aborts and closes
+    // the socket before a single TCP SYN leaves the host.
+    protect_socket2(protector, &sock)?;
 
     if if_index.is_some() || fwmark.is_some() {
         bind_underlay_socket2(&sock, is_ipv6, if_index, fwmark)?;
@@ -1423,6 +1773,180 @@ impl<'a> JsonCursor<'a> {
         raw.parse::<u64>()
             .map_err(|_| AppError::unavailable("u64 overflow in challenge JSON"))
     }
+
+    fn skip_value(&mut self, depth: usize) -> AppResult<()> {
+        if depth > MAX_ERROR_JSON_DEPTH {
+            return Err(AppError::unavailable("JSON nesting limit exceeded"));
+        }
+        self.skip_ws();
+        match self.peek() {
+            Some(b'"') => {
+                drop(self.parse_string()?);
+                Ok(())
+            }
+            Some(b'{') => self.skip_object(depth),
+            Some(b'[') => self.skip_array(depth),
+            Some(b't') => self.consume_literal(b"true"),
+            Some(b'f') => self.consume_literal(b"false"),
+            Some(b'n') => self.consume_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
+            _ => Err(AppError::unavailable("unexpected token in JSON value")),
+        }
+    }
+
+    fn skip_object(&mut self, depth: usize) -> AppResult<()> {
+        self.expect_byte(b'{')?;
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos = self.pos.saturating_add(1);
+            return Ok(());
+        }
+        loop {
+            drop(self.parse_string()?);
+            self.expect_byte(b':')?;
+            self.skip_value(depth.saturating_add(1))?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos = self.pos.saturating_add(1),
+                Some(b'}') => {
+                    self.pos = self.pos.saturating_add(1);
+                    return Ok(());
+                }
+                _ => return Err(AppError::unavailable("malformed JSON object")),
+            }
+        }
+    }
+
+    fn skip_array(&mut self, depth: usize) -> AppResult<()> {
+        self.expect_byte(b'[')?;
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos = self.pos.saturating_add(1);
+            return Ok(());
+        }
+        loop {
+            self.skip_value(depth.saturating_add(1))?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos = self.pos.saturating_add(1),
+                Some(b']') => {
+                    self.pos = self.pos.saturating_add(1);
+                    return Ok(());
+                }
+                _ => return Err(AppError::unavailable("malformed JSON array")),
+            }
+        }
+    }
+
+    fn consume_literal(&mut self, expected: &[u8]) -> AppResult<()> {
+        let end = self.pos.saturating_add(expected.len());
+        if self.bytes.get(self.pos..end) != Some(expected) {
+            return Err(AppError::unavailable("malformed JSON literal"));
+        }
+        self.pos = end;
+        Ok(())
+    }
+
+    fn skip_number(&mut self) -> AppResult<()> {
+        if self.peek() == Some(b'-') {
+            self.pos = self.pos.saturating_add(1);
+        }
+        let start = self.pos;
+        while let Some(b) = self.peek()
+            && (b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-'))
+        {
+            self.pos = self.pos.saturating_add(1);
+        }
+        if self.pos == start {
+            return Err(AppError::unavailable("malformed JSON number"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ParsedHttpErrorEnvelope {
+    kind: Option<String>,
+    code: Option<String>,
+    message: String,
+}
+
+impl ParsedHttpErrorEnvelope {
+    fn is_invalid_argument(&self) -> bool {
+        let kind_matches = self.kind.as_deref().is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("invalid_argument")
+                || kind.eq_ignore_ascii_case("InvalidArgument")
+        });
+        let code_matches = self
+            .code
+            .as_deref()
+            .is_some_and(|code| code.eq_ignore_ascii_case("E_INVALID_ARG"));
+        kind_matches || code_matches || (self.kind.is_none() && self.code.is_none())
+    }
+}
+
+fn parse_error_object_fields(
+    cursor: &mut JsonCursor<'_>,
+    depth: usize,
+) -> AppResult<ParsedHttpErrorEnvelope> {
+    if depth > MAX_ERROR_JSON_DEPTH {
+        return Err(AppError::unavailable("error JSON nesting limit exceeded"));
+    }
+    let mut parsed = ParsedHttpErrorEnvelope::default();
+    cursor.expect_byte(b'{')?;
+    cursor.skip_ws();
+    if cursor.peek() == Some(b'}') {
+        cursor.pos = cursor.pos.saturating_add(1);
+        return Ok(parsed);
+    }
+    loop {
+        let key = cursor.parse_string()?;
+        cursor.expect_byte(b':')?;
+        cursor.skip_ws();
+        if key == "error" && cursor.peek() == Some(b'{') {
+            return parse_error_object_fields(cursor, depth.saturating_add(1));
+        }
+        assign_error_envelope_field(&key, cursor, depth, &mut parsed)?;
+        cursor.skip_ws();
+        match cursor.peek() {
+            Some(b',') => cursor.pos = cursor.pos.saturating_add(1),
+            Some(b'}') => {
+                cursor.pos = cursor.pos.saturating_add(1);
+                return Ok(parsed);
+            }
+            _ => return Err(AppError::unavailable("malformed error JSON object")),
+        }
+    }
+}
+
+fn assign_error_envelope_field(
+    key: &str,
+    cursor: &mut JsonCursor<'_>,
+    depth: usize,
+    out: &mut ParsedHttpErrorEnvelope,
+) -> AppResult<()> {
+    match key {
+        "kind" if cursor.peek() == Some(b'"') => out.kind = Some(cursor.parse_string()?),
+        "code" if cursor.peek() == Some(b'"') => out.code = Some(cursor.parse_string()?),
+        "message" if cursor.peek() == Some(b'"') => out.message = cursor.parse_string()?,
+        _ => cursor.skip_value(depth.saturating_add(1))?,
+    }
+    Ok(())
+}
+
+fn parse_http_error_envelope(body: &[u8]) -> Option<ParsedHttpErrorEnvelope> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut cursor = JsonCursor::new(text.as_bytes());
+    parse_error_object_fields(&mut cursor, 0).ok()
+}
+
+fn is_protocol_incompatible_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unknown variant")
+        || lower.contains("protocol incompatible")
+        || lower.contains("agent upgrade required")
+        || lower.contains("unsupported os")
+        || lower.contains("unsupported protocol")
 }
 
 fn parse_challenge_response_json(body: &[u8]) -> AppResult<ChallengeResponse> {
@@ -1830,6 +2354,25 @@ fn looks_like_captive_portal_body(body: &[u8]) -> bool {
 
 fn map_http_status_error(status: u16, body: &[u8]) -> AppError {
     let text = String::from_utf8_lossy(body);
+    if status == 400 {
+        if let Some(envelope) = parse_http_error_envelope(body) {
+            if envelope.is_invalid_argument() && is_protocol_incompatible_message(&envelope.message)
+            {
+                return AppError::invalid_argument(format!(
+                    "{PROTOCOL_INCOMPATIBLE_ERR_PREFIX}: {}",
+                    envelope.message
+                ));
+            }
+            if envelope.is_invalid_argument() && !envelope.message.is_empty() {
+                return AppError::invalid_argument(envelope.message);
+            }
+        } else if !looks_like_captive_portal_body(body) && is_protocol_incompatible_message(&text) {
+            return AppError::invalid_argument(format!(
+                "{PROTOCOL_INCOMPATIBLE_ERR_PREFIX}: {}",
+                text.trim()
+            ));
+        }
+    }
     if status == 403 {
         if text.contains("E_NODE_REVOKED") || text.contains("node_revoked") {
             return AppError::node_revoked("server rejected node as revoked");
@@ -1885,7 +2428,20 @@ fn current_target_os_str() -> &'static str {
     {
         "windows"
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "android")]
+    {
+        "android"
+    }
+    #[cfg(target_os = "ios")]
+    {
+        "ios"
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android",
+        target_os = "ios"
+    )))]
     {
         "linux"
     }
@@ -2864,5 +3420,362 @@ mod tests {
         // Assert
         assert_eq!(observed_rtt, Some(23));
         assert_eq!(handle.last_rtt_ms(), Some(23));
+    }
+
+    // Traces: US-077, TargetOs compatibility
+    #[test]
+    fn test_relay_client_target_os_str_matches_supported_variants() {
+        // Arrange
+        let expected = if cfg!(target_os = "macos") {
+            "darwin"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "android") {
+            "android"
+        } else if cfg!(target_os = "ios") {
+            "ios"
+        } else {
+            "linux"
+        };
+
+        // Act
+        let actual = current_target_os_str();
+
+        // Assert
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            actual,
+            "darwin" | "windows" | "android" | "ios" | "linux"
+        ));
+    }
+
+    struct Http400RejectionConnector {
+        connect_calls: Arc<std::sync::atomic::AtomicUsize>,
+        http_response: Vec<u8>,
+    }
+
+    impl RelayConnector for Http400RejectionConnector {
+        fn connect<'a>(
+            &'a self,
+            _config: &'a RelayClientConfig,
+        ) -> Pin<Box<dyn Future<Output = AppResult<ConnectedRelayTransport>> + Send + 'a>> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            let payload = self.http_response.clone();
+            Box::pin(async move {
+                let (mut server, client) = tokio::io::duplex(4096);
+                tokio::spawn(async move {
+                    let mut req_buf = [0u8; 2048];
+                    drop(server.read(&mut req_buf).await);
+                    drop(server.write_all(&payload).await);
+                    drop(server.shutdown().await);
+                });
+                Ok(ConnectedRelayTransport {
+                    stream: Box::new(client),
+                    tls_exporter_binding: None,
+                })
+            })
+        }
+    }
+
+    // Traces: US-077, HTTP 400 ErrorEnvelope protocol incompatibility stops reconnect
+    #[tokio::test]
+    async fn test_relay_client_http_400_unknown_variant_stops_retry_cleanly() {
+        // Arrange
+        let wrapped_body = br#"{"error":{"kind":"invalid_argument","code":"E_INVALID_ARG","message":"Failed to deserialize JSON body: os: unknown variant `android`, expected one of `darwin`, `windows`, `linux`","request_id":"req-99"}}"#;
+        let flat_body =
+            br#"{"kind":"InvalidArgument","code":"E_INVALID_ARG","message":"unknown variant `ios`"}"#;
+        let transient_body = br#"{"error":{"kind":"unavailable","message":"busy"}}"#;
+
+        let err_wrapped = map_http_status_error(400, wrapped_body);
+        let err_flat = map_http_status_error(400, flat_body);
+        let err_transient = map_http_status_error(503, transient_body);
+
+        assert_eq!(err_wrapped.kind(), ErrorKind::InvalidArgument);
+        assert!(is_protocol_incompatible_error(&err_wrapped));
+        assert_eq!(err_flat.kind(), ErrorKind::InvalidArgument);
+        assert!(is_protocol_incompatible_error(&err_flat));
+        assert!(!is_protocol_incompatible_error(&err_transient));
+
+        let raw_http = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            wrapped_body.len(),
+            String::from_utf8_lossy(wrapped_body)
+        );
+        let connect_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connector = Arc::new(Http400RejectionConnector {
+            connect_calls: Arc::clone(&connect_calls),
+            http_response: raw_http.into_bytes(),
+        });
+        let cfg = RelayClientConfig {
+            endpoint: "relay.example.net:8443".to_owned(),
+            server_name_override: None,
+            pin_set: None,
+            underlay_if_index: None,
+            linux_fwmark: None,
+            require_challenge_auth: true,
+            agent_version: "0.2.0-mobile".to_owned(),
+        };
+        let client = RelayClient::with_connector(
+            cfg,
+            NodeKeypair::generate(),
+            DiscoKeypair::generate(),
+            connector,
+        );
+        let handle = client.handle();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(50_000));
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+        let shutdown = CancellationToken::new();
+
+        // Act
+        let run_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.run(clock, ev_tx, shutdown.clone()),
+        )
+        .await;
+
+        // Assert
+        assert!(
+            run_result.is_ok(),
+            "RelayClient::run must halt immediately instead of retrying on HTTP 400 unknown variant"
+        );
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.metrics_snapshot().reconnects, 0);
+
+        let mut events = Vec::new();
+        while let Ok(ev) = ev_rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(
+            events.contains(&RelayEvent::StateChanged(RelayConnectionState::Terminated(
+                ErrorKind::InvalidArgument
+            )))
+        );
+    }
+
+    struct DenyAllRelayProtector {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SocketProtector for DenyAllRelayProtector {
+        fn protect_socket(&self, _raw_fd: i32) -> AppResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(AppError::permission_denied(
+                "fail-closed socket protector denied relay socket",
+            ))
+        }
+    }
+
+    // Traces: US-077, Fail-closed SocketProtector on Blind Relay TCP socket
+    #[tokio::test]
+    async fn test_relay_client_fail_closed_socket_protector_blocks_tcp_connect() {
+        // Arrange
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let protector = DenyAllRelayProtector {
+            calls: Arc::clone(&calls),
+        };
+
+        // Act
+        let tcp_res = connect_bound_tcp_with_protector(
+            addr,
+            None,
+            None,
+            Duration::from_millis(500),
+            &protector,
+        )
+        .await;
+        let accepted = tokio::time::timeout(Duration::from_millis(80), listener.accept()).await;
+
+        // Assert
+        assert!(tcp_res.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            accepted.is_err(),
+            "zero TCP SYN packets may reach listener when protect_socket fails"
+        );
+    }
+
+    // Traces: US-077, NAT64 synthesis + original ServerName preservation
+    #[tokio::test]
+    async fn test_relay_client_nat64_resolves_ipv4_and_preserves_tls_server_name() {
+        // Arrange
+        let prefix = Nat64Prefix::well_known();
+        let raw_v4: SocketAddr = "192.0.2.44:8443".parse().expect("raw v4");
+        let native_v6: SocketAddr = "[2001:db8::5]:8443".parse().expect("native v6");
+
+        // Act
+        let resolved_nat64 = resolve_relay_target_addrs([raw_v4, native_v6], Some(prefix));
+        let resolved_plain = resolve_relay_target_addrs([raw_v4, native_v6], None);
+        let original_sni =
+            ServerName::try_from("192.0.2.44".to_owned()).expect("original IPv4 SAN preserved");
+
+        let cfg = RelayClientConfig {
+            endpoint: raw_v4.to_string(),
+            server_name_override: None,
+            pin_set: None,
+            underlay_if_index: None,
+            linux_fwmark: None,
+            require_challenge_auth: false,
+            agent_version: "0.2.0-nat64".to_owned(),
+        };
+        let protector_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_tx, nat64_rx) = watch::channel(Some(prefix));
+        let connector = ProtectedRelayConnector {
+            socket_protector: Arc::new(DenyAllRelayProtector {
+                calls: Arc::clone(&protector_calls),
+            }),
+            nat64_rx,
+        };
+        let connect_err = connector.connect(&cfg).await;
+
+        // Assert
+        assert_eq!(
+            resolved_nat64,
+            vec![
+                native_v6,
+                "[64:ff9b::c000:22c]:8443"
+                    .parse::<SocketAddr>()
+                    .expect("synthesized v6"),
+            ]
+        );
+        assert_eq!(resolved_plain, vec![native_v6, raw_v4]);
+        assert!(matches!(original_sni, ServerName::IpAddress(_)));
+        assert!(connect_err.is_err());
+        assert_eq!(protector_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Traces: US-077, IdleAware coalesced KeepAlive interval
+    #[tokio::test]
+    async fn test_relay_client_timer_mode_idle_aware_coalesces_keepalive_and_keeps_session_alive() {
+        // Arrange
+        assert_eq!(
+            keepalive_interval_for_mode(TimerMode::Responsive),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            keepalive_interval_for_mode(TimerMode::IdleAware),
+            Duration::from_millis(DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS)
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock ws listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let keepalives_rx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let keepalives_server = Arc::clone(&keepalives_rx);
+        let clock = Arc::new(FakeClock::new(1_000));
+        let server_clock = Arc::clone(&clock);
+        let server_task = tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(std_stream) = tcp.into_std() else {
+                return;
+            };
+            if std_stream.set_nonblocking(false).is_err() {
+                return;
+            }
+            drop(
+                tokio::task::spawn_blocking(move || {
+                    let Ok(mut ws) = accept(std_stream) else {
+                        return;
+                    };
+                    while let Ok(msg) = ws.read() {
+                        if let Message::Binary(raw) = msg
+                            && let Ok(RelayFrame::KeepAlive { sent_at_ms }) =
+                                RelayFrame::decode(&raw)
+                        {
+                            keepalives_server.fetch_add(1, Ordering::SeqCst);
+                            server_clock.advance(17);
+                            let Ok(echo) = (RelayFrame::KeepAlive { sent_at_ms }).encode() else {
+                                return;
+                            };
+                            if ws.send(Message::Binary(echo)).is_err() || ws.flush().is_err() {
+                                return;
+                            }
+                        }
+                    }
+                })
+                .await,
+            );
+        });
+
+        let cfg = RelayClientConfig {
+            endpoint: addr.to_string(),
+            server_name_override: None,
+            pin_set: None,
+            underlay_if_index: None,
+            linux_fwmark: None,
+            require_challenge_auth: false,
+            agent_version: "0.2.0-idle".to_owned(),
+        };
+        let client = RelayClient::with_connector_and_timer_mode(
+            cfg,
+            NodeKeypair::generate(),
+            DiscoKeypair::generate(),
+            Arc::new(PlainTcpConnector { addr }),
+            TimerMode::IdleAware,
+        );
+        let handle = client.handle();
+        let clock_dyn: Arc<dyn Clock> = clock;
+        let (ev_tx, mut ev_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let client_task = tokio::spawn(client.run(clock_dyn, ev_tx, shutdown.clone()));
+
+        // Act: wait for Connected event, confirm 0 speculative immediate KeepAlive frames sent
+        let mut connected = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(RelayEvent::StateChanged(RelayConnectionState::Connected)) = ev_rx.try_recv()
+            {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            connected,
+            "RelayClient must reach Connected under IdleAware"
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let idle_immediate_keepalives = keepalives_rx.load(Ordering::SeqCst);
+
+        // Nudge explicit KeepAlive via wake_reconnect to prove session stays responsive
+        handle.set_timer_mode(TimerMode::Responsive);
+        handle.wake_reconnect();
+        let mut rtt = None;
+        let rtt_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < rtt_deadline {
+            while ev_rx.try_recv().is_ok() {}
+            if let Some(val) = handle.last_rtt_ms() {
+                rtt = Some(val);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), client_task)
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), server_task)
+                .await
+                .is_ok()
+        );
+
+        // Assert
+        assert_eq!(
+            idle_immediate_keepalives, 0,
+            "IdleAware must defer initial KeepAlive to coalesced 45 s schedule"
+        );
+        assert_eq!(rtt, Some(17));
+        assert!(keepalives_rx.load(Ordering::SeqCst) >= 1);
     }
 }

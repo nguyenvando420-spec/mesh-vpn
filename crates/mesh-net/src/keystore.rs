@@ -6,7 +6,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mesh_core::{AppError, AppResult, NodeId, PublicKey};
-use mesh_crypto::{DiscoKeypair, NodeKeypair, Secret};
+use mesh_crypto::keys::{seal_aead_with_dek, unseal_aead_with_dek};
+use mesh_crypto::secret::{Secret, Zeroize as _, Zeroizing};
+use mesh_crypto::{DiscoKeypair, NodeKeypair};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for `keys.json`.
@@ -47,35 +49,21 @@ impl StoredNodeIdentity {
     /// Seals this identity with a 32-byte hardware-wrapped DEK (`"MSH1" || nonce[12] || ct_and_tag`)
     /// bound to AAD `"mesh-identity-v1"` (`IG-MOB-G2-02`).
     pub fn seal_with_dek(&self, dek: &[u8; 32]) -> AppResult<Vec<u8>> {
-        if dek == &[0_u8; 32] {
-            return Err(AppError::invalid_argument(
-                "identity DEK must not be all zeros",
-            ));
-        }
-        let _identity = self;
-        Err(AppError::unavailable(
-            "identity DEK sealing awaits Wave A.1 mesh-crypto AEAD implementation",
-        ))
+        let plaintext_json = serialize_identity_zeroizing(self)?;
+        seal_aead_with_dek(
+            dek,
+            SEALED_IDENTITY_AAD,
+            &SEALED_IDENTITY_MAGIC,
+            &plaintext_json,
+        )
     }
 
     /// Unseals an encrypted `"MSH1" || nonce[12] || ct_and_tag` blob using the 32-byte DEK
     /// (`IG-MOB-G2-02`).
     pub fn unseal_with_dek(ciphertext: &[u8], dek: &[u8; 32]) -> AppResult<Self> {
-        if dek == &[0_u8; 32] {
-            return Err(AppError::invalid_argument(
-                "identity DEK must not be all zeros",
-            ));
-        }
-        if ciphertext.len() < SEALED_IDENTITY_MAGIC.len() + 12 + 16
-            || !ciphertext.starts_with(&SEALED_IDENTITY_MAGIC)
-        {
-            return Err(AppError::invalid_argument(
-                "invalid sealed identity blob header or length",
-            ));
-        }
-        Err(AppError::unavailable(
-            "identity DEK unsealing awaits Wave A.1 mesh-crypto AEAD implementation",
-        ))
+        let plaintext_json =
+            unseal_aead_with_dek(dek, SEALED_IDENTITY_AAD, &SEALED_IDENTITY_MAGIC, ciphertext)?;
+        parse_keys_json(&plaintext_json)
     }
 }
 
@@ -161,7 +149,7 @@ impl KeysFileStore {
 
     /// Atomically replaces `keys.json` after explicit key rotation (`0600`).
     pub fn save_rotated(&self, identity: &StoredNodeIdentity) -> AppResult<()> {
-        let bytes = serialize_identity(identity)?;
+        let bytes = serialize_identity_zeroizing(identity)?;
         let parent = self.path.parent().ok_or_else(|| {
             AppError::invalid_argument("keystore path must have a parent directory")
         })?;
@@ -217,7 +205,7 @@ impl KeysFileStore {
             disco_keypair: DiscoKeypair::generate(),
             created_at_ms: now_ms,
         };
-        let bytes = serialize_identity(&identity)?;
+        let bytes = serialize_identity_zeroizing(&identity)?;
 
         match write_exclusive_0600(&self.path, &bytes, false) {
             Ok(()) => Ok(identity),
@@ -287,14 +275,14 @@ fn write_exclusive_0600(
     })
 }
 
-fn serialize_identity(identity: &StoredNodeIdentity) -> AppResult<Vec<u8>> {
+fn serialize_identity_zeroizing(identity: &StoredNodeIdentity) -> AppResult<Zeroizing<Vec<u8>>> {
     let node_priv_hex = Secret::new(encode_hex_32(
         identity.node_keypair.secret_bytes().expose_secret(),
     ));
     let disco_priv_hex = Secret::new(encode_hex_32(
         identity.disco_keypair.secret_bytes().expose_secret(),
     ));
-    let dto = KeysFileJson {
+    let mut dto = KeysFileJson {
         schema_version: KEYSTORE_SCHEMA_VERSION,
         node_id: identity.node_id,
         node_pubkey: identity.node_keypair.public_key(),
@@ -302,24 +290,31 @@ fn serialize_identity(identity: &StoredNodeIdentity) -> AppResult<Vec<u8>> {
         disco_privkey_hex: disco_priv_hex.expose_secret().clone(),
         created_at_ms: identity.created_at_ms,
     };
-    let encoded = Secret::new(
-        serde_json::to_vec_pretty(&dto)
-            .map_err(|err| AppError::internal(format!("failed to serialize keystore: {err}")))?,
-    );
-    Ok(encoded.expose_secret().clone())
+    let encoded_res = serde_json::to_vec_pretty(&dto);
+    dto.node_privkey_hex.zeroize();
+    dto.disco_privkey_hex.zeroize();
+    let encoded = encoded_res
+        .map_err(|err| AppError::internal(format!("failed to serialize keystore: {err}")))?;
+    Ok(Zeroizing::new(encoded))
 }
 
 fn parse_keys_json(bytes: &[u8]) -> AppResult<StoredNodeIdentity> {
-    let parsed: KeysFileJson = serde_json::from_slice(bytes)
+    let mut parsed: KeysFileJson = serde_json::from_slice(bytes)
         .map_err(|err| AppError::invalid_argument(format!("corrupt keystore JSON: {err}")))?;
     if parsed.schema_version != KEYSTORE_SCHEMA_VERSION {
+        parsed.node_privkey_hex.zeroize();
+        parsed.disco_privkey_hex.zeroize();
         return Err(AppError::invalid_argument(format!(
             "unsupported keystore schema version {}",
             parsed.schema_version
         )));
     }
-    let node_secret = Secret::new(decode_hex_32(&parsed.node_privkey_hex)?);
-    let disco_secret = Secret::new(decode_hex_32(&parsed.disco_privkey_hex)?);
+    let node_secret_res = decode_hex_32(&parsed.node_privkey_hex).map(Secret::new);
+    parsed.node_privkey_hex.zeroize();
+    let disco_secret_res = decode_hex_32(&parsed.disco_privkey_hex).map(Secret::new);
+    parsed.disco_privkey_hex.zeroize();
+    let node_secret = node_secret_res?;
+    let disco_secret = disco_secret_res?;
 
     let node_keypair = NodeKeypair::from_secret_bytes(*node_secret.expose_secret())?;
     if node_keypair.public_key() != parsed.node_pubkey {
@@ -443,23 +438,163 @@ mod tests {
     }
 
     #[test]
-    fn test_keystore_dek_stub_rejects_zero_dek_and_bad_header() {
+    fn test_keystore_dek_seal_and_unseal_roundtrip_preserves_identity() {
         // Arrange
-        let zero_dek = [0_u8; 32];
-        let nonzero_dek = [0x42_u8; 32];
+        let dek = [0x42_u8; 32];
         let node = mesh_crypto::NodeKeypair::generate();
         let disco = mesh_crypto::DiscoKeypair::generate();
+        let node_id = mesh_core::NodeId::new_v7(1_700_000_000_000);
         let identity = super::StoredNodeIdentity {
-            node_id: None,
-            node_keypair: node,
-            disco_keypair: disco,
-            created_at_ms: 1_700_000_000_000,
+            node_id: Some(node_id),
+            node_keypair: node.clone_keypair(),
+            disco_keypair: disco.clone_keypair(),
+            created_at_ms: 1_700_000_000_123,
         };
 
-        // Act & Assert
-        assert!(identity.seal_with_dek(&zero_dek).is_err());
-        assert!(identity.seal_with_dek(&nonzero_dek).is_err());
-        assert!(super::StoredNodeIdentity::unseal_with_dek(b"BAD!", &nonzero_dek).is_err());
-        assert!(super::StoredNodeIdentity::unseal_with_dek(&[0_u8; 32], &zero_dek).is_err());
+        // Act
+        let sealed_a = identity.seal_with_dek(&dek);
+        let sealed_b = identity.seal_with_dek(&dek);
+        assert!(sealed_a.is_ok());
+        assert!(sealed_b.is_ok());
+        let (Ok(blob_a), Ok(blob_b)) = (sealed_a, sealed_b) else {
+            return;
+        };
+        let unsealed = super::StoredNodeIdentity::unseal_with_dek(&blob_a, &dek);
+
+        // Assert
+        assert!(blob_a.starts_with(&super::SEALED_IDENTITY_MAGIC));
+        assert_ne!(blob_a.get(4..16), blob_b.get(4..16));
+        assert!(unsealed.is_ok());
+        let Ok(restored) = unsealed else {
+            return;
+        };
+        assert_eq!(restored.node_id, Some(node_id));
+        assert_eq!(restored.created_at_ms, 1_700_000_000_123);
+        assert_eq!(restored.node_keypair.public_key(), node.public_key());
+        assert_eq!(
+            restored.node_keypair.secret_bytes().expose_secret(),
+            node.secret_bytes().expose_secret()
+        );
+        assert_eq!(restored.disco_keypair.public_key(), disco.public_key());
+        assert_eq!(
+            restored.disco_keypair.secret_bytes().expose_secret(),
+            disco.secret_bytes().expose_secret()
+        );
+    }
+
+    #[test]
+    fn test_keystore_dek_rejects_zero_wrong_dek_bad_magic_tampered_and_truncated() {
+        // Arrange
+        let zero_dek = [0_u8; 32];
+        let valid_dek = [0x42_u8; 32];
+        let wrong_dek = [0x43_u8; 32];
+        let identity = super::StoredNodeIdentity {
+            node_id: None,
+            node_keypair: mesh_crypto::NodeKeypair::generate(),
+            disco_keypair: mesh_crypto::DiscoKeypair::generate(),
+            created_at_ms: 1_700_000_000_000,
+        };
+        let Ok(sealed) = identity.seal_with_dek(&valid_dek) else {
+            return;
+        };
+
+        // Act
+        let zero_seal = identity.seal_with_dek(&zero_dek);
+        let zero_unseal = super::StoredNodeIdentity::unseal_with_dek(&sealed, &zero_dek);
+        let wrong_dek_unseal = super::StoredNodeIdentity::unseal_with_dek(&sealed, &wrong_dek);
+
+        let mut bad_magic = sealed.clone();
+        if let Some(first) = bad_magic.first_mut() {
+            *first = b'X';
+        }
+        let bad_magic_unseal = super::StoredNodeIdentity::unseal_with_dek(&bad_magic, &valid_dek);
+
+        let mut tampered_tag = sealed.clone();
+        if let Some(last) = tampered_tag.last_mut() {
+            *last ^= 0x80;
+        }
+        let tampered_tag_unseal =
+            super::StoredNodeIdentity::unseal_with_dek(&tampered_tag, &valid_dek);
+
+        let mut tampered_ct = sealed.clone();
+        if let Some(mid) = tampered_ct.get_mut(20) {
+            *mid ^= 0x01;
+        }
+        let tampered_ct_unseal =
+            super::StoredNodeIdentity::unseal_with_dek(&tampered_ct, &valid_dek);
+
+        let short_blob = super::StoredNodeIdentity::unseal_with_dek(b"BAD!", &valid_dek);
+        let truncated_blob = super::StoredNodeIdentity::unseal_with_dek(
+            sealed
+                .get(..sealed.len().saturating_sub(1))
+                .unwrap_or_default(),
+            &valid_dek,
+        );
+
+        // Assert
+        assert!(zero_seal.is_err());
+        assert!(zero_unseal.is_err());
+        assert!(wrong_dek_unseal.is_err());
+        assert!(bad_magic_unseal.is_err());
+        assert!(tampered_tag_unseal.is_err());
+        assert!(tampered_ct_unseal.is_err());
+        assert!(short_blob.is_err());
+        assert!(truncated_blob.is_err());
+    }
+
+    #[test]
+    fn test_sealed_identity_never_exposes_plaintext_keys() {
+        // Arrange
+        let dek = [0x55_u8; 32];
+        let identity = super::StoredNodeIdentity {
+            node_id: Some(mesh_core::NodeId::new_v7(1_700_000_000_000)),
+            node_keypair: mesh_crypto::NodeKeypair::generate(),
+            disco_keypair: mesh_crypto::DiscoKeypair::generate(),
+            created_at_ms: 1_700_000_000_000,
+        };
+        let node_raw = *identity.node_keypair.secret_bytes().expose_secret();
+        let disco_raw = *identity.disco_keypair.secret_bytes().expose_secret();
+        let node_hex = super::encode_hex_32(&node_raw);
+        let disco_hex = super::encode_hex_32(&disco_raw);
+
+        // Act
+        let Ok(sealed) = identity.seal_with_dek(&dek) else {
+            return;
+        };
+        let dbg_str = format!("{identity:?}");
+
+        // Assert
+        assert!(
+            !sealed
+                .windows(node_raw.len())
+                .any(|window| window == node_raw)
+        );
+        assert!(
+            !sealed
+                .windows(disco_raw.len())
+                .any(|window| window == disco_raw)
+        );
+        assert!(
+            !sealed
+                .windows(node_hex.len())
+                .any(|window| window == node_hex.as_bytes())
+        );
+        assert!(
+            !sealed
+                .windows(disco_hex.len())
+                .any(|window| window == disco_hex.as_bytes())
+        );
+        assert!(
+            !sealed
+                .windows(b"node_privkey_hex".len())
+                .any(|window| window == b"node_privkey_hex")
+        );
+        assert!(
+            !sealed
+                .windows(b"disco_privkey_hex".len())
+                .any(|window| window == b"disco_privkey_hex")
+        );
+        assert!(!dbg_str.contains(&node_hex));
+        assert!(!dbg_str.contains(&disco_hex));
     }
 }

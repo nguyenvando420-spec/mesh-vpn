@@ -1,7 +1,7 @@
 //! RFC 6052 / RFC 7050 NAT64 address synthesis and Android/mobile outer socket protection
 //! (`US-095`, `IG-MOB-G2-02`).
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
 
 use mesh_core::{AppError, AppResult};
@@ -133,6 +133,9 @@ impl Nat64Prefix {
 
     /// Infers an RFC 7050 NAT64 `Pref64` from DNS64 `AAAA ipv4only.arpa` answers containing
     /// `192.0.0.170` or `192.0.0.171`.
+    ///
+    /// When multiple answers are supplied, prefers the candidate prefix confirmed by the highest
+    /// number of distinct RFC 7050 probe matches before breaking ties by prefix length order.
     #[must_use]
     pub fn from_ipv4only_arpa_addrs(addrs: &[Ipv6Addr]) -> Option<Self> {
         const CANDIDATES: [Nat64PrefixLen; 6] = [
@@ -143,6 +146,7 @@ impl Nat64Prefix {
             Nat64PrefixLen::P40,
             Nat64PrefixLen::P32,
         ];
+        let mut best: Option<(usize, Self)> = None;
         for &addr in addrs {
             for len in CANDIDATES {
                 let candidate = Self {
@@ -150,14 +154,19 @@ impl Nat64Prefix {
                     len,
                 };
                 let synth = Nat64Synthesizer::new(candidate);
-                if synth.synthesize_ip(RFC7050_IPV4ONLY_ADDR_A) == addr
-                    || synth.synthesize_ip(RFC7050_IPV4ONLY_ADDR_B) == addr
-                {
-                    return Some(candidate);
+                let matches = addrs
+                    .iter()
+                    .filter(|&&item| {
+                        synth.synthesize_ip(RFC7050_IPV4ONLY_ADDR_A) == item
+                            || synth.synthesize_ip(RFC7050_IPV4ONLY_ADDR_B) == item
+                    })
+                    .count();
+                if matches > 0 && best.is_none_or(|(best_count, _)| matches > best_count) {
+                    best = Some((matches, candidate));
                 }
             }
         }
-        None
+        best.map(|(_, prefix)| prefix)
     }
 }
 
@@ -285,6 +294,18 @@ impl Nat64Synthesizer {
             }
         }
     }
+
+    /// Recovers the underlying IPv4 endpoint when `addr` is a [`SocketAddr::V6`] produced under
+    /// this NAT64 prefix, preserving the port and returning `None` otherwise.
+    #[must_use]
+    pub fn desynthesize_sockaddr(&self, addr: SocketAddr) -> Option<SocketAddrV4> {
+        match addr {
+            SocketAddr::V4(_) => None,
+            SocketAddr::V6(v6) => self
+                .desynthesize_ip(*v6.ip())
+                .map(|ipv4| SocketAddrV4::new(ipv4, v6.port())),
+        }
+    }
 }
 
 const fn mask_prefix_octets(octets: [u8; 16], len: Nat64PrefixLen) -> [u8; 16] {
@@ -301,12 +322,14 @@ const fn mask_prefix_octets(octets: [u8; 16], len: Nat64PrefixLen) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::str::FromStr;
 
-    use proptest::prelude::*;
+    use proptest::prelude::{any, prop_assert_eq, proptest};
 
-    use super::{Nat64Prefix, Nat64Synthesizer, NoopSocketProtector, SocketProtector};
+    use super::{
+        Nat64Prefix, Nat64PrefixLen, Nat64Synthesizer, NoopSocketProtector, SocketProtector,
+    };
 
     #[test]
     fn test_nat64_rfc6052_vectors_and_rfc7050_discovery() {
@@ -346,12 +369,82 @@ mod tests {
         assert!(NoopSocketProtector.protect_socket(42).is_ok());
     }
 
+    #[test]
+    fn test_nat64_desynthesize_edge_cases_and_sockaddr_port_preservation() {
+        // Arrange
+        let target = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 42), 51820);
+        let synth_64 = Nat64Synthesizer::new(
+            Nat64Prefix::from_cidr("2001:db8:122:344::/64")
+                .unwrap_or_else(|_| Nat64Prefix::well_known()),
+        );
+        let other_prefix_ip =
+            Nat64Synthesizer::new(Nat64Prefix::well_known()).synthesize_ip(*target.ip());
+
+        // Act
+        let synthesized_v6 = synth_64.synthesize_sockaddr(target);
+        let roundtrip_v4 = synth_64.desynthesize_sockaddr(SocketAddr::V6(synthesized_v6));
+        let non_matching_prefix = synth_64.desynthesize_sockaddr(SocketAddr::V6(
+            SocketAddrV6::new(other_prefix_ip, 51820, 0, 0),
+        ));
+        let direct_v4_input = synth_64.desynthesize_sockaddr(SocketAddr::V4(target));
+
+        // Corrupt reserved byte `u` (octet index 8) for every `< /96` prefix length.
+        for cidr in [
+            "2001:db8::/32",
+            "2001:db8:100::/40",
+            "2001:db8:122::/48",
+            "2001:db8:122:300::/56",
+            "2001:db8:122:344::/64",
+        ] {
+            let Ok(prefix) = Nat64Prefix::from_cidr(cidr) else {
+                assert_eq!(cidr, "prefix parse failed");
+                return;
+            };
+            assert!(prefix.prefix_len() != Nat64PrefixLen::P96);
+            let synth = Nat64Synthesizer::new(prefix);
+            let mut octets = synth.synthesize_ip(*target.ip()).octets();
+            if let Some(reserved_u) = octets.get_mut(8) {
+                *reserved_u = 0xaa;
+            }
+            assert_eq!(synth.desynthesize_ip(Ipv6Addr::from(octets)), None);
+        }
+
+        // Assert
+        assert_eq!(roundtrip_v4, Some(target));
+        assert_eq!(non_matching_prefix, None);
+        assert_eq!(direct_v4_input, None);
+    }
+
+    #[test]
+    fn test_nat64_from_ipv4only_arpa_multiple_answers_and_noise() {
+        // Arrange
+        let Ok(prefix_64) = Nat64Prefix::from_cidr("2001:db8:122:344::/64") else {
+            return;
+        };
+        let synth_64 = Nat64Synthesizer::new(prefix_64);
+        let ans_a = synth_64.synthesize_ip(Ipv4Addr::new(192, 0, 0, 170));
+        let ans_b = synth_64.synthesize_ip(Ipv4Addr::new(192, 0, 0, 171));
+        let unrelated = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+
+        // Act
+        let discovered_dual = Nat64Prefix::from_ipv4only_arpa_addrs(&[unrelated, ans_b, ans_a]);
+        let discovered_empty = Nat64Prefix::from_ipv4only_arpa_addrs(&[]);
+        let discovered_garbage = Nat64Prefix::from_ipv4only_arpa_addrs(&[Ipv6Addr::LOCALHOST]);
+
+        // Assert
+        assert_eq!(discovered_dual, Some(prefix_64));
+        assert_eq!(discovered_empty, None);
+        assert_eq!(discovered_garbage, None);
+    }
+
     proptest! {
         #[test]
         fn proptest_nat64_roundtrip_and_reserved_octet_zero(
             prefix_bytes in any::<[u8; 8]>(),
             prefix_idx in 0_usize..6,
             v4 in any::<[u8; 4]>(),
+            port in any::<u16>(),
+            nonzero_u in 1_u8..=u8::MAX,
         ) {
             let lengths = [32_u8, 40, 48, 56, 64, 96];
             let prefix_len = lengths.get(prefix_idx).copied().unwrap_or(96);
@@ -363,10 +456,18 @@ mod tests {
                 let synth = Nat64Synthesizer::new(prefix);
                 let ip4 = Ipv4Addr::from(v4);
                 let ip6 = synth.synthesize_ip(ip4);
+                let sock4 = SocketAddrV4::new(ip4, port);
+                let sock6 = synth.synthesize_sockaddr(sock4);
                 if prefix_len < 96 {
                     prop_assert_eq!(ip6.octets().get(8).copied(), Some(0));
+                    let mut bad_u = ip6.octets();
+                    if let Some(u_slot) = bad_u.get_mut(8) {
+                        *u_slot = nonzero_u;
+                    }
+                    prop_assert_eq!(synth.desynthesize_ip(Ipv6Addr::from(bad_u)), None);
                 }
                 prop_assert_eq!(synth.desynthesize_ip(ip6), Some(ip4));
+                prop_assert_eq!(synth.desynthesize_sockaddr(SocketAddr::V6(sock6)), Some(sock4));
             }
         }
     }

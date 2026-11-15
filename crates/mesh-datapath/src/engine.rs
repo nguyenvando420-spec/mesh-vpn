@@ -13,9 +13,12 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 use mesh_core::clock::Clock;
-use mesh_core::defaults::MAX_FRAME_SIZE;
+use mesh_core::defaults::{
+    DEFAULT_IDLE_ENTRY_WINDOW_MS, DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS, MAX_FRAME_SIZE,
+};
 use mesh_core::{AppError, AppResult, NodeId, OverlayCidr, OverlayIp, PublicKey};
 use mesh_crypto::{DiscoKeypair, NodeKeypair};
+use mesh_net::Nat64Prefix;
 use mesh_net::endpoint_filter::CandidateFilterContext;
 use mesh_net::tun::TunDevice;
 use mesh_proto::disco::IngressSource;
@@ -30,7 +33,7 @@ use crate::disco_engine::{
 use crate::magic_socket::{MAGIC_SOCKET_BUFFER_SIZE, MagicSocket, MagicSocketConfig, PacketBuffer};
 use crate::peer_map::{ApplyDiffReport, PeerActivePath, PeerMap, PeerSendTarget};
 use crate::rebind::{RebindCommand, RebindOutcome, SocketRebinder};
-use crate::relay_client::{RelayClientHandle, RelayConnectionState, RelayEvent};
+use crate::relay_client::{RelayClientHandle, RelayConnectionState, RelayEvent, TimerMode};
 use crate::stun_client::{
     StunClient, StunClientConfig, StunProbeReport, resolve_stun_endpoints_cancellable,
 };
@@ -39,6 +42,83 @@ const DEFAULT_WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_DISCO_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DATAPATH_COMMAND_CAPACITY: usize = 64;
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Non-blocking decision returned by [`DnsPacketInterceptor::intercept_outbound_packet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsInterceptDecision {
+    /// Not an intercepted overlay DNS packet; forward to `CryptokeyValidator` and peer routing.
+    PassThrough,
+    /// Packet was handled locally (`overlay_dns_ip:53` or `:853`); bypass `CryptokeyValidator`
+    /// and inject zero or more synthetic response packets back into the TUN device.
+    Handled {
+        /// Complete L3 IP packets written straight to the local TUN device.
+        tun_responses: Vec<Vec<u8>>,
+    },
+}
+
+/// Optional pre-`CryptokeyValidator` packet interceptor for MagicDNS (`US-077`, §6.1).
+///
+/// Evaluated **before** `CryptokeyValidator` and WireGuard peer lookup so queries addressed to
+/// `overlay_dns_ip:53` or `:853` work even when `overlay_dns_ip` is not a WireGuard peer.
+/// Implementations MUST remain strictly non-blocking on the data-plane loop.
+pub trait DnsPacketInterceptor: Send + Sync {
+    /// Inspects a raw outbound IP packet read from the TUN device prior to `CryptokeyValidator`.
+    fn intercept_outbound_packet(&self, packet: &[u8]) -> DnsInterceptDecision;
+}
+
+/// Optional mobile controls passed to [`DatapathEngine::bind_with_options`] (`US-077`).
+#[derive(Clone)]
+pub struct DatapathEngineOptions {
+    /// Initial timer scheduling cadence (`TimerMode::Responsive` default).
+    pub timer_mode: TimerMode,
+    /// Idle inactivity window (`ms`) before `IdleAware` suspends `250 ms` ticks.
+    pub idle_entry_window_ms: u64,
+    /// Optional pre-`CryptokeyValidator` MagicDNS L3 interceptor (`None` on Desktop).
+    pub dns_interceptor: Option<Arc<dyn DnsPacketInterceptor>>,
+}
+
+impl std::fmt::Debug for DatapathEngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatapathEngineOptions")
+            .field("timer_mode", &self.timer_mode)
+            .field("idle_entry_window_ms", &self.idle_entry_window_ms)
+            .field("dns_interceptor", &self.dns_interceptor.is_some())
+            .finish()
+    }
+}
+
+impl Default for DatapathEngineOptions {
+    fn default() -> Self {
+        Self {
+            timer_mode: TimerMode::Responsive,
+            idle_entry_window_ms: DEFAULT_IDLE_ENTRY_WINDOW_MS,
+            dns_interceptor: None,
+        }
+    }
+}
+
+impl DatapathEngineOptions {
+    /// Configures the initial [`TimerMode`].
+    #[must_use]
+    pub const fn with_timer_mode(mut self, mode: TimerMode) -> Self {
+        self.timer_mode = mode;
+        self
+    }
+
+    /// Configures the idle entry timeout (`ms`) before `IdleAware` suspends background ticks.
+    #[must_use]
+    pub fn with_idle_entry_window_ms(mut self, ms: u64) -> Self {
+        self.idle_entry_window_ms = ms.max(1);
+        self
+    }
+
+    /// Attaches an optional pre-`CryptokeyValidator` [`DnsPacketInterceptor`].
+    #[must_use]
+    pub fn with_dns_interceptor(mut self, interceptor: Arc<dyn DnsPacketInterceptor>) -> Self {
+        self.dns_interceptor = Some(interceptor);
+        self
+    }
+}
 
 /// Runtime configuration for [`DatapathEngine`].
 pub struct DatapathConfig {
@@ -111,10 +191,15 @@ pub struct DatapathStatusSnapshot {
     pub disco_metrics: DiscoMetricsSnapshot,
     /// Per-peer active path and traffic status.
     pub peers: Vec<DatapathPeerStatus>,
+    /// Active data-plane timer scheduling mode (`Responsive` default).
+    pub timer_mode: TimerMode,
+    /// `true` while `IdleAware` has suspended high-frequency `250 ms` background polling.
+    pub idle_sleeping: bool,
+    /// Cumulative number of WireGuard/Disco timer ticks executed since engine start.
+    pub timer_tick_count: u64,
 }
 
 /// Control-plane & IPC commands processed inside [`DatapathEngine`]'s single event loop.
-#[derive(Debug)]
 pub enum DatapathCommand {
     /// Applies a new atomic `NetmapSnapshot` diff to `PeerMap` and syncs STUN targets.
     ApplyNetmap {
@@ -174,8 +259,54 @@ pub enum DatapathCommand {
         /// Completion reply yielding `Ok(bound_local_port)` or `Err(err)`.
         reply: oneshot::Sender<AppResult<u16>>,
     },
+    /// Dynamically updates timer cadence across [`DatapathEngine`] and [`crate::RelayClient`] (`US-077`).
+    SetTimerMode(TimerMode),
+    /// Updates active NAT64 RFC 6052 prefix across `MagicSocket`, `StunClient`, and `RelayClient` (`US-077`).
+    SetNat64Prefix(Option<Nat64Prefix>),
+    /// Replaces or clears the pre-`CryptokeyValidator` MagicDNS interceptor hook (`US-077`).
+    SetDnsInterceptor(Option<Arc<dyn DnsPacketInterceptor>>),
     /// Queries an immutable snapshot of data-plane metrics and active peer paths.
     QueryStatus(oneshot::Sender<DatapathStatusSnapshot>),
+}
+
+impl std::fmt::Debug for DatapathCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApplyNetmap { .. } => f.write_str("ApplyNetmap"),
+            Self::SetAdvertisedEndpoints(eps) => {
+                f.debug_tuple("SetAdvertisedEndpoints").field(eps).finish()
+            }
+            Self::TriggerStunProbe => f.write_str("TriggerStunProbe"),
+            Self::SetPacketFilter(policy) => {
+                f.debug_tuple("SetPacketFilter").field(policy).finish()
+            }
+            Self::TryReloadPacketFilterSpec { spec, .. } => f
+                .debug_struct("TryReloadPacketFilterSpec")
+                .field("spec", spec)
+                .finish_non_exhaustive(),
+            Self::InitiateHolePunch(id) => f.debug_tuple("InitiateHolePunch").field(id).finish(),
+            Self::SendPingProbe { peer_id, .. } => f
+                .debug_struct("SendPingProbe")
+                .field("peer_id", peer_id)
+                .finish_non_exhaustive(),
+            Self::HandleRelayedDisco { src_node_id, .. } => f
+                .debug_struct("HandleRelayedDisco")
+                .field("src_node_id", src_node_id)
+                .finish_non_exhaustive(),
+            Self::BeginRebind => f.write_str("BeginRebind"),
+            Self::RebindUnderlay { interface_name, .. } => f
+                .debug_struct("RebindUnderlay")
+                .field("interface_name", interface_name)
+                .finish_non_exhaustive(),
+            Self::SetTimerMode(mode) => f.debug_tuple("SetTimerMode").field(mode).finish(),
+            Self::SetNat64Prefix(prefix) => f.debug_tuple("SetNat64Prefix").field(prefix).finish(),
+            Self::SetDnsInterceptor(hook) => f
+                .debug_tuple("SetDnsInterceptor")
+                .field(&hook.is_some())
+                .finish(),
+            Self::QueryStatus(_) => f.write_str("QueryStatus"),
+        }
+    }
 }
 
 /// Clonable handle sending bounded commands to [`DatapathEngine`].
@@ -296,6 +427,26 @@ impl DatapathHandle {
             AppError::unavailable("datapath underlay rebind canceled during shutdown")
         })?
     }
+
+    /// Dynamically updates timer cadence across [`DatapathEngine`] and `RelayClient` (`US-077`).
+    pub async fn set_timer_mode(&self, mode: TimerMode) -> AppResult<()> {
+        self.send(DatapathCommand::SetTimerMode(mode)).await
+    }
+
+    /// Dynamically updates the active NAT64 prefix across `MagicSocket`, `StunClient`, and
+    /// `RelayClient` (`US-077`).
+    pub async fn set_nat64_prefix(&self, prefix: Option<Nat64Prefix>) -> AppResult<()> {
+        self.send(DatapathCommand::SetNat64Prefix(prefix)).await
+    }
+
+    /// Installs, replaces, or clears the pre-`CryptokeyValidator` MagicDNS interceptor (`US-077`).
+    pub async fn set_dns_interceptor(
+        &self,
+        interceptor: Option<Arc<dyn DnsPacketInterceptor>>,
+    ) -> AppResult<()> {
+        self.send(DatapathCommand::SetDnsInterceptor(interceptor))
+            .await
+    }
 }
 
 struct PendingPingWaiter {
@@ -312,6 +463,21 @@ struct SendPingProbeCmd {
     kick_hole_punch: bool,
     timeout_ms: u64,
     reply: oneshot::Sender<PingProbeOutcome>,
+}
+
+struct EngineLoopCtx<'a> {
+    relay_events_rx: &'a mut mpsc::Receiver<RelayEvent>,
+    rebind_rx: &'a mut mpsc::Receiver<RebindCommand>,
+    stun_dns_rx: &'a mut mpsc::Receiver<(Vec<String>, Vec<SocketAddr>)>,
+    stun_dns_tx: &'a mpsc::Sender<(Vec<String>, Vec<SocketAddr>)>,
+    tracker: &'a TaskTracker,
+    shutdown: &'a CancellationToken,
+    wg_tick: &'a mut tokio::time::Interval,
+    disco_tick: &'a mut tokio::time::Interval,
+    udp_rx_buf: PacketBuffer,
+    tun_rx_buf: PacketBuffer,
+    wg_tx_buf: PacketBuffer,
+    wg_rx_buf: PacketBuffer,
 }
 
 /// Non-blocking WireGuard/Disco/STUN/Relay coordinator wired to a [`TunDevice`] and [`MagicSocket`].
@@ -334,6 +500,14 @@ pub struct DatapathEngine {
     cmd_rx: mpsc::Receiver<DatapathCommand>,
     direct_udp_blocked: bool,
     stun_dns_cancel: Option<CancellationToken>,
+    timer_mode: TimerMode,
+    idle_entry_window_ms: u64,
+    idle_sleeping: bool,
+    last_activity_at: tokio::time::Instant,
+    timer_tick_count: u64,
+    coalesced_next_at: Option<tokio::time::Instant>,
+    reset_ticks_pending: bool,
+    dns_interceptor: Option<Arc<dyn DnsPacketInterceptor>>,
     #[cfg(test)]
     injected_rebind_failures: std::collections::VecDeque<AppError>,
 }
@@ -344,6 +518,8 @@ impl std::fmt::Debug for DatapathEngine {
             .field("local_node_id", &self.config.local_node_id)
             .field("local_overlay_ip", &self.config.local_overlay_ip)
             .field("relay_state", &self.relay_state)
+            .field("timer_mode", &self.timer_mode)
+            .field("idle_sleeping", &self.idle_sleeping)
             .finish_non_exhaustive()
     }
 }
@@ -356,13 +532,42 @@ impl DatapathEngine {
         clock: Arc<dyn Clock>,
         relay_handle: Option<RelayClientHandle>,
     ) -> AppResult<Self> {
+        Self::bind_with_options(
+            config,
+            tun,
+            clock,
+            relay_handle,
+            DatapathEngineOptions::default(),
+        )
+        .await
+    }
+
+    /// Initializes a [`DatapathEngine`] with mobile [`DatapathEngineOptions`] (`TimerMode` and
+    /// optional pre-`CryptokeyValidator` [`DnsPacketInterceptor`], `US-077`).
+    pub async fn bind_with_options(
+        config: DatapathConfig,
+        tun: Arc<dyn TunDevice>,
+        clock: Arc<dyn Clock>,
+        relay_handle: Option<RelayClientHandle>,
+        options: DatapathEngineOptions,
+    ) -> AppResult<Self> {
         let magic_socket = MagicSocket::bind(config.socket_config.clone()).await?;
         let peer_map = PeerMap::new(config.local_node_id, config.node_keypair.clone_keypair());
         let disco = DiscoEngine::new(
             config.disco_keypair.clone_keypair(),
             config.disco_config.clone(),
         );
-        let stun_client = StunClient::new(config.stun_config.clone());
+        let mut stun_cfg = config.stun_config.clone();
+        if stun_cfg.nat64_prefix.is_none() {
+            stun_cfg.nat64_prefix = config.socket_config.nat64_prefix;
+        }
+        let stun_client = StunClient::new(stun_cfg);
+        if let Some(relay) = &relay_handle {
+            relay.set_timer_mode(options.timer_mode);
+            if config.socket_config.nat64_prefix.is_some() {
+                relay.set_nat64_prefix(config.socket_config.nat64_prefix);
+            }
+        }
         let (cmd_tx, cmd_rx) = mpsc::channel(DATAPATH_COMMAND_CAPACITY);
         let (stun_report_tx, _) = watch::channel(None);
 
@@ -391,9 +596,22 @@ impl DatapathEngine {
             cmd_rx,
             direct_udp_blocked: false,
             stun_dns_cancel: None,
+            timer_mode: options.timer_mode,
+            idle_entry_window_ms: options.idle_entry_window_ms.max(1),
+            idle_sleeping: false,
+            last_activity_at: tokio::time::Instant::now(),
+            timer_tick_count: 0,
+            coalesced_next_at: None,
+            reset_ticks_pending: false,
+            dns_interceptor: options.dns_interceptor,
             #[cfg(test)]
             injected_rebind_failures: std::collections::VecDeque::new(),
         })
+    }
+
+    /// Sets or clears the pre-`CryptokeyValidator` MagicDNS interceptor before starting `run` (`US-077`).
+    pub fn set_dns_interceptor(&mut self, interceptor: Option<Arc<dyn DnsPacketInterceptor>>) {
+        self.dns_interceptor = interceptor;
     }
 
     #[cfg(test)]
@@ -437,64 +655,172 @@ impl DatapathEngine {
         let tracker = TaskTracker::new();
         let (stun_dns_tx, mut stun_dns_rx) = mpsc::channel::<(Vec<String>, Vec<SocketAddr>)>(8);
         let (mut wg_tick, mut disco_tick) = self.build_tick_intervals();
-        let mut udp_rx_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
-        let mut tun_rx_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
-        let mut wg_tx_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
-        let mut wg_rx_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
+        let mut ctx = EngineLoopCtx {
+            relay_events_rx: &mut relay_events_rx,
+            rebind_rx: &mut rebind_rx,
+            stun_dns_rx: &mut stun_dns_rx,
+            stun_dns_tx: &stun_dns_tx,
+            tracker: &tracker,
+            shutdown: &shutdown,
+            wg_tick: &mut wg_tick,
+            disco_tick: &mut disco_tick,
+            udp_rx_buf: [0u8; MAGIC_SOCKET_BUFFER_SIZE],
+            tun_rx_buf: [0u8; MAGIC_SOCKET_BUFFER_SIZE],
+            wg_tx_buf: [0u8; MAGIC_SOCKET_BUFFER_SIZE],
+            wg_rx_buf: [0u8; MAGIC_SOCKET_BUFFER_SIZE],
+        };
 
         info!(
             component = "datapath.engine",
             event = "datapath_started",
             overlay_ip = %self.config.local_overlay_ip,
             tun = %self.tun.interface_name(),
+            timer_mode = ?self.timer_mode,
             "DatapathEngine event loop running"
         );
 
-        loop {
-            let next_ping_deadline = self.earliest_ping_waiter_expiry();
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                () = wait_optional_deadline(next_ping_deadline) => {
-                    self.expire_ping_waiters();
-                }
-                udp_res = self.magic_socket.recv_from(&mut udp_rx_buf) => {
-                    self.handle_udp_recv_result(udp_res, &udp_rx_buf, &mut wg_rx_buf).await;
-                }
-                tun_res = self.tun.read_packet(&mut tun_rx_buf) => {
-                    if self.handle_tun_read_result(tun_res, &tun_rx_buf, &mut wg_tx_buf, &shutdown).await {
-                        break;
-                    }
-                }
-                maybe_relay = relay_events_rx.recv() => {
-                    if let Some(relay_ev) = maybe_relay {
-                        self.process_relay_event(relay_ev, &mut wg_rx_buf).await;
-                    }
-                }
-                maybe_cmd = self.cmd_rx.recv() => {
-                    match maybe_cmd {
-                        Some(cmd) => self.process_command(cmd, &tracker, &shutdown, &stun_dns_tx).await,
-                        None => break,
-                    }
-                }
-                maybe_rebind = rebind_rx.recv() => {
-                    if let Some(cmd) = maybe_rebind {
-                        self.process_rebind_command(&cmd).await;
-                    }
-                }
-                maybe_stun_dns = stun_dns_rx.recv() => {
-                    if let Some((raw_endpoints, resolved)) = maybe_stun_dns
-                        && self.stun_client.apply_resolved_endpoints_for_raw(&raw_endpoints, resolved)
-                    {
-                        self.reprobe_tracked_stun_endpoints().await;
-                    }
-                }
-                _ = wg_tick.tick() => self.step_wg_timers(&mut wg_tx_buf).await,
-                _ = disco_tick.tick() => self.step_disco_tick().await,
-            }
-        }
+        while self.run_loop_iteration(&mut ctx).await {}
 
         self.shutdown_cleanup(tracker).await;
         Ok(())
+    }
+
+    async fn run_loop_iteration(&mut self, ctx: &mut EngineLoopCtx<'_>) -> bool {
+        if self.reset_ticks_pending {
+            self.reset_ticks_pending = false;
+            ctx.wg_tick.reset();
+            ctx.disco_tick.reset();
+        }
+        let next_ping_deadline = self.earliest_ping_waiter_expiry();
+        let idle_entry_deadline = self.next_idle_entry_deadline();
+        let coalesced_deadline = if self.idle_sleeping {
+            self.coalesced_next_at
+        } else {
+            None
+        };
+
+        tokio::select! {
+            () = ctx.shutdown.cancelled() => return false,
+            () = wait_optional_deadline(next_ping_deadline) => self.expire_ping_waiters(),
+            () = wait_optional_deadline(idle_entry_deadline) => self.enter_idle_sleep(),
+            () = wait_optional_deadline(coalesced_deadline) => {
+                self.step_coalesced_heartbeat(&mut ctx.wg_tx_buf).await;
+            }
+            udp_res = self.magic_socket.recv_from(&mut ctx.udp_rx_buf) => {
+                self.handle_udp_recv_result(udp_res, &ctx.udp_rx_buf, &mut ctx.wg_rx_buf).await;
+            }
+            tun_res = self.tun.read_packet(&mut ctx.tun_rx_buf) => {
+                if self.handle_tun_read_result(tun_res, &ctx.tun_rx_buf, &mut ctx.wg_tx_buf, ctx.shutdown).await {
+                    return false;
+                }
+            }
+            maybe_relay = ctx.relay_events_rx.recv() => {
+                if let Some(relay_ev) = maybe_relay {
+                    self.process_relay_event(relay_ev, &mut ctx.wg_rx_buf).await;
+                }
+            }
+            maybe_cmd = self.cmd_rx.recv() => {
+                match maybe_cmd {
+                    Some(cmd) => self.process_command(cmd, ctx.tracker, ctx.shutdown, ctx.stun_dns_tx).await,
+                    None => return false,
+                }
+            }
+            maybe_rebind = ctx.rebind_rx.recv() => {
+                if let Some(cmd) = maybe_rebind {
+                    self.process_rebind_command(&cmd).await;
+                }
+            }
+            maybe_stun_dns = ctx.stun_dns_rx.recv() => {
+                if let Some((raw_endpoints, resolved)) = maybe_stun_dns
+                    && self.stun_client.apply_resolved_endpoints_for_raw(&raw_endpoints, resolved)
+                {
+                    self.reprobe_tracked_stun_endpoints().await;
+                }
+            }
+            _ = ctx.wg_tick.tick(), if !self.idle_sleeping => self.step_wg_timers(&mut ctx.wg_tx_buf).await,
+            _ = ctx.disco_tick.tick(), if !self.idle_sleeping => self.step_disco_tick().await,
+        }
+        true
+    }
+
+    fn has_active_probe_work(&self) -> bool {
+        self.stun_client.has_pending_requests() || !self.pending_ping_waiters.is_empty()
+    }
+
+    fn any_peer_within_disco_idle_window(&self) -> bool {
+        let now_ms = self.clock.now_unix_ms();
+        let window_ms = self.config.disco_config.idle_window_ms;
+        self.peer_map.iter().any(|(_, peer)| {
+            let last_active = peer.last_tx_at_ms.max(peer.last_rx_at_ms);
+            last_active > 0 && now_ms.saturating_sub(last_active) <= window_ms
+        })
+    }
+
+    fn next_idle_entry_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.timer_mode != TimerMode::IdleAware
+            || self.idle_sleeping
+            || self.has_active_probe_work()
+        {
+            return None;
+        }
+        Some(self.last_activity_at + Duration::from_millis(self.idle_entry_window_ms))
+    }
+
+    fn enter_idle_sleep(&mut self) {
+        if self.timer_mode != TimerMode::IdleAware || self.has_active_probe_work() {
+            return;
+        }
+        self.idle_sleeping = true;
+        self.coalesced_next_at = if self.any_peer_within_disco_idle_window() {
+            Some(
+                tokio::time::Instant::now()
+                    + Duration::from_millis(DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS),
+            )
+        } else {
+            None
+        };
+    }
+
+    async fn step_coalesced_heartbeat(&mut self, wg_tx_buf: &mut PacketBuffer) {
+        self.step_wg_timers(wg_tx_buf).await;
+        self.step_disco_tick().await;
+        self.coalesced_next_at = if self.idle_sleeping && self.any_peer_within_disco_idle_window() {
+            Some(
+                tokio::time::Instant::now()
+                    + Duration::from_millis(DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS),
+            )
+        } else {
+            None
+        };
+    }
+
+    fn note_traffic_activity(&mut self) {
+        self.last_activity_at = tokio::time::Instant::now();
+        if self.idle_sleeping {
+            self.idle_sleeping = false;
+            self.coalesced_next_at = None;
+            self.reset_ticks_pending = true;
+        }
+    }
+
+    fn apply_timer_mode(&mut self, mode: TimerMode) {
+        self.timer_mode = mode;
+        if let Some(relay) = &self.relay_handle {
+            relay.set_timer_mode(mode);
+        }
+        self.last_activity_at = tokio::time::Instant::now();
+        match mode {
+            TimerMode::Responsive => {
+                if self.idle_sleeping {
+                    self.idle_sleeping = false;
+                    self.reset_ticks_pending = true;
+                }
+                self.coalesced_next_at = None;
+            }
+            TimerMode::IdleAware => {
+                self.coalesced_next_at = None;
+            }
+        }
     }
 
     fn build_tick_intervals(&self) -> (tokio::time::Interval, tokio::time::Interval) {
@@ -567,6 +893,7 @@ impl DatapathEngine {
     }
 
     async fn step_wg_timers(&mut self, wg_tx_buf: &mut PacketBuffer) {
+        self.timer_tick_count = self.timer_tick_count.saturating_add(1);
         let timer_pkts = self.peer_map.tick_timers(wg_tx_buf);
         for (_, target, bytes) in timer_pkts {
             self.dispatch_send(target, &bytes).await;
@@ -574,6 +901,7 @@ impl DatapathEngine {
     }
 
     async fn step_disco_tick(&mut self) {
+        self.timer_tick_count = self.timer_tick_count.saturating_add(1);
         let now_ms = self.clock.now_unix_ms();
         if self.stun_client.has_pending_requests() && self.stun_client.is_probe_round_ready(now_ms)
         {
@@ -632,10 +960,12 @@ impl DatapathEngine {
                     self.peer_map
                         .decapsulate_from_udp(remote_addr, wg_bytes, wg_rx_buf, now_ms)
                 {
+                    self.note_traffic_activity();
                     self.deliver_decapsulated(dec, wg_rx_buf).await;
                 }
             }
             DemuxPacket::Disco(disco_bytes) => {
+                self.note_traffic_activity();
                 self.handle_disco_bytes(disco_bytes, IngressSource::DirectUdp(remote_addr))
                     .await;
             }
@@ -643,10 +973,12 @@ impl DatapathEngine {
                 if let Some(_obs) =
                     self.stun_client
                         .handle_incoming_stun(stun_bytes, remote_addr, now_ms)
-                    && self.stun_client.is_probe_round_ready(now_ms)
                 {
-                    let report = self.stun_client.finish_probe_round(now_ms);
-                    self.record_stun_report(report);
+                    self.note_traffic_activity();
+                    if self.stun_client.is_probe_round_ready(now_ms) {
+                        let report = self.stun_client.finish_probe_round(now_ms);
+                        self.record_stun_report(report);
+                    }
                 }
             }
             DemuxPacket::Unknown => {}
@@ -654,6 +986,25 @@ impl DatapathEngine {
     }
 
     async fn process_tun_packet(&mut self, packet: &[u8], wg_tx_buf: &mut PacketBuffer) {
+        let dns_decision = self
+            .dns_interceptor
+            .as_ref()
+            .map(|hook| hook.intercept_outbound_packet(packet));
+        if let Some(DnsInterceptDecision::Handled { tun_responses }) = dns_decision {
+            self.note_traffic_activity();
+            for resp in tun_responses {
+                if let Err(err) = self.tun.write_packet(&resp).await {
+                    warn!(
+                        component = "datapath.engine",
+                        event = "dns_interceptor_tun_write_error",
+                        error = %err,
+                        "failed writing intercepted MagicDNS response packet to TUN"
+                    );
+                }
+            }
+            return;
+        }
+
         let header = match self.cryptokey.validate_outbound(
             self.config.local_overlay_ip,
             self.config.overlay_cidr,
@@ -662,6 +1013,7 @@ impl DatapathEngine {
             Ok(h) => h,
             Err(_) => return,
         };
+        self.note_traffic_activity();
         let Ok(dst_ip) = OverlayIp::from_ipv4(header.dst_ip) else {
             return;
         };
@@ -713,10 +1065,12 @@ impl DatapathEngine {
                             .peer_map
                             .decapsulate_from_relay(src_pubkey, wg_bytes, wg_rx_buf, now_ms)
                         {
+                            self.note_traffic_activity();
                             self.deliver_decapsulated(dec, wg_rx_buf).await;
                         }
                     }
                     DemuxPacket::Disco(disco_bytes) => {
+                        self.note_traffic_activity();
                         self.handle_disco_bytes(
                             disco_bytes,
                             IngressSource::Relay {
@@ -740,6 +1094,7 @@ impl DatapathEngine {
     ) {
         match cmd {
             DatapathCommand::ApplyNetmap { snapshot, reply } => {
+                self.note_traffic_activity();
                 let report = self.peer_map.apply_diff(&snapshot);
                 if !report.removed_peer_ids.is_empty() {
                     self.disco.remove_peers(&report.removed_peer_ids);
@@ -801,6 +1156,7 @@ impl DatapathEngine {
                 self.advertised_endpoints = merged;
             }
             DatapathCommand::TriggerStunProbe => {
+                self.note_traffic_activity();
                 self.reprobe_tracked_stun_endpoints().await;
             }
             DatapathCommand::SetPacketFilter(policy) => {
@@ -816,6 +1172,7 @@ impl DatapathEngine {
                 }
             }
             DatapathCommand::InitiateHolePunch(peer_id) => {
+                self.note_traffic_activity();
                 let now_ms = self.clock.now_unix_ms();
                 self.initiate_hole_punch_for_peer(peer_id, now_ms).await;
             }
@@ -826,6 +1183,7 @@ impl DatapathEngine {
                 timeout_ms,
                 reply,
             } => {
+                self.note_traffic_activity();
                 self.handle_send_ping_probe(SendPingProbeCmd {
                     peer_id,
                     force_direct,
@@ -840,6 +1198,7 @@ impl DatapathEngine {
                 verified_src_pubkey,
                 packet,
             } => {
+                self.note_traffic_activity();
                 self.handle_relayed_disco_cmd(src_node_id, verified_src_pubkey, &packet)
                     .await;
             }
@@ -861,10 +1220,12 @@ impl DatapathEngine {
                 let res = match self.execute_socket_rebind(&rebind_cmd) {
                     Ok(RebindOutcome::Rebound { local_addr, .. }) => {
                         self.direct_udp_blocked = false;
+                        self.note_traffic_activity();
                         Ok(local_addr.port())
                     }
                     Ok(_) => {
                         self.direct_udp_blocked = false;
+                        self.note_traffic_activity();
                         self.magic_socket.local_addr().map(|addr| addr.port())
                     }
                     Err(err) => {
@@ -884,6 +1245,15 @@ impl DatapathEngine {
                     );
                 }
             }
+            DatapathCommand::SetTimerMode(mode) => {
+                self.apply_timer_mode(mode);
+            }
+            DatapathCommand::SetNat64Prefix(prefix) => {
+                self.handle_set_nat64_prefix(prefix).await;
+            }
+            DatapathCommand::SetDnsInterceptor(interceptor) => {
+                self.dns_interceptor = interceptor;
+            }
             DatapathCommand::QueryStatus(reply) => {
                 let status = self.build_status_snapshot();
                 if reply.send(status).is_err() {
@@ -894,6 +1264,29 @@ impl DatapathEngine {
                 }
             }
         }
+    }
+
+    async fn handle_set_nat64_prefix(&mut self, prefix: Option<Nat64Prefix>) {
+        self.note_traffic_activity();
+        self.magic_socket.set_nat64_prefix(prefix);
+        if let Some(relay) = &self.relay_handle {
+            relay.set_nat64_prefix(prefix);
+        }
+        if self.stun_client.set_nat64_prefix(prefix)
+            && !self.stun_client.tracked_endpoints().is_empty()
+        {
+            self.reprobe_tracked_stun_endpoints().await;
+        }
+    }
+
+    fn excluded_stun_endpoints(&self) -> Vec<SocketAddr> {
+        let mut excluded = self.stun_client.tracked_endpoints().to_vec();
+        for &raw in self.stun_client.untranslated_endpoints() {
+            if !excluded.contains(&raw) {
+                excluded.push(raw);
+            }
+        }
+        excluded
     }
 
     async fn reprobe_tracked_stun_endpoints(&mut self) {
@@ -913,7 +1306,7 @@ impl DatapathEngine {
     async fn handle_disco_bytes(&mut self, disco_bytes: &[u8], ingress: IngressSource) {
         let now_ms = self.clock.now_unix_ms();
         let ctx = self.filter_context();
-        let excluded = self.stun_client.tracked_endpoints().to_vec();
+        let excluded = self.excluded_stun_endpoints();
         let filter = DiscoFilterContext {
             candidates: &ctx,
             excluded_stun: &excluded,
@@ -1161,6 +1554,7 @@ impl DatapathEngine {
         match self.execute_socket_rebind(cmd) {
             Ok(RebindOutcome::Rebound { .. }) => {
                 self.direct_udp_blocked = false;
+                self.note_traffic_activity();
                 self.reprobe_tracked_stun_endpoints().await;
             }
             Ok(RebindOutcome::RefreshCandidatesRequested) => {
@@ -1257,7 +1651,7 @@ impl DatapathEngine {
 
     async fn initiate_hole_punch_for_peer(&mut self, peer_id: NodeId, now_ms: u64) {
         let ctx = self.filter_context();
-        let excluded = self.stun_client.tracked_endpoints().to_vec();
+        let excluded = self.excluded_stun_endpoints();
         let filter = DiscoFilterContext {
             candidates: &ctx,
             excluded_stun: &excluded,
@@ -1349,6 +1743,9 @@ impl DatapathEngine {
             cryptokey_metrics: self.cryptokey.metrics_snapshot(),
             disco_metrics: self.disco.metrics_snapshot(),
             peers,
+            timer_mode: self.timer_mode,
+            idle_sleeping: self.idle_sleeping,
+            timer_tick_count: self.timer_tick_count,
         }
     }
 }
@@ -2784,5 +3181,412 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    struct StubMagicDnsInterceptor {
+        dns_ip: Ipv4Addr,
+        reply_packet: Vec<u8>,
+        intercept_calls: Arc<std::sync::atomic::AtomicUsize>,
+        handled_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DnsPacketInterceptor for StubMagicDnsInterceptor {
+        fn intercept_outbound_packet(&self, packet: &[u8]) -> DnsInterceptDecision {
+            self.intercept_calls.fetch_add(1, Ordering::SeqCst);
+            let Some(&ver_ihl) = packet.first() else {
+                return DnsInterceptDecision::PassThrough;
+            };
+            if packet.len() < 28 || (ver_ihl >> 4) != 4 {
+                return DnsInterceptDecision::PassThrough;
+            }
+            let ihl = usize::from(ver_ihl & 0x0f).saturating_mul(4);
+            let Some(&proto) = packet.get(9) else {
+                return DnsInterceptDecision::PassThrough;
+            };
+            let Some(dst_octets) = packet.get(16..20) else {
+                return DnsInterceptDecision::PassThrough;
+            };
+            let Some(port_bytes) = packet.get(ihl.saturating_add(2)..ihl.saturating_add(4)) else {
+                return DnsInterceptDecision::PassThrough;
+            };
+            if ihl < 20 {
+                return DnsInterceptDecision::PassThrough;
+            }
+            let dst_ip = Ipv4Addr::new(
+                *dst_octets.first().unwrap_or(&0),
+                *dst_octets.get(1).unwrap_or(&0),
+                *dst_octets.get(2).unwrap_or(&0),
+                *dst_octets.get(3).unwrap_or(&0),
+            );
+            let dst_port = u16::from_be_bytes([
+                *port_bytes.first().unwrap_or(&0),
+                *port_bytes.get(1).unwrap_or(&0),
+            ]);
+            let is_dns_transport = matches!(proto, 17 | 6) && matches!(dst_port, 53 | 853);
+            if dst_ip == self.dns_ip && is_dns_transport {
+                self.handled_calls.fetch_add(1, Ordering::SeqCst);
+                return DnsInterceptDecision::Handled {
+                    tun_responses: vec![self.reply_packet.clone()],
+                };
+            }
+            DnsInterceptDecision::PassThrough
+        }
+    }
+
+    fn build_ipv4_tcp_msg_with_port(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        dst_port: u16,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let total = 40usize.saturating_add(body.len());
+        let total_u16 = u16::try_from(total).expect("tcp ipv4 fits in u16");
+        let mut pkt = vec![0u8; total];
+        if let Some(first) = pkt.first_mut() {
+            *first = 0x45;
+        }
+        pkt.get_mut(2..4)
+            .expect("totlen")
+            .copy_from_slice(&total_u16.to_be_bytes());
+        if let Some(proto) = pkt.get_mut(9) {
+            *proto = 6;
+        }
+        pkt.get_mut(12..16)
+            .expect("src")
+            .copy_from_slice(&src.octets());
+        pkt.get_mut(16..20)
+            .expect("dst")
+            .copy_from_slice(&dst.octets());
+        pkt.get_mut(20..22)
+            .expect("sport")
+            .copy_from_slice(&51000u16.to_be_bytes());
+        pkt.get_mut(22..24)
+            .expect("dport")
+            .copy_from_slice(&dst_port.to_be_bytes());
+        if let Some(data_off) = pkt.get_mut(32) {
+            *data_off = 0x50;
+        }
+        pkt.get_mut(40..)
+            .expect("tcp payload")
+            .copy_from_slice(body);
+        pkt
+    }
+
+    struct RejectAllEngineProtector;
+
+    impl mesh_net::SocketProtector for RejectAllEngineProtector {
+        fn protect_socket(&self, _raw_fd: i32) -> AppResult<()> {
+            Err(AppError::permission_denied(
+                "engine socket protector denied",
+            ))
+        }
+    }
+
+    // Traces: US-077, pre-CryptokeyValidator DnsPacketInterceptor
+    #[tokio::test]
+    async fn test_datapath_dns_interceptor_runs_before_cryptokey_without_wg_peer() {
+        // Arrange
+        let local_ip = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 10)).expect("local ip");
+        let cidr: OverlayCidr = "10.100.0.0/16".parse().expect("cidr");
+        let dns_vip = Ipv4Addr::new(100, 64, 0, 2); // intentionally outside overlay_cidr & not a WG peer
+        let tun = Arc::new(FakeTunDevice::new(
+            TunConfig::with_default_mtu("tun-dns-hook", local_ip, cidr).expect("tun cfg"),
+        ));
+        let tun_dyn: Arc<dyn TunDevice> = Arc::clone(&tun) as Arc<dyn TunDevice>;
+        let synthetic_rsp =
+            build_ipv4_udp_msg_with_port(dns_vip, local_ip.as_ipv4(), 53000, b"dns-answer");
+        let intercept_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handled_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let interceptor: Arc<dyn DnsPacketInterceptor> = Arc::new(StubMagicDnsInterceptor {
+            dns_ip: dns_vip,
+            reply_packet: synthetic_rsp.clone(),
+            intercept_calls: Arc::clone(&intercept_calls),
+            handled_calls: Arc::clone(&handled_calls),
+        });
+        let engine = DatapathEngine::bind_with_options(
+            DatapathConfig {
+                local_node_id: NodeId::from_bytes([0xA1; 16]),
+                local_overlay_ip: local_ip,
+                overlay_cidr: cidr,
+                node_keypair: NodeKeypair::generate(),
+                disco_keypair: DiscoKeypair::generate(),
+                socket_config: MagicSocketConfig::default()
+                    .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                stun_config: StunClientConfig::default(),
+                disco_config: DiscoConfig::default(),
+                control_tcp_endpoint: None,
+                wg_timer_interval: Duration::from_millis(100),
+                disco_tick_interval: Duration::from_millis(100),
+            },
+            tun_dyn,
+            Arc::new(SystemClock::new()),
+            None,
+            DatapathEngineOptions::default().with_dns_interceptor(interceptor),
+        )
+        .await
+        .expect("engine binds");
+        let handle = engine.handle();
+        let (_relay_tx, relay_rx) = mpsc::channel(8);
+        let (_rebind_h, rebind_rx) = RebindHandle::channel();
+        let shutdown = CancellationToken::new();
+        let engine_task = tokio::spawn(engine.run(relay_rx, rebind_rx, shutdown.clone()));
+
+        // Act 1: DNS UDP :53 & L3 TCP :853 to non-peer VIP bypass CryptokeyValidator & reply on TUN
+        let udp_query = build_ipv4_udp_msg_with_port(local_ip.as_ipv4(), dns_vip, 53, b"q-udp");
+        let tcp_dot = build_ipv4_tcp_msg_with_port(local_ip.as_ipv4(), dns_vip, 853, b"q-dot");
+        tun.inject_inbound_packet(udp_query)
+            .await
+            .expect("inject dns udp");
+        tun.inject_inbound_packet(tcp_dot)
+            .await
+            .expect("inject dns dot");
+        let mut collected_replies = 0usize;
+        for _ in 0..80 {
+            let drained = tun.drain_outbound_packets().await;
+            collected_replies = collected_replies.saturating_add(
+                drained
+                    .iter()
+                    .filter(|pkt| pkt.as_slice() == synthetic_rsp.as_slice())
+                    .count(),
+            );
+            if collected_replies >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            collected_replies, 2,
+            "both UDP :53 and L3 TCP :853 DNS queries must emit synthetic TUN responses"
+        );
+        let after_dns = handle.query_status().await.expect("status after dns");
+
+        // Act 2: non-DNS traffic must pass through interceptor into CryptokeyValidator
+        let spoofed_pkt = build_ipv4_udp_msg_with_port(
+            Ipv4Addr::new(192, 168, 99, 5),
+            Ipv4Addr::new(10, 100, 0, 55),
+            4001,
+            b"spoofed",
+        );
+        tun.inject_inbound_packet(spoofed_pkt)
+            .await
+            .expect("inject non-dns");
+        let mut dropped_seen = false;
+        for _ in 0..40 {
+            let st = handle.query_status().await.expect("status");
+            if st.cryptokey_metrics.non_overlay_packets_dropped >= 1 {
+                dropped_seen = true;
+                break;
+            }
+            sleep(Duration::from_millis(15)).await;
+        }
+
+        // Act 3: clear hook dynamically and confirm subsequent DNS query hits CryptokeyValidator
+        handle
+            .set_dns_interceptor(None)
+            .await
+            .expect("clear dns interceptor");
+        let dropped_before_clear = handle
+            .query_status()
+            .await
+            .expect("status before post-clear query")
+            .cryptokey_metrics
+            .non_overlay_packets_dropped;
+        tun.inject_inbound_packet(build_ipv4_udp_msg_with_port(
+            local_ip.as_ipv4(),
+            dns_vip,
+            53,
+            b"q-after-clear",
+        ))
+        .await
+        .expect("inject after clear");
+        let mut post_clear_dropped = false;
+        for _ in 0..40 {
+            let st = handle.query_status().await.expect("status");
+            if st.cryptokey_metrics.non_overlay_packets_dropped > dropped_before_clear {
+                post_clear_dropped = true;
+                break;
+            }
+            sleep(Duration::from_millis(15)).await;
+        }
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), engine_task)
+                .await
+                .is_ok()
+        );
+
+        // Assert
+        assert_eq!(after_dns.cryptokey_metrics.spoofed_packets_dropped, 0);
+        assert_eq!(after_dns.cryptokey_metrics.non_overlay_packets_dropped, 0);
+        assert_eq!(handled_calls.load(Ordering::SeqCst), 2);
+        assert!(intercept_calls.load(Ordering::SeqCst) >= 3);
+        assert!(
+            dropped_seen,
+            "non-DNS traffic must still traverse CryptokeyValidator"
+        );
+        assert!(
+            post_clear_dropped,
+            "clearing interceptor routes destination outside overlay through CryptokeyValidator"
+        );
+    }
+
+    // Traces: US-077, IdleAware timer mode + immediate traffic wakeup
+    #[tokio::test]
+    async fn test_datapath_timer_mode_idle_aware_suspends_polling_and_wakes_immediately() {
+        // Arrange
+        let local_ip = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 20)).expect("local ip");
+        let cidr: OverlayCidr = "10.100.0.0/16".parse().expect("cidr");
+        let tun = Arc::new(FakeTunDevice::new(
+            TunConfig::with_default_mtu("tun-idle", local_ip, cidr).expect("tun cfg"),
+        ));
+        let tun_dyn: Arc<dyn TunDevice> = Arc::clone(&tun) as Arc<dyn TunDevice>;
+        let engine = DatapathEngine::bind_with_options(
+            DatapathConfig {
+                local_node_id: NodeId::from_bytes([0xB2; 16]),
+                local_overlay_ip: local_ip,
+                overlay_cidr: cidr,
+                node_keypair: NodeKeypair::generate(),
+                disco_keypair: DiscoKeypair::generate(),
+                socket_config: MagicSocketConfig::default()
+                    .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                stun_config: StunClientConfig::default(),
+                disco_config: DiscoConfig::default(),
+                control_tcp_endpoint: None,
+                wg_timer_interval: Duration::from_millis(30),
+                disco_tick_interval: Duration::from_millis(30),
+            },
+            tun_dyn,
+            Arc::new(SystemClock::new()),
+            None,
+            DatapathEngineOptions::default()
+                .with_timer_mode(TimerMode::IdleAware)
+                .with_idle_entry_window_ms(220),
+        )
+        .await
+        .expect("engine binds");
+        let handle = engine.handle();
+        let (_relay_tx, relay_rx) = mpsc::channel(8);
+        let (_rebind_h, rebind_rx) = RebindHandle::channel();
+        let shutdown = CancellationToken::new();
+        let engine_task = tokio::spawn(engine.run(relay_rx, rebind_rx, shutdown.clone()));
+
+        // Act 1: wait for idle sleep transition and confirm zero periodic ticks occur while idle
+        let mut entered_idle = false;
+        for _ in 0..60 {
+            let st = handle.query_status().await.expect("status");
+            if st.idle_sleeping {
+                entered_idle = true;
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            entered_idle,
+            "IdleAware must transition to idle_sleeping after window"
+        );
+
+        let ticks_at_idle = handle
+            .query_status()
+            .await
+            .expect("idle tick sample 1")
+            .timer_tick_count;
+        sleep(Duration::from_millis(180)).await;
+        let idle_snap = handle.query_status().await.expect("idle tick sample 2");
+        assert!(idle_snap.idle_sleeping);
+        assert_eq!(
+            idle_snap.timer_tick_count, ticks_at_idle,
+            "zero 30 ms background ticks should fire while IdleAware is sleeping"
+        );
+
+        // Act 2: outbound TUN traffic wakes engine immediately & resumes normal timer servicing
+        let wakeup_pkt = build_ipv4_udp_msg_with_port(
+            local_ip.as_ipv4(),
+            Ipv4Addr::new(10, 100, 0, 99),
+            4001,
+            b"wake-now",
+        );
+        tun.inject_inbound_packet(wakeup_pkt)
+            .await
+            .expect("inject wakeup pkt");
+        let mut woke_up = false;
+        for _ in 0..40 {
+            let st = handle.query_status().await.expect("status after wakeup");
+            if !st.idle_sleeping {
+                woke_up = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            woke_up,
+            "outbound TUN packet must wake IdleAware engine immediately"
+        );
+
+        // Switch dynamically to Responsive and observe ticks running continuously
+        handle
+            .set_timer_mode(TimerMode::Responsive)
+            .await
+            .expect("set responsive");
+        let before_resp = handle
+            .query_status()
+            .await
+            .expect("responsive baseline")
+            .timer_tick_count;
+        sleep(Duration::from_millis(110)).await;
+        let after_resp = handle.query_status().await.expect("responsive after");
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), engine_task)
+                .await
+                .is_ok()
+        );
+
+        // Assert
+        assert_eq!(after_resp.timer_mode, TimerMode::Responsive);
+        assert!(!after_resp.idle_sleeping);
+        assert!(
+            after_resp.timer_tick_count > before_resp,
+            "Responsive mode must drive periodic timers continuously"
+        );
+    }
+
+    // Traces: US-077, fail-closed bind when SocketProtector denies socket creation
+    #[tokio::test]
+    async fn test_datapath_bind_fail_closed_when_socket_protector_rejects() {
+        // Arrange
+        let local_ip = OverlayIp::from_ipv4(Ipv4Addr::new(10, 100, 0, 30)).expect("local ip");
+        let cidr: OverlayCidr = "10.100.0.0/16".parse().expect("cidr");
+        let tun = Arc::new(FakeTunDevice::new(
+            TunConfig::with_default_mtu("tun-prot-fail", local_ip, cidr).expect("tun cfg"),
+        ));
+        let tun_dyn: Arc<dyn TunDevice> = Arc::clone(&tun) as Arc<dyn TunDevice>;
+
+        // Act
+        let res = DatapathEngine::bind(
+            DatapathConfig {
+                local_node_id: NodeId::from_bytes([0xC3; 16]),
+                local_overlay_ip: local_ip,
+                overlay_cidr: cidr,
+                node_keypair: NodeKeypair::generate(),
+                disco_keypair: DiscoKeypair::generate(),
+                socket_config: MagicSocketConfig::default()
+                    .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                    .with_socket_protector(Arc::new(RejectAllEngineProtector)),
+                stun_config: StunClientConfig::default(),
+                disco_config: DiscoConfig::default(),
+                control_tcp_endpoint: None,
+                wg_timer_interval: Duration::from_millis(100),
+                disco_tick_interval: Duration::from_millis(100),
+            },
+            tun_dyn,
+            Arc::new(SystemClock::new()),
+            None,
+        )
+        .await;
+
+        // Assert
+        assert!(res.is_err());
     }
 }

@@ -26,11 +26,11 @@ pub extern "system" fn Java_dev_meshvpn_android_ffi_MeshNativeInit_initPlatformV
     _class: JClass<'_>,
     context: JObject<'_>,
 ) -> jboolean {
-    if ANDROID_JNI_STATE.get().is_some() {
-        return JNI_TRUE;
-    }
     if context.is_null() {
         return JNI_FALSE;
+    }
+    if ANDROID_JNI_STATE.get().is_some() {
+        return JNI_TRUE;
     }
     let Ok(jvm) = env.get_java_vm() else {
         return JNI_FALSE;
@@ -38,7 +38,12 @@ pub extern "system" fn Java_dev_meshvpn_android_ffi_MeshNativeInit_initPlatformV
     let Ok(app_context) = env.new_global_ref(&context) else {
         return JNI_FALSE;
     };
-    let _ignored = ANDROID_JNI_STATE.set(AndroidJniContext { jvm, app_context });
+    if ANDROID_JNI_STATE
+        .set(AndroidJniContext { jvm, app_context })
+        .is_err()
+    {
+        // Another caller initialized `ANDROID_JNI_STATE` concurrently; cached state remains valid.
+    }
     JNI_TRUE
 }
 
@@ -67,4 +72,29 @@ pub fn ensure_jni_symbols_linked() {
     let entry: extern "system" fn(JNIEnv<'_>, JClass<'_>, JObject<'_>) -> jboolean =
         Java_dev_meshvpn_android_ffi_MeshNativeInit_initPlatformVerifier;
     let _kept = std::hint::black_box(entry);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::SysError;
+
+    use super::{ensure_jni_symbols_linked, with_attached_env_and_context};
+
+    #[test]
+    fn test_jni_android_with_attached_env_fails_closed_when_uninitialized() {
+        // Arrange
+        ensure_jni_symbols_linked();
+
+        // Act
+        let res = with_attached_env_and_context(|_, _| Ok(()));
+
+        // Assert
+        assert!(matches!(
+            res,
+            Err(SysError::SecurityViolation {
+                operation: "with_attached_env_and_context",
+                ..
+            })
+        ));
+    }
 }

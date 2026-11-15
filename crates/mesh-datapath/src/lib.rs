@@ -19,8 +19,8 @@ pub use disco_engine::{
     InteractivePingRequest, OutboundDiscoPacket, PingProbeOutcome, PingProbePath,
 };
 pub use engine::{
-    DatapathCommand, DatapathConfig, DatapathEngine, DatapathHandle, DatapathPeerStatus,
-    DatapathStatusSnapshot,
+    DatapathCommand, DatapathConfig, DatapathEngine, DatapathEngineOptions, DatapathHandle,
+    DatapathPeerStatus, DatapathStatusSnapshot, DnsInterceptDecision, DnsPacketInterceptor,
 };
 pub use magic_socket::{
     BindReport, MAGIC_SOCKET_BUFFER_SIZE, MagicSocket, MagicSocketConfig, PacketBuffer,
@@ -33,9 +33,11 @@ pub use rebind::{
     REBIND_COMMAND_CHANNEL_CAPACITY, RebindCommand, RebindHandle, RebindOutcome, SocketRebinder,
 };
 pub use relay_client::{
-    ConnectedRelayTransport, RelayClient, RelayClientConfig, RelayClientHandle,
-    RelayConnectionState, RelayConnector, RelayEvent, RelayIoStream, RelayMetricsSnapshot,
-    TlsRelayConnector, connect_bound_tcp_with_timeout,
+    ConnectedRelayTransport, ProtectedRelayConnector, RelayClient, RelayClientConfig,
+    RelayClientHandle, RelayClientOptions, RelayConnectionState, RelayConnector, RelayEvent,
+    RelayIoStream, RelayMetricsSnapshot, TimerMode, TlsRelayConnector,
+    connect_bound_tcp_with_protector, connect_bound_tcp_with_timeout,
+    is_protocol_incompatible_error, resolve_relay_target_addrs,
 };
 pub use stun_client::{
     StunClient, StunClientConfig, StunObservation, StunProbeReport, collect_and_sort_candidates,

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::lookup_host;
@@ -17,12 +18,13 @@ use mesh_net::endpoint_filter::{
     CandidateFilterContext, DiscoveredInterfaceEndpoint, is_valid_candidate_endpoint,
     is_virtual_interface_name,
 };
+use mesh_net::{Nat64Prefix, Nat64Synthesizer, NoopSocketProtector, SocketProtector};
 use mesh_proto::DemuxPacket;
 use mesh_proto::disco::MAX_DISCO_ENDPOINTS;
 use mesh_proto::netmap::{CandidateEndpoint, CandidateSource, NatMappingKind, RelayMap};
 use mesh_proto::stun::{STUN_BINDING_SUCCESS_RESPONSE, encode_binding_request, parse_stun_packet};
 
-use crate::magic_socket::{MAGIC_SOCKET_BUFFER_SIZE, MagicSocket, PacketBuffer};
+use crate::magic_socket::{MAGIC_SOCKET_BUFFER_SIZE, MagicSocket, MagicSocketConfig, PacketBuffer};
 
 /// Default STUN probe timeout (`<= 5 s` per `US-019 AC3`).
 pub const DEFAULT_STUN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,16 +32,42 @@ pub const DEFAULT_STUN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MAX_STUN_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration parameters for [`StunClient`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct StunClientConfig {
     /// Total timeout waiting for responses from `stun_udp_endpoints` (capped at `<= 5 s`).
     pub probe_timeout: Duration,
+    /// Optional NAT64 prefix for synthesizing IPv4 STUN targets on IPv6-only networks (`US-077`).
+    pub nat64_prefix: Option<Nat64Prefix>,
+    /// Fail-closed OS socket protector invoked before sending STUN packets (`US-077`).
+    pub socket_protector: Arc<dyn SocketProtector>,
 }
+
+impl std::fmt::Debug for StunClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StunClientConfig")
+            .field("probe_timeout", &self.probe_timeout)
+            .field("nat64_prefix", &self.nat64_prefix)
+            .field("socket_protector", &"<dyn SocketProtector>")
+            .finish()
+    }
+}
+
+impl PartialEq for StunClientConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.probe_timeout == other.probe_timeout
+            && self.nat64_prefix == other.nat64_prefix
+            && Arc::ptr_eq(&self.socket_protector, &other.socket_protector)
+    }
+}
+
+impl Eq for StunClientConfig {}
 
 impl Default for StunClientConfig {
     fn default() -> Self {
         Self {
             probe_timeout: DEFAULT_STUN_PROBE_TIMEOUT,
+            nat64_prefix: None,
+            socket_protector: Arc::new(NoopSocketProtector),
         }
     }
 }
@@ -55,7 +83,23 @@ impl StunClientConfig {
         };
         Self {
             probe_timeout: clamped,
+            nat64_prefix: None,
+            socket_protector: Arc::new(NoopSocketProtector),
         }
+    }
+
+    /// Configures an active NAT64 prefix for STUN endpoint synthesis (`US-077`).
+    #[must_use]
+    pub fn with_nat64_prefix(mut self, nat64_prefix: Option<Nat64Prefix>) -> Self {
+        self.nat64_prefix = nat64_prefix;
+        self
+    }
+
+    /// Configures a fail-closed OS [`SocketProtector`] enforced prior to STUN transmission (`US-077`).
+    #[must_use]
+    pub fn with_socket_protector(mut self, protector: Arc<dyn SocketProtector>) -> Self {
+        self.socket_protector = protector;
+        self
     }
 }
 
@@ -116,6 +160,7 @@ impl Default for StunProbeReport {
 pub struct StunClient {
     config: StunClientConfig,
     raw_endpoints: Vec<String>,
+    untranslated_endpoints: Vec<SocketAddr>,
     resolved_endpoints: Vec<SocketAddr>,
     pending_txs: HashMap<[u8; 12], PendingStunTx>,
     current_round_observations: Vec<StunObservation>,
@@ -129,11 +174,42 @@ impl StunClient {
         Self {
             config,
             raw_endpoints: Vec::new(),
+            untranslated_endpoints: Vec::new(),
             resolved_endpoints: Vec::new(),
             pending_txs: HashMap::new(),
             current_round_observations: Vec::new(),
             last_report: StunProbeReport::default(),
         }
+    }
+
+    /// Resolves STUN endpoint strings (`ip:port` literals or hostnames) and synthesizes any IPv4
+    /// addresses via RFC 6052 when a NAT64 prefix is active on an IPv6-only network (`US-077`).
+    pub async fn resolve_stun_target_addrs(
+        endpoints: &[String],
+        nat64_prefix: Option<Nat64Prefix>,
+    ) -> Vec<SocketAddr> {
+        let cancel = CancellationToken::new();
+        resolve_stun_endpoints_cancellable_with_nat64(endpoints, nat64_prefix, &cancel).await
+    }
+
+    /// Synthesizes IPv4 STUN socket addresses into RFC 6052 IPv6 addresses when `nat64_prefix` is set.
+    #[must_use]
+    pub fn synthesize_nat64_targets(
+        addrs: &[SocketAddr],
+        nat64_prefix: Option<Nat64Prefix>,
+    ) -> Vec<SocketAddr> {
+        let mut out = Vec::with_capacity(addrs.len());
+        let synth = nat64_prefix.map(Nat64Synthesizer::new);
+        for &addr in addrs {
+            let translated = match (addr, synth) {
+                (SocketAddr::V4(v4), Some(s)) => SocketAddr::V6(s.synthesize_sockaddr(v4)),
+                (other, _) => other,
+            };
+            if !out.contains(&translated) {
+                out.push(translated);
+            }
+        }
+        out
     }
 
     /// Returns the most recent completed NAT/STUN report.
@@ -146,6 +222,28 @@ impl StunClient {
     #[must_use]
     pub fn tracked_endpoints(&self) -> &[SocketAddr] {
         &self.resolved_endpoints
+    }
+
+    /// Returns untranslated STUN endpoints prior to NAT64 synthesis for candidate exclusion.
+    #[must_use]
+    pub fn untranslated_endpoints(&self) -> &[SocketAddr] {
+        &self.untranslated_endpoints
+    }
+
+    /// Updates the active NAT64 prefix and re-synthesizes tracked STUN targets.
+    ///
+    /// Returns `true` if `tracked_endpoints()` changed and callers should reprobe.
+    pub fn set_nat64_prefix(&mut self, prefix: Option<Nat64Prefix>) -> bool {
+        if self.config.nat64_prefix == prefix {
+            return false;
+        }
+        self.config.nat64_prefix = prefix;
+        let next = Self::synthesize_nat64_targets(&self.untranslated_endpoints, prefix);
+        if self.resolved_endpoints == next {
+            return false;
+        }
+        self.apply_resolved_endpoints(next);
+        true
     }
 
     /// Synchronizes STUN UDP targets from literal `ip:port` strings in `RelayMap` without DNS I/O.
@@ -164,7 +262,10 @@ impl StunClient {
                 parsed.push(addr);
             }
         }
-        self.apply_resolved_endpoints(parsed);
+        self.untranslated_endpoints = parsed;
+        let synthesized =
+            Self::synthesize_nat64_targets(&self.untranslated_endpoints, self.config.nat64_prefix);
+        self.apply_resolved_endpoints(synthesized);
         true
     }
 
@@ -186,10 +287,13 @@ impl StunClient {
         if self.raw_endpoints != raw_endpoints {
             return false;
         }
-        if self.resolved_endpoints == resolved {
+        self.untranslated_endpoints = resolved;
+        let synthesized =
+            Self::synthesize_nat64_targets(&self.untranslated_endpoints, self.config.nat64_prefix);
+        if self.resolved_endpoints == synthesized {
             return false;
         }
-        self.apply_resolved_endpoints(resolved);
+        self.apply_resolved_endpoints(synthesized);
         true
     }
 
@@ -204,7 +308,10 @@ impl StunClient {
         }
         self.raw_endpoints.clone_from(&relay_map.stun_udp_endpoints);
         let resolved = resolve_endpoint_strings(&relay_map.stun_udp_endpoints).await;
-        self.apply_resolved_endpoints(resolved);
+        self.untranslated_endpoints = resolved;
+        let synthesized =
+            Self::synthesize_nat64_targets(&self.untranslated_endpoints, self.config.nat64_prefix);
+        self.apply_resolved_endpoints(synthesized);
         changed
     }
 
@@ -217,6 +324,7 @@ impl StunClient {
             component = "datapath.stun_client",
             event = "stun_endpoints_updated",
             count = self.resolved_endpoints.len(),
+            nat64_active = self.config.nat64_prefix.is_some(),
             "updated tracked STUN UDP endpoints from RelayMap"
         );
     }
@@ -293,7 +401,7 @@ impl StunClient {
         if now_ms > tx.expires_at_ms {
             return None;
         }
-        if tx.target_endpoint != remote_addr {
+        if !stun_endpoint_matches(tx.target_endpoint, remote_addr, self.config.nat64_prefix) {
             warn!(
                 component = "datapath.stun_client",
                 event = "stun_source_mismatch",
@@ -362,6 +470,10 @@ impl StunClient {
             return Ok(self.finish_probe_round(clock.now_unix_ms()));
         }
 
+        // Fail-closed: enforce SocketProtector before transmitting any STUN packets.
+        let raw_fd = magic_socket.raw_fd()?;
+        self.config.socket_protector.protect_socket(raw_fd)?;
+
         for (target, pkt) in requests {
             if let Err(err) = magic_socket.send_to(&pkt, target).await {
                 warn!(
@@ -403,6 +515,59 @@ impl StunClient {
 
         Ok(self.finish_probe_round(clock.now_unix_ms()))
     }
+
+    /// Binds a short-lived protected [`MagicSocket`] inheriting `self`'s `SocketProtector` and
+    /// `nat64_prefix` when unset, then executes `probe_blocking` (`US-077`).
+    pub async fn probe_ephemeral_socket(
+        &mut self,
+        mut socket_config: MagicSocketConfig,
+        relay_map: &RelayMap,
+        clock: &dyn Clock,
+    ) -> AppResult<StunProbeReport> {
+        socket_config.socket_protector = Arc::clone(&self.config.socket_protector);
+        if socket_config.nat64_prefix.is_none() {
+            socket_config.nat64_prefix = self.config.nat64_prefix;
+        }
+        let sock = MagicSocket::bind(socket_config).await?;
+        self.probe_blocking(&sock, relay_map, clock).await
+    }
+}
+
+fn stun_endpoint_matches(
+    expected: SocketAddr,
+    observed: SocketAddr,
+    nat64_prefix: Option<Nat64Prefix>,
+) -> bool {
+    if expected == observed {
+        return true;
+    }
+    let Some(prefix) = nat64_prefix else {
+        return false;
+    };
+    if expected.port() != observed.port() {
+        return false;
+    }
+    let synth = Nat64Synthesizer::new(prefix);
+    match (expected, observed) {
+        (SocketAddr::V6(v6), SocketAddr::V4(v4)) => {
+            synth.desynthesize_ip(*v6.ip()) == Some(*v4.ip())
+        }
+        (SocketAddr::V4(v4), SocketAddr::V6(v6)) => {
+            synth.desynthesize_ip(*v6.ip()) == Some(*v4.ip())
+        }
+        _ => false,
+    }
+}
+
+/// Resolves `stun_udp_endpoints` concurrently with an overall `<= 5 s` deadline and immediate
+/// cooperative cancellation via `cancel`, synthesizing IPv4 targets via NAT64 when configured.
+pub(crate) async fn resolve_stun_endpoints_cancellable_with_nat64(
+    endpoints: &[String],
+    nat64_prefix: Option<Nat64Prefix>,
+    cancel: &CancellationToken,
+) -> Vec<SocketAddr> {
+    let raw_resolved = resolve_stun_endpoints_cancellable(endpoints, cancel).await;
+    StunClient::synthesize_nat64_targets(&raw_resolved, nat64_prefix)
 }
 
 /// Resolves `stun_udp_endpoints` concurrently with an overall `<= 5 s` deadline and immediate
@@ -834,5 +999,123 @@ mod tests {
         let timed_out_report = stun.finish_probe_round(22_000);
         assert!(timed_out_report.udp_blocked);
         assert!(!stun.has_pending_requests());
+    }
+
+    struct RejectAllProtector;
+
+    impl SocketProtector for RejectAllProtector {
+        fn protect_socket(&self, _raw_fd: i32) -> AppResult<()> {
+            Err(mesh_core::AppError::permission_denied(
+                "protector rejected STUN socket",
+            ))
+        }
+    }
+
+    // Traces: US-077, NAT64
+    #[tokio::test]
+    async fn test_stun_resolve_stun_target_addrs_synthesizes_ipv4_under_nat64() {
+        // Arrange
+        let prefix = Nat64Prefix::well_known();
+        let endpoints = vec![
+            "203.0.113.50:3478".to_owned(),
+            "[2001:db8::9]:3478".to_owned(),
+        ];
+
+        // Act
+        let with_nat64 = StunClient::resolve_stun_target_addrs(&endpoints, Some(prefix)).await;
+        let without_nat64 = StunClient::resolve_stun_target_addrs(&endpoints, None).await;
+
+        // Assert
+        assert_eq!(
+            with_nat64,
+            vec![
+                "[64:ff9b::cb00:7132]:3478"
+                    .parse::<SocketAddr>()
+                    .expect("synthesized v6"),
+                "[2001:db8::9]:3478"
+                    .parse::<SocketAddr>()
+                    .expect("native v6"),
+            ]
+        );
+        assert_eq!(
+            without_nat64,
+            vec![
+                "203.0.113.50:3478".parse::<SocketAddr>().expect("raw v4"),
+                "[2001:db8::9]:3478"
+                    .parse::<SocketAddr>()
+                    .expect("native v6"),
+            ]
+        );
+    }
+
+    // Traces: US-077, REL-09
+    #[tokio::test]
+    async fn test_stun_fail_closed_socket_protector_blocks_send_with_zero_packets() {
+        // Arrange
+        let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sink");
+        let sink_addr = sink.local_addr().expect("sink addr");
+        let rmap = sample_relay_map(vec![sink_addr]);
+        let clock = mesh_core::clock::FakeClock::new(100_000);
+        let sock = MagicSocket::bind(
+            MagicSocketConfig::default()
+                .with_bind_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        )
+        .await
+        .expect("bind test magic socket");
+        let mut stun = StunClient::new(
+            StunClientConfig::with_timeout(Duration::from_millis(100))
+                .with_socket_protector(Arc::new(RejectAllProtector)),
+        );
+
+        // Act
+        let probe_res = stun.probe_blocking(&sock, &rmap, &clock).await;
+        let eph_res = stun
+            .probe_ephemeral_socket(
+                MagicSocketConfig::default()
+                    .with_bind_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                &rmap,
+                &clock,
+            )
+            .await;
+        let mut rx_buf = [0u8; 64];
+        let recv = tokio::time::timeout(Duration::from_millis(60), sink.recv(&mut rx_buf)).await;
+
+        // Assert
+        assert!(probe_res.is_err());
+        assert!(eph_res.is_err());
+        assert!(
+            recv.is_err(),
+            "zero STUN bytes must be transmitted when SocketProtector fails"
+        );
+    }
+
+    // Traces: US-077, NAT64
+    #[test]
+    fn test_stun_handle_incoming_accepts_synthesized_and_desynthesized_nat64_sources() {
+        // Arrange
+        let prefix = Nat64Prefix::well_known();
+        let raw_v4: SocketAddr = "203.0.113.44:13478".parse().expect("raw v4");
+        let mapped: SocketAddr = "198.51.100.88:44000".parse().expect("mapped");
+        let rmap = sample_relay_map(vec![raw_v4]);
+        let mut stun = StunClient::new(StunClientConfig::default().with_nat64_prefix(Some(prefix)));
+        let requests = stun.start_probe_round(&rmap, 1_000);
+        let req = requests.first().expect("one synthesized STUN request");
+        assert!(
+            req.0.is_ipv6(),
+            "NAT64 prefix must translate STUN probe target to IPv6"
+        );
+        let parsed = parse_stun_packet(&req.1).expect("valid binding req");
+        let rsp = encode_binding_success_response(parsed.tx_id, mapped);
+
+        // Act: MagicSocket::recv_from desynthesizes incoming NAT64 IPv6 source back to raw IPv4
+        let obs = stun
+            .handle_incoming_stun(&rsp, raw_v4, 1_045)
+            .expect("desynthesized IPv4 source matches synthesized IPv6 NAT64 tx");
+
+        // Assert
+        assert_eq!(obs.rtt_ms, 45);
+        assert_eq!(obs.mapped_addr, mapped);
     }
 }

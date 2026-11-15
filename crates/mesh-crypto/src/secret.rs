@@ -3,7 +3,8 @@
 use std::fmt;
 
 use serde::{Serialize, Serializer};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
+pub use zeroize::{Zeroize, Zeroizing};
 
 /// Wrapper around sensitive memory (keys, pre-auth tokens, DER private keys) that zeroes
 /// its contents on drop and always formats/serializes as `"[REDACTED]"`.
@@ -73,7 +74,7 @@ impl<T: Zeroize> Serialize for Secret<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Secret;
+    use super::{Secret, Zeroizing};
 
     #[test]
     fn test_secret_always_redacts_debug_display_and_json() {
@@ -90,5 +91,23 @@ mod tests {
         assert_eq!(dbg_out, "[REDACTED]");
         assert_eq!(disp_out, "[REDACTED]");
         assert_eq!(json_out, "\"[REDACTED]\"");
+    }
+
+    #[test]
+    fn test_secret_clone_and_zeroizing_preserve_value_while_redacting() {
+        // Arrange
+        let original = Secret::new(vec![0x5a_u8; 32]);
+        let buf = Zeroizing::new(b"sensitive-plaintext-json".to_vec());
+
+        // Act
+        let cloned = original.clone_secret();
+        let dbg_cloned = format!("{cloned:?}");
+        let disp_cloned = format!("{cloned}");
+
+        // Assert
+        assert_eq!(cloned.expose_secret(), original.expose_secret());
+        assert_eq!(dbg_cloned, "[REDACTED]");
+        assert_eq!(disp_cloned, "[REDACTED]");
+        assert_eq!(buf.as_slice(), b"sensitive-plaintext-json");
     }
 }

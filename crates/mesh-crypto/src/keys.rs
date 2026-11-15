@@ -4,16 +4,18 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chacha20poly1305::aead::{Aead as _, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _, Nonce};
 use rand::RngCore as _;
 use rand::rngs::OsRng;
 use rustls::ConnectionCommon;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use mesh_core::brand::{PREAUTH_KEY_PREFIX, TLS_EXPORTER_LABEL};
 use mesh_core::{AppError, AppResult, PublicKey};
 
-use crate::hash::sha256_digest;
+use crate::hash::{ct_eq_bytes, sha256_digest};
 use crate::secret::Secret;
 
 /// Long-lived X25519 WireGuard / Control identity keypair stored with zeroized secret bytes.
@@ -147,6 +149,33 @@ impl PreAuthToken {
     pub const fn as_secret(&self) -> &Secret<String> {
         &self.raw
     }
+
+    /// Returns a masked display string preserving only a tiny boundary hint (e.g. `mpk_AbCd...6789`).
+    #[must_use]
+    pub fn masked_preview(&self) -> String {
+        mask_preauth_token(self.raw.expose_secret())
+    }
+}
+
+/// Formats a pre-authentication token with middle characters redacted (`SEC-01`).
+///
+/// Short, malformed, or non-ASCII inputs collapse completely to `"[REDACTED]"`.
+#[must_use]
+pub fn mask_preauth_token(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let min_maskable_len = PREAUTH_KEY_PREFIX.len() + 16;
+    if !trimmed.is_ascii()
+        || !trimmed.starts_with(PREAUTH_KEY_PREFIX)
+        || trimmed.len() < min_maskable_len
+    {
+        return "[REDACTED]".to_owned();
+    }
+    let prefix_end = PREAUTH_KEY_PREFIX.len() + 4;
+    let suffix_start = trimmed.len().saturating_sub(4);
+    match (trimmed.get(..prefix_end), trimmed.get(suffix_start..)) {
+        (Some(head), Some(tail)) => format!("{head}...{tail}"),
+        _ => "[REDACTED]".to_owned(),
+    }
 }
 
 impl fmt::Debug for PreAuthToken {
@@ -176,20 +205,109 @@ pub fn extract_tls_exporter_binding<Data>(conn: &ConnectionCommon<Data>) -> AppR
         .map_err(|err| AppError::internal(format!("TLS exporter binding unavailable: {err}")))
 }
 
+/// Seals `plaintext` using `ChaCha20-Poly1305` under `dek`, returning `magic || nonce[12] || ct_and_tag`.
+pub fn seal_aead_with_dek(
+    dek: &[u8; 32],
+    aad: &[u8],
+    magic: &[u8; 4],
+    plaintext: &[u8],
+) -> AppResult<Vec<u8>> {
+    if ct_eq_bytes(dek, &[0_u8; 32]) {
+        return Err(AppError::invalid_argument(
+            "identity DEK must not be all zeros",
+        ));
+    }
+    let nonce_bytes: [u8; 12] = random_bytes();
+    let cipher = ChaCha20Poly1305::new_from_slice(dek)
+        .map_err(|_| AppError::invalid_argument("invalid 32-byte ChaCha20-Poly1305 DEK"))?;
+    let ciphertext = cipher
+        .encrypt(
+            &Nonce::from(nonce_bytes),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| AppError::internal("failed sealing payload with ChaCha20-Poly1305"))?;
+
+    let mut out = Vec::with_capacity(magic.len() + nonce_bytes.len() + ciphertext.len());
+    out.extend_from_slice(magic);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Verifies `magic || nonce[12] || ct_and_tag` and returns decrypted bytes inside [`Zeroizing`].
+pub fn unseal_aead_with_dek(
+    dek: &[u8; 32],
+    aad: &[u8],
+    magic: &[u8; 4],
+    sealed: &[u8],
+) -> AppResult<Zeroizing<Vec<u8>>> {
+    if ct_eq_bytes(dek, &[0_u8; 32]) {
+        return Err(AppError::invalid_argument(
+            "identity DEK must not be all zeros",
+        ));
+    }
+    let Some(rest) = sealed.strip_prefix(magic.as_slice()) else {
+        return Err(AppError::invalid_argument(
+            "invalid sealed identity blob header",
+        ));
+    };
+    let Some((nonce_slice, ciphertext)) = rest.split_at_checked(12) else {
+        return Err(AppError::invalid_argument(
+            "sealed identity blob truncated before nonce",
+        ));
+    };
+    if ciphertext.len() < 16 {
+        return Err(AppError::invalid_argument(
+            "sealed identity blob truncated before Poly1305 tag",
+        ));
+    }
+    let nonce_bytes: [u8; 12] = nonce_slice
+        .try_into()
+        .map_err(|_| AppError::invalid_argument("invalid sealed identity nonce length"))?;
+
+    let cipher = ChaCha20Poly1305::new_from_slice(dek)
+        .map_err(|_| AppError::invalid_argument("invalid 32-byte ChaCha20-Poly1305 DEK"))?;
+    let plaintext = cipher
+        .decrypt(
+            &Nonce::from(nonce_bytes),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| {
+            AppError::invalid_argument("sealed identity authentication failed or wrong DEK")
+        })?;
+    Ok(Zeroizing::new(plaintext))
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "certgen")]
     use std::io;
+    #[cfg(feature = "certgen")]
     use std::net::Ipv4Addr;
+    #[cfg(feature = "certgen")]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(feature = "certgen")]
     use rustls::pki_types::{IpAddr, ServerName};
+    #[cfg(feature = "certgen")]
     use rustls::{ClientConnection, ServerConnection};
 
+    #[cfg(feature = "certgen")]
     use crate::certgen::{build_rustls_server_config_from_der, generate_ip_pinned_cert};
+    #[cfg(feature = "certgen")]
     use crate::tlspin::{PinSet, build_pinned_client_config};
 
+    #[cfg(feature = "certgen")]
+    use super::extract_tls_exporter_binding;
     use super::{
-        DiscoKeypair, NodeKeypair, PreAuthToken, extract_tls_exporter_binding, random_bytes,
+        DiscoKeypair, NodeKeypair, PreAuthToken, mask_preauth_token, random_bytes,
+        seal_aead_with_dek, unseal_aead_with_dek,
     };
 
     #[test]
@@ -223,6 +341,7 @@ mod tests {
         assert_ne!(r1, r2);
     }
 
+    #[cfg(feature = "certgen")]
     #[test]
     fn test_tls_exporter_binding_matches_between_client_and_server() {
         // Arrange
@@ -294,5 +413,68 @@ mod tests {
         assert!(client_binding.is_ok());
         assert!(server_binding.is_ok());
         assert_eq!(client_binding.ok(), server_binding.ok());
+    }
+
+    #[test]
+    fn test_mask_preauth_token_preserves_short_preview_and_redacts_invalid() {
+        // Arrange
+        let generated = PreAuthToken::generate();
+        let raw_secret = generated.as_secret().expose_secret();
+
+        // Act
+        let masked_gen = generated.masked_preview();
+        let masked_sample = mask_preauth_token("mpk_AbCdEfGhIjKlMnOpQrStUvWxYz6789");
+        let masked_short = mask_preauth_token("mpk_short");
+        let masked_bad_prefix = mask_preauth_token("other_AbCdEfGhIjKlMnOpQrStUv6789");
+        let masked_unicode = mask_preauth_token("mpk_AbCd\u{00e9}GhIjKlMnOpQrStUvWx6789");
+
+        // Assert
+        assert!(masked_gen.starts_with("mpk_"));
+        assert!(masked_gen.contains("..."));
+        assert!(!masked_gen.contains(raw_secret));
+        assert_eq!(masked_sample, "mpk_AbCd...6789");
+        assert_eq!(masked_short, "[REDACTED]");
+        assert_eq!(masked_bad_prefix, "[REDACTED]");
+        assert_eq!(masked_unicode, "[REDACTED]");
+    }
+
+    #[test]
+    fn test_aead_dek_roundtrip_and_rejects_tamper_wrong_dek_aad_or_magic() {
+        // Arrange
+        let dek = [0x37_u8; 32];
+        let wrong_dek = [0x99_u8; 32];
+        let magic = *b"MSH1";
+        let aad = b"mesh-identity-v1";
+        let plaintext = b"{\"schema_version\":1,\"secret\":\"sensitive_payload\"}";
+
+        // Act
+        let sealed = seal_aead_with_dek(&dek, aad, &magic, plaintext);
+        assert!(sealed.is_ok());
+        let Ok(mut blob) = sealed else {
+            return;
+        };
+        let opened = unseal_aead_with_dek(&dek, aad, &magic, &blob);
+        let wrong_dek_res = unseal_aead_with_dek(&wrong_dek, aad, &magic, &blob);
+        let wrong_aad_res = unseal_aead_with_dek(&dek, b"wrong-aad", &magic, &blob);
+        let wrong_magic_res = unseal_aead_with_dek(&dek, aad, b"MSH2", &blob);
+
+        let mut tampered_tag = blob.clone();
+        if let Some(last) = tampered_tag.last_mut() {
+            *last ^= 0x01;
+        }
+        let tampered_res = unseal_aead_with_dek(&dek, aad, &magic, &tampered_tag);
+        blob.truncate(20);
+        let truncated_res = unseal_aead_with_dek(&dek, aad, &magic, &blob);
+
+        // Assert
+        assert_eq!(
+            opened.ok().as_deref().map(Vec::as_slice),
+            Some(plaintext.as_slice())
+        );
+        assert!(wrong_dek_res.is_err());
+        assert!(wrong_aad_res.is_err());
+        assert!(wrong_magic_res.is_err());
+        assert!(tampered_res.is_err());
+        assert!(truncated_res.is_err());
     }
 }

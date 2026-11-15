@@ -3,12 +3,19 @@
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(all(
+    feature = "desktop-certs",
+    not(all(
+        feature = "mobile-platform-verifier",
+        any(target_os = "android", target_os = "ios")
+    ))
+))]
+use rustls::RootCertStore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    CertificateError, ClientConfig, DigitallySignedStruct, Error, OtherError, RootCertStore,
-    SignatureScheme,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error, OtherError, SignatureScheme,
 };
 use x509_cert::Certificate;
 use x509_cert::der::{Decode as _, Encode as _};
@@ -240,16 +247,114 @@ pub fn build_pinned_client_config(pins: PinSet) -> AppResult<Arc<ClientConfig>> 
 
 /// Builds a TLS 1.3 standard WebPKI `rustls::ClientConfig` trusting OS root certificates (`ring` provider).
 ///
-/// Fails closed if the OS trust store yields zero usable root certificates (`HR-01`).
+/// Fails closed if the OS trust store yields zero usable root certificates (`HR-01`) or if the
+/// Android JNI verifier context has not been initialized yet (`ADR-014`).
 pub fn build_system_ca_client_config() -> AppResult<Arc<ClientConfig>> {
-    let native = rustls_native_certs::load_native_certs();
-    let mut roots = RootCertStore::empty();
-    for cert in native.certs {
-        let _ignored = roots.add(cert);
+    #[cfg(all(
+        feature = "mobile-platform-verifier",
+        any(target_os = "android", target_os = "ios")
+    ))]
+    {
+        build_platform_verifier_client_config()
     }
-    build_client_config_from_root_store(roots)
+    #[cfg(all(
+        feature = "desktop-certs",
+        not(all(
+            feature = "mobile-platform-verifier",
+            any(target_os = "android", target_os = "ios")
+        ))
+    ))]
+    {
+        let native = rustls_native_certs::load_native_certs();
+        let mut roots = RootCertStore::empty();
+        for cert in native.certs {
+            let _ignored = roots.add(cert);
+        }
+        build_client_config_from_root_store(roots)
+    }
+    #[cfg(not(any(
+        feature = "desktop-certs",
+        all(
+            feature = "mobile-platform-verifier",
+            any(target_os = "android", target_os = "ios")
+        )
+    )))]
+    {
+        Err(AppError::unavailable(
+            "system CA verification is unavailable in this build configuration",
+        ))
+    }
 }
 
+#[cfg(all(feature = "mobile-platform-verifier", target_os = "android"))]
+fn ensure_android_platform_verifier_initialized() -> AppResult<()> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static ANDROID_VERIFIER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+    static ANDROID_VERIFIER_INIT_LOCK: Mutex<()> = Mutex::new(());
+
+    if ANDROID_VERIFIER_INITIALIZED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _guard = ANDROID_VERIFIER_INIT_LOCK
+        .lock()
+        .map_err(|_| AppError::internal("Android platform verifier init lock poisoned"))?;
+    if ANDROID_VERIFIER_INITIALIZED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    mesh_sys::jni_android::with_attached_env_and_context(|env, context| {
+        let local_ctx = env.new_local_ref(context).map_err(|err| {
+            mesh_sys::error::SysError::io(
+                "ensure_android_platform_verifier_initialized",
+                std::io::Error::other(format!("failed creating local JNI context ref: {err}")),
+            )
+        })?;
+        rustls_platform_verifier::android::init_hosted(env, local_ctx).map_err(|err| {
+            mesh_sys::error::SysError::io(
+                "ensure_android_platform_verifier_initialized",
+                std::io::Error::other(format!(
+                    "failed initializing rustls_platform_verifier Android runtime: {err}"
+                )),
+            )
+        })
+    })
+    .map_err(AppError::from)?;
+
+    ANDROID_VERIFIER_INITIALIZED.store(true, Ordering::Release);
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "mobile-platform-verifier",
+    any(target_os = "android", target_os = "ios")
+))]
+fn build_platform_verifier_client_config() -> AppResult<Arc<ClientConfig>> {
+    use rustls_platform_verifier::BuilderVerifierExt as _;
+
+    #[cfg(target_os = "android")]
+    ensure_android_platform_verifier_initialized()?;
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| AppError::internal(format!("failed configuring TLS 1.3 versions: {err}")))?
+        .with_platform_verifier()
+        .map_err(|err| {
+            AppError::unavailable(format!("failed initializing platform TLS verifier: {err}"))
+        })?
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+#[cfg(all(
+    feature = "desktop-certs",
+    not(all(
+        feature = "mobile-platform-verifier",
+        any(target_os = "android", target_os = "ios")
+    ))
+))]
 fn build_client_config_from_root_store(roots: RootCertStore) -> AppResult<Arc<ClientConfig>> {
     if roots.is_empty() {
         return Err(AppError::unavailable(
@@ -267,21 +372,51 @@ fn build_client_config_from_root_store(roots: RootCertStore) -> AppResult<Arc<Cl
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "certgen")]
     use std::time::Duration;
 
+    #[cfg(all(
+        feature = "desktop-certs",
+        not(all(
+            feature = "mobile-platform-verifier",
+            any(target_os = "android", target_os = "ios")
+        ))
+    ))]
+    use rustls::RootCertStore;
+    #[cfg(feature = "certgen")]
     use rustls::client::danger::ServerCertVerifier as _;
+    #[cfg(feature = "certgen")]
     use rustls::pki_types::{CertificateDer, IpAddr, ServerName, UnixTime};
-    use rustls::{CertificateError, Error, RootCertStore};
+    use rustls::{CertificateError, Error};
 
-    use mesh_core::{ErrorKind, SpkiPin};
+    use mesh_core::ErrorKind;
+    #[cfg(feature = "certgen")]
+    use mesh_core::SpkiPin;
 
+    #[cfg(feature = "certgen")]
     use crate::certgen::generate_ip_pinned_cert;
 
-    use super::{
-        PinSet, SpkiPinVerifier, build_client_config_from_root_store, build_pinned_client_config,
-        classify_rustls_error, extract_spki_pin_from_der,
-    };
+    #[cfg(all(
+        feature = "desktop-certs",
+        not(all(
+            feature = "mobile-platform-verifier",
+            any(target_os = "android", target_os = "ios")
+        ))
+    ))]
+    use super::build_client_config_from_root_store;
+    #[cfg(not(any(
+        feature = "desktop-certs",
+        all(
+            feature = "mobile-platform-verifier",
+            any(target_os = "android", target_os = "ios")
+        )
+    )))]
+    use super::build_system_ca_client_config;
+    use super::classify_rustls_error;
+    #[cfg(feature = "certgen")]
+    use super::{PinSet, SpkiPinVerifier, build_pinned_client_config, extract_spki_pin_from_der};
 
+    #[cfg(feature = "certgen")]
     #[test]
     fn test_spki_pin_verifier_enforces_pin_dual_rotation_and_clock_bounds() {
         // Arrange
@@ -344,6 +479,13 @@ mod tests {
         assert!(build_pinned_client_config(PinSet::single(identity.spki_pin)).is_ok());
     }
 
+    #[cfg(all(
+        feature = "desktop-certs",
+        not(all(
+            feature = "mobile-platform-verifier",
+            any(target_os = "android", target_os = "ios")
+        ))
+    ))]
     #[test]
     fn test_system_ca_fails_closed_when_empty_and_webpki_expiry_maps_clock_skew() {
         // Arrange & Act
@@ -357,5 +499,43 @@ mod tests {
             Some(ErrorKind::Unavailable)
         );
         assert_eq!(expired_webpki.kind(), ErrorKind::ClockSkew);
+    }
+
+    #[cfg(not(any(
+        feature = "desktop-certs",
+        all(
+            feature = "mobile-platform-verifier",
+            any(target_os = "android", target_os = "ios")
+        )
+    )))]
+    #[test]
+    fn test_system_ca_unavailable_without_cert_features() {
+        // Arrange & Act
+        let res = build_system_ca_client_config();
+
+        // Assert
+        assert_eq!(res.err().map(|e| e.kind()), Some(ErrorKind::Unavailable));
+    }
+
+    #[test]
+    fn test_classify_rustls_errors_cover_clock_skew_and_pin_rejection() {
+        // Arrange
+        let not_yet = Error::InvalidCertificate(CertificateError::NotValidYet);
+        let expired = Error::InvalidCertificate(CertificateError::Expired);
+        let app_rejected =
+            Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure);
+        let revoked = Error::InvalidCertificate(CertificateError::Revoked);
+
+        // Act & Assert
+        assert_eq!(classify_rustls_error(&not_yet).kind(), ErrorKind::ClockSkew);
+        assert_eq!(classify_rustls_error(&expired).kind(), ErrorKind::ClockSkew);
+        assert_eq!(
+            classify_rustls_error(&app_rejected).kind(),
+            ErrorKind::PinMismatch
+        );
+        assert_eq!(
+            classify_rustls_error(&revoked).kind(),
+            ErrorKind::Unavailable
+        );
     }
 }

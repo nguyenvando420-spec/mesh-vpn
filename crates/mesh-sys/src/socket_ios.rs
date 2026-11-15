@@ -23,6 +23,12 @@ pub fn bind_socket_to_interface_index(fd: RawFd, is_ipv6: bool, if_index: u32) -
     ensure_interface_not_utun(if_index, "bind_socket_to_interface_index")?;
 
     let raw_idx: libc::c_uint = if_index;
+    let optlen = libc::socklen_t::try_from(size_of::<libc::c_uint>()).map_err(|_| {
+        SysError::io(
+            "bind_socket_to_interface_index",
+            Error::from_raw_os_error(libc::EINVAL),
+        )
+    })?;
     let (level, optname) = if is_ipv6 {
         (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
     } else {
@@ -37,7 +43,7 @@ pub fn bind_socket_to_interface_index(fd: RawFd, is_ipv6: bool, if_index: u32) -
             level,
             optname,
             (&raw const raw_idx).cast::<libc::c_void>(),
-            size_of::<libc::c_uint>() as libc::socklen_t,
+            optlen,
         )
     };
     if rc != 0 {
@@ -54,6 +60,12 @@ pub fn bind_socket_to_interface_index(fd: RawFd, is_ipv6: bool, if_index: u32) -
 pub fn disable_ipv4_dont_fragment(fd: RawFd) -> SysResult<()> {
     validate_fd(fd, "disable_ipv4_dont_fragment")?;
     let disabled: libc::c_int = 0;
+    let optlen = libc::socklen_t::try_from(size_of::<libc::c_int>()).map_err(|_| {
+        SysError::io(
+            "disable_ipv4_dont_fragment",
+            Error::from_raw_os_error(libc::EINVAL),
+        )
+    })?;
 
     // SAFETY: `fd` is validated non-negative and `disabled` points to a valid `c_int` on the stack
     // for the synchronous `setsockopt` syscall.
@@ -63,7 +75,7 @@ pub fn disable_ipv4_dont_fragment(fd: RawFd) -> SysResult<()> {
             libc::IPPROTO_IP,
             libc::IP_DONTFRAG,
             (&raw const disabled).cast::<libc::c_void>(),
-            size_of::<libc::c_int>() as libc::socklen_t,
+            optlen,
         )
     };
     if rc != 0 {
@@ -106,4 +118,30 @@ fn validate_fd(fd: RawFd, operation: &'static str) -> SysResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::SysError;
+
+    use super::{bind_socket_to_interface_index, disable_ipv4_dont_fragment};
+
+    #[test]
+    fn test_socket_ios_rejects_negative_fd_and_zero_interface_index() {
+        // Arrange & Act
+        let neg_bind = bind_socket_to_interface_index(-1, false, 1);
+        let neg_df = disable_ipv4_dont_fragment(-1);
+        let zero_idx = bind_socket_to_interface_index(0, true, 0);
+
+        // Assert
+        assert!(neg_bind.is_err());
+        assert!(neg_df.is_err());
+        assert!(matches!(
+            zero_idx,
+            Err(SysError::SecurityViolation {
+                operation: "bind_socket_to_interface_index",
+                ..
+            })
+        ));
+    }
 }

@@ -1,7 +1,8 @@
 //! Single shared non-blocking UDP socket with static receive buffers, MTU checks, and demuxing.
 
 use std::io::ErrorKind as IoErrorKind;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::Arc;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
@@ -9,7 +10,10 @@ use tracing::{info, warn};
 
 use mesh_core::defaults::{DEFAULT_TUN_MTU, MAX_FRAME_SIZE, MAX_TUN_MTU, MIN_TUN_MTU};
 use mesh_core::{AppError, AppResult, ErrorKind, Port};
-use mesh_net::{bind_underlay_socket2, bind_underlay_udp_socket, disable_udp_dont_fragment};
+use mesh_net::{
+    Nat64Prefix, Nat64Synthesizer, NoopSocketProtector, SocketProtector, bind_underlay_socket2,
+    bind_underlay_udp_socket, disable_udp_dont_fragment,
+};
 use mesh_proto::relay::RELAY_MAX_CIPHERTEXT_BYTES;
 use mesh_proto::{DemuxPacket, demux_packet};
 
@@ -25,7 +29,7 @@ const WIREGUARD_PADDING_ALIGNMENT: usize = 16;
 pub type PacketBuffer = [u8; MAGIC_SOCKET_BUFFER_SIZE];
 
 /// Configuration for binding or rebinding `MagicSocket` (`US-017`, `US-019`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct MagicSocketConfig {
     /// Persisted local UDP port to try before falling back to an OS ephemeral port (`0`).
     pub preferred_port: Option<Port>,
@@ -37,7 +41,39 @@ pub struct MagicSocketConfig {
     pub underlay_if_index: Option<u32>,
     /// Optional Linux `SO_MARK` fwmark for policy routing loop prevention.
     pub linux_fwmark: Option<u32>,
+    /// Optional NAT64 prefix for synthesizing IPv4 peer/STUN targets on IPv6-only networks (`US-077`).
+    pub nat64_prefix: Option<Nat64Prefix>,
+    /// Fail-closed socket protector hook (`VpnService.protect` / mobile bypass) (`US-077`).
+    pub socket_protector: Arc<dyn SocketProtector>,
 }
+
+impl std::fmt::Debug for MagicSocketConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MagicSocketConfig")
+            .field("preferred_port", &self.preferred_port)
+            .field("bind_ip", &self.bind_ip)
+            .field("mtu", &self.mtu)
+            .field("underlay_if_index", &self.underlay_if_index)
+            .field("linux_fwmark", &self.linux_fwmark)
+            .field("nat64_prefix", &self.nat64_prefix)
+            .field("socket_protector", &"<dyn SocketProtector>")
+            .finish()
+    }
+}
+
+impl PartialEq for MagicSocketConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.preferred_port == other.preferred_port
+            && self.bind_ip == other.bind_ip
+            && self.mtu == other.mtu
+            && self.underlay_if_index == other.underlay_if_index
+            && self.linux_fwmark == other.linux_fwmark
+            && self.nat64_prefix == other.nat64_prefix
+            && Arc::ptr_eq(&self.socket_protector, &other.socket_protector)
+    }
+}
+
+impl Eq for MagicSocketConfig {}
 
 impl Default for MagicSocketConfig {
     fn default() -> Self {
@@ -47,6 +83,8 @@ impl Default for MagicSocketConfig {
             mtu: DEFAULT_TUN_MTU,
             underlay_if_index: None,
             linux_fwmark: None,
+            nat64_prefix: None,
+            socket_protector: Arc::new(NoopSocketProtector),
         }
     }
 }
@@ -78,6 +116,20 @@ impl MagicSocketConfig {
     pub fn with_underlay(mut self, if_index: Option<u32>, linux_fwmark: Option<u32>) -> Self {
         self.underlay_if_index = if_index;
         self.linux_fwmark = linux_fwmark;
+        self
+    }
+
+    /// Configures an active NAT64 RFC 6052 prefix for IPv6-only cellular/Wi-Fi synthesis (`US-077`).
+    #[must_use]
+    pub fn with_nat64_prefix(mut self, nat64_prefix: Option<Nat64Prefix>) -> Self {
+        self.nat64_prefix = nat64_prefix;
+        self
+    }
+
+    /// Configures a fail-closed OS socket protector (`Android VpnService.protect` / iOS) (`US-077`).
+    #[must_use]
+    pub fn with_socket_protector(mut self, protector: Arc<dyn SocketProtector>) -> Self {
+        self.socket_protector = protector;
         self
     }
 }
@@ -125,6 +177,7 @@ pub struct MagicSocket {
     bind_report: BindReport,
     mtu: u16,
     config: MagicSocketConfig,
+    protection_failed: bool,
 }
 
 impl MagicSocket {
@@ -142,6 +195,7 @@ impl MagicSocket {
             bind_report,
             mtu,
             config,
+            protection_failed: false,
         })
     }
 
@@ -155,6 +209,28 @@ impl MagicSocket {
     #[must_use]
     pub fn bind_report(&self) -> BindReport {
         self.bind_report
+    }
+
+    /// Returns the configured NAT64 prefix, if any (`US-077`).
+    #[must_use]
+    pub fn nat64_prefix(&self) -> Option<Nat64Prefix> {
+        self.config.nat64_prefix
+    }
+
+    /// Updates the active NAT64 RFC 6052 prefix at runtime (`US-077`).
+    pub fn set_nat64_prefix(&mut self, prefix: Option<Nat64Prefix>) {
+        self.config.nat64_prefix = prefix;
+    }
+
+    /// Returns a reference to the configured OS [`SocketProtector`].
+    #[must_use]
+    pub fn socket_protector(&self) -> &Arc<dyn SocketProtector> {
+        &self.config.socket_protector
+    }
+
+    /// Returns the underlying raw OS socket descriptor for external verification or STUN protection.
+    pub fn raw_fd(&self) -> AppResult<i32> {
+        extract_udp_raw_fd(&self.socket)
     }
 
     /// Returns the effective normalized local socket address.
@@ -177,12 +253,13 @@ impl MagicSocket {
         self.bind_report.local_addr.is_ipv6() || self.bind_report.dual_stack
     }
 
-    /// Receives a raw UDP datagram into a pre-allocated `[u8; 2048]` buffer and unmaps the peer IP.
+    /// Receives a raw UDP datagram into a pre-allocated `[u8; 2048]` buffer and unmaps/desynthesizes
+    /// the peer address back to canonical IPv4 when a NAT64 prefix matches (`US-077`).
     pub async fn recv_from(&self, buf: &mut PacketBuffer) -> AppResult<(usize, SocketAddr)> {
         let (len, peer) = self.socket.recv_from(buf).await.map_err(|err| {
             AppError::unavailable(format!("magic socket recv_from failed: {err}"))
         })?;
-        Ok((len, unmap_socket_addr(peer)))
+        Ok((len, self.normalize_ingress_addr(peer)))
     }
 
     /// Receives and demultiplexes one UDP datagram without per-packet heap allocation.
@@ -214,13 +291,18 @@ impl MagicSocket {
             .map_err(|err| AppError::unavailable(format!("magic socket try_send_to failed: {err}")))
     }
 
-    /// Re-applies physical underlay socket binding (`IP_UNICAST_IF` / `IP_BOUND_IF` / `SO_MARK`)
-    /// in place without closing the UDP port.
+    /// Re-applies [`SocketProtector`] and physical underlay socket binding (`IP_UNICAST_IF` /
+    /// `IP_BOUND_IF` / `SO_MARK`) in place without closing the UDP port.
     pub fn rebind_underlay(
         &mut self,
         if_index: Option<u32>,
         linux_fwmark: Option<u32>,
     ) -> AppResult<()> {
+        if let Err(err) = protect_udp_socket(self.config.socket_protector.as_ref(), &self.socket) {
+            self.protection_failed = true;
+            return Err(err);
+        }
+        self.protection_failed = false;
         self.config.underlay_if_index = if_index;
         self.config.linux_fwmark = linux_fwmark;
         if if_index.is_none() && linux_fwmark.is_none() {
@@ -256,14 +338,41 @@ impl MagicSocket {
             self.socket = tokio_dummy;
         }
 
-        let (new_sock, report) = open_and_bind_socket(&next_cfg)?;
+        let (new_sock, report) = match open_and_bind_socket(&next_cfg) {
+            Ok(bound) => bound,
+            Err(err) => {
+                // Fail-closed: prevent sending packets via any temporary placeholder socket.
+                self.protection_failed = true;
+                return Err(err);
+            }
+        };
         self.socket = new_sock;
         self.bind_report = report;
         self.config = next_cfg;
+        self.protection_failed = false;
         Ok(report)
     }
 
+    fn normalize_ingress_addr(&self, addr: SocketAddr) -> SocketAddr {
+        let unmapped = unmap_socket_addr(addr);
+        match (unmapped, self.config.nat64_prefix) {
+            (SocketAddr::V6(v6), Some(prefix)) => {
+                if let Some(v4) = Nat64Synthesizer::new(prefix).desynthesize_ip(*v6.ip()) {
+                    SocketAddr::V4(SocketAddrV4::new(v4, v6.port()))
+                } else {
+                    SocketAddr::V6(v6)
+                }
+            }
+            (other, _) => other,
+        }
+    }
+
     fn prepare_send(&self, payload: &[u8], target: SocketAddr) -> AppResult<SocketAddr> {
+        if self.protection_failed {
+            return Err(AppError::permission_denied(
+                "refusing outbound udp packet over unprotected MagicSocket",
+            ));
+        }
         if payload.len() > MAX_FRAME_SIZE {
             return Err(AppError::invalid_argument(format!(
                 "outbound udp payload ({} B) exceeds max frame size ({MAX_FRAME_SIZE} B)",
@@ -279,7 +388,21 @@ impl MagicSocket {
             target,
             self.bind_report.local_addr,
             self.bind_report.dual_stack,
+            self.config.nat64_prefix,
         )
+    }
+}
+
+enum BindFailure {
+    Protector(AppError),
+    Socket(AppError),
+}
+
+impl BindFailure {
+    fn into_app_error(self) -> AppError {
+        match self {
+            Self::Protector(err) | Self::Socket(err) => err,
+        }
     }
 }
 
@@ -287,7 +410,8 @@ fn open_and_bind_socket(config: &MagicSocketConfig) -> AppResult<(UdpSocket, Bin
     let preferred_u16 = config.preferred_port.map_or(0, Port::get);
     match try_bind_family(config, preferred_u16) {
         Ok(result) => Ok(result),
-        Err(err) if preferred_u16 != 0 && is_port_busy_error(&err) => {
+        Err(BindFailure::Protector(err)) => Err(err),
+        Err(BindFailure::Socket(err)) if preferred_u16 != 0 && is_port_busy_error(&err) => {
             warn!(
                 component = "datapath.magic_socket",
                 event = "preferred_udp_port_busy",
@@ -295,16 +419,20 @@ fn open_and_bind_socket(config: &MagicSocketConfig) -> AppResult<(UdpSocket, Bin
                 error = %err,
                 "preferred UDP port busy; falling back to ephemeral port 0"
             );
-            let (sock, mut report) = try_bind_family(config, 0)?;
+            let (sock, mut report) =
+                try_bind_family(config, 0).map_err(BindFailure::into_app_error)?;
             report.preferred_port_requested = config.preferred_port;
             report.used_fallback_port = true;
             Ok((sock, report))
         }
-        Err(err) => Err(err),
+        Err(BindFailure::Socket(err)) => Err(err),
     }
 }
 
-fn try_bind_family(config: &MagicSocketConfig, port: u16) -> AppResult<(UdpSocket, BindReport)> {
+fn try_bind_family(
+    config: &MagicSocketConfig,
+    port: u16,
+) -> Result<(UdpSocket, BindReport), BindFailure> {
     match config.bind_ip {
         Some(IpAddr::V4(v4)) => bind_single_socket(config, SocketAddr::from((v4, port)), false),
         Some(IpAddr::V6(v6)) => {
@@ -315,7 +443,8 @@ fn try_bind_family(config: &MagicSocketConfig, port: u16) -> AppResult<(UdpSocke
             let v6_addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
             match bind_single_socket(config, v6_addr, true) {
                 Ok(res) => Ok(res),
-                Err(v6_err) => {
+                Err(BindFailure::Protector(err)) => Err(BindFailure::Protector(err)),
+                Err(BindFailure::Socket(v6_err)) => {
                     warn!(
                         component = "datapath.magic_socket",
                         event = "ipv6_dualstack_bind_fallback",
@@ -323,7 +452,20 @@ fn try_bind_family(config: &MagicSocketConfig, port: u16) -> AppResult<(UdpSocke
                         "dual-stack IPv6 UDP bind unavailable; falling back to IPv4 unspecified"
                     );
                     let v4_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-                    bind_single_socket(config, v4_addr, false)
+                    match bind_single_socket(config, v4_addr, false) {
+                        Ok(res) => Ok(res),
+                        Err(BindFailure::Protector(err)) => Err(BindFailure::Protector(err)),
+                        Err(BindFailure::Socket(v4_err)) if config.nat64_prefix.is_some() => {
+                            warn!(
+                                component = "datapath.magic_socket",
+                                event = "ipv6_only_nat64_bind_fallback",
+                                error = %v4_err,
+                                "IPv4 fallback bind unavailable under NAT64; attempting IPv6-only unspecified bind"
+                            );
+                            bind_single_socket(config, v6_addr, false)
+                        }
+                        Err(err) => Err(err),
+                    }
                 }
             }
         }
@@ -334,22 +476,32 @@ fn bind_single_socket(
     config: &MagicSocketConfig,
     bind_addr: SocketAddr,
     dual_stack: bool,
-) -> AppResult<(UdpSocket, BindReport)> {
+) -> Result<(UdpSocket, BindReport), BindFailure> {
     let is_ipv6 = bind_addr.is_ipv6();
     let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
-    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|err| AppError::unavailable(format!("failed to create udp socket: {err}")))?;
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(|err| {
+        BindFailure::Socket(AppError::unavailable(format!(
+            "failed to create udp socket: {err}"
+        )))
+    })?;
 
-    sock.set_nonblocking(true)
-        .map_err(|err| AppError::unavailable(format!("failed to set udp nonblocking: {err}")))?;
+    sock.set_nonblocking(true).map_err(|err| {
+        BindFailure::Socket(AppError::unavailable(format!(
+            "failed to set udp nonblocking: {err}"
+        )))
+    })?;
 
     if is_ipv6 && dual_stack {
         sock.set_only_v6(false).map_err(|err| {
-            AppError::unavailable(format!(
+            BindFailure::Socket(AppError::unavailable(format!(
                 "failed to configure dual-stack IPV6_V6ONLY=false: {err}"
-            ))
+            )))
         })?;
     }
+
+    // Fail-closed: protect the raw descriptor BEFORE binding or applying underlay options
+    // so an unprotected socket can never transmit packets across the active tunnel interface.
+    protect_socket2(config.socket_protector.as_ref(), &sock).map_err(BindFailure::Protector)?;
 
     if config.underlay_if_index.is_some() || config.linux_fwmark.is_some() {
         bind_underlay_socket2(
@@ -357,23 +509,29 @@ fn bind_single_socket(
             is_ipv6,
             config.underlay_if_index,
             config.linux_fwmark,
-        )?;
+        )
+        .map_err(BindFailure::Socket)?;
     }
 
     sock.bind(&bind_addr.into()).map_err(|err| {
         if err.kind() == IoErrorKind::AddrInUse || err.kind() == IoErrorKind::AddrNotAvailable {
-            AppError::new(
+            BindFailure::Socket(AppError::new(
                 ErrorKind::Conflict,
                 format!("udp bind {bind_addr} unavailable: {err}"),
-            )
+            ))
         } else {
-            AppError::unavailable(format!("failed to bind udp socket {bind_addr}: {err}"))
+            BindFailure::Socket(AppError::unavailable(format!(
+                "failed to bind udp socket {bind_addr}: {err}"
+            )))
         }
     })?;
 
     let std_sock: std::net::UdpSocket = sock.into();
-    let tokio_sock = UdpSocket::from_std(std_sock)
-        .map_err(|err| AppError::unavailable(format!("failed to adopt tokio udp socket: {err}")))?;
+    let tokio_sock = UdpSocket::from_std(std_sock).map_err(|err| {
+        BindFailure::Socket(AppError::unavailable(format!(
+            "failed to adopt tokio udp socket: {err}"
+        )))
+    })?;
 
     let df_disabled = match disable_udp_dont_fragment(&tokio_sock) {
         Ok(()) => true,
@@ -392,7 +550,9 @@ fn bind_single_socket(
         .local_addr()
         .map(unmap_socket_addr)
         .map_err(|err| {
-            AppError::unavailable(format!("failed to read local_addr after bind: {err}"))
+            BindFailure::Socket(AppError::unavailable(format!(
+                "failed to read local_addr after bind: {err}"
+            )))
         })?;
 
     info!(
@@ -402,6 +562,7 @@ fn bind_single_socket(
         dual_stack,
         df_disabled,
         mtu = config.mtu,
+        nat64_active = config.nat64_prefix.is_some(),
         "bound shared MagicSocket"
     );
 
@@ -415,6 +576,59 @@ fn bind_single_socket(
             df_disabled,
         },
     ))
+}
+
+pub(crate) fn extract_socket2_raw_fd(socket: &Socket) -> AppResult<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        Ok(socket.as_raw_fd())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket as _;
+        raw_socket_to_fd(socket.as_raw_socket())
+    }
+}
+
+pub(crate) fn extract_udp_raw_fd(socket: &UdpSocket) -> AppResult<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        Ok(socket.as_raw_fd())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket as _;
+        raw_socket_to_fd(socket.as_raw_socket())
+    }
+}
+
+#[cfg(windows)]
+fn raw_socket_to_fd(raw: std::os::windows::io::RawSocket) -> AppResult<i32> {
+    if raw == u64::MAX {
+        return Err(AppError::unavailable("invalid OS socket descriptor"));
+    }
+    match i32::try_from(raw) {
+        Ok(fd) => Ok(fd),
+        Err(_) => {
+            let masked = raw & 0x7FFF_FFFF;
+            i32::try_from(masked).map_err(|_| AppError::unavailable("invalid OS socket descriptor"))
+        }
+    }
+}
+
+pub(crate) fn protect_socket2(protector: &dyn SocketProtector, socket: &Socket) -> AppResult<()> {
+    let raw_fd = extract_socket2_raw_fd(socket)?;
+    protector.protect_socket(raw_fd)
+}
+
+pub(crate) fn protect_udp_socket(
+    protector: &dyn SocketProtector,
+    socket: &UdpSocket,
+) -> AppResult<()> {
+    let raw_fd = extract_udp_raw_fd(socket)?;
+    protector.protect_socket(raw_fd)
 }
 
 fn apply_underlay_binding(
@@ -465,7 +679,16 @@ fn normalize_target_for_socket(
     target: SocketAddr,
     local_addr: SocketAddr,
     dual_stack: bool,
+    nat64_prefix: Option<Nat64Prefix>,
 ) -> AppResult<SocketAddr> {
+    if let (SocketAddr::V4(v4), Some(prefix)) = (target, nat64_prefix)
+        && (local_addr.is_ipv6() || dual_stack)
+    {
+        return Ok(SocketAddr::V6(
+            Nat64Synthesizer::new(prefix).synthesize_sockaddr(v4),
+        ));
+    }
+
     match (local_addr, dual_stack, target) {
         (SocketAddr::V4(_), false, SocketAddr::V4(_)) => Ok(target),
         (SocketAddr::V4(_), false, SocketAddr::V6(_)) => Err(AppError::invalid_argument(
@@ -578,5 +801,160 @@ mod tests {
             .expect("send disco packet");
         let (_, demuxed_disco) = sock_b.recv_demuxed(&mut buf).await.expect("recv disco");
         assert!(matches!(demuxed_disco, DemuxPacket::Disco(_)));
+    }
+
+    struct ToggleSocketProtector {
+        fail_after: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+        observed_fds: std::sync::Mutex<Vec<i32>>,
+    }
+
+    impl ToggleSocketProtector {
+        fn always_fail() -> Self {
+            Self {
+                fail_after: std::sync::atomic::AtomicUsize::new(0),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                observed_fds: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn fail_after(succeed_count: usize) -> Self {
+            Self {
+                fail_after: std::sync::atomic::AtomicUsize::new(succeed_count),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                observed_fds: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SocketProtector for ToggleSocketProtector {
+        fn protect_socket(&self, raw_fd: i32) -> AppResult<()> {
+            let idx = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut guard) = self.observed_fds.lock() {
+                guard.push(raw_fd);
+            }
+            if idx >= self.fail_after.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(AppError::permission_denied("VpnService.protect failed"));
+            }
+            Ok(())
+        }
+    }
+
+    // Traces: US-077, REL-09
+    #[tokio::test]
+    async fn test_magic_socket_fail_closed_when_protector_errors_blocks_bind_and_send() {
+        // Arrange
+        let failing_protector = Arc::new(ToggleSocketProtector::always_fail());
+        let cfg = MagicSocketConfig::default()
+            .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_socket_protector(failing_protector.clone());
+
+        // Act
+        let bind_res = MagicSocket::bind(cfg).await;
+
+        // Assert
+        assert!(bind_res.is_err());
+        assert_eq!(failing_protector.call_count(), 1);
+        assert_eq!(
+            bind_res.err().map(|e| e.kind()),
+            Some(ErrorKind::PermissionDenied)
+        );
+
+        // Arrange: fail protector after initial bind succeeds during rebind / recreate
+        let sink = UdpSocket::bind("127.0.0.1:0").await.expect("bind sink udp");
+        let sink_addr = sink.local_addr().expect("sink addr");
+        let conditional_protector = Arc::new(ToggleSocketProtector::fail_after(1));
+        let mut sock = MagicSocket::bind(
+            MagicSocketConfig::default()
+                .with_bind_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .with_socket_protector(conditional_protector.clone()),
+        )
+        .await
+        .expect("initial bind should succeed");
+
+        // Act: rebind fails protection -> subsequent send must fail closed with 0 bytes transmitted
+        let rebind_err = sock.recreate_socket(None, None);
+        let send_err = sock.try_send_to(b"hello", sink_addr);
+        let mut rx_buf = [0u8; 64];
+        let recv_timeout =
+            tokio::time::timeout(std::time::Duration::from_millis(60), sink.recv(&mut rx_buf))
+                .await;
+
+        // Assert
+        assert!(rebind_err.is_err());
+        assert!(send_err.is_err());
+        assert!(
+            recv_timeout.is_err(),
+            "zero bytes must leave socket after protector failure"
+        );
+        assert!(conditional_protector.call_count() >= 2);
+    }
+
+    // Traces: US-077, NAT64
+    #[tokio::test]
+    async fn test_magic_socket_nat64_synthesizes_outbound_and_desynthesizes_ingress() {
+        // Arrange: bind an IPv6 loopback MagicSocket and configure NAT64 prefix mapping 0.0.0.1 -> ::1
+        let nat64 = Nat64Prefix::well_known();
+        let v4_target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 10), 51820));
+        let v6_local = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 51820, 0, 0));
+
+        // Act 1: outbound normalization converts IPv4 targets into RFC 6052 IPv6
+        let synthesized = normalize_target_for_socket(v4_target, v6_local, false, Some(nat64))
+            .expect("NAT64 synthesis on IPv6 socket should succeed");
+
+        // Assert 1
+        assert_eq!(
+            synthesized,
+            SocketAddr::V6(SocketAddrV6::new(
+                "64:ff9b::cb00:710a".parse::<Ipv6Addr>().expect("ipv6"),
+                51820,
+                0,
+                0,
+            ))
+        );
+
+        // Arrange 2: live loopback UDP exchange using prefix `::/96` mapping `0.0.0.1` <-> `::1`
+        let loopback_nat64 = Nat64Prefix::from_prefix_and_len(Ipv6Addr::UNSPECIFIED, 96)
+            .expect("::/96 prefix valid for RFC 6052 loopback test");
+        let sock_sender = MagicSocket::bind(
+            MagicSocketConfig::default()
+                .with_bind_ip(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                .with_nat64_prefix(Some(loopback_nat64)),
+        )
+        .await
+        .expect("bind sender IPv6 MagicSocket");
+        let sock_receiver = MagicSocket::bind(
+            MagicSocketConfig::default()
+                .with_bind_ip(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                .with_nat64_prefix(Some(loopback_nat64)),
+        )
+        .await
+        .expect("bind receiver IPv6 MagicSocket");
+        let rx_port = sock_receiver.local_port().expect("rx port").get();
+        let tx_port = sock_sender.local_port().expect("tx port").get();
+
+        // Act 2: send to synthetic IPv4 `0.0.0.1:rx_port` -> delivered to `[::1]:rx_port` and
+        // desynthesized on ingress back to `0.0.0.1:tx_port`.
+        let stun_pkt = mesh_proto::stun::encode_binding_request([9u8; 12]);
+        sock_sender
+            .send_to(
+                &stun_pkt,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 1), rx_port)),
+            )
+            .await
+            .expect("NAT64 synthesized send should deliver to ::1");
+        let mut rx_buf: PacketBuffer = [0u8; MAGIC_SOCKET_BUFFER_SIZE];
+        let (len, peer_addr) = sock_receiver.recv_from(&mut rx_buf).await.expect("recv");
+
+        // Assert 2
+        assert_eq!(len, stun_pkt.len());
+        assert_eq!(
+            peer_addr,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 1), tx_port))
+        );
     }
 }
