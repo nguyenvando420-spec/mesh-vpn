@@ -1359,18 +1359,27 @@ dependencies = [
 name = "mesh-client"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "mesh-core",
  "mesh-crypto",
  "mesh-datapath",
  "mesh-net",
  "mesh-proto",
+ "proptest",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "tokio-util",
  "toml 0.8.23",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

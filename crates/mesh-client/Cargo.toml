@@ -12,6 +12,7 @@ workspace = true
 [features]
 default = ["desktop-os"]
 desktop-os = ["mesh-net/desktop-os", "mesh-datapath/desktop-os", "mesh-crypto/desktop-certs"]
+mobile-platform-verifier = ["mesh-crypto/mobile-platform-verifier"]
 
 [dependencies]
 mesh-core.workspace = true
@@ -19,12 +20,22 @@ mesh-crypto = { path = "../mesh-crypto", version = "0.1.0", default-features = f
 mesh-proto.workspace = true
 mesh-net = { path = "../mesh-net", version = "0.1.0", default-features = false }
 mesh-datapath = { path = "../mesh-datapath", version = "0.1.0", default-features = false }
+base64.workspace = true
+bytes.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+socket2.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+mesh-crypto = { path = "../mesh-crypto", version = "0.1.0", features = ["certgen"] }
+proptest.workspace = true
 tempfile.workspace = true

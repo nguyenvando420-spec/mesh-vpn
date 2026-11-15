@@ -1,33 +1,42 @@
-//! Daemon lifecycle supervisor: startup `ResourceLedger` crash recovery, dual IPC/Roaming/
-//! Control/Datapath orchestration, and bounded Graceful Shutdown (`<= 5 s`, `US-055`, `REL-08`).
+//! Daemon lifecycle supervisor: startup `ResourceLedger` crash recovery, dual IPC listeners,
+//! desktop OS platform hooks, and thin delegation to `mesh_client::ClientSessionSupervisor`
+//! (`US-055`, `REL-08`, `US-099`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
-use mesh_core::clock::Clock;
-use mesh_core::defaults::{DEFAULT_OVERLAY_CIDR, GRACEFUL_SHUTDOWN_BUDGET_MS};
-use mesh_core::{AppError, AppResult, OverlayCidr, Port};
-use mesh_crypto::{DiscoKeypair, NodeKeypair};
-use mesh_datapath::{
-    DatapathCommand, DatapathConfig, DatapathEngine, DiscoConfig, MagicSocketConfig, RebindCommand,
-    RebindHandle, RelayClient, RelayClientConfig, RelayEvent, StunClientConfig,
+use mesh_client::hooks::{
+    ClientFuture, ClientPlatformHooks, DnsUpstreamHook, FileClientStateStore, TunActivationOutcome,
 };
-use mesh_net::endpoint_filter::{OverlaySubnetConflict, detect_overlay_subnet_conflict};
-use mesh_net::hosts::{FileHostsEditor, HostsEditor};
-use mesh_net::keystore::{KeysFileStore, StoredNodeIdentity};
-use mesh_net::ledger::{LedgerCleanupOps, ResourceLedger};
 #[cfg(test)]
-use mesh_net::netmon::FakePhysicalNetworkProbe;
-use mesh_net::netmon::{
-    NetMonitor, NetworkChangeEvent, OsPhysicalNetworkProbe, PhysicalNetworkProbe,
-};
+use mesh_client::session::apply_registration_to_bootstrap;
+use mesh_client::{ClientCommand, ClientSessionOptions, ClientSessionSupervisor};
+#[cfg(target_os = "windows")]
+use mesh_core::AppError;
+use mesh_core::brand::DAEMON_BINARY_NAME;
+use mesh_core::clock::Clock;
+use mesh_core::{AppResult, NodeName, OverlayCidr, OverlayIp};
+#[cfg(test)]
+use mesh_datapath::RebindCommand;
+use mesh_net::DiscoveredInterfaceEndpoint;
+use mesh_net::endpoint_filter::{OverlaySubnetConflict, detect_overlay_subnet_conflict};
+use mesh_net::hosts::{FileHostsEditor, HostsEditor as _, HostsEntry};
+use mesh_net::ledger::{LedgerCleanupOps, ResourceLedger};
+use mesh_net::nat64::SocketProtector;
+use mesh_net::netmon::{FakeNetMonitor, NetMonitor, OsPhysicalNetworkProbe, PhysicalNetworkProbe};
+#[cfg(test)]
+use mesh_net::netmon::{FakePhysicalNetworkProbe, NetworkChangeEvent};
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use mesh_net::route::RouteSpec;
 #[cfg(any(
     test,
@@ -35,63 +44,28 @@ use mesh_net::route::RouteSpec;
 ))]
 use mesh_net::tun::FakeTunDevice;
 use mesh_net::tun::{TunConfig, TunDevice};
-use mesh_proto::agent_ipc::{
-    AgentActionResponse, AgentRotateKeyRequest, AgentSetRequest, AgentUpRequest, BugreportResponse,
-    DaemonState, TlsAuthMode,
-};
-use mesh_proto::control::{RegisterNodeRequest, RegisterNodeResponse, TerminationReason};
+#[cfg(test)]
+use mesh_proto::agent_ipc::{AgentActionResponse, AgentSetRequest};
+#[cfg(test)]
+use mesh_proto::control::{RegisterNodeResponse, TerminationReason};
+use mesh_proto::netmap::NetmapSnapshot;
 
 use crate::config::{
-    BootstrapConfig, BootstrapStore, DaemonRuntimePaths, detect_default_node_name, split_host_port,
-    validate_tls_trust_policy, write_private_file_atomic,
+    DaemonRuntimePaths, candidate_log_dirs, collect_os_route_table, default_state_dir,
+    load_inbound_filter_spec, split_host_port,
 };
 use crate::control_loop::{
-    ControlLoop, ControlLoopContext, ControlWakeSignal, DaemonRuntimeState,
-    build_relay_client_config_for_runtime,
+    ControlLoop, discover_desktop_local_interface_endpoints, sync_platform_hosts_entries,
 };
+#[cfg(test)]
+use crate::control_loop::{ControlWakeSignal, DaemonRuntimeState};
 use crate::ipc_service::{IpcRouterState, IpcService};
-use crate::netmap_cache::{NetmapCacheFile, NetmapCacheStore};
+use crate::netmap_cache::NetmapCacheStore;
 use crate::ping_probe::PingProbe;
-use crate::roaming_loop::{NETWORK_CHANGE_CHANNEL_CAPACITY, RoamingLoop};
+use crate::roaming_loop::RoamingLoop;
 
-const SUPERVISOR_CMD_CAPACITY: usize = 32;
-const WS_CLOSE_PHASE_WAIT: Duration = Duration::from_millis(600);
-const SESSION_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-const LEDGER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
-const RELAY_EVENT_CAPACITY: usize = 128;
-
-/// Commands routed from `meshd-admin` IPC endpoints to the supervisor lifecycle owner.
-#[derive(Debug)]
-pub(crate) enum SupervisorCommand {
-    /// Registers (if needed) and starts the overlay tunnel session (`POST /v1/agent/up`).
-    Up {
-        req: AgentUpRequest,
-        reply: oneshot::Sender<AppResult<AgentActionResponse>>,
-    },
-    /// Gracefully stops the active tunnel session (`POST /v1/agent/down`).
-    Down {
-        reply: oneshot::Sender<AppResult<AgentActionResponse>>,
-    },
-    /// Forces idempotent `ResourceLedger::cleanup_all` recovery (`POST /v1/agent/cleanup`).
-    Cleanup {
-        reply: oneshot::Sender<AppResult<AgentActionResponse>>,
-    },
-    /// Updates Control server endpoint / pins cleanly (`POST /v1/agent/set`).
-    Set {
-        req: AgentSetRequest,
-        reply: oneshot::Sender<AppResult<AgentActionResponse>>,
-    },
-    /// Rotates WireGuard identity keypair with `previous_node_pubkey` (`POST /v1/agent/rotate-key`).
-    RotateKey {
-        req: AgentRotateKeyRequest,
-        reply: oneshot::Sender<AppResult<AgentActionResponse>>,
-    },
-    /// Generates a redacted non-secret diagnostic bundle (`POST /v1/agent/bugreport`).
-    Bugreport {
-        reply: oneshot::Sender<AppResult<BugreportResponse>>,
-    },
-}
-
+/// Commands routed from `meshd-admin` IPC endpoints to the client session supervisor.
+pub(crate) type SupervisorCommand = ClientCommand;
 /// Result of opening the TUN adapter and evaluating overlay subnet conflicts (`US-037`).
 pub(crate) struct TunRouteSetupOutcome {
     pub(crate) tun: Arc<dyn TunDevice>,
@@ -607,28 +581,284 @@ impl PlatformAdapters for InMemoryPlatformAdapters {
     }
 }
 
-struct ActiveTunnelSession {
-    cancel: CancellationToken,
-    tracker: TaskTracker,
-    wake_tx: mpsc::Sender<ControlWakeSignal>,
+#[derive(Debug)]
+struct DesktopDnsHook {
+    hosts_override: Option<PathBuf>,
+    ledger: Arc<Mutex<ResourceLedger>>,
 }
 
-/// Top-level daemon orchestrator owning `TaskTracker`, hierarchical cancellation, and `ResourceLedger`.
-pub(crate) struct DaemonSupervisor {
+impl DnsUpstreamHook for DesktopDnsHook {
+    fn sync_mesh_dns<'a>(
+        &'a self,
+        snapshot: &'a NetmapSnapshot,
+        self_overlay_ip: Option<OverlayIp>,
+        self_name: Option<&'a NodeName>,
+    ) -> ClientFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            let mut entries = Vec::with_capacity(snapshot.peers.len() + 1);
+            if let (Some(ip), Some(name)) = (self_overlay_ip, self_name)
+                && let Ok(entry) = HostsEntry::new(
+                    ip,
+                    name.clone(),
+                    &snapshot.domain_suffix,
+                    Some(&snapshot.relay_map.control_tcp_endpoint),
+                )
+            {
+                entries.push(entry);
+            }
+            for peer in &snapshot.peers {
+                if let Ok(entry) = HostsEntry::new(
+                    peer.overlay_ip,
+                    peer.name.clone(),
+                    &snapshot.domain_suffix,
+                    Some(&snapshot.relay_map.control_tcp_endpoint),
+                ) {
+                    entries.push(entry);
+                }
+            }
+
+            let public_host = split_host_port(&snapshot.relay_map.control_tcp_endpoint)
+                .map(|(h, _)| h)
+                .ok();
+
+            if let Some(ref custom_path) = self.hosts_override {
+                let editor = FileHostsEditor::new(custom_path.clone());
+                let mut ledger = self.ledger.lock().await;
+                if let Err(err) =
+                    ledger.record_hosts_before_activate(custom_path.display().to_string())
+                {
+                    warn!(
+                        component = "meshd.supervisor",
+                        event = "hosts_ledger_record_failed",
+                        error = %err,
+                        "failed recording override hosts path into ResourceLedger"
+                    );
+                }
+                return editor.apply(&entries, public_host.as_deref());
+            }
+
+            sync_platform_hosts_entries(&entries, public_host.as_deref(), &self.ledger).await;
+            Ok(())
+        })
+    }
+
+    fn clear_mesh_dns<'a>(&'a self) -> ClientFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            clear_override_hosts_best_effort(self.hosts_override.as_ref());
+            Ok(())
+        })
+    }
+}
+
+/// Desktop [`ClientPlatformHooks`] bridging `PlatformAdapters`, `ResourceLedger`, `/etc/hosts`,
+/// `sysexec` route diagnostics, and `inbound-filter.conf`.
+pub(crate) struct DesktopPlatformHooks {
     paths: DaemonRuntimePaths,
-    clock: Arc<dyn Clock>,
     adapters: Arc<dyn PlatformAdapters>,
     ledger: Arc<Mutex<ResourceLedger>>,
+    dns: Arc<DesktopDnsHook>,
+    route_installed_flag: OnceLock<Arc<AtomicBool>>,
+    net_monitor_override: OnceLock<Arc<dyn NetMonitor>>,
+}
+
+impl std::fmt::Debug for DesktopPlatformHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DesktopPlatformHooks")
+            .field("bootstrap_path", &self.paths.bootstrap_path)
+            .field("dns", &self.dns)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DesktopPlatformHooks {
+    fn new(
+        paths: DaemonRuntimePaths,
+        adapters: Arc<dyn PlatformAdapters>,
+        ledger: Arc<Mutex<ResourceLedger>>,
+    ) -> Self {
+        let dns = Arc::new(DesktopDnsHook {
+            hosts_override: paths.hosts_path_override.clone(),
+            ledger: Arc::clone(&ledger),
+        });
+        Self {
+            paths,
+            adapters,
+            ledger,
+            dns,
+            route_installed_flag: OnceLock::new(),
+            net_monitor_override: OnceLock::new(),
+        }
+    }
+
+    fn bind_route_flag(&self, flag: Arc<AtomicBool>) {
+        if self.route_installed_flag.set(flag).is_err() {
+            debug!(
+                component = "meshd.supervisor",
+                event = "route_flag_already_bound",
+                "desktop route-installed flag already bound"
+            );
+        }
+    }
+
+    fn bind_net_monitor(&self, monitor: Arc<dyn NetMonitor>) {
+        if self.net_monitor_override.set(monitor).is_err() {
+            debug!(
+                component = "meshd.supervisor",
+                event = "net_monitor_already_bound",
+                "desktop network monitor already bound"
+            );
+        }
+    }
+}
+
+impl ClientPlatformHooks for DesktopPlatformHooks {
+    fn network_probe(&self) -> Arc<dyn PhysicalNetworkProbe> {
+        self.adapters.network_probe()
+    }
+
+    fn net_monitor(&self) -> Arc<dyn NetMonitor> {
+        self.net_monitor_override
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(FakeNetMonitor::new()))
+    }
+
+    fn dns_hook(&self) -> Arc<dyn DnsUpstreamHook> {
+        Arc::clone(&self.dns) as Arc<dyn DnsUpstreamHook>
+    }
+
+    fn socket_protector(&self) -> Option<Arc<dyn SocketProtector>> {
+        None
+    }
+
+    fn activate_tun_and_routes<'a>(
+        &'a self,
+        tun_cfg: TunConfig,
+        overlay_cidr: OverlayCidr,
+        _dns_server_ip: Option<OverlayIp>,
+        _domain_suffix: Option<&'a str>,
+        now_ms: u64,
+    ) -> ClientFuture<'a, AppResult<TunActivationOutcome>> {
+        Box::pin(async move {
+            let mut ledger = self.ledger.lock().await;
+            let setup =
+                self.adapters
+                    .setup_tun_and_route(tun_cfg, overlay_cidr, &mut ledger, now_ms)?;
+            if let Some(flag) = self.route_installed_flag.get() {
+                flag.store(setup.route_installed, Ordering::SeqCst);
+            }
+            Ok(TunActivationOutcome {
+                tun: setup.tun,
+                route_installed: setup.route_installed,
+                conflict_warning: setup.conflict_warning,
+                lockdown_warning: None,
+                private_dns_warning: None,
+            })
+        })
+    }
+
+    fn reconcile_on_roam_or_netmap<'a>(
+        &'a self,
+        tun_ifname: &'a str,
+        overlay_cidr: OverlayCidr,
+        _dns_server_ip: Option<OverlayIp>,
+        _domain_suffix: Option<&'a str>,
+    ) -> ClientFuture<'a, AppResult<Option<String>>> {
+        Box::pin(async move {
+            let conflict = check_overlay_conflict_with_probe(
+                self.adapters.network_probe().as_ref(),
+                overlay_cidr,
+            );
+            let currently_installed = self
+                .route_installed_flag
+                .get()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst));
+            match conflict {
+                Some(c) => {
+                    if currently_installed {
+                        self.adapters
+                            .remove_overlay_route_only(tun_ifname, overlay_cidr)?;
+                        if let Some(flag) = self.route_installed_flag.get() {
+                            flag.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    Ok(Some(c.format_warning()))
+                }
+                None => {
+                    if !currently_installed {
+                        let mut ledger = self.ledger.lock().await;
+                        self.adapters.install_overlay_route_only(
+                            tun_ifname,
+                            overlay_cidr,
+                            &mut ledger,
+                        )?;
+                        if let Some(flag) = self.route_installed_flag.get() {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    fn deactivate_and_cleanup<'a>(&'a self) -> ClientFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            let res = {
+                let mut ledger = self.ledger.lock().await;
+                ledger.cleanup_all(self.adapters.cleanup_ops())
+            };
+            clear_override_hosts_best_effort(self.paths.hosts_path_override.as_ref());
+            res
+        })
+    }
+
+    fn discover_local_interface_endpoints(
+        &self,
+        udp_port: u16,
+    ) -> Vec<DiscoveredInterfaceEndpoint> {
+        discover_desktop_local_interface_endpoints(udp_port)
+    }
+
+    fn collect_route_diagnostics(&self) -> String {
+        collect_os_route_table()
+    }
+
+    fn inbound_filter_spec(&self) -> Option<String> {
+        load_inbound_filter_spec(self.paths.bootstrap_path.parent())
+    }
+
+    fn reconcile_firewall_on_roam(
+        &self,
+        tun_ifname: &str,
+        overlay_cidr: OverlayCidr,
+    ) -> AppResult<()> {
+        self.adapters
+            .reconcile_firewall_on_roam(tun_ifname, overlay_cidr)
+    }
+
+    fn enforce_startup_security(&self) -> AppResult<()> {
+        verify_startup_path_security(&self.paths, self.adapters.as_ref())
+    }
+}
+
+/// Top-level desktop daemon orchestrator wrapping [`ClientSessionSupervisor`], `ResourceLedger`
+/// crash recovery, and dual Read-Only / Admin IPC listeners (`US-055`, `REL-08`, `US-099`).
+pub(crate) struct DaemonSupervisor {
+    client: ClientSessionSupervisor,
+    paths: DaemonRuntimePaths,
+    adapters: Arc<dyn PlatformAdapters>,
+    desktop_hooks: Arc<DesktopPlatformHooks>,
+    #[cfg(test)]
+    ledger: Arc<Mutex<ResourceLedger>>,
+    #[cfg(test)]
     runtime: Arc<DaemonRuntimeState>,
+    #[cfg(test)]
     roaming_control_tx: mpsc::Sender<NetworkChangeEvent>,
-    roaming_control_rx: Arc<Mutex<mpsc::Receiver<NetworkChangeEvent>>>,
-    termination_tx: mpsc::Sender<(TerminationReason, String)>,
-    termination_rx: mpsc::Receiver<(TerminationReason, String)>,
-    cmd_tx: mpsc::Sender<SupervisorCommand>,
-    cmd_rx: mpsc::Receiver<SupervisorCommand>,
+    #[cfg(test)]
     active_wake_tx: Arc<StdMutex<Option<mpsc::Sender<ControlWakeSignal>>>>,
+    #[cfg(test)]
     overlay_route_installed: Arc<AtomicBool>,
-    active_session: Option<ActiveTunnelSession>,
 }
 
 impl std::fmt::Debug for DaemonSupervisor {
@@ -654,7 +884,7 @@ impl DaemonSupervisor {
         )
     }
 
-    /// Initializes the daemon supervisor and IMMEDIATELY executes startup crash recovery
+    /// Initializes the desktop supervisor and IMMEDIATELY executes startup crash recovery
     /// against `ledger.json` BEFORE allocating any TUN or route resources (`US-055 AC5`).
     pub(crate) fn boot(
         paths: DaemonRuntimePaths,
@@ -678,79 +908,64 @@ impl DaemonSupervisor {
                 "stale overlay resources cleaned strictly from ledger"
             );
         }
+        let ledger = Arc::new(Mutex::new(ledger));
 
-        let bootstrap_store = BootstrapStore::new(paths.bootstrap_path.clone());
-        let bootstrap = bootstrap_store.load_or_default()?;
-
-        let netmap_cache = NetmapCacheStore::new(paths.netmap_cache_path.clone());
-        let cached_file: Option<NetmapCacheFile> = match netmap_cache.load_verified() {
-            Ok(Some(cf)) if !cf.is_within_offline_grace(clock.now_unix_ms()) => {
-                warn!(
-                    component = "meshd.supervisor",
-                    event = "netmap_cache_expired",
-                    cached_at_ms = cf.cached_at_ms,
-                    offline_grace_hours = cf.offline_grace_hours,
-                    "ignored cached netmap-cache.json beyond offline grace window"
-                );
-                None
-            }
-            Ok(opt) => opt,
-            Err(err) => {
-                warn!(
-                    component = "meshd.supervisor",
-                    event = "netmap_cache_rejected",
-                    error = %err,
-                    "ignored tampered or corrupt netmap-cache.json (fail-closed)"
-                );
-                None
-            }
-        };
-
-        let runtime = Arc::new(DaemonRuntimeState::new_with_now(
-            bootstrap,
-            bootstrap_store,
-            netmap_cache,
-            cached_file.as_ref(),
-            paths.tun_mtu,
-            clock.now_unix_ms(),
+        let state_dir = paths
+            .bootstrap_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_state_dir);
+        let state_store = Arc::new(FileClientStateStore::new(
+            state_dir,
+            paths.keystore_path.clone(),
+            paths.bootstrap_path.clone(),
+            paths.netmap_cache_path.clone(),
         ));
-        let initial_probe = adapters.network_probe();
-        let probed_primary = initial_probe.query_primary_interface().ok();
-        if let Ok(mut g) = runtime.inner.try_write() {
-            g.underlay_if_index = paths
-                .underlay_if_index
-                .or_else(|| {
-                    probed_primary
-                        .as_ref()
-                        .map(|p| p.if_index)
-                        .filter(|&id| id != 0)
-                })
-                .filter(|&id| id != 0);
-            g.linux_fwmark = paths.linux_fwmark;
-            if let Some(ref primary) = probed_primary {
-                g.bound_physical_interface = Some(primary.name.clone());
-            }
-        }
-        let (roaming_control_tx, roaming_control_rx) =
-            mpsc::channel(NETWORK_CHANGE_CHANNEL_CAPACITY);
-        let (termination_tx, termination_rx) = mpsc::channel(4);
-        let (cmd_tx, cmd_rx) = mpsc::channel(SUPERVISOR_CMD_CAPACITY);
+        let desktop_hooks = Arc::new(DesktopPlatformHooks::new(
+            paths.clone(),
+            Arc::clone(&adapters),
+            Arc::clone(&ledger),
+        ));
+        let options = ClientSessionOptions::new(paths.to_client_runtime_config())
+            .with_underlay(paths.underlay_if_index, paths.linux_fwmark)
+            .with_default_tun_ifname(default_tun_interface_hint())
+            .with_bugreport(
+                paths.bugreport_dir.clone(),
+                DAEMON_BINARY_NAME,
+                candidate_log_dirs(paths.bootstrap_path.parent()),
+                None,
+            );
+        let client = ClientSessionSupervisor::boot(
+            options,
+            clock,
+            Arc::clone(&desktop_hooks) as Arc<dyn ClientPlatformHooks>,
+            state_store,
+        )?;
+        let overlay_route_installed = client.overlay_route_flag();
+        desktop_hooks.bind_route_flag(Arc::clone(&overlay_route_installed));
+        #[cfg(test)]
+        let runtime = client.runtime_state();
+        #[cfg(test)]
+        let roaming_control_tx = client.roaming_control_sender();
+        #[cfg(test)]
+        let active_wake_tx = client.active_wake_slot();
 
         Ok(Self {
+            client,
             paths,
-            clock,
             adapters,
-            ledger: Arc::new(Mutex::new(ledger)),
+            desktop_hooks,
+            #[cfg(test)]
+            ledger,
+            #[cfg(test)]
             runtime,
+            #[cfg(test)]
             roaming_control_tx,
-            roaming_control_rx: Arc::new(Mutex::new(roaming_control_rx)),
-            termination_tx,
-            termination_rx,
-            cmd_tx,
-            cmd_rx,
-            active_wake_tx: Arc::new(StdMutex::new(None)),
-            overlay_route_installed: Arc::new(AtomicBool::new(false)),
-            active_session: None,
+            #[cfg(test)]
+            active_wake_tx,
+            #[cfg(test)]
+            overlay_route_installed,
         })
     }
 
@@ -758,22 +973,74 @@ impl DaemonSupervisor {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn runtime_state(&self) -> Arc<DaemonRuntimeState> {
-        Arc::clone(&self.runtime)
+        self.client.runtime_state()
     }
 
-    /// Runs IPC listeners, roaming loop, optional auto-resume tunnel, and command handling
-    /// until `root_shutdown` fires, guaranteeing teardown completes in `<= 5 s` (`US-055`).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn has_active_session(&self) -> bool {
+        self.client.has_active_session()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn handle_verified_identity_termination(
+        &mut self,
+        reason: TerminationReason,
+        message: &str,
+    ) {
+        self.client
+            .handle_verified_identity_termination(reason, message)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn auto_resume_enrolled_session_best_effort(
+        &mut self,
+        root_shutdown: &CancellationToken,
+    ) {
+        self.client
+            .auto_resume_enrolled_session_best_effort(root_shutdown)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_set(
+        &mut self,
+        req: AgentSetRequest,
+    ) -> AppResult<AgentActionResponse> {
+        self.client.execute_set(req).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_enrolled_session(
+        &mut self,
+        root_shutdown: &CancellationToken,
+        initial_reg: Option<RegisterNodeResponse>,
+    ) -> AppResult<()> {
+        self.client
+            .start_enrolled_session(root_shutdown, initial_reg)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn stop_active_session_and_cleanup(&mut self) -> AppResult<()> {
+        self.client.stop_active_session_and_cleanup().await
+    }
+
+    /// Runs desktop IPC listeners plus the shared client supervisor lifecycle until
+    /// `root_shutdown` fires, guaranteeing teardown completes in `<= 5 s` (`US-055`).
     pub(crate) async fn run(
-        mut self,
+        self,
         monitor: Arc<dyn NetMonitor>,
         root_shutdown: CancellationToken,
     ) -> AppResult<()> {
+        self.desktop_hooks.bind_net_monitor(Arc::clone(&monitor));
         let daemon_tracker = TaskTracker::new();
 
         if self.adapters.bind_ipc_listeners() {
             let router_state = IpcRouterState {
-                runtime: Arc::clone(&self.runtime),
-                cmd_tx: self.cmd_tx.clone(),
+                runtime: self.client.runtime_state(),
+                cmd_tx: self.client.command_sender(),
             };
             IpcService::start_listeners(
                 &self.paths.ro_ipc_endpoint,
@@ -785,1191 +1052,45 @@ impl DaemonSupervisor {
             .await?;
         }
 
-        let (roam_rebind_handle, mut roam_rebind_rx) = RebindHandle::channel();
-        let (rebind_feedback_tx, rebind_feedback_rx) = mpsc::channel::<AppResult<()>>(8);
-        let forward_ctx = RebindForwardContext {
-            runtime: Arc::clone(&self.runtime),
-            adapters: Arc::clone(&self.adapters),
-            ledger: Arc::clone(&self.ledger),
-            active_wake_tx: Arc::clone(&self.active_wake_tx),
-            overlay_route_installed: Arc::clone(&self.overlay_route_installed),
-            agent_version: self.paths.agent_version.clone(),
-            rebind_feedback_tx: Some(rebind_feedback_tx),
-            shutdown: root_shutdown.clone(),
-        };
-        daemon_tracker.spawn(async move {
-            forward_rebind_loop(forward_ctx, &mut roam_rebind_rx).await;
-        });
-
-        let roaming = RoamingLoop::new(
-            monitor,
-            Arc::clone(&self.clock),
-            roam_rebind_handle,
-            self.roaming_control_tx.clone(),
-        )
-        .with_probe(self.adapters.network_probe())
-        .with_runtime(Arc::clone(&self.runtime))
-        .with_rebind_feedback(rebind_feedback_rx);
-        daemon_tracker.spawn(roaming.run(root_shutdown.clone()));
-
-        self.auto_resume_enrolled_session_best_effort(&root_shutdown)
-            .await;
-
-        loop {
-            tokio::select! {
-                () = root_shutdown.cancelled() => break,
-                maybe_term = self.termination_rx.recv() => {
-                    if let Some((reason, message)) = maybe_term {
-                        self.handle_verified_identity_termination(reason, &message).await;
-                    }
-                }
-                maybe_cmd = self.cmd_rx.recv() => {
-                    match maybe_cmd {
-                        Some(cmd) => self.handle_supervisor_command(cmd, &root_shutdown).await,
-                        None => break,
-                    }
-                }
-            }
-        }
-
-        self.graceful_shutdown_within_5s(daemon_tracker).await
-    }
-
-    async fn handle_verified_identity_termination(
-        &mut self,
-        reason: TerminationReason,
-        message: &str,
-    ) {
-        let terminated_state = match reason {
-            TerminationReason::NodeRevoked => DaemonState::Revoked,
-            TerminationReason::NodeKeyExpired => DaemonState::ReauthRequired,
-        };
-        warn!(
-            component = "meshd.supervisor",
-            event = "supervisor_identity_terminated_teardown",
-            reason = ?reason,
-            message = %message,
-            "tearing down TUN, routes, hosts, and RelayClient after verified server termination"
-        );
-        {
-            let mut g = self.runtime.inner.write().await;
-            g.daemon_state = terminated_state;
-            g.last_error = Some(message.to_owned());
-        }
-        if let Err(err) = self.stop_active_session_and_cleanup().await {
-            warn!(
-                component = "meshd.supervisor",
-                event = "terminated_teardown_cleanup_warning",
-                error = %err,
-                "ledger cleanup reported warning while tearing down terminated session"
-            );
-        }
-        let mut g = self.runtime.inner.write().await;
-        g.daemon_state = terminated_state;
-        g.control_connected = false;
-        g.last_error = Some(message.to_owned());
-    }
-
-    async fn auto_resume_enrolled_session_best_effort(
-        &mut self,
-        root_shutdown: &CancellationToken,
-    ) {
-        let now_ms = self.clock.now_unix_ms();
-        let (has_enrollment, key_expires_at_ms) = {
-            let g = self.runtime.inner.read().await;
-            (
-                g.bootstrap.server_endpoint.is_some() && g.bootstrap.node_id.is_some(),
-                g.key_expires_at_ms.or(g.bootstrap.key_expires_at_ms),
-            )
-        };
-        if !has_enrollment {
-            return;
-        }
-        if !NetmapCacheFile::is_key_usable_offline(
-            key_expires_at_ms,
-            now_ms,
-            crate::netmap_cache::DEFAULT_KEY_EXPIRY_GRACE_HOURS,
-        ) {
-            warn!(
-                component = "meshd.supervisor",
-                event = "auto_resume_rejected_key_expired_offline",
-                key_expires_at_ms = ?key_expires_at_ms,
-                now_ms,
-                "skipping auto-resume: local node key offline 24h grace expired; reauthentication required"
-            );
-            let mut g = self.runtime.inner.write().await;
-            g.daemon_state = DaemonState::ReauthRequired;
-            g.control_connected = false;
-            g.latest_netmap = None;
-            g.last_error = Some(
-                "local node key offline 24h grace expired; run `mesh up` to reauthenticate"
-                    .to_owned(),
-            );
-            return;
-        }
-        if let Err(err) = self.start_enrolled_session(root_shutdown, None).await {
-            warn!(
-                component = "meshd.supervisor",
-                event = "auto_resume_failed",
-                error = %err,
-                "failed auto-resuming persisted overlay session on daemon startup"
-            );
-            let mut g = self.runtime.inner.write().await;
-            g.last_error = Some(err.to_string());
-        }
-    }
-
-    async fn handle_supervisor_command(
-        &mut self,
-        cmd: SupervisorCommand,
-        root_shutdown: &CancellationToken,
-    ) {
-        match cmd {
-            SupervisorCommand::Up { req, reply } => {
-                let res = self.execute_up(req, root_shutdown).await;
-                let _ignored = reply.send(res);
-            }
-            SupervisorCommand::Down { reply } => {
-                let res = self.execute_down().await;
-                let _ignored = reply.send(res);
-            }
-            SupervisorCommand::Cleanup { reply } => {
-                let res = self.execute_cleanup().await;
-                let _ignored = reply.send(res);
-            }
-            SupervisorCommand::Set { req, reply } => {
-                let res = self.execute_set(req).await;
-                let _ignored = reply.send(res);
-            }
-            SupervisorCommand::RotateKey { req, reply } => {
-                let res = self.execute_rotate_key(req, root_shutdown).await;
-                let _ignored = reply.send(res);
-            }
-            SupervisorCommand::Bugreport { reply } => {
-                let res = self.execute_bugreport().await;
-                let _ignored = reply.send(res);
-            }
-        }
-    }
-
-    async fn execute_up(
-        &mut self,
-        req: AgentUpRequest,
-        root_shutdown: &CancellationToken,
-    ) -> AppResult<AgentActionResponse> {
-        let endpoint = apply_port_override(&req.server_endpoint, req.port_override)?;
-        let tls_auth_mode = if req.server_pin.is_some() {
-            TlsAuthMode::SpkiPin
-        } else {
-            TlsAuthMode::SystemCa
-        };
-        validate_tls_trust_policy(&endpoint, tls_auth_mode, req.server_pin)?;
-
-        self.stop_active_session_and_cleanup().await?;
-
-        let now_ms = self.clock.now_unix_ms();
-        let key_store = KeysFileStore::new(self.paths.keystore_path.clone());
-        let mut identity = key_store.load_or_create(now_ms)?;
-
-        let underlay = {
-            let g = self.runtime.inner.read().await;
-            (g.underlay_if_index, g.linux_fwmark)
-        };
-        let mut bootstrap = { self.runtime.inner.read().await.bootstrap.clone() };
-        bootstrap.server_endpoint = Some(endpoint);
-        bootstrap.tls_auth_mode = tls_auth_mode;
-        match req.server_pin {
-            Some(pin) => {
-                bootstrap.active_pin = Some(pin);
-                bootstrap.next_pin = None;
-            }
-            None => {
-                bootstrap.active_pin = None;
-                bootstrap.next_pin = None;
-            }
-        }
-
-        let desired_name = match &req.node_name {
-            Some(n) => n.clone(),
-            None => match bootstrap.node_name.clone() {
-                Some(existing) => existing,
-                None => detect_default_node_name()?,
-            },
-        };
-
-        let mut initial_reg: Option<RegisterNodeResponse> = None;
-        if req.preauth_key.is_some() || bootstrap.node_id.is_none() {
-            let preauth_key = req.preauth_key.clone().ok_or_else(|| {
-                AppError::invalid_argument(
-                    "first enrollment requires --authkey-file or --authkey-stdin",
-                )
-            })?;
-            let reg_req = RegisterNodeRequest {
-                preauth_key,
-                node_pubkey: identity.node_keypair.public_key(),
-                disco_pubkey: identity.disco_keypair.public_key(),
-                node_name: desired_name,
-                previous_node_pubkey: None,
-            };
-            let reg = ControlLoop::register_node(
-                &bootstrap,
-                &identity.node_keypair,
-                &reg_req,
-                &self.paths.agent_version,
-                underlay,
-            )
-            .await?;
-            identity = key_store.set_node_id(reg.node_id)?;
-            apply_registration_to_bootstrap(&mut bootstrap, &reg);
-            initial_reg = Some(reg);
-        }
-
-        persist_bootstrap_and_runtime(&self.runtime, &bootstrap).await?;
-        self.start_enrolled_session_with_identity(root_shutdown, identity, initial_reg)
-            .await?;
-
-        let state = { self.runtime.inner.read().await.daemon_state };
-        Ok(AgentActionResponse {
-            state,
-            message: "tunnel up".to_owned(),
-        })
-    }
-
-    async fn execute_down(&mut self) -> AppResult<AgentActionResponse> {
-        self.stop_active_session_and_cleanup().await?;
-        Ok(AgentActionResponse {
-            state: DaemonState::Stopped,
-            message: "tunnel stopped and ledger resources cleaned".to_owned(),
-        })
-    }
-
-    async fn execute_cleanup(&mut self) -> AppResult<AgentActionResponse> {
-        self.stop_active_session_and_cleanup().await?;
-        Ok(AgentActionResponse {
-            state: DaemonState::Stopped,
-            message: "ledger cleanup completed idempotently".to_owned(),
-        })
-    }
-
-    async fn execute_set(&mut self, req: AgentSetRequest) -> AppResult<AgentActionResponse> {
-        let tls_auth_mode = if req.server_pin.is_some() {
-            TlsAuthMode::SpkiPin
-        } else {
-            TlsAuthMode::SystemCa
-        };
-        validate_tls_trust_policy(&req.server_endpoint, tls_auth_mode, req.server_pin)?;
-
-        let (updated_bootstrap, relay_update) = {
-            let mut g = self.runtime.inner.write().await;
-            let prev_server_ep = g.bootstrap.server_endpoint.clone();
-            g.bootstrap.server_endpoint = Some(req.server_endpoint.clone());
-            g.bootstrap.tls_auth_mode = tls_auth_mode;
-            if let Some(pin) = req.server_pin {
-                g.bootstrap.active_pin = Some(pin);
-                g.bootstrap.next_pin = None;
-            } else {
-                g.bootstrap.active_pin = None;
-                g.bootstrap.next_pin = None;
-            }
-            g.migration_pending_endpoint = None;
-            g.bootstrap_store.save_atomic(&g.bootstrap)?;
-
-            let relay_target = match g.latest_netmap.as_ref() {
-                Some(nm)
-                    if Some(nm.relay_map.relay_tcp_endpoint.as_str())
-                        != prev_server_ep.as_deref() =>
-                {
-                    nm.relay_map.relay_tcp_endpoint.clone()
-                }
-                _ => req.server_endpoint.clone(),
-            };
-            let relay_update = g.relay_handle.as_ref().and_then(|rh| {
-                build_relay_client_config_for_runtime(
-                    &g.bootstrap,
-                    relay_target,
-                    (g.underlay_if_index, g.linux_fwmark),
-                    self.paths.agent_version.clone(),
-                )
-                .ok()
-                .map(|cfg| (rh.clone(), cfg))
-            });
-            (g.bootstrap.clone(), relay_update)
-        };
-        if let Some((relay_handle, relay_cfg)) = relay_update {
-            relay_handle.update_config(relay_cfg);
-        }
-        if let Some(ref session) = self.active_session
-            && let Err(err) = session.wake_tx.try_send(ControlWakeSignal::ConfigUpdated)
-        {
-            debug!(
-                component = "meshd.supervisor",
-                event = "control_wake_try_send_skipped",
-                error = %err,
-                "control wake signal skipped after bootstrap update"
-            );
-        }
-        let state = { self.runtime.inner.read().await.daemon_state };
-        Ok(AgentActionResponse {
-            state,
-            message: format!(
-                "updated control endpoint to {}",
-                updated_bootstrap.server_endpoint.as_deref().unwrap_or("")
-            ),
-        })
-    }
-
-    async fn execute_rotate_key(
-        &mut self,
-        req: AgentRotateKeyRequest,
-        root_shutdown: &CancellationToken,
-    ) -> AppResult<AgentActionResponse> {
-        let now_ms = self.clock.now_unix_ms();
-        let key_store = KeysFileStore::new(self.paths.keystore_path.clone());
-        let old_identity = key_store.load_existing()?;
-        let new_node_kp = NodeKeypair::generate();
-        let new_disco_kp = DiscoKeypair::generate();
-
-        let (bootstrap, underlay) = {
-            let g = self.runtime.inner.read().await;
-            (g.bootstrap.clone(), (g.underlay_if_index, g.linux_fwmark))
-        };
-        let node_name = match bootstrap.node_name.clone() {
-            Some(existing) => existing,
-            None => detect_default_node_name()?,
-        };
-        let reg_req = RegisterNodeRequest {
-            preauth_key: req.preauth_key.clone(),
-            node_pubkey: new_node_kp.public_key(),
-            disco_pubkey: new_disco_kp.public_key(),
-            node_name,
-            previous_node_pubkey: Some(old_identity.node_keypair.public_key()),
-        };
-        let reg = ControlLoop::register_node(
-            &bootstrap,
-            &new_node_kp,
-            &reg_req,
-            &self.paths.agent_version,
-            underlay,
-        )
-        .await?;
-
-        let new_identity = StoredNodeIdentity {
-            node_id: Some(reg.node_id),
-            node_keypair: new_node_kp,
-            disco_keypair: new_disco_kp,
-            created_at_ms: now_ms,
-        };
-        key_store.save_rotated(&new_identity)?;
-
-        let mut updated_bootstrap = bootstrap;
-        apply_registration_to_bootstrap(&mut updated_bootstrap, &reg);
-        persist_bootstrap_and_runtime(&self.runtime, &updated_bootstrap).await?;
-
-        self.stop_active_session_and_cleanup().await?;
-        self.start_enrolled_session_with_identity(root_shutdown, new_identity, Some(reg))
-            .await?;
-
-        let state = { self.runtime.inner.read().await.daemon_state };
-        Ok(AgentActionResponse {
-            state,
-            message: "node WireGuard identity key rotated cleanly".to_owned(),
-        })
-    }
-
-    /// Generates a redacted non-secret diagnostic snapshot file (`IMP-W12-01`).
-    ///
-    /// Sprint 1 writes a redacted `.json` diagnostics file for `POST /v1/agent/bugreport`; full
-    /// `.tar.gz`/`.zip` bundling of logs and OS route tables is scheduled for Sprint 2 (`US-041`).
-    async fn execute_bugreport(&self) -> AppResult<BugreportResponse> {
-        let status = self.runtime.build_status_response().await;
-        let payload = serde_json::to_vec_pretty(&status).map_err(|err| {
-            AppError::internal(format!("failed serializing bugreport payload: {err}"))
-        })?;
-        let text = String::from_utf8_lossy(&payload);
-        let (scrubbed, scrubbed_items) = scrub_diagnostic_text(&text);
-
-        let ts = self.clock.now_unix_ms();
-        let file_name = format!("mesh-bugreport-{ts}.json");
-        let target = self.paths.bugreport_dir.join(file_name);
-        write_private_file_atomic(&target, scrubbed.as_bytes())?;
-
-        Ok(BugreportResponse {
-            bundle_path: target.display().to_string(),
-            size_bytes: u64::try_from(scrubbed.len()).unwrap_or(0),
-            scrubbed_items,
-        })
-    }
-
-    async fn start_enrolled_session(
-        &mut self,
-        root_shutdown: &CancellationToken,
-        initial_reg: Option<RegisterNodeResponse>,
-    ) -> AppResult<()> {
-        let key_store = KeysFileStore::new(self.paths.keystore_path.clone());
-        let identity = key_store.load_existing()?;
-        self.start_enrolled_session_with_identity(root_shutdown, identity, initial_reg)
+        self.client
+            .run_with_tracker(monitor, daemon_tracker, root_shutdown)
             .await
     }
-
-    async fn start_enrolled_session_with_identity(
-        &mut self,
-        root_shutdown: &CancellationToken,
-        identity: StoredNodeIdentity,
-        initial_reg: Option<RegisterNodeResponse>,
-    ) -> AppResult<()> {
-        let now_ms = self.clock.now_unix_ms();
-        let bootstrap = { self.runtime.inner.read().await.bootstrap.clone() };
-        let endpoint = bootstrap.server_endpoint.clone().ok_or_else(|| {
-            AppError::invalid_argument("cannot start session without server_endpoint")
-        })?;
-        let node_id = identity
-            .node_id
-            .or(bootstrap.node_id)
-            .ok_or_else(|| AppError::invalid_argument("node_id missing prior to tunnel start"))?;
-
-        let cached = self.runtime.inner.read().await.latest_netmap.clone();
-        let initial_netmap = initial_reg.as_ref().map(|r| r.netmap.clone()).or(cached);
-        let overlay_cidr = match initial_netmap.as_ref() {
-            Some(n) => n.overlay_cidr,
-            None => OverlayCidr::parse(DEFAULT_OVERLAY_CIDR)?,
-        };
-        let overlay_ip = initial_reg
-            .as_ref()
-            .map(|r| r.overlay_ip)
-            .or(bootstrap.overlay_ip)
-            .ok_or_else(|| {
-                AppError::invalid_argument("overlay_ip missing; run `mesh up` with auth key")
-            })?;
-
-        let preferred_udp_port = {
-            let p = self.runtime.inner.read().await.local_udp_port;
-            Port::from_u16(p).ok()
-        };
-        let desired_ifname = default_tun_interface_hint();
-        let tun_cfg = TunConfig::new(desired_ifname, overlay_ip, overlay_cidr, self.paths.tun_mtu)?;
-
-        let setup_outcome = {
-            let mut ledger = self.ledger.lock().await;
-            self.adapters
-                .setup_tun_and_route(tun_cfg, overlay_cidr, &mut ledger, now_ms)?
-        };
-        let tun_dev = setup_outcome.tun;
-        let startup_conflict_warning = setup_outcome.conflict_warning;
-        self.overlay_route_installed
-            .store(setup_outcome.route_installed, Ordering::SeqCst);
-        let actual_ifname = tun_dev.interface_name().to_owned();
-
-        let probed_primary = self.adapters.network_probe().query_primary_interface().ok();
-        let (underlay_if_index, linux_fwmark) = {
-            let mut g = self.runtime.inner.write().await;
-            if g.underlay_if_index.is_none()
-                && let Some(ref primary) = probed_primary
-            {
-                if primary.if_index != 0 {
-                    g.underlay_if_index = Some(primary.if_index);
-                }
-                if g.bound_physical_interface.is_none() {
-                    g.bound_physical_interface = Some(primary.name.clone());
-                }
-            }
-            (
-                g.underlay_if_index
-                    .or(self.paths.underlay_if_index)
-                    .filter(|&id| id != 0),
-                g.linux_fwmark.or(self.paths.linux_fwmark),
-            )
-        };
-        let socket_cfg = MagicSocketConfig::default()
-            .with_mtu(self.paths.tun_mtu)?
-            .with_underlay(underlay_if_index, linux_fwmark);
-        let socket_cfg = match preferred_udp_port {
-            Some(port) => socket_cfg.with_preferred_port(port),
-            None => socket_cfg,
-        };
-
-        let relay_ep = initial_netmap
-            .as_ref()
-            .map(|n| n.relay_map.relay_tcp_endpoint.clone())
-            .unwrap_or_else(|| endpoint.clone());
-        let (relay_host, _) = split_host_port(&endpoint)?;
-        let relay_cfg = RelayClientConfig {
-            endpoint: relay_ep,
-            server_name_override: Some(relay_host),
-            pin_set: bootstrap.pin_set(),
-            underlay_if_index,
-            linux_fwmark,
-            require_challenge_auth: true,
-            agent_version: self.paths.agent_version.clone(),
-        };
-        let relay_client = RelayClient::new(
-            relay_cfg,
-            identity.node_keypair.clone_keypair(),
-            identity.disco_keypair.clone_keypair(),
-        );
-        let relay_handle = relay_client.handle();
-        let control_tcp_endpoint = resolve_control_tcp_endpoint(&endpoint).await;
-
-        let dp_cfg = DatapathConfig {
-            local_node_id: node_id,
-            local_overlay_ip: overlay_ip,
-            overlay_cidr,
-            node_keypair: identity.node_keypair.clone_keypair(),
-            disco_keypair: identity.disco_keypair.clone_keypair(),
-            socket_config: socket_cfg,
-            stun_config: StunClientConfig::default(),
-            disco_config: DiscoConfig::default(),
-            control_tcp_endpoint,
-            wg_timer_interval: Duration::from_millis(250),
-            disco_tick_interval: Duration::from_millis(250),
-        };
-        let engine = DatapathEngine::bind(
-            dp_cfg,
-            tun_dev,
-            Arc::clone(&self.clock),
-            Some(relay_handle.clone()),
-        )
-        .await?;
-        let dp_handle = engine.handle();
-        let bound_udp_port = engine.local_udp_addr().map_or(0, |a| a.port());
-        let effective_key_expires_at_ms = initial_reg
-            .as_ref()
-            .and_then(|r| r.key_expires_at_ms)
-            .or(bootstrap.key_expires_at_ms)
-            .or_else(|| {
-                initial_netmap.as_ref().and_then(|snap| {
-                    snap.peers
-                        .iter()
-                        .find(|p| p.node_id == node_id)
-                        .and_then(|p| p.key_expires_at_ms)
-                })
-            });
-
-        if let Some(ref snap) = initial_netmap
-            && let Ok(port) = Port::from_u16(bound_udp_port.max(1))
-        {
-            let cache = { self.runtime.inner.read().await.netmap_cache.clone() };
-            if let Err(err) = cache.save_atomic(port, snap, now_ms, effective_key_expires_at_ms) {
-                warn!(
-                    component = "meshd.supervisor",
-                    event = "initial_netmap_cache_save_failed",
-                    error = %err,
-                    "failed persisting initial netmap-cache.json"
-                );
-            }
-        }
-
-        let initial_netmap_for_dp = initial_netmap.clone();
-        let apply_dp_handle = dp_handle.clone();
-        let (session_rebind_handle, session_rebind_rx) = RebindHandle::channel();
-        {
-            self.runtime.reset_ws_close();
-            let mut g = self.runtime.inner.write().await;
-            g.daemon_state = DaemonState::Connecting;
-            g.node_id = Some(node_id);
-            g.node_name = bootstrap.node_name.clone();
-            g.fqdn = initial_reg
-                .as_ref()
-                .map(|r| r.fqdn.clone())
-                .or(bootstrap.fqdn.clone());
-            g.overlay_ip = Some(overlay_ip);
-            g.overlay_cidr = Some(overlay_cidr);
-            g.key_expires_at_ms = effective_key_expires_at_ms;
-            g.tun_interface_name = Some(actual_ifname);
-            g.local_udp_port = bound_udp_port;
-            g.latest_netmap = initial_netmap;
-            g.datapath_handle = Some(dp_handle);
-            g.rebind_handle = Some(session_rebind_handle);
-            g.relay_handle = Some(relay_handle);
-            g.overlay_conflict_warning = startup_conflict_warning;
-            g.last_error = None;
-        }
-
-        let session_cancel = root_shutdown.child_token();
-        let session_tracker = TaskTracker::new();
-        let (relay_events_tx, relay_events_rx) = mpsc::channel::<RelayEvent>(RELAY_EVENT_CAPACITY);
-        let (wake_tx, wake_rx) = mpsc::channel::<ControlWakeSignal>(8);
-        if let Ok(mut guard) = self.active_wake_tx.lock() {
-            *guard = Some(wake_tx.clone());
-        }
-
-        let roaming_rx = Arc::clone(&self.roaming_control_rx);
-
-        session_tracker.spawn(relay_client.run(
-            Arc::clone(&self.clock),
-            relay_events_tx,
-            session_cancel.clone(),
-        ));
-        let dp_cancel = session_cancel.clone();
-        session_tracker.spawn(async move {
-            if let Err(err) = engine
-                .run(relay_events_rx, session_rebind_rx, dp_cancel)
-                .await
-            {
-                warn!(
-                    component = "meshd.supervisor",
-                    event = "datapath_engine_exited_error",
-                    error = %err,
-                    "DatapathEngine exited with error"
-                );
-            }
-        });
-
-        // Apply initial/cached netmap only AFTER `relay_client.run` and `engine.run` are spawned
-        // so `ApplyNetmap`'s command reply is serviced immediately without startup deadlock (`BLK-W21-01`).
-        if let Some(snap) = initial_netmap_for_dp
-            && let Err(err) = apply_dp_handle.apply_netmap(snap).await
-        {
-            warn!(
-                component = "meshd.supervisor",
-                event = "initial_netmap_apply_failed",
-                error = %err,
-                "failed applying initial netmap snapshot to datapath"
-            );
-        }
-        session_tracker.spawn(ControlLoop::run(ControlLoopContext {
-            state: Arc::clone(&self.runtime),
-            clock: Arc::clone(&self.clock),
-            node_keypair: identity.node_keypair,
-            disco_pubkey: identity.disco_keypair.public_key(),
-            agent_version: self.paths.agent_version.clone(),
-            hosts_override: self.paths.hosts_path_override.clone(),
-            ledger: Arc::clone(&self.ledger),
-            roaming_rx,
-            wake_rx,
-            termination_tx: Some(self.termination_tx.clone()),
-            shutdown: session_cancel.clone(),
-        }));
-
-        self.active_session = Some(ActiveTunnelSession {
-            cancel: session_cancel,
-            tracker: session_tracker,
-            wake_tx,
-        });
-        Ok(())
-    }
-
-    /// Stops any active session cleanly (`WS Close <= 1 s`, `cleanup_all <= 4 s`) idempotently.
-    pub(crate) async fn stop_active_session_and_cleanup(&mut self) -> AppResult<()> {
-        if let Ok(mut guard) = self.active_wake_tx.lock() {
-            *guard = None;
-        }
-        self.overlay_route_installed.store(false, Ordering::SeqCst);
-        self.runtime.notify_ws_close();
-        if let Some(session) = self.active_session.take() {
-            if let Err(err) = session
-                .wake_tx
-                .try_send(ControlWakeSignal::GracefulShutdown)
-            {
-                debug!(
-                    component = "meshd.supervisor",
-                    event = "shutdown_wake_try_send_skipped",
-                    error = %err,
-                    "control wake channel already closed or full during shutdown"
-                );
-            }
-            tokio::time::sleep(WS_CLOSE_PHASE_WAIT.min(Duration::from_millis(50))).await;
-            session.cancel.cancel();
-            session.tracker.close();
-            if tokio::time::timeout(SESSION_JOIN_TIMEOUT, session.tracker.wait())
-                .await
-                .is_err()
-            {
-                warn!(
-                    component = "meshd.supervisor",
-                    event = "session_tasks_wait_timeout",
-                    "timed out waiting for tunnel session tasks during shutdown"
-                );
-            }
-        }
-
-        let cleanup_res = tokio::time::timeout(LEDGER_CLEANUP_TIMEOUT, async {
-            let mut ledger = self.ledger.lock().await;
-            ledger.cleanup_all(self.adapters.cleanup_ops())
-        })
-        .await;
-
-        clear_override_hosts_best_effort(self.paths.hosts_path_override.as_ref());
-
-        {
-            let mut g = self.runtime.inner.write().await;
-            if g.daemon_state != DaemonState::Revoked
-                && g.daemon_state != DaemonState::ReauthRequired
-            {
-                g.daemon_state = DaemonState::Stopped;
-            }
-            g.control_connected = false;
-            g.datapath_handle = None;
-            g.rebind_handle = None;
-            g.relay_handle = None;
-            g.tun_interface_name = None;
-            g.overlay_conflict_warning = None;
-        }
-
-        match cleanup_res {
-            Ok(inner) => inner,
-            Err(_) => Err(AppError::unavailable(
-                "timed out waiting for ResourceLedger cleanup",
-            )),
-        }
-    }
-
-    async fn graceful_shutdown_within_5s(&mut self, daemon_tracker: TaskTracker) -> AppResult<()> {
-        info!(
-            component = "meshd.supervisor",
-            event = "graceful_shutdown_started",
-            "starting bounded Graceful Shutdown (<= 5s)"
-        );
-        if let Err(err) = self.stop_active_session_and_cleanup().await {
-            warn!(
-                component = "meshd.supervisor",
-                event = "graceful_shutdown_cleanup_warning",
-                error = %err,
-                "ledger cleanup reported a non-fatal warning during shutdown"
-            );
-        }
-
-        daemon_tracker.close();
-        let budget = Duration::from_millis(GRACEFUL_SHUTDOWN_BUDGET_MS);
-        if tokio::time::timeout(budget, daemon_tracker.wait())
-            .await
-            .is_err()
-        {
-            warn!(
-                component = "meshd.supervisor",
-                event = "graceful_shutdown_tracker_timeout",
-                "background task tracker wait exceeded 5s budget"
-            );
-        }
-        info!(
-            component = "meshd.supervisor",
-            event = "graceful_shutdown_completed",
-            "meshd supervisor shutdown completed cleanly"
-        );
-        Ok(())
-    }
 }
 
-async fn resolve_control_tcp_endpoint(endpoint: &str) -> Option<std::net::SocketAddr> {
-    if let Ok(addr) = endpoint.parse::<std::net::SocketAddr>() {
-        return Some(addr);
-    }
-    let (host, port) = split_host_port(endpoint).ok()?;
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::net::lookup_host((host.as_str(), port.get())),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .and_then(|mut addrs| addrs.next())
+#[cfg(test)]
+pub(crate) struct RebindForwardContext {
+    pub(crate) runtime: Arc<DaemonRuntimeState>,
+    pub(crate) adapters: Arc<dyn PlatformAdapters>,
+    pub(crate) ledger: Arc<Mutex<ResourceLedger>>,
+    pub(crate) active_wake_tx: Arc<StdMutex<Option<mpsc::Sender<ControlWakeSignal>>>>,
+    pub(crate) overlay_route_installed: Arc<AtomicBool>,
+    pub(crate) agent_version: String,
+    pub(crate) rebind_feedback_tx: Option<mpsc::Sender<AppResult<()>>>,
+    pub(crate) shutdown: CancellationToken,
 }
 
-struct RebindForwardContext {
-    runtime: Arc<DaemonRuntimeState>,
-    adapters: Arc<dyn PlatformAdapters>,
-    ledger: Arc<Mutex<ResourceLedger>>,
-    active_wake_tx: Arc<StdMutex<Option<mpsc::Sender<ControlWakeSignal>>>>,
-    overlay_route_installed: Arc<AtomicBool>,
-    agent_version: String,
-    rebind_feedback_tx: Option<mpsc::Sender<AppResult<()>>>,
-    shutdown: CancellationToken,
-}
-
-async fn forward_rebind_loop(ctx: RebindForwardContext, rx: &mut mpsc::Receiver<RebindCommand>) {
-    loop {
-        tokio::select! {
-            () = ctx.shutdown.cancelled() => break,
-            maybe_cmd = rx.recv() => {
-                let Some(cmd) = maybe_cmd else {
-                    break;
-                };
-                handle_rebind_command(&ctx, cmd).await;
-            }
-        }
-    }
-}
-
-async fn handle_rebind_command(ctx: &RebindForwardContext, cmd: RebindCommand) {
-    let RebindCommand::RebindInterface {
-        ref interface_name,
-        if_index,
-        is_ipv6,
-    } = cmd
-    else {
-        let (rebind_handle, relay_handle) = {
-            let g = ctx.runtime.inner.read().await;
-            (g.rebind_handle.clone(), g.relay_handle.clone())
-        };
-        if matches!(cmd, RebindCommand::WakeRelay)
-            && let Some(relay) = relay_handle
-        {
-            relay.wake_reconnect();
-        }
-        if let Some(handle) = rebind_handle
-            && let Err(err) = handle.try_send(cmd)
-        {
-            debug!(
-                component = "meshd.supervisor",
-                event = "rebind_forward_skipped",
-                error = %err,
-                "failed forwarding datapath rebind command"
-            );
-        }
-        return;
+#[cfg(test)]
+pub(crate) async fn handle_rebind_command(ctx: &RebindForwardContext, cmd: RebindCommand) {
+    let mut paths = DaemonRuntimePaths::for_temp_dir(&std::env::temp_dir(), "rebind-test");
+    paths.hosts_path_override = None;
+    let hooks = Arc::new(DesktopPlatformHooks::new(
+        paths,
+        Arc::clone(&ctx.adapters),
+        Arc::clone(&ctx.ledger),
+    ));
+    hooks.bind_route_flag(Arc::clone(&ctx.overlay_route_installed));
+    let client_ctx = mesh_client::RebindForwardContext {
+        runtime: Arc::clone(&ctx.runtime),
+        platform_hooks: hooks,
+        active_wake_tx: Arc::clone(&ctx.active_wake_tx),
+        overlay_route_installed: Arc::clone(&ctx.overlay_route_installed),
+        agent_version: ctx.agent_version.clone(),
+        rebind_feedback_tx: ctx.rebind_feedback_tx.clone(),
+        shutdown: ctx.shutdown.clone(),
     };
-
-    let effective_if_index = if_index.filter(|&id| id != 0);
-    let (
-        bootstrap,
-        overlay_cidr,
-        tun_ifname,
-        underlay,
-        rebind_handle,
-        relay_handle,
-        dp_handle,
-        peer_ids,
-        relay_endpoint,
-    ) = {
-        let mut g = ctx.runtime.inner.write().await;
-        g.bound_physical_interface = Some(interface_name.clone());
-        if let Some(idx) = effective_if_index {
-            g.underlay_if_index = Some(idx);
-        }
-        if !matches!(
-            g.daemon_state,
-            DaemonState::Stopped | DaemonState::Revoked | DaemonState::ReauthRequired
-        ) {
-            g.daemon_state = DaemonState::Connecting;
-            g.control_connected = false;
-            g.last_error = Some("rebinding network interface".to_owned());
-        }
-        let relay_ep = g
-            .latest_netmap
-            .as_ref()
-            .map(|n| n.relay_map.relay_tcp_endpoint.clone())
-            .or_else(|| g.bootstrap.server_endpoint.clone());
-        let peers = g
-            .latest_netmap
-            .as_ref()
-            .map(|n| n.peers.iter().map(|p| p.node_id).collect::<Vec<_>>())
-            .unwrap_or_default();
-        (
-            g.bootstrap.clone(),
-            g.overlay_cidr,
-            g.tun_interface_name.clone(),
-            (g.underlay_if_index, g.linux_fwmark),
-            g.rebind_handle.clone(),
-            g.relay_handle.clone(),
-            g.datapath_handle.clone(),
-            peers,
-            relay_ep,
-        )
-    };
-
-    if let Some(ref dp) = dp_handle
-        && let Err(err) = dp.begin_rebind().await
-    {
-        debug!(
-            component = "meshd.supervisor",
-            event = "datapath_begin_rebind_skipped",
-            error = %err,
-            "failed marking datapath rebinding before route reconciliation"
-        );
-    }
-
-    if let (Some(cidr), Some(tun_if)) = (overlay_cidr, tun_ifname.as_deref()) {
-        reconcile_overlay_conflict_on_roam(ctx, cidr, tun_if).await;
-        if let Err(err) = ctx.adapters.reconcile_firewall_on_roam(tun_if, cidr) {
-            warn!(
-                component = "meshd.supervisor",
-                event = "firewall_roam_reconcile_warning",
-                interface = %tun_if,
-                error = %err,
-                "failed reconciling OS overlay firewall rule after roam"
-            );
-        }
-    }
-
-    let mut reprobe_ready = true;
-    let mut feedback: AppResult<()> = Ok(());
-
-    if let Some(ref dp) = dp_handle {
-        match dp
-            .rebind_underlay(interface_name.clone(), effective_if_index, is_ipv6)
-            .await
-        {
-            Ok(bound_port) => {
-                let mut g = ctx.runtime.inner.write().await;
-                g.local_udp_port = bound_port;
-            }
-            Err(err) => {
-                reprobe_ready = false;
-                warn!(
-                    component = "meshd.supervisor",
-                    event = "datapath_rebind_underlay_failed",
-                    interface = %interface_name,
-                    if_index = ?effective_if_index,
-                    error = %err,
-                    "underlay UDP socket rebind failed; retaining direct-UDP block until retry"
-                );
-                let mut g = ctx.runtime.inner.write().await;
-                g.last_error = Some(format!("rebinding network interface failed: {err}"));
-                feedback = Err(err);
-            }
-        }
-    } else if let Some(handle) = rebind_handle.as_ref()
-        && let Err(err) = handle.try_send(cmd)
-    {
-        debug!(
-            component = "meshd.supervisor",
-            event = "rebind_forward_skipped",
-            error = %err,
-            "failed forwarding network-change rebind command to datapath"
-        );
-    }
-
-    if reprobe_ready {
-        if dp_handle.is_some()
-            && let Some(ref handle) = rebind_handle
-            && let Err(err) = handle.try_send(RebindCommand::RefreshCandidates)
-        {
-            debug!(
-                component = "meshd.supervisor",
-                event = "refresh_candidates_forward_skipped",
-                error = %err,
-                "failed forwarding candidate refresh after successful rebind"
-            );
-        }
-
-        if let (Some(relay_h), Some(ep)) = (relay_handle, relay_endpoint) {
-            match build_relay_client_config_for_runtime(
-                &bootstrap,
-                ep,
-                (effective_if_index.or(underlay.0), underlay.1),
-                ctx.agent_version.clone(),
-            ) {
-                Ok(next_cfg) => {
-                    relay_h.update_config(next_cfg);
-                    relay_h.wake_reconnect();
-                }
-                Err(err) => {
-                    warn!(
-                        component = "meshd.supervisor",
-                        event = "relay_reconfig_build_failed",
-                        error = %err,
-                        "failed rebuilding RelayClient config on roam"
-                    );
-                }
-            }
-        }
-
-        dispatch_datapath_reprobe_and_wake_control(ctx, dp_handle, &peer_ids).await;
-    }
-
-    if let Some(ref tx) = ctx.rebind_feedback_tx
-        && let Err(err) = tx.try_send(feedback)
-    {
-        debug!(
-            component = "meshd.supervisor",
-            event = "rebind_feedback_send_skipped",
-            error = %err,
-            "failed delivering rebind feedback to roaming loop"
-        );
-    }
+    mesh_client::handle_rebind_command(&client_ctx, cmd).await;
 }
-
-async fn reconcile_overlay_conflict_on_roam(
-    ctx: &RebindForwardContext,
-    overlay_cidr: OverlayCidr,
-    tun_ifname: &str,
-) {
-    let probe = ctx.adapters.network_probe();
-    match check_overlay_conflict_with_probe(probe.as_ref(), overlay_cidr) {
-        Some(conflict) => {
-            let warning = conflict.format_warning();
-            ctx.runtime.inner.write().await.overlay_conflict_warning = Some(warning);
-            if ctx.overlay_route_installed.load(Ordering::SeqCst) {
-                match ctx
-                    .adapters
-                    .remove_overlay_route_only(tun_ifname, overlay_cidr)
-                {
-                    Ok(()) => {
-                        ctx.overlay_route_installed.store(false, Ordering::SeqCst);
-                    }
-                    Err(err) => {
-                        warn!(
-                            component = "meshd.supervisor",
-                            event = "overlay_conflict_route_remove_failed",
-                            error = %err,
-                            "failed removing newly conflicting overlay route on roam"
-                        );
-                    }
-                }
-            }
-        }
-        None => {
-            let had_warning = ctx
-                .runtime
-                .inner
-                .write()
-                .await
-                .overlay_conflict_warning
-                .take()
-                .is_some();
-            if had_warning {
-                info!(
-                    component = "meshd.supervisor",
-                    event = "overlay_subnet_conflict_cleared",
-                    overlay_cidr = %overlay_cidr,
-                    "physical subnet no longer overlaps overlay CIDR; warning cleared"
-                );
-            }
-            if !ctx.overlay_route_installed.load(Ordering::SeqCst) {
-                let install_res = {
-                    let mut ledger = ctx.ledger.lock().await;
-                    ctx.adapters
-                        .install_overlay_route_only(tun_ifname, overlay_cidr, &mut ledger)
-                };
-                match install_res {
-                    Ok(()) => {
-                        ctx.overlay_route_installed.store(true, Ordering::SeqCst);
-                    }
-                    Err(err) => {
-                        warn!(
-                            component = "meshd.supervisor",
-                            event = "deferred_overlay_route_install_failed",
-                            error = %err,
-                            "failed installing deferred overlay route after conflict cleared"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn dispatch_datapath_reprobe_and_wake_control(
-    ctx: &RebindForwardContext,
-    dp_handle: Option<mesh_datapath::DatapathHandle>,
-    peer_ids: &[mesh_core::NodeId],
-) {
-    if let Some(dp) = dp_handle {
-        tokio::task::yield_now().await;
-        match tokio::time::timeout(
-            Duration::from_millis(150),
-            dp.send(DatapathCommand::TriggerStunProbe),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                debug!(
-                    component = "meshd.supervisor",
-                    event = "roam_stun_probe_skipped",
-                    error = %err,
-                    "datapath skipped STUN probe dispatch on roam"
-                );
-            }
-            Err(_) => {
-                debug!(
-                    component = "meshd.supervisor",
-                    event = "roam_stun_probe_timeout",
-                    "timed out queuing STUN probe on roam"
-                );
-            }
-        }
-        for &peer_id in peer_ids {
-            match tokio::time::timeout(
-                Duration::from_millis(100),
-                dp.send(DatapathCommand::InitiateHolePunch(peer_id)),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    debug!(
-                        component = "meshd.supervisor",
-                        event = "roam_disco_probe_skipped",
-                        peer_id = %peer_id,
-                        error = %err,
-                        "datapath skipped peer Disco probe dispatch on roam"
-                    );
-                }
-                Err(_) => {
-                    debug!(
-                        component = "meshd.supervisor",
-                        event = "roam_disco_probe_timeout",
-                        peer_id = %peer_id,
-                        "timed out queuing peer Disco probe on roam"
-                    );
-                }
-            }
-        }
-    }
-
-    let wake_opt = ctx.active_wake_tx.lock().ok().and_then(|g| g.clone());
-    if let Some(wake_tx) = wake_opt
-        && let Err(err) = wake_tx.try_send(ControlWakeSignal::ConfigUpdated)
-    {
-        debug!(
-            component = "meshd.supervisor",
-            event = "roaming_control_wake_skipped",
-            error = %err,
-            "control wake signal skipped after rebind"
-        );
-    }
-}
-
-fn apply_port_override(endpoint: &str, port_override: Option<Port>) -> AppResult<String> {
-    let (host, current_port) = split_host_port(endpoint)?;
-    let chosen_port = port_override.unwrap_or(current_port);
-    if host.contains(':') {
-        Ok(format!("[{host}]:{}", chosen_port.get()))
-    } else {
-        Ok(format!("{host}:{}", chosen_port.get()))
-    }
-}
-
-fn apply_registration_to_bootstrap(bootstrap: &mut BootstrapConfig, reg: &RegisterNodeResponse) {
-    bootstrap.node_id = Some(reg.node_id);
-    bootstrap.node_name = Some(reg.node_name.clone());
-    bootstrap.overlay_ip = Some(reg.overlay_ip);
-    bootstrap.fqdn = Some(reg.fqdn.clone());
-    bootstrap.key_expires_at_ms = reg.key_expires_at_ms;
-    bootstrap.apply_netmap_pins(reg.netmap.pin_set.active_pin, reg.netmap.pin_set.next_pin);
-    bootstrap.acked_endpoint_version = reg.netmap.relay_map.endpoint_version;
-}
-
-async fn persist_bootstrap_and_runtime(
-    runtime: &DaemonRuntimeState,
-    bootstrap: &BootstrapConfig,
-) -> AppResult<()> {
-    let mut g = runtime.inner.write().await;
-    g.bootstrap_store.save_atomic(bootstrap)?;
-    g.bootstrap = bootstrap.clone();
-    g.node_id = bootstrap.node_id;
-    g.node_name = bootstrap.node_name.clone();
-    g.overlay_ip = bootstrap.overlay_ip;
-    g.fqdn = bootstrap.fqdn.clone();
-    Ok(())
-}
-
-fn scrub_diagnostic_text(raw: &str) -> (String, u32) {
-    let mut count: u32 = 0;
-    let mut out = String::with_capacity(raw.len());
-    for line in raw.lines() {
-        let lower = line.to_ascii_lowercase();
-        if lower.contains("mpk_") || lower.contains("privkey") || lower.contains("preauth") {
-            count = count.saturating_add(1);
-            out.push_str("  \"[REDACTED]\"\n");
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    (out, count)
-}
-
 fn clear_override_hosts_best_effort(path: Option<&PathBuf>) {
     if let Some(p) = path
         && p.exists()
@@ -2265,7 +1386,7 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert!(supervisor.active_session.is_some());
+        assert!(supervisor.has_active_session());
 
         // Act (`HR-W12-02`)
         supervisor
@@ -2276,7 +1397,7 @@ mod tests {
             .await;
 
         // Assert
-        assert!(supervisor.active_session.is_none());
+        assert!(!supervisor.has_active_session());
         let status = supervisor.runtime.build_status_response().await;
         assert_eq!(status.daemon_state, DaemonState::Revoked);
         assert_eq!(
@@ -2987,7 +2108,7 @@ mod tests {
             sup_ok
                 .auto_resume_enrolled_session_best_effort(&root_shutdown)
                 .await;
-            assert!(sup_ok.active_session.is_some());
+            assert!(sup_ok.has_active_session());
             assert!(sup_ok.stop_active_session_and_cleanup().await.is_ok());
         }
 
@@ -3004,7 +2125,7 @@ mod tests {
             sup_exp
                 .auto_resume_enrolled_session_best_effort(&root_shutdown)
                 .await;
-            assert!(sup_exp.active_session.is_none());
+            assert!(!sup_exp.has_active_session());
             let status_after = sup_exp.runtime.build_status_response().await;
             assert_eq!(status_after.daemon_state, DaemonState::ReauthRequired);
             assert_eq!(status_after.key_expires_at_ms, Some(key_expiry_ms));

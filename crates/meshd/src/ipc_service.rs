@@ -163,11 +163,7 @@ async fn handle_rotate_key(
 async fn handle_bugreport(State(state): State<IpcRouterState>) -> Response {
     let (bootstrap, state_dir_opt) = {
         let g = state.runtime.inner.read().await;
-        let dir = g
-            .bootstrap_store
-            .path()
-            .parent()
-            .map(std::path::Path::to_path_buf);
+        let dir = g.state_store.state_dir().map(std::path::Path::to_path_buf);
         (g.bootstrap.clone(), dir)
     };
     let status = state.runtime.build_status_response().await;
@@ -509,16 +505,17 @@ mod tests {
     use tokio::io::duplex;
     use tokio::sync::mpsc;
 
+    use mesh_client::hooks::FileClientStateStore;
     use mesh_core::ErrorKind;
     use mesh_core::defaults::MAX_RO_IPC_BODY_BYTES;
+    use mesh_datapath::TimerMode;
     use mesh_net::ipc::{send_ipc_json_request, serve_ipc_http_connection};
     use mesh_proto::agent_ipc::{AgentActionResponse, AgentStatusResponse};
     use tempfile::tempdir;
 
     use super::{IpcRouterState, IpcService};
-    use crate::config::{BootstrapConfig, BootstrapStore};
+    use crate::config::BootstrapConfig;
     use crate::control_loop::DaemonRuntimeState;
-    use crate::netmap_cache::NetmapCacheStore;
 
     #[tokio::test]
     async fn test_ipc_ro_router_exposes_only_four_read_routes_and_blocks_admin_mutations() {
@@ -526,10 +523,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let runtime = Arc::new(DaemonRuntimeState::new(
             BootstrapConfig::default(),
-            BootstrapStore::new(dir.path().join("bootstrap.toml")),
-            NetmapCacheStore::new(dir.path().join("netmap-cache.json")),
+            Arc::new(FileClientStateStore::from_dir(dir.path().to_path_buf())),
             None,
             1280,
+            TimerMode::Responsive,
         ));
         let (cmd_tx, _cmd_rx) = mpsc::channel(4);
         let ro_router = IpcService::build_ro_router(IpcRouterState { runtime, cmd_tx });
@@ -599,10 +596,10 @@ mod tests {
 
         let runtime = Arc::new(DaemonRuntimeState::new(
             BootstrapConfig::default(),
-            BootstrapStore::new(dir.path().join("bootstrap.toml")),
-            NetmapCacheStore::new(dir.path().join("netmap-cache.json")),
+            Arc::new(FileClientStateStore::from_dir(dir.path().to_path_buf())),
             None,
             1280,
+            TimerMode::Responsive,
         ));
         let (cmd_tx, _cmd_rx) = mpsc::channel(4);
         let router_state = IpcRouterState { runtime, cmd_tx };
