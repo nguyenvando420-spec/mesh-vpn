@@ -422,6 +422,29 @@ pub(crate) fn format_preauth_key_created(resp: &PreAuthKeyCreatedResponse) -> St
     out.trim_end().to_owned()
 }
 
+/// Formats `mesh preauthkey create` output with optional stdout-only `--emit-uri` / `--qr` sections.
+#[must_use]
+pub(crate) fn format_preauth_key_created_with_mobile(
+    resp: &PreAuthKeyCreatedResponse,
+    join_uri: Option<&Secret<String>>,
+    qr_terminal: Option<&str>,
+) -> String {
+    let mut out = format_preauth_key_created(resp);
+    if let Some(uri_secret) = join_uri {
+        out.push('\n');
+        push_line(
+            &mut out,
+            format_args!("Mobile Join URI : {}", uri_secret.expose_secret()),
+        );
+    }
+    if let Some(qr) = qr_terminal {
+        out.push_str("\nScan Mobile Join QR Code:\n");
+        out.push_str(qr);
+        out.push('\n');
+    }
+    out.trim_end().to_owned()
+}
+
 /// Formats `mesh preauthkey list` summary rows.
 #[must_use]
 pub(crate) fn format_preauth_key_list(items: &[PreAuthKeySummary]) -> String {

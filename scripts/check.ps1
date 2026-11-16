@@ -96,7 +96,7 @@ try {
 
             # Rule: unsafe is forbidden outside crates/mesh-sys/ (including crates/mesh-mobile-ffi/ and tools/)
             if ($rel -notlike "crates/mesh-sys/*") {
-                if ($content -match "(?m)^\s*(pub\s+)?unsafe\s+(fn|trait|impl)\b|\bunsafe\s*\{") {
+                if ($content -match "(?m)^\s*(pub(\([^)]*\))?\s+)?unsafe\s+(fn|trait|impl|extern)\b|\bunsafe\s*\{|#\[unsafe\s*\(") {
                     Write-Error "Forbidden 'unsafe' usage outside crates/mesh-sys/: $rel"
                     exit 1
                 }

@@ -683,10 +683,9 @@ fn normalize_target_for_socket(
 ) -> AppResult<SocketAddr> {
     if let (SocketAddr::V4(v4), Some(prefix)) = (target, nat64_prefix)
         && (local_addr.is_ipv6() || dual_stack)
+        && let Some(synthesized) = Nat64Synthesizer::new(prefix).try_synthesize_sockaddr(v4)
     {
-        return Ok(SocketAddr::V6(
-            Nat64Synthesizer::new(prefix).synthesize_sockaddr(v4),
-        ));
+        return Ok(SocketAddr::V6(synthesized));
     }
 
     match (local_addr, dual_stack, target) {
@@ -956,5 +955,42 @@ mod tests {
             peer_addr,
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 1), tx_port))
         );
+    }
+
+    #[test]
+    fn test_magic_socket_normalize_skips_nat64_for_rfc1918_and_link_local() {
+        // Arrange
+        let nat64 = Some(Nat64Prefix::well_known());
+        let dual_local = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 51820, 0, 0));
+        let v6_only_local = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 51820, 0, 0));
+        let lan_target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 50), 51820));
+        let rfc1918_ten = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 51820));
+        let link_local = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(169, 254, 1, 2), 51820));
+
+        // Act
+        let dual_res = normalize_target_for_socket(lan_target, dual_local, true, nat64);
+        let ten_res = normalize_target_for_socket(rfc1918_ten, dual_local, true, nat64);
+        let v6_only_res = normalize_target_for_socket(link_local, v6_only_local, false, nat64);
+
+        // Assert
+        assert_eq!(
+            dual_res.ok(),
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv4Addr::new(192, 168, 1, 50).to_ipv6_mapped(),
+                51820,
+                0,
+                0
+            )))
+        );
+        assert_eq!(
+            ten_res.ok(),
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped(),
+                51820,
+                0,
+                0
+            )))
+        );
+        assert!(v6_only_res.is_err());
     }
 }

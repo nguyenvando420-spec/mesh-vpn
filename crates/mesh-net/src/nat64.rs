@@ -170,6 +170,21 @@ impl Nat64Prefix {
     }
 }
 
+/// Returns `true` when an IPv4 target is eligible for RFC 6052 NAT64 synthesis (`HIGH-MOB-WA-05`).
+///
+/// Excludes RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`), link-local (`169.254/16`),
+/// loopback (`127/8`), unspecified (`0.0.0.0`), broadcast (`255.255.255.255`), and multicast
+/// (`224/4`) addresses so LAN/CGNAT/local targets are never diverted through a carrier NAT64 translator.
+#[must_use]
+pub const fn is_eligible_for_nat64_synthesis(ip: Ipv4Addr) -> bool {
+    !ip.is_private()
+        && !ip.is_link_local()
+        && !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_broadcast()
+        && !ip.is_multicast()
+}
+
 /// Pure RFC 6052 §2.2 IPv4-embedded IPv6 address synthesizer preserving reserved octet `u = 0x00`
 /// at byte index `8` (bits `64..71`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +203,24 @@ impl Nat64Synthesizer {
     #[must_use]
     pub const fn prefix(&self) -> Nat64Prefix {
         self.prefix
+    }
+
+    /// Synthesizes an RFC 6052 IPv6 address only when `ipv4` is eligible for NAT64 synthesis.
+    #[must_use]
+    pub const fn try_synthesize_ip(&self, ipv4: Ipv4Addr) -> Option<Ipv6Addr> {
+        if !is_eligible_for_nat64_synthesis(ipv4) {
+            return None;
+        }
+        Some(self.synthesize_ip(ipv4))
+    }
+
+    /// Synthesizes a [`SocketAddrV6`] only when `target.ip()` is eligible for NAT64 synthesis.
+    #[must_use]
+    pub const fn try_synthesize_sockaddr(&self, target: SocketAddrV4) -> Option<SocketAddrV6> {
+        if !is_eligible_for_nat64_synthesis(*target.ip()) {
+            return None;
+        }
+        Some(self.synthesize_sockaddr(target))
     }
 
     /// Synthesizes an RFC 6052 IPv6 address embedding `ipv4` (with `u = 0x00` at bits `64..71`).
@@ -435,6 +468,43 @@ mod tests {
         assert_eq!(discovered_dual, Some(prefix_64));
         assert_eq!(discovered_empty, None);
         assert_eq!(discovered_garbage, None);
+    }
+
+    #[test]
+    fn test_nat64_try_synthesize_excludes_rfc1918_link_local_and_special_addrs() {
+        // Arrange
+        let synth = Nat64Synthesizer::new(Nat64Prefix::well_known());
+        let excluded = [
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(172, 16, 4, 5),
+            Ipv4Addr::new(172, 31, 255, 1),
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(169, 254, 10, 20),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+        ];
+        let public_ip = Ipv4Addr::new(203, 0, 113, 44);
+
+        // Act
+        let rejected: Vec<Option<Ipv6Addr>> = excluded
+            .iter()
+            .map(|ip| synth.try_synthesize_ip(*ip))
+            .collect();
+        let accepted = synth.try_synthesize_sockaddr(SocketAddrV4::new(public_ip, 51820));
+
+        // Assert
+        assert!(rejected.iter().all(Option::is_none));
+        assert_eq!(
+            accepted,
+            Some(SocketAddrV6::new(
+                synth.synthesize_ip(public_ip),
+                51820,
+                0,
+                0
+            ))
+        );
     }
 
     proptest! {

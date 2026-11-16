@@ -5,6 +5,7 @@ mod admin_cmds;
 mod cli;
 mod client_cmds;
 mod output;
+mod qr;
 
 use std::process::ExitCode;
 

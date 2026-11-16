@@ -79,7 +79,7 @@ if [ -n "$RUST_DIRS" ]; then
   # Rule: unsafe is forbidden outside crates/mesh-sys/ (including crates/mesh-mobile-ffi/ and tools/)
   # shellcheck disable=SC2086
   UNSAFE_HITS=$(find $RUST_DIRS -type f -name '*.rs' -not -path 'crates/mesh-sys/*' \
-    -exec grep -HnE '(^[[:space:]]*(pub[[:space:]]+)?unsafe[[:space:]]+(fn|trait|impl)[^a-zA-Z0-9_]|unsafe[[:space:]]*\{)' {} + || true)
+    -exec grep -HnE '(^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?unsafe[[:space:]]+(fn|trait|impl|extern)[^a-zA-Z0-9_]|unsafe[[:space:]]*\{|#\[unsafe[[:space:]]*\()' {} + || true)
   if [ -n "$UNSAFE_HITS" ]; then
     echo "ERROR: Forbidden 'unsafe' usage outside crates/mesh-sys/:" >&2
     echo "$UNSAFE_HITS" >&2

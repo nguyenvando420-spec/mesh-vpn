@@ -14,7 +14,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use mesh_core::defaults::LINUX_SERVER_ADMIN_SOCKET;
 #[cfg(any(unix, test))]
 use mesh_core::defaults::MAX_HTTP_BODY_BYTES;
-use mesh_core::{AppError, AppResult, NodeName, Port};
+use mesh_core::{AppError, AppResult, MobileJoinTlsAuth, NodeName, Port, SpkiPin, format_join_uri};
+use mesh_crypto::Secret;
 #[cfg(any(unix, test))]
 use mesh_net::ipc::send_ipc_json_request;
 use mesh_proto::admin_ipc::{
@@ -27,10 +28,12 @@ use mesh_proto::admin_ipc::{
 
 use crate::output::{
     format_audit_events, format_backup_created, format_hardening_check, format_migrate_endpoint,
-    format_node_inspect, format_node_list, format_preauth_key_created, format_preauth_key_list,
-    format_restore_backup, format_revoke_action, format_rotate_tls_key, format_server_status,
-    render_json_string, write_stderr, write_stdout,
+    format_node_inspect, format_node_list, format_preauth_key_created,
+    format_preauth_key_created_with_mobile, format_preauth_key_list, format_restore_backup,
+    format_revoke_action, format_rotate_tls_key, format_server_status, render_json_string,
+    write_stderr, write_stdout,
 };
+use crate::qr::QrCode;
 
 #[cfg(unix)]
 const SERVER_IPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -47,6 +50,7 @@ pub(crate) struct AdminDispatchConfig {
 #[derive(Debug, Subcommand)]
 pub(crate) enum AdminCommand {
     /// Create, list, or revoke enrollment pre-authentication keys (`US-002`).
+    #[command(visible_alias = "preauth")]
     Preauthkey(PreauthkeyArgs),
     /// List, inspect, rename, expire, or immediately revoke mesh nodes (`US-012`).
     Node(NodeArgs),
@@ -95,6 +99,21 @@ pub(crate) struct PreauthkeyCreateArgs {
     /// Offline reap timeout in seconds for `--ephemeral` nodes.
     #[arg(long)]
     pub(crate) ephemeral_timeout_secs: Option<u32>,
+    /// Emit a `mesh://join?v=1&...` mobile onboarding URI to stdout (`US-079`).
+    #[arg(long)]
+    pub(crate) emit_uri: bool,
+    /// Render a Unicode terminal QR Code for the mobile onboarding URI (`US-079`).
+    #[arg(long)]
+    pub(crate) qr: bool,
+    /// Control server endpoint override (`<host_or_ip>:<port>`) for `--emit-uri`/`--qr`.
+    #[arg(long)]
+    pub(crate) server: Option<String>,
+    /// Server TLS SPKI pin override (`sha256:<hex>`) for `--emit-uri`/`--qr`.
+    #[arg(long)]
+    pub(crate) pin: Option<String>,
+    /// Optional suggested RFC 1123 node name embedded in `--emit-uri`/`--qr`.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -245,6 +264,7 @@ async fn handle_preauthkey(args: &PreauthkeyArgs, cfg: &AdminDispatchConfig) -> 
     match &args.action {
         PreauthkeySubcommand::Create(create) => {
             let req = build_create_preauth_request(create)?;
+            let parsed_overrides = parse_mobile_join_overrides(create)?;
             let resp: PreAuthKeyCreatedResponse = send_server_admin(
                 cfg,
                 hyper::Method::POST,
@@ -252,7 +272,7 @@ async fn handle_preauthkey(args: &PreauthkeyArgs, cfg: &AdminDispatchConfig) -> 
                 Some(&req),
             )
             .await?;
-            emit_admin(&resp, cfg.json, format_preauth_key_created)
+            emit_preauth_created_output(create, &parsed_overrides, &resp, cfg.json)
         }
         PreauthkeySubcommand::List => {
             let resp: Vec<PreAuthKeySummary> = send_server_admin(
@@ -617,6 +637,133 @@ fn emit_revoke_result(
     }
 }
 
+#[derive(Debug, Clone)]
+struct ParsedMobileJoinOverrides {
+    server: Option<String>,
+    pin: Option<SpkiPin>,
+    name: Option<NodeName>,
+}
+
+#[derive(Serialize)]
+struct PreAuthKeyCreatedWithMobileJson<'a> {
+    #[serde(flatten)]
+    base: &'a PreAuthKeyCreatedResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mobile_join_uri: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mobile_join_qr: Option<&'a str>,
+}
+
+fn parse_mobile_join_overrides(
+    args: &PreauthkeyCreateArgs,
+) -> AppResult<ParsedMobileJoinOverrides> {
+    let server = match args.server.as_deref() {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::invalid_argument(
+                    "--server endpoint cannot be empty",
+                ));
+            }
+            if trimmed.contains(['?', '#', '/', '\\']) || !trimmed.contains(':') {
+                return Err(AppError::invalid_argument(format!(
+                    "invalid --server '{raw}': expected <host_or_ip>:<port>"
+                )));
+            }
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+    let pin = match args.pin.as_deref() {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::invalid_argument("--pin cannot be empty"));
+            }
+            Some(SpkiPin::parse(trimmed)?)
+        }
+        None => None,
+    };
+    let name = match args.name.as_deref() {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(AppError::invalid_argument("--name cannot be empty"));
+            }
+            Some(NodeName::parse(trimmed)?)
+        }
+        None => None,
+    };
+    Ok(ParsedMobileJoinOverrides { server, pin, name })
+}
+
+fn build_mobile_join_uri_from_created(
+    overrides: &ParsedMobileJoinOverrides,
+    resp: &PreAuthKeyCreatedResponse,
+) -> AppResult<Secret<String>> {
+    let endpoint = overrides
+        .server
+        .as_deref()
+        .unwrap_or_else(|| resp.server_endpoint.trim());
+    if endpoint.is_empty() {
+        return Err(AppError::invalid_argument(
+            "missing control server endpoint for --emit-uri/--qr; pass --server <host_or_ip>:<port>",
+        ));
+    }
+    let tls_auth = match overrides.pin.or(resp.active_pin) {
+        Some(pin) => MobileJoinTlsAuth::SpkiPin(pin),
+        None => MobileJoinTlsAuth::SystemCa,
+    };
+    let uri = format_join_uri(endpoint, &tls_auth, &resp.raw_key, overrides.name.as_ref())
+        .map_err(|err| {
+            let msg = err.public_message();
+            if msg.contains("IP literal") {
+                AppError::invalid_argument(format!(
+                    "{msg}; pass --pin sha256:<64_lowercase_hex> when targeting an IP endpoint"
+                ))
+            } else {
+                err
+            }
+        })?;
+    Ok(Secret::new(uri))
+}
+
+fn emit_preauth_created_output(
+    args: &PreauthkeyCreateArgs,
+    overrides: &ParsedMobileJoinOverrides,
+    resp: &PreAuthKeyCreatedResponse,
+    json_mode: bool,
+) -> AppResult<()> {
+    if !args.emit_uri && !args.qr {
+        return emit_admin(resp, json_mode, format_preauth_key_created);
+    }
+
+    let join_uri = build_mobile_join_uri_from_created(overrides, resp)?;
+    let qr_rendered = if args.qr {
+        let code = QrCode::encode_bytes(join_uri.expose_secret().as_bytes())?;
+        Some(code.render_half_blocks())
+    } else {
+        None
+    };
+
+    if json_mode {
+        let payload = PreAuthKeyCreatedWithMobileJson {
+            base: resp,
+            mobile_join_uri: args.emit_uri.then_some(join_uri.expose_secret()),
+            mobile_join_qr: qr_rendered.as_deref(),
+        };
+        let json_out = render_json_string(&payload)?;
+        return write_stdout(&json_out);
+    }
+
+    let formatted = format_preauth_key_created_with_mobile(
+        resp,
+        args.emit_uri.then_some(&join_uri),
+        qr_rendered.as_deref(),
+    );
+    write_stdout(&formatted)
+}
+
 /// Dispatches a JSON request over an already-connected Server Admin stream (UDS or test duplex).
 #[cfg(any(unix, test))]
 pub(crate) async fn call_server_admin_stream<S, Req, Resp>(
@@ -693,11 +840,19 @@ mod tests {
     use mesh_core::{ErrorKind, NodeName};
     use mesh_proto::admin_ipc::{AdminNodeSummary, RestoreBackupResponse};
 
+    use clap::Parser;
+    use mesh_core::{KeyId, SpkiPin, parse_join_uri};
+    use mesh_proto::admin_ipc::PreAuthKeyCreatedResponse;
+
     use super::{
-        PreauthkeyCreateArgs, build_create_preauth_request, build_restore_path,
-        build_restore_path_with_options, call_server_admin_stream, format_expiring_nodes_warning,
+        AdminCommand, PreauthkeyCreateArgs, PreauthkeySubcommand, build_create_preauth_request,
+        build_mobile_join_uri_from_created, build_restore_path, build_restore_path_with_options,
+        call_server_admin_stream, format_expiring_nodes_warning, parse_mobile_join_overrides,
         parse_ttl_secs, validate_min_netmap_version, validate_path_segment,
     };
+    use crate::cli::{Cli, TopCommand};
+    use crate::output::{format_preauth_key_created, format_preauth_key_created_with_mobile};
+    use crate::qr::QrCode;
 
     #[test]
     fn test_ttl_parser_and_preauth_request_validation() {
@@ -716,6 +871,11 @@ mod tests {
             max_uses: None,
             ephemeral: false,
             ephemeral_timeout_secs: None,
+            emit_uri: false,
+            qr: false,
+            server: None,
+            pin: None,
+            name: None,
         };
         let bad_single = PreauthkeyCreateArgs {
             max_uses: Some(5),
@@ -728,6 +888,11 @@ mod tests {
             max_uses: None,
             ephemeral: false,
             ephemeral_timeout_secs: None,
+            emit_uri: false,
+            qr: false,
+            server: None,
+            pin: None,
+            name: None,
         };
 
         // Assert
@@ -735,6 +900,131 @@ mod tests {
         let req = build_create_preauth_request(&good_single).expect("valid single req");
         assert_eq!(req.max_uses, 1);
         assert_eq!(req.target_node.as_deref(), Some("laptop-01"));
+    }
+
+    #[test]
+    fn test_preauthkey_create_cli_emit_uri_qr_and_alias() -> Result<(), String> {
+        // Arrange / Act
+        let cli_full = Cli::try_parse_from([
+            "mesh",
+            "preauthkey",
+            "create",
+            "--emit-uri",
+            "--qr",
+            "--server",
+            "198.51.100.10:8443",
+            "--pin",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--name",
+            "iphone-16",
+        ])
+        .map_err(|e| e.to_string())?;
+        let cli_alias = Cli::try_parse_from(["mesh", "preauth", "create", "--emit-uri"])
+            .map_err(|e| e.to_string())?;
+
+        // Assert
+        assert!(matches!(
+            cli_full.command,
+            TopCommand::Admin(AdminCommand::Preauthkey(ref pa))
+                if matches!(
+                    pa.action,
+                    PreauthkeySubcommand::Create(ref c)
+                        if c.emit_uri
+                            && c.qr
+                            && c.server.as_deref() == Some("198.51.100.10:8443")
+                            && c.pin.is_some()
+                            && c.name.as_deref() == Some("iphone-16")
+                )
+        ));
+        assert!(matches!(
+            cli_alias.command,
+            TopCommand::Admin(AdminCommand::Preauthkey(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_preauthkey_mobile_uri_qr_emission_and_omitted_zero_leak_guard() -> Result<(), String> {
+        // Arrange
+        let pin = SpkiPin::from_sha256_bytes([0xAB_u8; 32]);
+        let raw_key = "mpk_Q2FuYXJ5VG9rZW4zMkJ5dGVzQ2FuYXJ5VG9rZW4zMkI".to_owned();
+        let resp = PreAuthKeyCreatedResponse {
+            key_id: KeyId::new_v7(1_700_000_000_000),
+            raw_key: raw_key.clone(),
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_700_003_600_000,
+            reusable: false,
+            max_uses: 1,
+            target_node_id: None,
+            server_endpoint: "198.51.100.10:8443".to_owned(),
+            active_pin: Some(pin),
+            cli_join_command: "mesh up ...".to_owned(),
+            join_command_file: "mesh up ...".to_owned(),
+            join_command_stdin: "mesh up ...".to_owned(),
+        };
+        let default_human = format_preauth_key_created(&resp);
+
+        let args = PreauthkeyCreateArgs {
+            ttl: "1h".to_owned(),
+            for_node: None,
+            reusable: false,
+            max_uses: None,
+            ephemeral: false,
+            ephemeral_timeout_secs: None,
+            emit_uri: true,
+            qr: true,
+            server: None,
+            pin: None,
+            name: Some("pixel-9".to_owned()),
+        };
+
+        // Act
+        let overrides = parse_mobile_join_overrides(&args).map_err(|e| e.to_string())?;
+        let uri_secret =
+            build_mobile_join_uri_from_created(&overrides, &resp).map_err(|e| e.to_string())?;
+        let parsed = parse_join_uri(uri_secret.expose_secret()).map_err(|e| e.to_string())?;
+        let qr = QrCode::encode_bytes(uri_secret.expose_secret().as_bytes())
+            .map_err(|e| e.to_string())?;
+        let qr_rendered = qr.render_half_blocks();
+        let mobile_human =
+            format_preauth_key_created_with_mobile(&resp, Some(&uri_secret), Some(&qr_rendered));
+
+        // Assert
+        assert!(!default_human.contains("mesh://join"));
+        assert!(!default_human.contains('█'));
+        assert_eq!(parsed.control_endpoint, "198.51.100.10:8443");
+        assert_eq!(
+            parsed.node_name.as_ref().map(|n| n.as_str()),
+            Some("pixel-9")
+        );
+        assert_eq!(parsed.preauth_key(), raw_key);
+        assert!(mobile_human.contains("Mobile Join URI : mesh://join?"));
+        assert!(mobile_human.contains("Scan Mobile Join QR Code:"));
+
+        // Error case: IP endpoint without pin fails closed and does not echo raw_key.
+        let mut no_pin_resp = resp.clone();
+        no_pin_resp.active_pin = None;
+        let err_missing_pin = build_mobile_join_uri_from_created(&overrides, &no_pin_resp).err();
+        assert!(
+            err_missing_pin
+                .as_ref()
+                .is_some_and(|e| e.kind() == ErrorKind::InvalidArgument)
+        );
+        assert!(
+            err_missing_pin
+                .as_ref()
+                .is_some_and(|e| !e.public_message().contains(&raw_key))
+        );
+
+        let mut no_ep_resp = resp;
+        no_ep_resp.server_endpoint = String::new();
+        let err_missing_ep = build_mobile_join_uri_from_created(&overrides, &no_ep_resp).err();
+        assert!(
+            err_missing_ep
+                .as_ref()
+                .is_some_and(|e| e.kind() == ErrorKind::InvalidArgument)
+        );
+        Ok(())
     }
 
     #[test]

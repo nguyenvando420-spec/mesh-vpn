@@ -455,6 +455,7 @@ mod tests {
         let ticks_at_idle = handle.query_status().await?.timer_tick_count;
         tokio::time::sleep(Duration::from_millis(90)).await;
         let idle_snap = handle.query_status().await?;
+        let wakeups_at_idle = idle_snap.idle_wakeup_count;
 
         // Send DNS query to 10.100.0.2:53 (not a WireGuard peer) and wake engine immediately.
         let dns_query = build_ipv4_packet(Ipv4Addr::new(10, 100, 0, 10), dns_ip, 17, 53);
@@ -467,7 +468,7 @@ mod tests {
             let drained = fake_tun.drain_outbound_packets().await;
             collected_replies.extend(drained);
             let st = handle.query_status().await?;
-            if !st.idle_sleeping {
+            if !st.idle_sleeping || st.idle_wakeup_count > wakeups_at_idle {
                 woke_up = true;
             }
             if woke_up && !collected_replies.is_empty() {

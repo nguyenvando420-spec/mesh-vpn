@@ -197,6 +197,8 @@ pub struct DatapathStatusSnapshot {
     pub idle_sleeping: bool,
     /// Cumulative number of WireGuard/Disco timer ticks executed since engine start.
     pub timer_tick_count: u64,
+    /// Cumulative number of `idle_sleeping: true -> false` wakeups triggered by traffic/rebind.
+    pub idle_wakeup_count: u64,
 }
 
 /// Control-plane & IPC commands processed inside [`DatapathEngine`]'s single event loop.
@@ -505,6 +507,7 @@ pub struct DatapathEngine {
     idle_sleeping: bool,
     last_activity_at: tokio::time::Instant,
     timer_tick_count: u64,
+    idle_wakeup_count: u64,
     coalesced_next_at: Option<tokio::time::Instant>,
     reset_ticks_pending: bool,
     dns_interceptor: Option<Arc<dyn DnsPacketInterceptor>>,
@@ -601,6 +604,7 @@ impl DatapathEngine {
             idle_sleeping: false,
             last_activity_at: tokio::time::Instant::now(),
             timer_tick_count: 0,
+            idle_wakeup_count: 0,
             coalesced_next_at: None,
             reset_ticks_pending: false,
             dns_interceptor: options.dns_interceptor,
@@ -798,6 +802,7 @@ impl DatapathEngine {
         self.last_activity_at = tokio::time::Instant::now();
         if self.idle_sleeping {
             self.idle_sleeping = false;
+            self.idle_wakeup_count = self.idle_wakeup_count.saturating_add(1);
             self.coalesced_next_at = None;
             self.reset_ticks_pending = true;
         }
@@ -1746,6 +1751,7 @@ impl DatapathEngine {
             timer_mode: self.timer_mode,
             idle_sleeping: self.idle_sleeping,
             timer_tick_count: self.timer_tick_count,
+            idle_wakeup_count: self.idle_wakeup_count,
         }
     }
 }
@@ -3498,6 +3504,7 @@ mod tests {
             idle_snap.timer_tick_count, ticks_at_idle,
             "zero 30 ms background ticks should fire while IdleAware is sleeping"
         );
+        let wakeups_at_idle = idle_snap.idle_wakeup_count;
 
         // Act 2: outbound TUN traffic wakes engine immediately & resumes normal timer servicing
         let wakeup_pkt = build_ipv4_udp_msg_with_port(
@@ -3512,7 +3519,7 @@ mod tests {
         let mut woke_up = false;
         for _ in 0..40 {
             let st = handle.query_status().await.expect("status after wakeup");
-            if !st.idle_sleeping {
+            if !st.idle_sleeping || st.idle_wakeup_count > wakeups_at_idle {
                 woke_up = true;
                 break;
             }
