@@ -20,7 +20,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run-mobile-qa.ps1
 
 ```bash
 # Linux / macOS:
-sh scripts/run-mobile-qa.sh
+bash scripts/run-mobile-qa.sh
 
 # Trên Linux có Android NDK r27c+:
 bash scripts/build-android-ffi.sh

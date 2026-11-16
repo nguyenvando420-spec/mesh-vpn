@@ -222,6 +222,59 @@ resolve_android_ndk() {
     return 1
 }
 
+ANDROID_MIN_SDK="${ANDROID_MIN_SDK:-26}"
+
+configure_android_ndk_env() {
+    local ndk_dir="$1"
+    if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
+        export ANDROID_NDK_HOME="${ndk_dir}"
+    fi
+    local prebuilt_root="${ndk_dir}/toolchains/llvm/prebuilt"
+    local host_tag=""
+    case "$(uname -s)" in
+        Linux) host_tag="linux-x86_64" ;;
+        Darwin)
+            if [[ -d "${prebuilt_root}/darwin-arm64/bin" ]]; then
+                host_tag="darwin-arm64"
+            else
+                host_tag="darwin-x86_64"
+            fi
+            ;;
+    esac
+
+    local llvm_bin=""
+    if [[ -n "${host_tag}" && -d "${prebuilt_root}/${host_tag}/bin" ]]; then
+        llvm_bin="${prebuilt_root}/${host_tag}/bin"
+    elif [[ -d "${prebuilt_root}" ]]; then
+        local cand_dir
+        for cand_dir in "${prebuilt_root}"/*/bin; do
+            if [[ -d "${cand_dir}" ]]; then
+                llvm_bin="${cand_dir}"
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "${llvm_bin}" && -d "${llvm_bin}" ]]; then
+        local aarch64_cc="${llvm_bin}/aarch64-linux-android${ANDROID_MIN_SDK}-clang"
+        local x86_64_cc="${llvm_bin}/x86_64-linux-android${ANDROID_MIN_SDK}-clang"
+        local ndk_ar="${llvm_bin}/llvm-ar"
+
+        if [[ -z "${CC_aarch64_linux_android:-}" && -x "${aarch64_cc}" ]]; then
+            export CC_aarch64_linux_android="${aarch64_cc}"
+        fi
+        if [[ -z "${AR_aarch64_linux_android:-}" && -x "${ndk_ar}" ]]; then
+            export AR_aarch64_linux_android="${ndk_ar}"
+        fi
+        if [[ -z "${CC_x86_64_linux_android:-}" && -x "${x86_64_cc}" ]]; then
+            export CC_x86_64_linux_android="${x86_64_cc}"
+        fi
+        if [[ -z "${AR_x86_64_linux_android:-}" && -x "${ndk_ar}" ]]; then
+            export AR_x86_64_linux_android="${ndk_ar}"
+        fi
+    fi
+}
+
 has_apple_sdk() {
     if [[ -n "${SDKROOT:-}" && -d "${SDKROOT}" ]]; then
         return 0
@@ -260,6 +313,13 @@ if ! command -v cargo-deny >/dev/null 2>&1; then
 fi
 
 ANDROID_NDK_DIR="$(resolve_android_ndk || true)"
+HAS_CARGO_NDK=0
+if [[ -n "${ANDROID_NDK_DIR}" ]]; then
+    configure_android_ndk_env "${ANDROID_NDK_DIR}"
+    if cargo ndk --version >/dev/null 2>&1; then
+        HAS_CARGO_NDK=1
+    fi
+fi
 APPLE_SDK_OK=0
 if has_apple_sdk; then
     APPLE_SDK_OK=1
@@ -289,7 +349,25 @@ for t in "${MOBILE_TARGETS[@]}"; do
     fi
 
     if [[ "${can_check_ffi}" -eq 1 ]]; then
-        if cargo check -p mesh-mobile-ffi --target "${t}"; then
+        ffi_ok=0
+        if [[ "${t}" == *-linux-android && "${HAS_CARGO_NDK}" -eq 1 ]]; then
+            abi=""
+            case "${t}" in
+                aarch64-linux-android) abi="arm64-v8a" ;;
+                x86_64-linux-android) abi="x86_64" ;;
+            esac
+            if [[ -n "${abi}" ]]; then
+                if cargo ndk -t "${abi}" --platform "${ANDROID_MIN_SDK}" check -p mesh-mobile-ffi; then
+                    ffi_ok=1
+                fi
+            elif cargo check -p mesh-mobile-ffi --target "${t}"; then
+                ffi_ok=1
+            fi
+        elif cargo check -p mesh-mobile-ffi --target "${t}"; then
+            ffi_ok=1
+        fi
+
+        if [[ "${ffi_ok}" -eq 1 ]]; then
             record_target "${t}" "PASS" "PASS" "PASS" "Native SDK present; full FFI check passed"
         else
             record_target "${t}" "PASS" "PASS" "FAIL" "cargo check -p mesh-mobile-ffi failed"

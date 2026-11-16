@@ -134,6 +134,41 @@ function Get-AndroidNdkPath {
     return $null
 }
 
+function Get-AndroidNdkLlvmBin {
+    param([Parameter(Mandatory = $true)][string]$NdkDir)
+
+    $prebuiltRoot = Join-Path $NdkDir "toolchains/llvm/prebuilt"
+    if (-not (Test-Path $prebuiltRoot)) {
+        return $null
+    }
+    $winCandidate = Join-Path $prebuiltRoot "windows-x86_64/bin"
+    if (Test-Path $winCandidate) {
+        return $winCandidate
+    }
+    $dirs = @(Get-ChildItem -Path $prebuiltRoot -Directory -ErrorAction SilentlyContinue)
+    foreach ($d in $dirs) {
+        $binDir = Join-Path $d.FullName "bin"
+        if (Test-Path $binDir) {
+            return $binDir
+        }
+    }
+    return $null
+}
+
+function Resolve-NdkToolPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinDir,
+        [Parameter(Mandatory = $true)][string[]]$Candidates
+    )
+    foreach ($name in $Candidates) {
+        $cand = Join-Path $BinDir $name
+        if (Test-Path $cand) {
+            return $cand
+        }
+    }
+    return $null
+}
+
 function Test-AppleSdkAvailable {
     if (-not [string]::IsNullOrWhiteSpace($env:SDKROOT) -and (Test-Path $env:SDKROOT)) {
         return $true
@@ -316,41 +351,102 @@ try {
 
     $targetFailures = [System.Collections.Generic.List[string]]::new()
     $targetSkippedFfi = 0
-    foreach ($t in $MobileTargets) {
-        Write-Host "    -> Target: $t"
-        $denyRes = Invoke-NativeChecked -Exe "cargo-deny" -Args @("--target", $t, "check", "advisories", "bans", "licenses", "sources")
-        if ($denyRes.ExitCode -ne 0) {
-            $targetFailures.Add("${t}: cargo-deny failed ($($denyRes.Output))")
-            $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "FAIL"; core_sys_check = "NOT_RUN"; mobile_ffi_check = "NOT_RUN"; notes = "cargo-deny failed" })
-            continue
+    $androidMinSdk = if (-not [string]::IsNullOrWhiteSpace($env:ANDROID_MIN_SDK)) { $env:ANDROID_MIN_SDK } else { "26" }
+    $prevNdkHome = $env:ANDROID_NDK_HOME
+    $prevCcAarch64 = $env:CC_aarch64_linux_android
+    $prevArAarch64 = $env:AR_aarch64_linux_android
+    $prevCcX8664 = $env:CC_x86_64_linux_android
+    $prevArX8664 = $env:AR_x86_64_linux_android
+    try {
+        if ($null -ne $androidNdk) {
+            if ([string]::IsNullOrWhiteSpace($env:ANDROID_NDK_HOME)) {
+                $env:ANDROID_NDK_HOME = $androidNdk
+            }
+            $ndkLlvmBin = Get-AndroidNdkLlvmBin -NdkDir $androidNdk
+            if ($null -ne $ndkLlvmBin) {
+                $ndkAr = Resolve-NdkToolPath -BinDir $ndkLlvmBin -Candidates @("llvm-ar.exe", "llvm-ar")
+                $aarch64Cc = Resolve-NdkToolPath -BinDir $ndkLlvmBin -Candidates @(
+                    "aarch64-linux-android${androidMinSdk}-clang.cmd",
+                    "aarch64-linux-android${androidMinSdk}-clang.exe",
+                    "aarch64-linux-android${androidMinSdk}-clang"
+                )
+                $x8664Cc = Resolve-NdkToolPath -BinDir $ndkLlvmBin -Candidates @(
+                    "x86_64-linux-android${androidMinSdk}-clang.cmd",
+                    "x86_64-linux-android${androidMinSdk}-clang.exe",
+                    "x86_64-linux-android${androidMinSdk}-clang"
+                )
+                if ([string]::IsNullOrWhiteSpace($env:CC_aarch64_linux_android) -and ($null -ne $aarch64Cc)) {
+                    $env:CC_aarch64_linux_android = $aarch64Cc
+                }
+                if ([string]::IsNullOrWhiteSpace($env:AR_aarch64_linux_android) -and ($null -ne $ndkAr)) {
+                    $env:AR_aarch64_linux_android = $ndkAr
+                }
+                if ([string]::IsNullOrWhiteSpace($env:CC_x86_64_linux_android) -and ($null -ne $x8664Cc)) {
+                    $env:CC_x86_64_linux_android = $x8664Cc
+                }
+                if ([string]::IsNullOrWhiteSpace($env:AR_x86_64_linux_android) -and ($null -ne $ndkAr)) {
+                    $env:AR_x86_64_linux_android = $ndkAr
+                }
+            }
         }
+        $hasCargoNdk = ($null -ne $androidNdk) -and ((Invoke-NativeChecked -Exe "cargo" -Args (@() + $CargoToolchainArgs + @("ndk", "--version"))).ExitCode -eq 0)
 
-        $coreArgs = @() + $CargoToolchainArgs + @("check", "-p", "mesh-core", "-p", "mesh-sys", "--target", $t)
-        $coreRes = Invoke-NativeChecked -Exe "cargo" -Args $coreArgs
-        if ($coreRes.ExitCode -ne 0) {
-            $targetFailures.Add("${t}: cargo check -p mesh-core -p mesh-sys failed ($($coreRes.Output))")
-            $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "FAIL"; mobile_ffi_check = "NOT_RUN"; notes = "mesh-core/mesh-sys check failed" })
-            continue
-        }
-
-        $isAndroid = $t -like "*-linux-android"
-        $canCheckFfi = ($isAndroid -and ($null -ne $androidNdk)) -or ((-not $isAndroid) -and $hasAppleSdk)
-        if ($canCheckFfi) {
-            $ffiArgs = @() + $CargoToolchainArgs + @("check", "-p", "mesh-mobile-ffi", "--target", $t)
-            $ffiRes = Invoke-NativeChecked -Exe "cargo" -Args $ffiArgs
-            if ($ffiRes.ExitCode -ne 0) {
-                $targetFailures.Add("${t}: cargo check -p mesh-mobile-ffi failed ($($ffiRes.Output))")
-                $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "PASS"; mobile_ffi_check = "FAIL"; notes = "mesh-mobile-ffi check failed" })
+        foreach ($t in $MobileTargets) {
+            Write-Host "    -> Target: $t"
+            $denyRes = Invoke-NativeChecked -Exe "cargo-deny" -Args @("--target", $t, "check", "advisories", "bans", "licenses", "sources")
+            if ($denyRes.ExitCode -ne 0) {
+                $targetFailures.Add("${t}: cargo-deny failed ($($denyRes.Output))")
+                $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "FAIL"; core_sys_check = "NOT_RUN"; mobile_ffi_check = "NOT_RUN"; notes = "cargo-deny failed" })
                 continue
             }
-            $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "PASS"; mobile_ffi_check = "PASS"; notes = "Native SDK present; full FFI check passed" })
+
+            $coreArgs = @() + $CargoToolchainArgs + @("check", "-p", "mesh-core", "-p", "mesh-sys", "--target", $t)
+            $coreRes = Invoke-NativeChecked -Exe "cargo" -Args $coreArgs
+            if ($coreRes.ExitCode -ne 0) {
+                $targetFailures.Add("${t}: cargo check -p mesh-core -p mesh-sys failed ($($coreRes.Output))")
+                $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "FAIL"; mobile_ffi_check = "NOT_RUN"; notes = "mesh-core/mesh-sys check failed" })
+                continue
+            }
+
+            $isAndroid = $t -like "*-linux-android"
+            $canCheckFfi = ($isAndroid -and ($null -ne $androidNdk)) -or ((-not $isAndroid) -and $hasAppleSdk)
+            if ($canCheckFfi) {
+                $ffiArgs = $null
+                if ($isAndroid -and $hasCargoNdk) {
+                    $abi = switch ($t) {
+                        "aarch64-linux-android" { "arm64-v8a" }
+                        "x86_64-linux-android" { "x86_64" }
+                        default { $null }
+                    }
+                    if ($null -ne $abi) {
+                        $ffiArgs = @() + $CargoToolchainArgs + @("ndk", "-t", $abi, "--platform", $androidMinSdk, "check", "-p", "mesh-mobile-ffi")
+                    }
+                }
+                if ($null -eq $ffiArgs) {
+                    $ffiArgs = @() + $CargoToolchainArgs + @("check", "-p", "mesh-mobile-ffi", "--target", $t)
+                }
+                $ffiRes = Invoke-NativeChecked -Exe "cargo" -Args $ffiArgs
+                if ($ffiRes.ExitCode -ne 0) {
+                    $targetFailures.Add("${t}: cargo check -p mesh-mobile-ffi failed ($($ffiRes.Output))")
+                    $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "PASS"; mobile_ffi_check = "FAIL"; notes = "mesh-mobile-ffi check failed" })
+                    continue
+                }
+                $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "PASS"; mobile_ffi_check = "PASS"; notes = "Native SDK present; full FFI check passed" })
+            }
+            else {
+                $skipMsg = "[SKIP - Host lacks NDK/Xcode SDK; enforced in mobile CI workflows]"
+                Write-Host "       $skipMsg" -ForegroundColor Yellow
+                $targetSkippedFfi++
+                $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "PASS"; mobile_ffi_check = "SKIP"; notes = $skipMsg })
+            }
         }
-        else {
-            $skipMsg = "[SKIP - Host lacks NDK/Xcode SDK; enforced in mobile CI workflows]"
-            Write-Host "       $skipMsg" -ForegroundColor Yellow
-            $targetSkippedFfi++
-            $TargetMatrix.Add([ordered]@{ target = $t; cargo_deny = "PASS"; core_sys_check = "PASS"; mobile_ffi_check = "SKIP"; notes = $skipMsg })
-        }
+    }
+    finally {
+        $env:ANDROID_NDK_HOME = $prevNdkHome
+        $env:CC_aarch64_linux_android = $prevCcAarch64
+        $env:AR_aarch64_linux_android = $prevArAarch64
+        $env:CC_x86_64_linux_android = $prevCcX8664
+        $env:AR_x86_64_linux_android = $prevArX8664
     }
     $sw.Stop()
     if ($targetFailures.Count -gt 0) {

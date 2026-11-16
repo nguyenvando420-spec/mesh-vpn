@@ -1,5 +1,5 @@
 import Foundation
-import LocalAuthentication
+@preconcurrency import LocalAuthentication
 
 /// Outcome of an iOS LocalAuthentication gate before sensitive security actions.
 public enum BiometricAuthOutcome: Sendable, Equatable {

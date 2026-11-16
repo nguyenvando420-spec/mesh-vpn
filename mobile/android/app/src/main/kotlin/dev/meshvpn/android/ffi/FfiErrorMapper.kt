@@ -158,14 +158,17 @@ object FfiErrorMapper {
             "Unlock your phone once after reboot so encrypted keys can load.",
         )
         is MobileException.Unavailable -> mapUnavailable(ex)
-        else -> simpleInfo(
-            UiErrorKind.INTERNAL,
-            ex.errorCode,
-            "Internal Engine Error",
-            SafeLogger.redact(ex.message),
-            "Export a scrubbed bugreport for inspection.",
-        )
+        is MobileException.Internal -> internalErrorInfo(ex)
+        else -> internalErrorInfo(ex)
     }
+
+    private fun internalErrorInfo(ex: MobileException): UiErrorInfo = simpleInfo(
+        UiErrorKind.INTERNAL,
+        ex.errorCode,
+        "Internal Engine Error",
+        SafeLogger.redact(ex.message),
+        "Export a scrubbed bugreport for inspection.",
+    )
 
     private fun mapUnavailable(ex: MobileException.Unavailable): UiErrorInfo {
         val redacted = SafeLogger.redact(ex.message)

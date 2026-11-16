@@ -1,9 +1,12 @@
 package dev.meshvpn.android.vpn
 
+import android.os.ParcelFileDescriptor
 import dev.meshvpn.android.data.diagnostics.SafeLogger
 import dev.meshvpn.android.data.keystore.AndroidKeystoreDekManager
 import dev.meshvpn.android.data.storage.PrivateStateFileStore
 import dev.meshvpn.android.ffi.MobileEngineHandle
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -43,6 +46,8 @@ class AndroidPlatformBridge(
     private val stateStore: PrivateStateFileStore,
     private val statusSink: (MobileStatusSnapshot) -> Unit,
     private val warningSink: (MobilePlatformWarning) -> Unit,
+    private val routeDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val fdCloser: (Int) -> Unit = ::closeDetachedFdWithParcelFd,
 ) : PlatformNetworkBridge {
     private val routeMutex = Mutex()
 
@@ -75,7 +80,7 @@ class AndroidPlatformBridge(
             return
         }
 
-        scope.launch(Dispatchers.IO) {
+        scope.launch(routeDispatcher) {
             routeMutex.withLock {
                 var detachedFd: Int? = null
                 var errorMessage: String? = null
@@ -96,13 +101,26 @@ class AndroidPlatformBridge(
 
                 val engine = engineProvider()
                 if (engine != null) {
-                    engine.completeRouteChange(
-                        opId = opId,
-                        ok = ok,
-                        newAndroidTunFd = detachedFd,
-                        errorMessage = errorMessage,
-                    )
+                    try {
+                        engine.completeRouteChange(
+                            opId = opId,
+                            ok = ok,
+                            newAndroidTunFd = detachedFd,
+                            errorMessage = errorMessage,
+                        )
+                    } catch (err: Throwable) {
+                        closeDetachedFd(detachedFd)
+                        SafeLogger.w(
+                            TAG,
+                            "completeRouteChange($opId) threw; closed detached TUN fd",
+                            err,
+                        )
+                        if (err is CancellationException) {
+                            throw err
+                        }
+                    }
                 } else {
+                    closeDetachedFd(detachedFd)
                     SafeLogger.w(TAG, "MobileEngine disappeared before completeRouteChange($opId)")
                 }
             }
@@ -131,7 +149,21 @@ class AndroidPlatformBridge(
         stateStore.deleteStateFile(fileName)
     }
 
+    private fun closeDetachedFd(fd: Int?) {
+        if (fd != null && fd >= 0) {
+            fdCloser(fd)
+        }
+    }
+
     companion object {
         private const val TAG = "AndroidPlatformBridge"
+
+        private fun closeDetachedFdWithParcelFd(fd: Int) {
+            try {
+                ParcelFileDescriptor.adoptFd(fd).close()
+            } catch (err: Throwable) {
+                SafeLogger.w(TAG, "Failed closing orphaned detached TUN fd=$fd", err)
+            }
+        }
     }
 }

@@ -462,6 +462,26 @@ impl MobileEngine {
         new_android_tun_fd: Option<i32>,
         error_message: Option<String>,
     ) {
+        let rt_handle = self
+            .runtime
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|rt| rt.handle().clone()));
+        let Some(handle) = rt_handle else {
+            self.platform_hooks
+                .discard_unused_android_tun_fd(new_android_tun_fd);
+            warn!(
+                component = "mesh_mobile_ffi.engine",
+                event = "complete_route_change_after_shutdown",
+                op_id,
+                "ignoring route change callback because mobile runtime is shut down"
+            );
+            return;
+        };
+
+        // Caller threads outside Tokio (e.g. Android `Dispatchers.IO`) lack an ambient reactor;
+        // entering the engine runtime keeps `AndroidTunDevice::swap_raw_fd` reactor registration valid.
+        let _rt_guard = handle.enter();
         if let Err(err) =
             self.platform_hooks
                 .complete_route_change(op_id, ok, new_android_tun_fd, error_message)
@@ -1195,6 +1215,7 @@ mod tests {
         BYTES_PER_MIB, JETSAM_COOLDOWN_MS, JetsamPressureController, JetsamPressureStage,
         MobileEngine,
     };
+    use crate::bridge::RouteOpKind;
     use crate::bugreport::LogRingBuffer;
     use crate::types::{
         MobileEngineInitConfig, MobileError, MobilePlatformKind, MobilePlatformWarning,
@@ -1633,6 +1654,147 @@ mod tests {
             assert!(!surface.contains("disco_privkey_hex"));
         }
 
+        engine.shutdown().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_complete_route_change_from_non_tokio_thread_enters_runtime_and_handles_shutdown()
+    -> Result<(), String> {
+        // Arrange: build Android MobileEngine and ensure test thread itself is outside Tokio.
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let dir = TempDir::new().map_err(|e| e.to_string())?;
+        let bridge = Arc::new(TestMobileBridge::default());
+        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
+        let engine = MobileEngine::new_with_clock(
+            MobileEngineInitConfig {
+                platform: MobilePlatformKind::Android,
+                agent_version: "0.2.0-mobile".to_owned(),
+                default_node_name: Some("pixel-roam".to_owned()),
+                log_dir_path: dir.path().to_string_lossy().into_owned(),
+            },
+            bridge,
+            clock,
+        )
+        .map_err(|e| e.to_string())?;
+        let expected_rt_id = engine.rt_handle.id();
+
+        let rx_reconcile = engine
+            .platform_hooks
+            .insert_test_pending_route_op(55, RouteOpKind::Reconcile);
+
+        // Act 1: Call `complete_route_change` from a plain OS thread without Tokio context
+        // (matching Kotlin `Dispatchers.IO`).
+        let engine_for_thread = Arc::clone(&engine);
+        let join = std::thread::spawn(move || {
+            let before_err = tokio::runtime::Handle::try_current().is_err();
+            engine_for_thread.complete_route_change(55, true, None, None);
+            let after_err = tokio::runtime::Handle::try_current().is_err();
+            (before_err, after_err)
+        });
+        let (before_err, after_err) = join
+            .join()
+            .map_err(|_| "route completion test thread panicked".to_owned())?;
+        let reconcile_outcome = rx_reconcile.blocking_recv().map_err(|e| e.to_string())?;
+
+        // Assert 1: Caller thread had no Tokio context, yet callback entered engine's Tokio runtime.
+        assert!(before_err);
+        assert!(after_err);
+        assert!(reconcile_outcome.is_ok());
+        assert_eq!(
+            engine.platform_hooks.take_test_route_complete_runtime_ids(),
+            vec![Some(expected_rt_id)]
+        );
+
+        // Act 2: Shutdown engine, then invoke `complete_route_change` with raw FDs from OS thread.
+        engine.shutdown().map_err(|e| e.to_string())?;
+        let engine_after_shutdown = Arc::clone(&engine);
+        let post_shutdown_join = std::thread::spawn(move || {
+            engine_after_shutdown.complete_route_change(56, true, Some(701), None);
+            engine_after_shutdown.complete_route_change(
+                57,
+                false,
+                Some(702),
+                Some("late reject".to_owned()),
+            );
+        });
+        post_shutdown_join
+            .join()
+            .map_err(|_| "post-shutdown route test thread panicked".to_owned())?;
+
+        // Assert 2: After shutdown, callback never dispatches into dead runtime and closes FDs.
+        assert!(
+            engine
+                .platform_hooks
+                .take_test_route_complete_runtime_ids()
+                .is_empty()
+        );
+        assert_eq!(
+            engine.platform_hooks.take_test_closed_unused_fds(),
+            vec![701, 702]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_complete_route_change_from_std_thread_allows_unix_tun_fd_swap_registration()
+    -> Result<(), String> {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+
+        use mesh_core::{OverlayCidr, OverlayIp};
+        use mesh_net::TunConfig;
+
+        use crate::tun_bridge::AndroidTunDevice;
+
+        // Arrange: create engine and enter its runtime from plain std::thread to swap Unix FD.
+        let dir = TempDir::new().map_err(|e| e.to_string())?;
+        let bridge = Arc::new(TestMobileBridge::default());
+        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
+        let engine = MobileEngine::new_with_clock(
+            MobileEngineInitConfig {
+                platform: MobilePlatformKind::Android,
+                agent_version: "0.2.0-mobile".to_owned(),
+                default_node_name: Some("pixel-swap".to_owned()),
+                log_dir_path: dir.path().to_string_lossy().into_owned(),
+            },
+            bridge,
+            clock,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let (_k1, a1) = UnixDatagram::pair().map_err(|e| e.to_string())?;
+        let (_k2, a2) = UnixDatagram::pair().map_err(|e| e.to_string())?;
+        a1.set_nonblocking(true).map_err(|e| e.to_string())?;
+        a2.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let cidr = OverlayCidr::parse("100.64.0.0/16").map_err(|e| e.to_string())?;
+        let ip = OverlayIp::from_ipv4(std::net::Ipv4Addr::new(100, 64, 0, 8))
+            .map_err(|e| e.to_string())?;
+        let cfg = TunConfig::with_default_mtu("tun0", ip, cidr).map_err(|e| e.to_string())?;
+
+        // Enter engine runtime inside a plain thread, mirroring `MobileEngine::complete_route_change`.
+        let engine_for_thread = Arc::clone(&engine);
+        let swap_res = std::thread::spawn(move || -> Result<(), String> {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let rt_handle = engine_for_thread
+                .runtime
+                .lock()
+                .map_err(|_| "runtime mutex poisoned".to_owned())?
+                .as_ref()
+                .map(|rt| rt.handle().clone())
+                .ok_or_else(|| "missing runtime".to_owned())?;
+            let _guard = rt_handle.enter();
+            let dev = AndroidTunDevice::from_owned_fd(cfg, OwnedFd::from(a1))
+                .map_err(|e| e.to_string())?;
+            dev.swap_owned_fd(OwnedFd::from(a2))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .join()
+        .map_err(|_| "unix swap thread panicked".to_owned())?;
+
+        assert!(swap_res.is_ok());
         engine.shutdown().map_err(|e| e.to_string())?;
         Ok(())
     }

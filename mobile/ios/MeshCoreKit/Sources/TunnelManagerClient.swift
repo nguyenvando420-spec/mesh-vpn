@@ -1,5 +1,5 @@
 import Foundation
-import NetworkExtension
+@preconcurrency import NetworkExtension
 
 /// Observable tunnel connection phase decoupled from `NEVPNStatus` for SwiftUI & XCTest.
 public enum MeshTunnelConnectionStatus: String, Sendable, Equatable {

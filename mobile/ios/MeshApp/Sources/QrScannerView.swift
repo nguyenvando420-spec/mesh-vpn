@@ -10,8 +10,8 @@ private final class CaptureSessionRunner: @unchecked Sendable {
     let session = AVCaptureSession()
 
     func configureAndStart(
-        delegate: AVCaptureMetadataOutputObjectsDelegate,
-        onUnavailable: @escaping @MainActor (String) -> Void
+        delegate: AVCaptureMetadataOutputObjectsDelegate & Sendable,
+        onUnavailable: @escaping @MainActor @Sendable (String) -> Void
     ) {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
         switch status {
@@ -45,8 +45,8 @@ private final class CaptureSessionRunner: @unchecked Sendable {
     }
 
     private func startPipeline(
-        delegate: AVCaptureMetadataOutputObjectsDelegate,
-        onUnavailable: @escaping @MainActor (String) -> Void
+        delegate: AVCaptureMetadataOutputObjectsDelegate & Sendable,
+        onUnavailable: @escaping @MainActor @Sendable (String) -> Void
     ) {
         sessionQueue.async { [self] in
             guard let device = AVCaptureDevice.default(for: .video) else {

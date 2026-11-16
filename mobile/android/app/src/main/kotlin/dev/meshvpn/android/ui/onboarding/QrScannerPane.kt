@@ -144,6 +144,9 @@ private fun CameraPreviewScanner(
         val reader = createQrReader()
 
         val listener = Runnable {
+            if (providerFuture.isCancelled) {
+                return@Runnable
+            }
             try {
                 val provider = providerFuture.get()
                 val preview = Preview.Builder().build().also {
@@ -177,7 +180,11 @@ private fun CameraPreviewScanner(
         providerFuture.addListener(listener, mainExecutor)
 
         onDispose {
-            runCatching { providerFuture.get().unbindAll() }
+            if (providerFuture.isDone && !providerFuture.isCancelled) {
+                runCatching { providerFuture.get().unbindAll() }
+            } else if (!providerFuture.isDone) {
+                providerFuture.cancel(false)
+            }
             analysisExecutor.shutdown()
         }
     }

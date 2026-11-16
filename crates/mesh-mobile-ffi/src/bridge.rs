@@ -468,8 +468,27 @@ impl DnsUpstreamHook for FfiDnsUpstreamHook {
     }
 }
 
+/// Safely closes a detached Android TUN descriptor that was never transferred into an
+/// [`AndroidTunDevice`] (for example, on failure, waiter timeout, stale `op_id`, or shutdown).
+pub(crate) fn close_unused_android_tun_fd(raw_fd: Option<i32>) {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(fd) = raw_fd
+            && fd >= 0
+        {
+            // Dropping the returned `OwnedFd` closes the descriptor via RAII with zero
+            // hand-written `unsafe` inside `mesh-mobile-ffi`.
+            drop(mesh_sys::tun_android::adopt_raw_tun_fd(fd));
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _unused = raw_fd;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RouteOpKind {
+pub(crate) enum RouteOpKind {
     InitialEstablish,
     Reconcile,
 }
@@ -531,6 +550,10 @@ pub(crate) struct FfiPlatformHooks {
     memory_override_bytes: AtomicU64,
     use_memory_override: AtomicBool,
     rfc7050_lookup: StdRwLock<Option<Rfc7050LookupFn>>,
+    #[cfg(test)]
+    closed_unused_fds: StdMutex<Vec<i32>>,
+    #[cfg(test)]
+    complete_route_tokio_runtime_ids: StdMutex<Vec<Option<tokio::runtime::Id>>>,
 }
 
 impl std::fmt::Debug for FfiPlatformHooks {
@@ -581,6 +604,10 @@ impl FfiPlatformHooks {
             memory_override_bytes: AtomicU64::new(0),
             use_memory_override: AtomicBool::new(false),
             rfc7050_lookup: StdRwLock::new(None),
+            #[cfg(test)]
+            closed_unused_fds: StdMutex::new(Vec::new()),
+            #[cfg(test)]
+            complete_route_tokio_runtime_ids: StdMutex::new(Vec::new()),
         }
     }
 
@@ -595,9 +622,30 @@ impl FfiPlatformHooks {
 
     /// Configures an optional initial Android TUN descriptor before `start_tunnel`.
     pub(crate) fn set_initial_android_tun_fd(&self, raw_fd: Option<i32>) {
-        if let Ok(mut guard) = self.initial_android_tun_fd.lock() {
-            *guard = raw_fd;
+        let prev = self
+            .initial_android_tun_fd
+            .lock()
+            .ok()
+            .and_then(|mut guard| {
+                let old = guard.take();
+                *guard = raw_fd;
+                old
+            });
+        if prev != raw_fd {
+            self.discard_unused_android_tun_fd(prev);
         }
+    }
+
+    /// Closes an unused Android TUN descriptor (and records it in unit tests).
+    pub(crate) fn discard_unused_android_tun_fd(&self, raw_fd: Option<i32>) {
+        #[cfg(test)]
+        if let Some(fd) = raw_fd
+            && fd >= 0
+            && let Ok(mut guard) = self.closed_unused_fds.lock()
+        {
+            guard.push(fd);
+        }
+        close_unused_android_tun_fd(raw_fd);
     }
 
     /// Injects an L3 packet batch from iOS `NEPacketTunnelFlow` into active [`PacketFlowAdapter`].
@@ -628,6 +676,38 @@ impl FfiPlatformHooks {
         if let Ok(mut guard) = self.rfc7050_lookup.write() {
             *guard = lookup;
         }
+    }
+
+    /// Inserts a pending route operation for deterministic callback tests.
+    #[cfg(test)]
+    pub(crate) fn insert_test_pending_route_op(
+        &self,
+        op_id: u64,
+        kind: RouteOpKind,
+    ) -> oneshot::Receiver<Result<Option<i32>, MobileError>> {
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut ops) = self.pending_route_ops.lock() {
+            ops.insert(op_id, (kind, tx));
+        }
+        rx
+    }
+
+    /// Drains recorded unused Android TUN FD discards in unit tests.
+    #[cfg(test)]
+    pub(crate) fn take_test_closed_unused_fds(&self) -> Vec<i32> {
+        self.closed_unused_fds
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+
+    /// Drains recorded Tokio runtime IDs seen inside `complete_route_change` in unit tests.
+    #[cfg(test)]
+    pub(crate) fn take_test_route_complete_runtime_ids(&self) -> Vec<Option<tokio::runtime::Id>> {
+        self.complete_route_tokio_runtime_ids
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
     }
 
     /// Returns current active warnings surfaced by platform probes/pressure watchers.
@@ -727,13 +807,21 @@ impl FfiPlatformHooks {
         new_android_tun_fd: Option<i32>,
         error_message: Option<String>,
     ) -> Result<(), MobileError> {
-        let maybe_op = self
-            .pending_route_ops
-            .lock()
-            .map_err(|_| MobileError::internal("pending_route_ops lock poisoned"))?
-            .remove(&op_id);
+        #[cfg(test)]
+        if let Ok(mut guard) = self.complete_route_tokio_runtime_ids.lock() {
+            guard.push(tokio::runtime::Handle::try_current().ok().map(|h| h.id()));
+        }
+
+        let maybe_op = match self.pending_route_ops.lock() {
+            Ok(mut ops) => ops.remove(&op_id),
+            Err(_) => {
+                self.discard_unused_android_tun_fd(new_android_tun_fd);
+                return Err(MobileError::internal("pending_route_ops lock poisoned"));
+            }
+        };
 
         if !success {
+            self.discard_unused_android_tun_fd(new_android_tun_fd);
             if let Some((_kind, tx)) = maybe_op
                 && tx
                     .send(Err(MobileError::unavailable(error_message.unwrap_or_else(
@@ -754,7 +842,10 @@ impl FfiPlatformHooks {
         match maybe_op {
             Some((RouteOpKind::InitialEstablish, tx)) => {
                 // Hand raw FD directly to `activate_tun_and_routes` so `from_raw_fd` adopts it once.
-                if tx.send(Ok(new_android_tun_fd)).is_err() {
+                if let Err(returned) = tx.send(Ok(new_android_tun_fd)) {
+                    if let Ok(unused_fd) = returned {
+                        self.discard_unused_android_tun_fd(unused_fd);
+                    }
                     debug!(
                         component = "mesh_mobile_ffi.bridge",
                         event = "route_change_waiter_dropped",
@@ -765,46 +856,56 @@ impl FfiPlatformHooks {
                 Ok(())
             }
             Some((RouteOpKind::Reconcile, tx)) => {
-                let swap_res = if let Some(fd) = new_android_tun_fd {
-                    let existing = self
-                        .active_android_tun
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.clone());
-                    match existing {
-                        Some(existing_tun) => {
-                            existing_tun.swap_raw_fd(fd).map_err(MobileError::from)
-                        }
-                        None => Ok(()),
-                    }
-                } else {
-                    Ok(())
-                };
-                let return_res = swap_res.as_ref().map(|()| None).map_err(Clone::clone);
-                if tx.send(return_res).is_err() {
-                    debug!(
-                        component = "mesh_mobile_ffi.bridge",
-                        event = "route_change_waiter_dropped",
-                        op_id,
-                        "reconcile route waiter already timed out or dropped"
-                    );
-                }
-                swap_res
+                self.complete_reconcile_route_op(op_id, tx, new_android_tun_fd)
             }
             None => {
-                if let Some(fd) = new_android_tun_fd {
-                    let existing = self
-                        .active_android_tun
-                        .lock()
-                        .ok()
-                        .and_then(|guard| guard.clone());
-                    if let Some(existing_tun) = existing {
-                        existing_tun.swap_raw_fd(fd).map_err(MobileError::from)?;
-                    }
-                }
+                self.discard_unused_android_tun_fd(new_android_tun_fd);
+                debug!(
+                    component = "mesh_mobile_ffi.bridge",
+                    event = "route_change_waiter_dropped",
+                    op_id,
+                    has_android_tun_fd = new_android_tun_fd.is_some(),
+                    "ignoring stale or timed-out route change completion"
+                );
                 Ok(())
             }
         }
+    }
+
+    fn complete_reconcile_route_op(
+        &self,
+        op_id: u64,
+        tx: oneshot::Sender<Result<Option<i32>, MobileError>>,
+        new_android_tun_fd: Option<i32>,
+    ) -> Result<(), MobileError> {
+        let swap_res = if let Some(fd) = new_android_tun_fd {
+            let existing = self
+                .active_android_tun
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            match existing {
+                Some(existing_tun) => existing_tun.swap_raw_fd(fd).map_err(MobileError::from),
+                None => {
+                    self.discard_unused_android_tun_fd(Some(fd));
+                    Err(MobileError::unavailable(
+                        "cannot apply Android TUN FD reconcile without active TUN device",
+                    ))
+                }
+            }
+        } else {
+            Ok(())
+        };
+        let return_res = swap_res.as_ref().map(|()| None).map_err(Clone::clone);
+        if tx.send(return_res).is_err() {
+            debug!(
+                component = "mesh_mobile_ffi.bridge",
+                event = "route_change_waiter_dropped",
+                op_id,
+                "reconcile route waiter already timed out or dropped"
+            );
+        }
+        swap_res
     }
 
     /// Dispatches an underlay transition event into the supervised session `NetMonitor`.
@@ -1081,23 +1182,45 @@ impl ClientPlatformHooks for FfiPlatformHooks {
                     }
                 }
                 MobilePlatformKind::Android => {
-                    let callback_fd = self
+                    let callback_fd = match self
                         .dispatch_route_update(
                             op_id,
                             RouteOpKind::InitialEstablish,
                             route_cfg.clone(),
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(fd) => fd,
+                        Err(err) => {
+                            let leftover_initial = self
+                                .initial_android_tun_fd
+                                .lock()
+                                .ok()
+                                .and_then(|mut g| g.take());
+                            self.discard_unused_android_tun_fd(leftover_initial);
+                            return Err(err);
+                        }
+                    };
                     let initial_fd = self
                         .initial_android_tun_fd
                         .lock()
                         .ok()
                         .and_then(|mut g| g.take());
-                    let chosen_fd = callback_fd.or(initial_fd).ok_or_else(|| {
-                        AppError::unavailable(
-                            "Android VpnService.Builder.establish() did not provide a TUN FD",
-                        )
-                    })?;
+                    let chosen_fd = match (callback_fd, initial_fd) {
+                        (Some(cb_fd), Some(init_fd)) => {
+                            if init_fd != cb_fd {
+                                self.discard_unused_android_tun_fd(Some(init_fd));
+                            }
+                            cb_fd
+                        }
+                        (Some(cb_fd), None) => cb_fd,
+                        (None, Some(init_fd)) => init_fd,
+                        (None, None) => {
+                            return Err(AppError::unavailable(
+                                "Android VpnService.Builder.establish() did not provide a TUN FD",
+                            ));
+                        }
+                    };
                     let android_tun =
                         Arc::new(AndroidTunDevice::from_raw_fd(tun_cfg.clone(), chosen_fd)?);
                     if let Ok(mut guard) = self.active_android_tun.lock() {
@@ -1217,9 +1340,12 @@ impl ClientPlatformHooks for FfiPlatformHooks {
             if let Some(tun) = android_tun {
                 let _ignored = tun.close().await;
             }
-            if let Ok(mut guard) = self.initial_android_tun_fd.lock() {
-                *guard = None;
-            }
+            let leftover_initial = self
+                .initial_android_tun_fd
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.take());
+            self.discard_unused_android_tun_fd(leftover_initial);
             if let Ok(mut ops) = self.pending_route_ops.lock() {
                 for (_, (_kind, tx)) in ops.drain() {
                     let _ignored = tx.send(Err(MobileError::unavailable("tunnel shutting down")));
@@ -1309,7 +1435,10 @@ mod tests {
     use mesh_net::{Nat64Prefix, Nat64Synthesizer, TunConfig};
     use mesh_proto::agent_ipc::TlsAuthMode;
 
-    use super::{FfiPlatformHooks, FfiStateStore, parse_underlay_state};
+    use super::{
+        FfiPlatformHooks, FfiStateStore, RouteOpKind, close_unused_android_tun_fd,
+        parse_underlay_state,
+    };
     use crate::dns_responder::MobileSplitDnsInterceptor;
     use crate::types::{
         MobileError, MobileNetEventKind, MobilePlatformKind, MobilePlatformWarning,
@@ -1634,6 +1763,121 @@ mod tests {
         assert_eq!(dual_parsed.nat64_prefix, None);
         assert_eq!(discovered, Some(expected_prefix));
         assert_eq!(cleared_on_dual_stack, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_complete_route_change_closes_unused_android_tun_fd_on_all_drop_paths()
+    -> Result<(), String> {
+        // Arrange
+        let bridge = Arc::new(FakeBridge::default());
+        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
+        let dns = Arc::new(MobileSplitDnsInterceptor::new(clock));
+        let hooks = Arc::new(FfiPlatformHooks::new(
+            MobilePlatformKind::Android,
+            bridge,
+            dns,
+        ));
+
+        // Act 1: `!success` with pending op and `Some(fd)` must notify waiter and discard FD.
+        let rx_fail = hooks.insert_test_pending_route_op(1, RouteOpKind::InitialEstablish);
+        hooks
+            .complete_route_change(1, false, Some(101), Some("host denied".to_owned()))
+            .map_err(|e| e.to_string())?;
+        let fail_outcome = rx_fail.await.map_err(|e| e.to_string())?;
+        assert!(matches!(fail_outcome, Err(MobileError::Unavailable { .. })));
+
+        // Act 2: `!success` with unknown op_id and `Some(fd)` must still discard FD.
+        hooks
+            .complete_route_change(999, false, Some(102), None)
+            .map_err(|e| e.to_string())?;
+
+        // Act 3: `success = true` with unknown/expired op_id and `Some(fd)` must discard FD.
+        hooks
+            .complete_route_change(888, true, Some(103), None)
+            .map_err(|e| e.to_string())?;
+
+        // Act 4: `InitialEstablish` where waiter timed out / dropped before completion.
+        let rx_dropped = hooks.insert_test_pending_route_op(2, RouteOpKind::InitialEstablish);
+        drop(rx_dropped);
+        hooks
+            .complete_route_change(2, true, Some(104), None)
+            .map_err(|e| e.to_string())?;
+
+        // Act 5: `Reconcile` with `active_android_tun == None` must discard FD and error.
+        let rx_reconcile = hooks.insert_test_pending_route_op(3, RouteOpKind::Reconcile);
+        let reconcile_res = hooks.complete_route_change(3, true, Some(105), None);
+        assert!(matches!(
+            reconcile_res,
+            Err(MobileError::Unavailable { .. })
+        ));
+        let reconcile_waiter_res = rx_reconcile.await.map_err(|e| e.to_string())?;
+        assert!(matches!(
+            reconcile_waiter_res,
+            Err(MobileError::Unavailable { .. })
+        ));
+
+        // Act 6: overwriting & cleaning up unused `initial_android_tun_fd` discards old FD.
+        hooks.set_initial_android_tun_fd(Some(106));
+        hooks.set_initial_android_tun_fd(Some(107));
+        hooks
+            .deactivate_and_cleanup()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Act 7: `close_unused_android_tun_fd` accepts `None` and negative sentinel cleanly.
+        close_unused_android_tun_fd(None);
+        close_unused_android_tun_fd(Some(-1));
+        hooks.discard_unused_android_tun_fd(None);
+        hooks.discard_unused_android_tun_fd(Some(-1));
+
+        // Assert
+        let discarded = hooks.take_test_closed_unused_fds();
+        assert_eq!(discarded, vec![101, 102, 103, 104, 105, 106, 107]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unknown_route_op_does_not_swap_active_android_tun_and_discards_fd()
+    -> Result<(), String> {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+
+        use crate::tun_bridge::AndroidTunDevice;
+
+        // Arrange
+        let bridge = Arc::new(FakeBridge::default());
+        let clock = Arc::new(FakeClock::new(1_700_000_000_000));
+        let dns = Arc::new(MobileSplitDnsInterceptor::new(clock));
+        let hooks = Arc::new(FfiPlatformHooks::new(
+            MobilePlatformKind::Android,
+            bridge,
+            dns,
+        ));
+        let (_k1, a1) = UnixDatagram::pair().map_err(|e| e.to_string())?;
+        a1.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let cidr = OverlayCidr::parse("100.64.0.0/16").map_err(|e| e.to_string())?;
+        let ip = OverlayIp::from_ipv4(Ipv4Addr::new(100, 64, 0, 7)).map_err(|e| e.to_string())?;
+        let cfg = TunConfig::with_default_mtu("tun0", ip, cidr).map_err(|e| e.to_string())?;
+        let dev = Arc::new(
+            AndroidTunDevice::from_owned_fd(cfg, OwnedFd::from(a1)).map_err(|e| e.to_string())?,
+        );
+        if let Ok(mut guard) = hooks.active_android_tun.lock() {
+            *guard = Some(Arc::clone(&dev));
+        }
+
+        // Act: unknown op_id with Some(201) must NOT swap into active_android_tun; must discard.
+        hooks
+            .complete_route_change(77_777, true, Some(201), None)
+            .map_err(|e| e.to_string())?;
+
+        // Assert
+        assert_eq!(hooks.take_test_closed_unused_fds(), vec![201]);
+        hooks
+            .deactivate_and_cleanup()
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }

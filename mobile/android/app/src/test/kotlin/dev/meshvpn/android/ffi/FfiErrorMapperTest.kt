@@ -56,4 +56,21 @@ class FfiErrorMapperTest {
             ).requiresReenroll,
         )
     }
+
+    @Test
+    fun ffiErrorMapperInternalRedactsSecretsAndUsesErrorCode() {
+        // Arrange
+        val internal = MobileException.Internal(
+            errorCode = "E_INTERNAL",
+            message = "failure with token mpk_SecretPreauthValue123456",
+        )
+
+        // Act
+        val mapped = FfiErrorMapper.mapThrowable(internal)
+
+        // Assert
+        assertEquals(UiErrorKind.INTERNAL, mapped.kind)
+        assertEquals("E_INTERNAL", mapped.code)
+        assertTrue(mapped.detail.contains("[REDACTED_TOKEN]"))
+    }
 }

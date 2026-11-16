@@ -12,7 +12,7 @@ public enum MeshConstants: Sendable {
     public static let tunnelBundleIdentifier = "dev.meshvpn.ios.PacketTunnel"
     public static let tunnelProviderDescription = "Mesh VPN"
     public static let loggerSubsystem = "dev.meshvpn.ios"
-    public static let agentVersion = "0.1.0-rc1"
+    public static let agentVersion = "0.2.0"
 
     public static let sealedIdentityFileName = "identity.sealed.bin"
     public static let bootstrapFileName = "bootstrap.toml"
