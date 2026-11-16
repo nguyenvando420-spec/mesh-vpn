@@ -1457,6 +1457,8 @@ dependencies = [
 name = "mesh-mobile-ffi"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "mesh-client",
  "mesh-core",
  "mesh-crypto",
@@ -1465,12 +1467,15 @@ dependencies = [
  "mesh-proto",
  "mesh-sys",
  "proptest",
+ "rustls",
  "serde",
  "serde_json",
  "socket2 0.5.10",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
  "tokio-util",
  "toml 0.8.23",
  "tracing",
