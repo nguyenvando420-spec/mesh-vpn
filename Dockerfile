@@ -40,28 +40,34 @@ COPY crates/mesh-datapath/Cargo.toml crates/mesh-datapath/Cargo.toml
 COPY crates/mesh-server/Cargo.toml crates/mesh-server/Cargo.toml
 COPY crates/meshd/Cargo.toml crates/meshd/Cargo.toml
 COPY crates/mesh/Cargo.toml crates/mesh/Cargo.toml
+COPY crates/mesh-client/Cargo.toml crates/mesh-client/Cargo.toml
+COPY crates/mesh-mobile-ffi/Cargo.toml crates/mesh-mobile-ffi/Cargo.toml
+COPY tools/uniffi-bindgen/Cargo.toml tools/uniffi-bindgen/Cargo.toml
 
 # Create minimal placeholder entrypoints so `cargo fetch --locked` caches all crates
 # cleanly before copying real source trees.
 RUN mkdir -p \
       crates/mesh-core/src crates/mesh-sys/src crates/mesh-crypto/src \
       crates/mesh-proto/src crates/mesh-net/src crates/mesh-store/src \
-      crates/mesh-datapath/src crates/mesh-server/src crates/meshd/src crates/mesh/src && \
-    for lib in mesh-core mesh-sys mesh-crypto mesh-proto mesh-net mesh-store mesh-datapath; do \
+      crates/mesh-datapath/src crates/mesh-server/src crates/meshd/src crates/mesh/src \
+      crates/mesh-client/src crates/mesh-mobile-ffi/src tools/uniffi-bindgen/src && \
+    for lib in mesh-core mesh-sys mesh-crypto mesh-proto mesh-net mesh-store mesh-datapath mesh-client mesh-mobile-ffi; do \
       touch "crates/${lib}/src/lib.rs"; \
     done && \
     for bin in mesh-server meshd mesh; do \
       printf 'fn main() {}\n' > "crates/${bin}/src/main.rs"; \
     done && \
+    printf 'fn main() {}\n' > tools/uniffi-bindgen/src/main.rs && \
     if [ -n "${CARGO_TARGET}" ]; then \
       cargo fetch --locked --target "${CARGO_TARGET}"; \
     else \
       cargo fetch --locked; \
     fi && \
-    rm -rf crates/*/src
+    rm -rf crates/*/src tools/uniffi-bindgen/src
 
 # Copy full workspace sources and build release binaries offline against Cargo.lock.
 COPY crates ./crates
+COPY tools ./tools
 
 RUN mkdir -p /out && \
     if [ -n "${CARGO_TARGET}" ]; then \

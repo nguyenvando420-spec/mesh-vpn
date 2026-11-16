@@ -304,17 +304,16 @@ public final class CoordinatedAppGroupStore: AppGroupFileManaging, Sendable {
         let attrs: [FileAttributeKey: Any] = [
             .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication
         ]
-        for dirURL in [stateDirectoryURL, diagnosticsDirectoryURL, logsDirectoryURL] {
-            if !fileManager.fileExists(atPath: dirURL.path) {
-                do {
-                    try fileManager.createDirectory(
-                        at: dirURL,
-                        withIntermediateDirectories: true,
-                        attributes: attrs
-                    )
-                } catch {
-                    throw wrapIOError(error, action: "create directory")
-                }
+        for dirURL in [stateDirectoryURL, diagnosticsDirectoryURL, logsDirectoryURL]
+        where !fileManager.fileExists(atPath: dirURL.path) {
+            do {
+                try fileManager.createDirectory(
+                    at: dirURL,
+                    withIntermediateDirectories: true,
+                    attributes: attrs
+                )
+            } catch {
+                throw wrapIOError(error, action: "create directory")
             }
         }
     }

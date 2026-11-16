@@ -290,6 +290,7 @@ main() {
         cd "${REPO_ROOT}"
         CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
         CARGO_PROFILE_RELEASE_LTO=fat \
+        CARGO_PROFILE_RELEASE_STRIP=none \
         RUSTFLAGS="${link_rustflags}" \
         cargo ndk \
             -t arm64-v8a \
@@ -298,6 +299,14 @@ main() {
             --platform "${ANDROID_MIN_SDK}" \
             build --release --locked -p mesh-mobile-ffi
     )
+
+    local llvm_strip
+    llvm_strip="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -name llvm-strip -type f 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${llvm_strip}" ]]; then
+        "${llvm_strip}" --strip-unneeded \
+            "${JNI_LIBS_DIR}/arm64-v8a/libmesh_mobile_ffi.so" \
+            "${JNI_LIBS_DIR}/x86_64/libmesh_mobile_ffi.so"
+    fi
 
     verify_elf_and_size "${JNI_LIBS_DIR}/arm64-v8a/libmesh_mobile_ffi.so"
     verify_elf_and_size "${JNI_LIBS_DIR}/x86_64/libmesh_mobile_ffi.so"
@@ -308,7 +317,9 @@ main() {
         cd "${REPO_ROOT}"
         cargo run --release --locked -p mesh-uniffi-bindgen -- \
             generate \
-            --library "${JNI_LIBS_DIR}/arm64-v8a/libmesh_mobile_ffi.so" \
+            --library "${REPO_ROOT}/target/aarch64-linux-android/release/libmesh_mobile_ffi.so" \
+            --crate mesh_mobile_ffi \
+            --no-format \
             --language kotlin \
             --out-dir "${UNIFFI_OUT_DIR}"
     )

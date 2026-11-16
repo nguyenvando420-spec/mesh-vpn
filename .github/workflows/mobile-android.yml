@@ -124,7 +124,18 @@ jobs:
           tool: cargo-ndk
 
       - name: Build Android JNI .so, Maven repo & UniFFI Kotlin bindings
-        run: bash scripts/build-android-ffi.sh
+        run: |
+          set -euo pipefail
+          if ! bash scripts/build-android-ffi.sh 2>&1 | tee /tmp/android-ffi.log; then
+            python3 - <<'PY'
+          import pathlib, re
+          lines = pathlib.Path("/tmp/android-ffi.log").read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"error[:\[]|FAILED|AssertionError|SystemExit", ln)]
+          snippet = "\n".join((matches[-10:] + ["--- tail ---"] + lines[-25:])[-36:])
+          print("::error title=Build Android JNI .so::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
+            exit 1
+          fi
 
       - name: Set up Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
@@ -158,7 +169,8 @@ jobs:
           MESH_ANDROID_KEY_ALIAS: ${{ secrets.MESH_ANDROID_KEY_ALIAS }}
           MESH_ANDROID_KEY_PASSWORD: ${{ secrets.MESH_ANDROID_KEY_PASSWORD }}
         run: |
-          gradle --no-daemon \
+          set -euo pipefail
+          if ! gradle --no-daemon \
             ktlintCheck \
             detekt \
             lintDebug \
@@ -166,7 +178,16 @@ jobs:
             assembleDebug \
             bundleRelease \
             assembleRelease \
-            -PrustlsPlatformVerifierRepo="${RUSTLS_PLATFORM_VERIFIER_REPO}"
+            -PrustlsPlatformVerifierRepo="${RUSTLS_PLATFORM_VERIFIER_REPO}" 2>&1 | tee /tmp/android-gradle.log; then
+            python3 - <<'PY'
+          import pathlib, re
+          lines = pathlib.Path("/tmp/android-gradle.log").read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"FAILURE:|Execution failed|e: file://|> .*ktlint|> .*detekt|Lint found", ln)]
+          snippet = "\n".join((matches[-10:] + ["--- tail ---"] + lines[-25:])[-36:])
+          print("::error title=Android Gradle Build::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
+            exit 1
+          fi
 
       - name: Wipe temporary signing keystore
         if: always()

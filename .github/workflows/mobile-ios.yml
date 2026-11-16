@@ -181,9 +181,18 @@ jobs:
           PY
           )"
           echo "Using iOS Simulator UDID: ${SIM_UDID}"
-          xcodebuild \
+          if ! xcodebuild \
             -project mobile/ios/MeshApp.xcodeproj \
             -scheme MeshApp \
             -destination "platform=iOS Simulator,id=${SIM_UDID}" \
             CODE_SIGNING_ALLOWED=NO \
-            build test
+            build test 2>&1 | tee /tmp/ios-xcodebuild.log; then
+            python3 - <<'PY'
+          import pathlib, re
+          lines = pathlib.Path("/tmp/ios-xcodebuild.log").read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"(?:error:|fatal error:|BUILD FAILED|Test Case .* failed)", ln)]
+          snippet = "\n".join((matches[-10:] + ["--- tail ---"] + lines[-25:])[-36:])
+          print("::error title=xcodebuild build test::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
+            exit 1
+          fi
