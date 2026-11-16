@@ -2,7 +2,6 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" path="." />
-        <exclude domain="file" path="." />
         <exclude domain="file" path="identity.sealed.bin" />
         <exclude domain="file" path="dek.enc" />
         <exclude domain="file" path="bootstrap.toml" />
@@ -14,7 +13,6 @@
     </cloud-backup>
     <device-transfer>
         <exclude domain="root" path="." />
-        <exclude domain="file" path="." />
         <exclude domain="file" path="identity.sealed.bin" />
         <exclude domain="file" path="dek.enc" />
         <exclude domain="file" path="bootstrap.toml" />

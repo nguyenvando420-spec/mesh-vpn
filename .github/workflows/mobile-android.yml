@@ -180,10 +180,15 @@ jobs:
             assembleRelease \
             -PrustlsPlatformVerifierRepo="${RUSTLS_PLATFORM_VERIFIER_REPO}" 2>&1 | tee /tmp/android-gradle.log; then
             python3 - <<'PY'
-          import pathlib, re
+          import glob, pathlib, re
           lines = pathlib.Path("/tmp/android-gradle.log").read_text(encoding="utf-8", errors="replace").splitlines()
           matches = [ln for ln in lines if re.search(r"FAILURE:|Execution failed|e: file://|> .*ktlint|> .*detekt|Lint found|\[[A-Za-z0-9_]+\]$|FAILED", ln)]
-          snippet = "\n".join((matches[-10:] + ["--- tail ---"] + lines[-25:])[-36:])
+          lint_lines = []
+          for rpt in sorted(glob.glob("app/build/intermediates/lint_intermediate_text_report/**/lint-results-*.txt", recursive=True)):
+              for ln in pathlib.Path(rpt).read_text(encoding="utf-8", errors="replace").splitlines():
+                  if re.search(r": (Error|Warning):", ln):
+                      lint_lines.append(ln)
+          snippet = "\n".join((matches[-10:] + lint_lines[:20] + ["--- tail ---"] + lines[-20:])[-45:])
           print("::error title=Android Gradle Build::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
           PY
             exit 1

@@ -332,6 +332,7 @@ main() {
             generate \
             --library "${REPO_ROOT}/target/aarch64-linux-android/release/libmesh_mobile_ffi.so" \
             --crate mesh_mobile_ffi \
+            --config "${REPO_ROOT}/crates/mesh-mobile-ffi/uniffi.toml" \
             --no-format \
             --language kotlin \
             --out-dir "${UNIFFI_OUT_DIR}"
