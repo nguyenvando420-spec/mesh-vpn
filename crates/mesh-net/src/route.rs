@@ -267,11 +267,12 @@ pub fn bind_underlay_udp_socket(
     {
         use std::os::fd::AsRawFd as _;
         let _unused = (is_ipv6, physical_if_index);
-        mesh_sys::socket_linux::set_socket_fwmark(
-            socket.as_raw_fd(),
-            fwmark.unwrap_or(LINUX_FWMARK),
-        )
-        .map_err(AppError::from)
+        if let Some(mark) = fwmark {
+            mesh_sys::socket_linux::set_socket_fwmark(socket.as_raw_fd(), mark)
+                .map_err(AppError::from)
+        } else {
+            Ok(())
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -341,11 +342,12 @@ pub fn bind_underlay_socket2(
     {
         use std::os::fd::AsRawFd as _;
         let _unused = (is_ipv6, physical_if_index);
-        mesh_sys::socket_linux::set_socket_fwmark(
-            socket.as_raw_fd(),
-            fwmark.unwrap_or(LINUX_FWMARK),
-        )
-        .map_err(AppError::from)
+        if let Some(mark) = fwmark {
+            mesh_sys::socket_linux::set_socket_fwmark(socket.as_raw_fd(), mark)
+                .map_err(AppError::from)
+        } else {
+            Ok(())
+        }
     }
     #[cfg(target_os = "macos")]
     {

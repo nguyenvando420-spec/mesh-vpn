@@ -88,6 +88,13 @@ public enum MeshErrorMapper: Sendable {
         case .RateLimited(let code, let message):
             return MeshUserFacingError(code: code, title: "Rate Limited", message: message)
 
+        default:
+            return mapMobileRuntimeError(error)
+        }
+    }
+
+    private static func mapMobileRuntimeError(_ error: MobileError) -> MeshUserFacingError {
+        switch error {
         case .Unavailable(let code, let message):
             let lower = message.lowercased()
             let title = lower.contains("captive") ? "Captive Portal Detected" : "Server Unavailable"
@@ -133,6 +140,13 @@ public enum MeshErrorMapper: Sendable {
 
         case .Internal(let code, let message):
             return MeshUserFacingError(code: code, title: "Internal Error", message: message)
+
+        default:
+            return MeshUserFacingError(
+                code: "E_INTERNAL",
+                title: "Operation Failed",
+                message: MeshSecretScrubber.scrub(error.localizedDescription)
+            )
         }
     }
 }

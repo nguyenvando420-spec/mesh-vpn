@@ -171,7 +171,7 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
     }
 }
 
-/// Manages the 32-byte Master Data Encryption Key (DEK) in the shared iOS Keychain Access Group.
+/// Manages the 32-byte Primary Data Encryption Key (DEK) in the shared iOS Keychain Access Group.
 public final class KeychainDekStore: Sendable {
     public typealias RandomBytesGenerator = @Sendable (Int) -> Data?
 

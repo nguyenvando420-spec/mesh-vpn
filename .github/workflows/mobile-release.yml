@@ -133,6 +133,7 @@ jobs:
           KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || secrets.MESH_ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || secrets.MESH_ANDROID_KEY_ALIAS }}
           KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.MESH_ANDROID_KEY_PASSWORD }}
+          GOOGLE_PLAY_SA: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
           if [[ -n "${KEYSTORE_B64}" && -n "${KEYSTORE_PASS}" && -n "${KEY_ALIAS}" && -n "${KEY_PASS}" ]]; then
             python3 - <<'PY'
@@ -145,9 +146,15 @@ jobs:
           PY
             echo "MESH_ANDROID_KEYSTORE_PATH=/tmp/mesh-release.jks" >> "${GITHUB_ENV}"
             echo "ANDROID_SIGNING_CONFIGURED=true" >> "${GITHUB_ENV}"
+            if [[ -n "${GOOGLE_PLAY_SA}" ]]; then
+              echo "PLAY_INTERNAL_UPLOAD_ENABLED=true" >> "${GITHUB_ENV}"
+            else
+              echo "PLAY_INTERNAL_UPLOAD_ENABLED=false" >> "${GITHUB_ENV}"
+            fi
             echo "Android release signing keystore configured."
           else
             echo "ANDROID_SIGNING_CONFIGURED=false" >> "${GITHUB_ENV}"
+            echo "PLAY_INTERNAL_UPLOAD_ENABLED=false" >> "${GITHUB_ENV}"
             echo "::notice title=\$0 Mode (Android Unsigned Release)::ANDROID_KEYSTORE_BASE64/PASSWORD/ALIAS secrets not configured. Building $0 sideload debug APK and unsigned release APK/AAB."
           fi
 
@@ -266,7 +273,7 @@ jobs:
           retention-days: 14
 
       - name: Push AAB to Google Play Internal Track (when service account & keystore present)
-        if: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON != '' && env.ANDROID_SIGNING_CONFIGURED == 'true' }}
+        if: env.PLAY_INTERNAL_UPLOAD_ENABLED == 'true'
         uses: r0adkll/upload-google-play@v1
         with:
           serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
@@ -276,7 +283,7 @@ jobs:
           status: completed
 
       - name: Notice when Google Play Internal upload is skipped ($0 Mode)
-        if: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON == '' || env.ANDROID_SIGNING_CONFIGURED != 'true' }}
+        if: env.PLAY_INTERNAL_UPLOAD_ENABLED != 'true'
         run: |
           echo "::notice title=Google Play Internal Upload Skipped (\$0 Mode)::Missing GOOGLE_PLAY_SERVICE_ACCOUNT_JSON or Android release signing keystore. Signed/debug APKs remain available for $0 sideloading."
 
@@ -443,12 +450,15 @@ jobs:
           if-no-files-found: error
 
       - name: Archive signed .ipa & upload to App Store Connect / TestFlight (hardware_signoff_required)
-        if: ${{ secrets.APPLE_TEAM_ID != '' && secrets.APP_STORE_CONNECT_API_KEY_JSON != '' }}
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APP_STORE_CONNECT_API_KEY_JSON: ${{ secrets.APP_STORE_CONNECT_API_KEY_JSON }}
         run: |
           set -euo pipefail
+          if [[ -z "${APPLE_TEAM_ID}" || -z "${APP_STORE_CONNECT_API_KEY_JSON}" ]]; then
+            echo "::notice title=hardware_signoff_required - Apple Developer \$99/yr::APPLE_TEAM_ID or APP_STORE_CONNECT_API_KEY_JSON is not configured. Signed .ipa archive and TestFlight upload skipped; \$0 MeshMobileFFI.xcframework and iOS Simulator XCTest suite passed."
+            exit 0
+          fi
           mkdir -p /tmp/asc-key artifacts/ios-ipa
           python3 - <<'PY'
           import json
@@ -506,11 +516,6 @@ jobs:
       - name: Wipe temporary App Store Connect credentials
         if: always()
         run: rm -rf /tmp/asc-key
-
-      - name: Notice when TestFlight upload is skipped (hardware_signoff_required - Apple Developer $99/yr)
-        if: ${{ secrets.APPLE_TEAM_ID == '' || secrets.APP_STORE_CONNECT_API_KEY_JSON == '' }}
-        run: |
-          echo "::notice title=hardware_signoff_required - Apple Developer \$99/yr::APPLE_TEAM_ID or APP_STORE_CONNECT_API_KEY_JSON is not configured. Signed .ipa archive and TestFlight upload skipped; $0 MeshMobileFFI.xcframework and iOS Simulator XCTest suite passed."
 
   publish-release:
     name: Publish Mobile GitHub Release & Unified SHA256SUMS

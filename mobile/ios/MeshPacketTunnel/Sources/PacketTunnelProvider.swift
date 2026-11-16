@@ -40,6 +40,39 @@ private struct PacketTunnelRuntimeState {
     var isStopping = false
 }
 
+/// Dependencies captured when launching tunnel path and memory monitors.
+private struct SystemMonitorDependencies {
+    let engine: MobileEngine
+    let bridge: IosPlatformBridge
+    let appGroupStore: CoordinatedAppGroupStore
+    let bootstrap: BootstrapSummary
+    let packetWriter: BoundedPacketWriter
+    let routeContinuation: AsyncStream<RouteChangeEvent>.Continuation?
+    let routeTask: Task<Void, Never>
+}
+
+/// Snapshot extracted when handling an `NWPathMonitor` update.
+private struct PathUpdateContext {
+    let engine: MobileEngine?
+    let bridge: IosPlatformBridge?
+    let previous: UnderlayPathSnapshot?
+    let isStopping: Bool
+}
+
+/// Snapshot extracted when handling a Jetsam memory-pressure callback.
+private struct MemoryPressureContext {
+    let engine: MobileEngine?
+    let source: DispatchSourceMemoryPressure?
+    let isStopping: Bool
+}
+
+/// Snapshot extracted when processing an App Group IPC request.
+private struct AppMessageContext: Sendable {
+    let engine: MobileEngine?
+    let bridge: IosPlatformBridge?
+    let store: CoordinatedAppGroupStore?
+}
+
 /// Network Extension `NEPacketTunnelProvider` owning the Rust `MobileEngine` runtime (`ADR-014`).
 final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
     // SAFETY-SENDABLE: All mutable state is synchronized through `stateLock`.
@@ -85,7 +118,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
                 await self?.handleRouteChange(event, engine: engine, bootstrap: bootstrap)
             }
         }
-        startSystemMonitors(
+        let deps = SystemMonitorDependencies(
             engine: engine,
             bridge: bridge,
             appGroupStore: appGroupStore,
@@ -94,6 +127,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider, @unchecked Sendable {
             routeContinuation: routeStreamContinuation,
             routeTask: routeTask
         )
+        startSystemMonitors(deps)
 
         let upConfig = MobileUpConfig(
             serverEndpoint: bootstrap.serverEndpoint,
@@ -172,15 +206,7 @@ private extension PacketTunnelProvider {
         )
     }
 
-    func startSystemMonitors(
-        engine: MobileEngine,
-        bridge: IosPlatformBridge,
-        appGroupStore: CoordinatedAppGroupStore,
-        bootstrap: BootstrapSummary,
-        packetWriter: BoundedPacketWriter,
-        routeContinuation: AsyncStream<RouteChangeEvent>.Continuation?,
-        routeTask: Task<Void, Never>
-    ) {
+    func startSystemMonitors(_ deps: SystemMonitorDependencies) {
         let pathMonitor = NWPathMonitor()
         pathMonitor.pathUpdateHandler = { [weak self] path in
             self?.handleNetworkPathUpdate(path)
@@ -194,15 +220,15 @@ private extension PacketTunnelProvider {
         }
 
         stateLock.withLock { state in
-            state.engine = engine
-            state.bridge = bridge
-            state.appGroupStore = appGroupStore
-            state.bootstrap = bootstrap
-            state.packetWriter = packetWriter
+            state.engine = deps.engine
+            state.bridge = deps.bridge
+            state.appGroupStore = deps.appGroupStore
+            state.bootstrap = deps.bootstrap
+            state.packetWriter = deps.packetWriter
             state.pathMonitor = pathMonitor
             state.memorySource = memorySource
-            state.routeContinuation = routeContinuation
-            state.routeTask = routeTask
+            state.routeContinuation = deps.routeContinuation
+            state.routeTask = deps.routeTask
             state.isStopping = false
         }
         pathMonitor.start(queue: monitorQueue)
@@ -274,16 +300,21 @@ private extension PacketTunnelProvider {
 
     func handleNetworkPathUpdate(_ path: NWPath) {
         let newSnapshot = UnderlayPathConverter.snapshot(from: path)
-        let (engine, bridge, previous, stopping) = stateLock.withLock { state in
+        let ctx = stateLock.withLock { state in
             let prev = state.lastUnderlay
             state.lastUnderlay = newSnapshot
-            return (state.engine, state.bridge, prev, state.isStopping)
+            return PathUpdateContext(
+                engine: state.engine,
+                bridge: state.bridge,
+                previous: prev,
+                isStopping: state.isStopping
+            )
         }
-        guard !stopping, let bridge, let engine else { return }
+        guard !ctx.isStopping, let bridge = ctx.bridge, let engine = ctx.engine else { return }
 
         bridge.updateUnderlaySnapshot(newSnapshot)
         if let kind = UnderlayPathConverter.classifyTransition(
-            previous: previous,
+            previous: ctx.previous,
             current: newSnapshot
         ) {
             engine.onNetworkChange(kind: kind, underlay: newSnapshot.toMobileUnderlayState())
@@ -297,10 +328,14 @@ private extension PacketTunnelProvider {
     func handleMemoryPressure() {
         let availableBytes = os_proc_available_memory()
         let availableMiB = Double(availableBytes) / (1024.0 * 1024.0)
-        let (engine, source, stopping) = stateLock.read {
-            ($0.engine, $0.memorySource, $0.isStopping)
+        let ctx = stateLock.read {
+            MemoryPressureContext(
+                engine: $0.engine,
+                source: $0.memorySource,
+                isStopping: $0.isStopping
+            )
         }
-        guard !stopping, let engine, let source else { return }
+        guard !ctx.isStopping, let engine = ctx.engine, let source = ctx.source else { return }
         let event = source.data
 
         if event.contains(.critical) {
@@ -330,18 +365,22 @@ private extension PacketTunnelProvider {
     }
 
     func processAppMessage(_ messageData: Data) async -> Data {
-        let (engine, bridge, store) = stateLock.read {
-            ($0.engine, $0.bridge, $0.appGroupStore)
+        let ctx = stateLock.read {
+            AppMessageContext(
+                engine: $0.engine,
+                bridge: $0.bridge,
+                store: $0.appGroupStore
+            )
         }
         do {
             let request = try TunnelIpcCodec.decodeRequest(from: messageData)
             let response = try await dispatchIpcRequest(
                 request,
-                engine: engine,
-                bridge: bridge,
-                store: store
+                engine: ctx.engine,
+                bridge: ctx.bridge,
+                store: ctx.store
             )
-            return try encodeIpcResponse(response, store: store)
+            return try encodeIpcResponse(response, store: ctx.store)
         } catch {
             let mapped = MeshErrorMapper.map(error)
             return (try? encodeErrorResponse(code: mapped.code, message: mapped.message)) ?? Data()
