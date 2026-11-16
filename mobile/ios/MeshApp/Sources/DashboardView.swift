@@ -175,8 +175,8 @@ struct DashboardView: View {
         let warnings = viewModel.statusSnapshot?.warnings ?? []
         if !warnings.isEmpty {
             Section("Operational Warnings") {
-                ForEach(Array(warnings.enumerated()), id: \.offset) { _, warning in
-                    Label(warning.message, systemImage: "exclamationmark.triangle.fill")
+                ForEach(warnings.indices, id: \.self) { idx in
+                    Label(warnings[idx].message, systemImage: "exclamationmark.triangle.fill")
                         .font(.subheadline)
                         .foregroundStyle(.orange)
                 }

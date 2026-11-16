@@ -627,7 +627,15 @@ impl ClientSessionSupervisor {
     ) -> AppResult<EnrollOrRotateResult> {
         let (bootstrap, identity, reg) = self.perform_enrollment_or_rotation(req).await?;
         persist_bootstrap_and_runtime(&self.runtime, &bootstrap).await?;
-        self.save_initial_netmap_cache_best_effort(Some(&reg.netmap), 1, reg.key_expires_at_ms);
+        let port_hint = {
+            let existing = self.runtime.inner.read().await.local_udp_port;
+            if existing >= 1024 { existing } else { 1 }
+        };
+        self.save_initial_netmap_cache_best_effort(
+            Some(&reg.netmap),
+            port_hint,
+            reg.key_expires_at_ms,
+        );
 
         let mut g = self.runtime.inner.write().await;
         g.key_expires_at_ms = reg.key_expires_at_ms;
@@ -1232,7 +1240,9 @@ impl ClientSessionSupervisor {
             .ok_or_else(|| {
                 AppError::invalid_argument("overlay_ip missing; run `mesh up` with auth key")
             })?;
-        let preferred_udp_port = Port::from_u16(g.local_udp_port).ok();
+        let preferred_udp_port = (g.local_udp_port >= 1024)
+            .then(|| Port::from_u16(g.local_udp_port).ok())
+            .flatten();
         let effective_key_expires_at_ms = initial_reg
             .and_then(|r| r.key_expires_at_ms)
             .or(bootstrap.key_expires_at_ms)

@@ -514,7 +514,10 @@ fn bind_single_socket(
     }
 
     sock.bind(&bind_addr.into()).map_err(|err| {
-        if err.kind() == IoErrorKind::AddrInUse || err.kind() == IoErrorKind::AddrNotAvailable {
+        if err.kind() == IoErrorKind::AddrInUse
+            || err.kind() == IoErrorKind::AddrNotAvailable
+            || (bind_addr.port() != 0 && err.kind() == IoErrorKind::PermissionDenied)
+        {
             BindFailure::Socket(AppError::new(
                 ErrorKind::Conflict,
                 format!("udp bind {bind_addr} unavailable: {err}"),

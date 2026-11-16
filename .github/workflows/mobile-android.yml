@@ -108,7 +108,7 @@ jobs:
           echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018" >> "${GITHUB_ENV}"
 
       - name: Install Rust 1.94.1 & Android targets
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.94.1"
           targets: aarch64-linux-android,x86_64-linux-android
@@ -119,7 +119,9 @@ jobs:
           key: android-ffi-v1
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
 
       - name: Build Android JNI .so, Maven repo & UniFFI Kotlin bindings
         run: bash scripts/build-android-ffi.sh

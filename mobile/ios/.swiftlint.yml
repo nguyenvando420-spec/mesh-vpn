@@ -9,18 +9,32 @@ excluded:
   - Frameworks
   - MeshApp.xcodeproj
 
+disabled_rules:
+  - multiple_closures_with_trailing_closure
+
 opt_in_rules:
   - empty_count
+  - fatal_error_message
   - force_unwrapping
   - implicitly_unwrapped_optional
   - private_outlet
   - unneeded_parentheses_in_closure_argument
 
-force_unwrapping: error
-force_try: error
-force_cast: error
-fatal_error_message: error
-implicitly_unwrapped_optional: error
+force_unwrapping:
+  severity: error
+
+force_try:
+  severity: error
+
+force_cast:
+  severity: error
+
+fatal_error_message:
+  severity: error
+
+implicitly_unwrapped_optional:
+  severity: error
+  mode: all_except_iboutlets
 
 line_length:
   warning: 100
@@ -69,8 +83,11 @@ cyclomatic_complexity:
   ignores_case_statements: true
 
 nesting:
-  type_level: 2
-  function_level: 3
+  type_level:
+    warning: 2
+  function_level:
+    warning: 3
+  check_nesting_in_closures_and_statements: false
 
 custom_rules:
   no_fatal_error:

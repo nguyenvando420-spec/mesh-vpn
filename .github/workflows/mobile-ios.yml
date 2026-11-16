@@ -145,7 +145,7 @@ jobs:
       - name: Run SwiftLint (--strict)
         run: |
           cd mobile/ios
-          swiftlint lint --strict
+          swiftlint lint --strict --reporter github-actions-logging
 
       - name: Select available iPhone Simulator and run xcodebuild build test ($0)
         run: |

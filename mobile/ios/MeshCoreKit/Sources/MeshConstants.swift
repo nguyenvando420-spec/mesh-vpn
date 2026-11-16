@@ -5,7 +5,7 @@ public enum MeshConstants: Sendable {
     public static let appGroupIdentifier = "group.dev.meshvpn.ios"
     public static let keychainAccessGroupSuffix = "dev.meshvpn.ios.shared"
     public static let keychainService = "dev.meshvpn.ios.dek"
-    public static let keychainAccount = "mesh_master_dek_v1"
+    public static let keychainAccount = "mesh_primary_dek_v1"
     public static let keychainProbeService = "dev.meshvpn.ios.dek.probe"
     public static let keychainProbeAccount = "access_group_probe"
 
