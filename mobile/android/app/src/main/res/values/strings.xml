@@ -6,7 +6,7 @@
     <string name="notification_channel_alerts">Mesh VPN Alerts</string>
     <string name="notification_title">Mesh VPN</string>
     <string name="notification_status_connected">Connected (%1$s)</string>
-    <string name="notification_status_connecting">Connecting to Mesh...</string>
+    <string name="notification_status_connecting">Connecting to Mesh&#8230;</string>
     <string name="notification_status_degraded">Control offline; P2P active</string>
     <string name="notification_status_stopped">Disconnected</string>
     <string name="notification_status_waiting_unlock">Waiting for device unlock to load VPN keys</string>

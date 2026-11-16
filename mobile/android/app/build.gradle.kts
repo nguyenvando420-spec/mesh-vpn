@@ -93,6 +93,7 @@ android {
                 "GradleDependency",
                 "AndroidGradlePluginVersion",
                 "NewerVersionAvailable",
+                "OldTargetApi",
             )
     }
 
@@ -135,10 +136,6 @@ tasks.withType<Detekt>().configureEach {
 }
 
 dependencies {
-    val verifierVersion =
-        providers.gradleProperty("rustlsPlatformVerifierVersion").orNull
-            ?: libs.versions.rustlsPlatformVerifier.get()
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.fragment.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -159,15 +156,19 @@ dependencies {
     implementation(libs.androidx.camera.view)
     implementation(libs.zxing.core)
     implementation(libs.kotlinx.coroutines.android)
-    implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
-    implementation("rustls:rustls-platform-verifier:$verifierVersion")
+    implementation(libs.jna.aar) {
+        artifact {
+            type = "aar"
+        }
+    }
+    implementation(libs.rustls.platform.verifier)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
-    testImplementation("net.java.dev.jna:jna:${libs.versions.jna.get()}")
+    testImplementation(libs.jna.aar)
 
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)

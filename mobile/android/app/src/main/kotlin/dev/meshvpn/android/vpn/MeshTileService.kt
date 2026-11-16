@@ -1,5 +1,6 @@
 package dev.meshvpn.android.vpn
 
+import android.annotation.SuppressLint
 import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
@@ -76,6 +77,7 @@ class MeshTileService : TileService() {
         tile.updateTile()
     }
 
+    @SuppressLint("StartActivityAndCollapseDeprecated")
     private fun openMainApp() {
         val intent =
             Intent(this, MainActivity::class.java)
