@@ -12,10 +12,11 @@ final class UniFFIBindingsAndSecurityTests: XCTestCase {
 
     func test_parseMobileJoinUri_masksPreauthSecretAndExtractsTrustFields() throws {
         // Arrange
-        let secret = "mpk_supersecretvalue12345"
+        let secret = "mpk_Q2FuYXJ5VG9rZW4zMkJ5dGVzQ2FuYXJ5VG9rZW4zMkI"
         let pin = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        let rawUri = "mesh://join?v=1&server=203.0.113.10:443&pin=\(pin)"
-            + "&token=\(secret)&name=iphone-15"
+        let encodedPin = pin.replacingOccurrences(of: ":", with: "%3A")
+        let rawUri = "mesh://join?v=1&ep=203.0.113.10%3A443&pin=\(encodedPin)"
+            + "&key=\(secret)&name=iphone-15"
 
         // Act
         let parsed = try parseMobileJoinUri(rawUri: rawUri)
@@ -37,7 +38,7 @@ final class UniFFIBindingsAndSecurityTests: XCTestCase {
         // Arrange & Act & Assert
         XCTAssertThrowsError(try createPendingJoinSession(rawPreauthKey: "   "))
 
-        let secret = "mpk_alpha987654321"
+        let secret = "mpk_Q2FuYXJ5VG9rZW4zMkJ5dGVzQ2FuYXJ5VG9rZW4zMkI"
         let session = try createPendingJoinSession(rawPreauthKey: secret)
         defer { session.cancel() }
         XCTAssertFalse(session.maskedPreview().contains(secret))
