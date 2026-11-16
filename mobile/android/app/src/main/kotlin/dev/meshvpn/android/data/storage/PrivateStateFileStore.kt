@@ -25,7 +25,7 @@ data class StoredBootstrapSummary(
     val fqdn: String?,
 )
 
-interface DeviceUnlockChecker {
+fun interface DeviceUnlockChecker {
     fun isUserUnlocked(): Boolean
 }
 

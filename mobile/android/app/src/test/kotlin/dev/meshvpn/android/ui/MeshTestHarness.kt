@@ -25,6 +25,30 @@ import uniffi.mesh_mobile_ffi.MobileTlsAuthMode
 import uniffi.mesh_mobile_ffi.MobileUnderlayState
 import uniffi.mesh_mobile_ffi.PlatformNetworkBridge
 
+internal class TestKeyWrapBackend : KeyWrapBackend {
+    val keys = mutableSetOf<String>()
+
+    override fun hasWrappingKey(alias: String) = alias in keys
+
+    override fun createWrappingKey(alias: String) {
+        keys.add(alias)
+    }
+
+    override fun wrapDek(
+        alias: String,
+        plainDek: ByteArray,
+    ) = plainDek.copyOf()
+
+    override fun unwrapDek(
+        alias: String,
+        wrappedBlob: ByteArray,
+    ) = wrappedBlob.copyOf()
+
+    override fun deleteWrappingKey(alias: String) {
+        keys.remove(alias)
+    }
+}
+
 internal class MeshTestHarness(
     stateDir: File,
     testScope: TestScope,
@@ -44,30 +68,7 @@ internal class MeshTestHarness(
             stateDirProvider = { stateDir },
             deviceUnlockChecker = DeviceUnlockChecker { true },
         )
-    val keyBackend =
-        object : KeyWrapBackend {
-            val keys = mutableSetOf<String>()
-
-            override fun hasWrappingKey(alias: String) = alias in keys
-
-            override fun createWrappingKey(alias: String) {
-                keys.add(alias)
-            }
-
-            override fun wrapDek(
-                alias: String,
-                plainDek: ByteArray,
-            ) = plainDek.copyOf()
-
-            override fun unwrapDek(
-                alias: String,
-                wrappedBlob: ByteArray,
-            ) = wrappedBlob.copyOf()
-
-            override fun deleteWrappingKey(alias: String) {
-                keys.remove(alias)
-            }
-        }
+    val keyBackend = TestKeyWrapBackend()
     val dekManager = AndroidKeystoreDekManager(stateStore, keyBackend)
     val bugreportOps =
         object : BugreportShareOps {

@@ -307,7 +307,7 @@ public final class TunnelManagerClient {
     }
 
     /// Validates that `providerConfiguration` contains zero secret keys (`BLK-MOB-G2-02`).
-    public static func buildValidatedProviderConfiguration(
+    public nonisolated static func buildValidatedProviderConfiguration(
         from bootstrap: BootstrapSummary
     ) throws -> [String: Any] {
         var dict: [String: Any] = [

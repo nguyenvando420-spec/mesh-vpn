@@ -78,8 +78,12 @@ public final class AppViewModel: ObservableObject {
         } catch {
             let fallbackRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("MeshFallback", isDirectory: true)
-            let fallbackStore = (try? CoordinatedAppGroupStore(rootDirectoryURL: fallbackRoot))
-                ?? InMemoryFallbackAppGroupStore(rootURL: fallbackRoot)
+            let fallbackStore: any AppGroupFileManaging
+            if let diskStore = try? CoordinatedAppGroupStore(rootDirectoryURL: fallbackRoot) {
+                fallbackStore = diskStore
+            } else {
+                fallbackStore = InMemoryFallbackAppGroupStore(rootURL: fallbackRoot)
+            }
             let vm = AppViewModel(
                 appGroupStore: fallbackStore,
                 dekStore: KeychainDekStore(),
@@ -94,8 +98,11 @@ public final class AppViewModel: ObservableObject {
     public func startObserving() async {
         await refreshAllState()
         guard statusObserverTask == nil else { return }
-        statusObserverTask = Task { [weak self] in
-            for await _ in NotificationCenter.default.notifications(named: .NEVPNStatusDidChange) {
+        statusObserverTask = Task.detached { [weak self] in
+            let stream = NotificationCenter.default.notifications(
+                named: .NEVPNStatusDidChange
+            )
+            for await _ in stream {
                 guard !Task.isCancelled else { break }
                 await self?.refreshAllState()
             }
