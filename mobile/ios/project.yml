@@ -23,10 +23,10 @@ targets:
     sources:
       - path: MeshCoreKit/Sources
       - path: Generated/mesh_mobile_ffi.swift
-    info:
-      path: MeshCoreKit/Info.plist
     settings:
       base:
+        INFOPLIST_FILE: MeshCoreKit/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
         PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.ios.MeshCoreKit
         APPLICATION_EXTENSION_API_ONLY: "YES"
         SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
@@ -50,12 +50,11 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - path: MeshPacketTunnel/Sources
-    info:
-      path: MeshPacketTunnel/Info.plist
-    entitlements:
-      path: Entitlements/MeshPacketTunnel.entitlements
     settings:
       base:
+        INFOPLIST_FILE: MeshPacketTunnel/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: Entitlements/MeshPacketTunnel.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.ios.PacketTunnel
         APPLICATION_EXTENSION_API_ONLY: "YES"
         SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
@@ -74,12 +73,11 @@ targets:
     sources:
       - path: MeshApp/Sources
       - path: MeshApp/Resources
-    info:
-      path: MeshApp/Info.plist
-    entitlements:
-      path: Entitlements/MeshApp.entitlements
     settings:
       base:
+        INFOPLIST_FILE: MeshApp/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: Entitlements/MeshApp.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.ios
         SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

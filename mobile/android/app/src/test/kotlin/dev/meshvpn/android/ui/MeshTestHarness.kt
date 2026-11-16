@@ -15,6 +15,7 @@ import dev.meshvpn.android.vpn.MeshSessionRepository
 import java.io.File
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.plus
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import uniffi.mesh_mobile_ffi.MobileDaemonState
@@ -187,6 +188,6 @@ internal class MeshTestHarness(
             authRequester = { authResult },
             cleanupDiagnostics = {},
             ioDispatcher = dispatcher,
-            externalScope = testScope.backgroundScope,
+            externalScope = testScope.backgroundScope + dispatcher,
         )
 }
