@@ -11,11 +11,15 @@ import dev.meshvpn.android.data.diagnostics.SafeLogger
  * Direct-Boot-aware receiver resuming Mesh VPN when Always-On auto-start is enabled (`US-085`).
  */
 class BootReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context?, intent: Intent?) {
+    override fun onReceive(
+        context: Context?,
+        intent: Intent?,
+    ) {
         val action = intent?.action
-        val validAction = action == Intent.ACTION_LOCKED_BOOT_COMPLETED ||
-            action == Intent.ACTION_BOOT_COMPLETED ||
-            action == Intent.ACTION_USER_UNLOCKED
+        val validAction =
+            action == Intent.ACTION_LOCKED_BOOT_COMPLETED ||
+                action == Intent.ACTION_BOOT_COMPLETED ||
+                action == Intent.ACTION_USER_UNLOCKED
         val app = context?.applicationContext as? MeshApplication
         if (context == null || !validAction || app == null) {
             return

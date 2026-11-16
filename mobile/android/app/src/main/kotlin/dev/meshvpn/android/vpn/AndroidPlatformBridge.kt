@@ -67,7 +67,10 @@ class AndroidPlatformBridge(
         // Android uses detached raw `android_tun_fd` directly via Tokio AsyncFd in Rust.
     }
 
-    override fun onRouteChanged(opId: ULong, config: MobileTunnelNetworkConfig) {
+    override fun onRouteChanged(
+        opId: ULong,
+        config: MobileTunnelNetworkConfig,
+    ) {
         val scope = routeScope
         val establisher = tunEstablisher
         if (scope == null || establisher == null) {
@@ -84,20 +87,21 @@ class AndroidPlatformBridge(
             routeMutex.withLock {
                 var detachedFd: Int? = null
                 var errorMessage: String? = null
-                val ok = try {
-                    val fd = establisher.establishDetachedTunFd(config)
-                    if (fd != null && fd >= 0) {
-                        detachedFd = fd
-                        true
-                    } else {
-                        errorMessage = "VpnService.Builder.establish() returned null"
+                val ok =
+                    try {
+                        val fd = establisher.establishDetachedTunFd(config)
+                        if (fd != null && fd >= 0) {
+                            detachedFd = fd
+                            true
+                        } else {
+                            errorMessage = "VpnService.Builder.establish() returned null"
+                            false
+                        }
+                    } catch (err: Throwable) {
+                        SafeLogger.e(TAG, "Failed configuring VpnService TUN route op=$opId", err)
+                        errorMessage = err.message ?: "Failed configuring Android TUN interface"
                         false
                     }
-                } catch (err: Throwable) {
-                    SafeLogger.e(TAG, "Failed configuring VpnService TUN route op=$opId", err)
-                    errorMessage = err.message ?: "Failed configuring Android TUN interface"
-                    false
-                }
 
                 val engine = engineProvider()
                 if (engine != null) {
@@ -108,6 +112,14 @@ class AndroidPlatformBridge(
                             newAndroidTunFd = detachedFd,
                             errorMessage = errorMessage,
                         )
+                    } catch (cancelErr: CancellationException) {
+                        closeDetachedFd(detachedFd)
+                        SafeLogger.w(
+                            TAG,
+                            "completeRouteChange($opId) cancelled; closed detached TUN fd",
+                            cancelErr,
+                        )
+                        throw cancelErr
                     } catch (err: Throwable) {
                         closeDetachedFd(detachedFd)
                         SafeLogger.w(
@@ -115,9 +127,6 @@ class AndroidPlatformBridge(
                             "completeRouteChange($opId) threw; closed detached TUN fd",
                             err,
                         )
-                        if (err is CancellationException) {
-                            throw err
-                        }
                     }
                 } else {
                     closeDetachedFd(detachedFd)
@@ -141,7 +150,10 @@ class AndroidPlatformBridge(
 
     override fun loadStateFile(fileName: String): ByteArray? = stateStore.loadStateFile(fileName)
 
-    override fun saveStateFile(fileName: String, content: ByteArray) {
+    override fun saveStateFile(
+        fileName: String,
+        content: ByteArray,
+    ) {
         stateStore.saveStateFile(fileName, content)
     }
 

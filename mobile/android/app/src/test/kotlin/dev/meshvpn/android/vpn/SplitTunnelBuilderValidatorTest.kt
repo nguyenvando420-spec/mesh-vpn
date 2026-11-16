@@ -9,16 +9,17 @@ class SplitTunnelBuilderValidatorTest {
     @Test
     fun splitTunnelValidatorAcceptsSlash32WithDnsRoute() {
         // Arrange
-        val cfg = MobileTunnelNetworkConfig(
-            overlayIp = "100.64.0.10",
-            tunInterfacePrefixLen = 32u,
-            overlayCidr = "100.64.0.0/10",
-            overlaySubnetMask = "255.192.0.0",
-            overlayDnsIp = "100.64.0.2",
-            domainSuffix = "mesh.local",
-            tunMtu = 1280u,
-            includedRoutesCidr = listOf("100.64.0.0/10", "100.64.0.2/32"),
-        )
+        val cfg =
+            MobileTunnelNetworkConfig(
+                overlayIp = "100.64.0.10",
+                tunInterfacePrefixLen = 32u,
+                overlayCidr = "100.64.0.0/10",
+                overlaySubnetMask = "255.192.0.0",
+                overlayDnsIp = "100.64.0.2",
+                domainSuffix = "mesh.local",
+                tunMtu = 1280u,
+                includedRoutesCidr = listOf("100.64.0.0/10", "100.64.0.2/32"),
+            )
 
         // Act
         val validated = SplitTunnelBuilderValidator.validate(cfg)
@@ -35,20 +36,22 @@ class SplitTunnelBuilderValidatorTest {
     @Test
     fun splitTunnelValidatorRejectsDefaultRouteAndNon32Prefix() {
         // Arrange
-        val badDefaultRoute = MobileTunnelNetworkConfig(
-            overlayIp = "100.64.0.10",
-            tunInterfacePrefixLen = 32u,
-            overlayCidr = "100.64.0.0/10",
-            overlaySubnetMask = "255.192.0.0",
-            overlayDnsIp = "100.64.0.2",
-            domainSuffix = "mesh.local",
-            tunMtu = 1280u,
-            includedRoutesCidr = listOf("0.0.0.0/0"),
-        )
-        val badPrefix = badDefaultRoute.copy(
-            tunInterfacePrefixLen = 10u,
-            includedRoutesCidr = listOf("100.64.0.0/10"),
-        )
+        val badDefaultRoute =
+            MobileTunnelNetworkConfig(
+                overlayIp = "100.64.0.10",
+                tunInterfacePrefixLen = 32u,
+                overlayCidr = "100.64.0.0/10",
+                overlaySubnetMask = "255.192.0.0",
+                overlayDnsIp = "100.64.0.2",
+                domainSuffix = "mesh.local",
+                tunMtu = 1280u,
+                includedRoutesCidr = listOf("0.0.0.0/0"),
+            )
+        val badPrefix =
+            badDefaultRoute.copy(
+                tunInterfacePrefixLen = 10u,
+                includedRoutesCidr = listOf("100.64.0.0/10"),
+            )
 
         // Act + Assert
         assertThrows(IllegalArgumentException::class.java) {
@@ -62,16 +65,17 @@ class SplitTunnelBuilderValidatorTest {
     @Test
     fun splitTunnelValidatorRejectsRouteMissingDnsCoverage() {
         // Arrange
-        val missingDnsRoute = MobileTunnelNetworkConfig(
-            overlayIp = "100.64.0.10",
-            tunInterfacePrefixLen = 32u,
-            overlayCidr = "100.64.0.0/10",
-            overlaySubnetMask = "255.192.0.0",
-            overlayDnsIp = "100.127.255.253",
-            domainSuffix = "mesh.local",
-            tunMtu = 1280u,
-            includedRoutesCidr = listOf("100.64.0.0/16"),
-        )
+        val missingDnsRoute =
+            MobileTunnelNetworkConfig(
+                overlayIp = "100.64.0.10",
+                tunInterfacePrefixLen = 32u,
+                overlayCidr = "100.64.0.0/10",
+                overlaySubnetMask = "255.192.0.0",
+                overlayDnsIp = "100.127.255.253",
+                domainSuffix = "mesh.local",
+                tunMtu = 1280u,
+                includedRoutesCidr = listOf("100.64.0.0/16"),
+            )
 
         // Act + Assert
         assertThrows(IllegalArgumentException::class.java) {

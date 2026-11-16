@@ -10,18 +10,19 @@ class UnderlayStateClassifierTest {
     @Test
     fun underlayClassifierDetectsStrictPrivateDnsAndLockdown() {
         // Arrange
-        val raw = RawLinkSnapshot(
-            activeInterfaceName = " wlan0 ",
-            physicalIfIndex = 12u,
-            hasIpv4 = false,
-            hasIpv6 = true,
-            underlayDnsServers = listOf("2001:4860:4860::8888", "2001:4860:4860::8888"),
-            osNat64Prefix = "64:ff9b::/96",
-            physicalSubnets = listOf("192.168.1.0/24", "invalid"),
-            isAndroidLockdownEnabled = true,
-            isPrivateDnsActive = true,
-            privateDnsServerName = "dns.quad9.net",
-        )
+        val raw =
+            RawLinkSnapshot(
+                activeInterfaceName = " wlan0 ",
+                physicalIfIndex = 12u,
+                hasIpv4 = false,
+                hasIpv6 = true,
+                underlayDnsServers = listOf("2001:4860:4860::8888", "2001:4860:4860::8888"),
+                osNat64Prefix = "64:ff9b::/96",
+                physicalSubnets = listOf("192.168.1.0/24", "invalid"),
+                isAndroidLockdownEnabled = true,
+                isPrivateDnsActive = true,
+                privateDnsServerName = "dns.quad9.net",
+            )
 
         // Act
         val state = UnderlayStateClassifier.toMobileUnderlayState(raw)
@@ -42,18 +43,19 @@ class UnderlayStateClassifierTest {
     @Test
     fun underlayClassifierOpportunisticPrivateDnsIsNotStrict() {
         // Arrange
-        val raw = RawLinkSnapshot(
-            activeInterfaceName = "rmnet_data0",
-            physicalIfIndex = 4u,
-            hasIpv4 = true,
-            hasIpv6 = true,
-            underlayDnsServers = listOf("8.8.8.8"),
-            osNat64Prefix = null,
-            physicalSubnets = emptyList(),
-            isAndroidLockdownEnabled = false,
-            isPrivateDnsActive = true,
-            privateDnsServerName = null,
-        )
+        val raw =
+            RawLinkSnapshot(
+                activeInterfaceName = "rmnet_data0",
+                physicalIfIndex = 4u,
+                hasIpv4 = true,
+                hasIpv6 = true,
+                underlayDnsServers = listOf("8.8.8.8"),
+                osNat64Prefix = null,
+                physicalSubnets = emptyList(),
+                isAndroidLockdownEnabled = false,
+                isPrivateDnsActive = true,
+                privateDnsServerName = null,
+            )
 
         // Act
         val state = UnderlayStateClassifier.toMobileUnderlayState(raw)
@@ -65,20 +67,21 @@ class UnderlayStateClassifierTest {
     @Test
     fun underlayClassifierInfersRoamingAndConnectivityTransitions() {
         // Arrange
-        val wifi = UnderlayStateClassifier.toMobileUnderlayState(
-            RawLinkSnapshot(
-                activeInterfaceName = "wlan0",
-                physicalIfIndex = 5u,
-                hasIpv4 = true,
-                hasIpv6 = false,
-                underlayDnsServers = listOf("192.168.1.1"),
-                osNat64Prefix = null,
-                physicalSubnets = listOf("192.168.1.0/24"),
-                isAndroidLockdownEnabled = false,
-                isPrivateDnsActive = false,
-                privateDnsServerName = null,
-            ),
-        )
+        val wifi =
+            UnderlayStateClassifier.toMobileUnderlayState(
+                RawLinkSnapshot(
+                    activeInterfaceName = "wlan0",
+                    physicalIfIndex = 5u,
+                    hasIpv4 = true,
+                    hasIpv6 = false,
+                    underlayDnsServers = listOf("192.168.1.1"),
+                    osNat64Prefix = null,
+                    physicalSubnets = listOf("192.168.1.0/24"),
+                    isAndroidLockdownEnabled = false,
+                    isPrivateDnsActive = false,
+                    privateDnsServerName = null,
+                ),
+            )
         val cellular = wifi.copy(activeInterfaceName = "rmnet0", physicalIfIndex = 9u)
         val offline = UnderlayStateClassifier.emptyOfflineState(isLockdownEnabled = false)
 

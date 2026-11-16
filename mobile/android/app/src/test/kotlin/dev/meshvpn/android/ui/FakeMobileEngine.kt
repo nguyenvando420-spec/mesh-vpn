@@ -22,7 +22,9 @@ internal class FakePendingSession(
     private val preview: String,
 ) : PendingJoinSessionHandle {
     var cancelled = false
+
     override fun maskedPreview() = preview
+
     override fun cancel() {
         cancelled = true
     }
@@ -66,9 +68,15 @@ internal class FakeMobileEngineHandle(
         errorMessage: String?,
     ) = Unit
 
-    override fun onNetworkChange(kind: MobileNetEventKind, underlay: MobileUnderlayState) = Unit
+    override fun onNetworkChange(
+        kind: MobileNetEventKind,
+        underlay: MobileUnderlayState,
+    ) = Unit
+
     override fun setPowerSavingMode(enabled: Boolean) = Unit
+
     override fun shutdown() = Unit
+
     override fun destroy() = Unit
 }
 
@@ -88,26 +96,28 @@ internal fun sampleSnapshot(
     tunMtu = 1280u,
     netmapVersion = 1u,
     keyExpiresAtMs = null,
-    serverConnection = MobileServerStatus(
-        controlEndpoint = endpoint,
-        relayEndpoint = endpoint,
-        stunEndpoints = emptyList(),
-        tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
-        activePin = pin,
-        nextPin = null,
-        controlConnected = state == MobileDaemonState.CONNECTED,
-        relayConnected = state == MobileDaemonState.CONNECTED,
-        relayRttMs = 25u,
-        lastError = null,
-    ),
-    selfNetwork = MobileSelfNetworkStatus(
-        localUdpPort = 51820u,
-        boundPhysicalInterface = "wlan0",
-        natType = MobileNatKind.UNKNOWN,
-        overlayConflictWarning = null,
-        nat64ActivePrefix = null,
-        candidates = emptyList(),
-    ),
+    serverConnection =
+        MobileServerStatus(
+            controlEndpoint = endpoint,
+            relayEndpoint = endpoint,
+            stunEndpoints = emptyList(),
+            tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
+            activePin = pin,
+            nextPin = null,
+            controlConnected = state == MobileDaemonState.CONNECTED,
+            relayConnected = state == MobileDaemonState.CONNECTED,
+            relayRttMs = 25u,
+            lastError = null,
+        ),
+    selfNetwork =
+        MobileSelfNetworkStatus(
+            localUdpPort = 51820u,
+            boundPhysicalInterface = "wlan0",
+            natType = MobileNatKind.UNKNOWN,
+            overlayConflictWarning = null,
+            nat64ActivePrefix = null,
+            candidates = emptyList(),
+        ),
     peers = emptyList(),
     warnings = emptyList(),
 )

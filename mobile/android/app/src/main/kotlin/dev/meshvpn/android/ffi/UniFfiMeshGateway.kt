@@ -23,12 +23,13 @@ class UniFfiMeshGateway : MeshFfiGateway {
     }
 
     override fun createPendingSessionFromChars(rawPreauthKey: CharArray): PendingJoinSessionHandle {
-        val nativeSession = try {
-            val transientKey = String(rawPreauthKey)
-            createPendingJoinSession(transientKey)
-        } finally {
-            rawPreauthKey.fill('\u0000')
-        }
+        val nativeSession =
+            try {
+                val transientKey = String(rawPreauthKey)
+                createPendingJoinSession(transientKey)
+            } finally {
+                rawPreauthKey.fill('\u0000')
+            }
         return UniFfiPendingJoinSessionHandle(nativeSession)
     }
 
@@ -37,18 +38,20 @@ class UniFfiMeshGateway : MeshFfiGateway {
         bridge: PlatformNetworkBridge,
         params: EnrollParams,
     ): MobileStatusSnapshot {
-        val nativeSession = requireNotNull(params.pendingJoin.unwrapNative()) {
-            "Pending join session is unavailable for native enrollment"
-        }
-        val enrollConfig = MobileEnrollConfig(
-            serverEndpoint = params.serverEndpoint,
-            portOverride = params.portOverride,
-            tlsAuthMode = params.tlsAuthMode,
-            serverPin = params.serverPin,
-            pendingJoin = nativeSession,
-            nodeName = params.nodeName,
-            rotateExistingIdentity = params.rotateExistingIdentity,
-        )
+        val nativeSession =
+            requireNotNull(params.pendingJoin.unwrapNative()) {
+                "Pending join session is unavailable for native enrollment"
+            }
+        val enrollConfig =
+            MobileEnrollConfig(
+                serverEndpoint = params.serverEndpoint,
+                portOverride = params.portOverride,
+                tlsAuthMode = params.tlsAuthMode,
+                serverPin = params.serverPin,
+                pendingJoin = nativeSession,
+                nodeName = params.nodeName,
+                rotateExistingIdentity = params.rotateExistingIdentity,
+            )
         return mobileEnrollOrRotateNode(init, bridge, enrollConfig)
     }
 

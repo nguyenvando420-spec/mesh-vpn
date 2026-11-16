@@ -12,11 +12,12 @@ data class ManualJoinValidationResult(
     val nodeNameError: String? = null,
 ) {
     val isValid: Boolean
-        get() = endpointError == null &&
-            pinError == null &&
-            preauthKeyError == null &&
-            nodeNameError == null &&
-            canonicalEndpoint != null
+        get() =
+            endpointError == null &&
+                pinError == null &&
+                preauthKeyError == null &&
+                nodeNameError == null &&
+                canonicalEndpoint != null
 }
 
 /**
@@ -32,10 +33,11 @@ object OnboardingInputValidator {
     private const val MAX_NODE_NAME_LEN = 63
 
     private val spkiPinRegex = Regex("^sha256:[0-9a-f]{64}$")
-    private val ipv4Regex = Regex(
-        "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}" +
-            "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$",
-    )
+    private val ipv4Regex =
+        Regex(
+            "^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}" +
+                "(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$",
+        )
     private val nodeNameRegex = Regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
     private val reservedNodeNames = setOf("localhost", "broadcasthost", "wpad", "isatap", "local")
 
@@ -69,8 +71,9 @@ object OnboardingInputValidator {
         if (preCheck != null) {
             return Triple(null, false, preCheck)
         }
-        val split = splitHostAndPort(trimmed)
-            ?: return Triple(null, false, "Endpoint must include valid host and :port")
+        val split =
+            splitHostAndPort(trimmed)
+                ?: return Triple(null, false, "Endpoint must include valid host and :port")
         val (host, portStr, bracketedV6) = split
         val portErr = validatePortString(portStr)
         if (portErr != null) {
@@ -86,20 +89,22 @@ object OnboardingInputValidator {
     ): Pair<String?, String?> {
         val trimmed = rawPin.trim().lowercase()
         return when (mode) {
-            MobileTlsAuthMode.SPKI_PIN -> when {
-                trimmed.isEmpty() ->
-                    null to "SPKI Pin (sha256:<64 hex>) is required; TOFU is disabled"
-                !spkiPinRegex.matches(trimmed) ->
-                    null to "Pin must match sha256:<64 lowercase hex characters>"
-                else -> trimmed to null
-            }
-            MobileTlsAuthMode.SYSTEM_CA -> when {
-                hostIsIp ->
-                    null to "System CA requires a DNS domain; IP endpoints require an SPKI pin"
-                trimmed.isNotEmpty() ->
-                    null to "Omit SPKI pin when System CA mode is selected"
-                else -> null to null
-            }
+            MobileTlsAuthMode.SPKI_PIN ->
+                when {
+                    trimmed.isEmpty() ->
+                        null to "SPKI Pin (sha256:<64 hex>) is required; TOFU is disabled"
+                    !spkiPinRegex.matches(trimmed) ->
+                        null to "Pin must match sha256:<64 lowercase hex characters>"
+                    else -> trimmed to null
+                }
+            MobileTlsAuthMode.SYSTEM_CA ->
+                when {
+                    hostIsIp ->
+                        null to "System CA requires a DNS domain; IP endpoints require an SPKI pin"
+                    trimmed.isNotEmpty() ->
+                        null to "Omit SPKI pin when System CA mode is selected"
+                    else -> null to null
+                }
         }
     }
 
@@ -113,14 +118,16 @@ object OnboardingInputValidator {
             end--
         }
         val len = end - start
-        val prefixErr = when {
-            len == 0 -> "Pre-auth key (mpk_...) is required"
-            len > MAX_PREAUTH_LEN -> "Pre-auth key exceeds maximum length ($MAX_PREAUTH_LEN chars)"
-            !hasMpkPrefix(chars, start, len) -> "Pre-auth key must begin with mpk_"
-            len - PREAUTH_PREFIX.length < MIN_PREAUTH_BODY_LEN ->
-                "Pre-auth key must carry at least 256 bits of entropy"
-            else -> null
-        }
+        val prefixErr =
+            when {
+                len == 0 -> "Pre-auth key (mpk_...) is required"
+                len > MAX_PREAUTH_LEN ->
+                    "Pre-auth key exceeds maximum length ($MAX_PREAUTH_LEN chars)"
+                !hasMpkPrefix(chars, start, len) -> "Pre-auth key must begin with mpk_"
+                len - PREAUTH_PREFIX.length < MIN_PREAUTH_BODY_LEN ->
+                    "Pre-auth key must carry at least 256 bits of entropy"
+                else -> null
+            }
         if (prefixErr != null) {
             return prefixErr
         }
@@ -140,13 +147,18 @@ object OnboardingInputValidator {
         }
     }
 
-    private fun precheckEndpointSyntax(trimmed: String): String? = when {
-        trimmed.isEmpty() -> "Control server endpoint is required (host:port)"
-        trimmed.contains("://") || trimmed.contains('/') || trimmed.contains('?') ||
-            trimmed.contains('#') || trimmed.contains('@') || trimmed.any { it.isWhitespace() } ->
-            "Enter host:port without URL scheme, path, or spaces"
-        else -> null
-    }
+    private fun precheckEndpointSyntax(trimmed: String): String? =
+        when {
+            trimmed.isEmpty() -> "Control server endpoint is required (host:port)"
+            trimmed.contains("://") ||
+                trimmed.contains('/') ||
+                trimmed.contains('?') ||
+                trimmed.contains('#') ||
+                trimmed.contains('@') ||
+                trimmed.any { it.isWhitespace() } ->
+                "Enter host:port without URL scheme, path, or spaces"
+            else -> null
+        }
 
     private fun splitHostAndPort(trimmed: String): Triple<String, String, Boolean>? {
         if (trimmed.startsWith("[")) {
@@ -173,11 +185,12 @@ object OnboardingInputValidator {
         bracketedV6: Boolean,
     ): Triple<String?, Boolean, String?> {
         if (bracketedV6) {
-            val err = if (!isPlausibleIpv6Literal(host)) {
-                "Invalid bracketed IPv6 literal address"
-            } else {
-                null
-            }
+            val err =
+                if (!isPlausibleIpv6Literal(host)) {
+                    "Invalid bracketed IPv6 literal address"
+                } else {
+                    null
+                }
             return Triple(if (err == null) "[$host]:$portNum" else null, err == null, err)
         }
         if (ipv4Regex.matches(host)) {
@@ -187,22 +200,34 @@ object OnboardingInputValidator {
         return Triple(if (dnsErr == null) "$host:$portNum" else null, false, dnsErr)
     }
 
-    private fun hasMpkPrefix(chars: CharArray, start: Int, len: Int): Boolean =
+    private fun hasMpkPrefix(
+        chars: CharArray,
+        start: Int,
+        len: Int,
+    ): Boolean =
         len >= PREAUTH_PREFIX.length &&
             chars[start] == 'm' &&
             chars[start + 1] == 'p' &&
             chars[start + 2] == 'k' &&
             chars[start + 3] == '_'
 
-    private fun validatePreauthBodyChars(chars: CharArray, start: Int, end: Int): String? {
+    private fun validatePreauthBodyChars(
+        chars: CharArray,
+        start: Int,
+        end: Int,
+    ): String? {
         for (i in start until end) {
             val ch = chars[i]
             if (ch.isISOControl() || ch.isWhitespace()) {
                 return "Pre-auth key cannot contain spaces or control characters"
             }
             if (i >= start + PREAUTH_PREFIX.length) {
-                val ok = ch in 'A'..'Z' || ch in 'a'..'z' ||
-                    ch in '0'..'9' || ch == '-' || ch == '_'
+                val ok =
+                    ch in 'A'..'Z' ||
+                        ch in 'a'..'z' ||
+                        ch in '0'..'9' ||
+                        ch == '-' ||
+                        ch == '_'
                 if (!ok) {
                     return "Pre-auth key contains non-base64url characters"
                 }
@@ -223,13 +248,14 @@ object OnboardingInputValidator {
     }
 
     private fun validateDnsHostname(host: String): String? {
-        val boundaryErr = when {
-            host.isEmpty() || host.length > MAX_DNS_LEN ->
-                "Hostname must be 1..$MAX_DNS_LEN characters"
-            host.startsWith('.') || host.endsWith('.') || host.contains("..") ->
-                "Hostname contains invalid dot placement"
-            else -> null
-        }
+        val boundaryErr =
+            when {
+                host.isEmpty() || host.length > MAX_DNS_LEN ->
+                    "Hostname must be 1..$MAX_DNS_LEN characters"
+                host.startsWith('.') || host.endsWith('.') || host.contains("..") ->
+                    "Hostname contains invalid dot placement"
+                else -> null
+            }
         if (boundaryErr != null) {
             return boundaryErr
         }
@@ -246,15 +272,16 @@ object OnboardingInputValidator {
         }
     }
 
-    private fun validateDnsLabel(label: String): String? = when {
-        label.isEmpty() || label.length > MAX_NODE_NAME_LEN ->
-            "Hostname label must be 1..63 characters"
-        label.startsWith('-') || label.endsWith('-') ->
-            "Hostname labels cannot start or end with '-'"
-        !label.all { (it.isLetterOrDigit() && it.code < 128) || it == '-' } ->
-            "Hostname contains unsupported characters"
-        else -> null
-    }
+    private fun validateDnsLabel(label: String): String? =
+        when {
+            label.isEmpty() || label.length > MAX_NODE_NAME_LEN ->
+                "Hostname label must be 1..63 characters"
+            label.startsWith('-') || label.endsWith('-') ->
+                "Hostname labels cannot start or end with '-'"
+            !label.all { (it.isLetterOrDigit() && it.code < 128) || it == '-' } ->
+                "Hostname contains unsupported characters"
+            else -> null
+        }
 
     private fun isPlausibleIpv6Literal(host: String): Boolean {
         if (host.isEmpty() || !host.contains(':')) {

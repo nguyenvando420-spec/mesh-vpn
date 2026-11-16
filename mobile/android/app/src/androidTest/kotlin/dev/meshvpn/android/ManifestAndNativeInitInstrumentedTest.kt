@@ -22,9 +22,10 @@ class ManifestAndNativeInitInstrumentedTest {
 
         val deepLinkProbe = Intent(Intent.ACTION_VIEW, Uri.parse("mesh://join?v=1"))
         val handlers = context.packageManager.queryIntentActivities(deepLinkProbe, 0)
-        val selfHandlers = handlers.filter {
-            it.activityInfo.packageName == context.packageName
-        }
+        val selfHandlers =
+            handlers.filter {
+                it.activityInfo.packageName == context.packageName
+            }
         assertTrue(selfHandlers.isEmpty())
     }
 

@@ -59,27 +59,32 @@ class MainActivity : FragmentActivity() {
         )
     }
 
-    private val vpnPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { result ->
-        val granted = result.resultCode == RESULT_OK
-        viewModel.onVpnConsentResult(granted) {
-            startTunnelWithNotificationCheck()
+    private val vpnPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult(),
+        ) { result ->
+            val granted = result.resultCode == RESULT_OK
+            viewModel.onVpnConsentResult(granted) {
+                startTunnelWithNotificationCheck()
+            }
         }
-    }
 
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { _ ->
-        MeshVpnService.startTunnelService(this)
-    }
+    private val notificationPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { _ ->
+            MeshVpnService.startTunnelService(this)
+        }
 
-    private val bugreportShareLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) { _ ->
-        (application as? MeshApplication)?.container?.bugreportManager
-            ?.cleanupAllDiagnosticArtifacts()
-    }
+    private val bugreportShareLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult(),
+        ) { _ ->
+            (application as? MeshApplication)
+                ?.container
+                ?.bugreportManager
+                ?.cleanupAllDiagnosticArtifacts()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -126,13 +131,17 @@ class MainActivity : FragmentActivity() {
     private suspend fun authorizeAdminPurpose(purpose: AdminAuthPurpose) =
         biometricBridge.authenticate(
             title = getString(R.string.biometric_prompt_title),
-            subtitle = when (purpose) {
-                AdminAuthPurpose.REVEAL_SPKI_PIN -> "Reveal Control server SPKI fingerprint"
-                AdminAuthPurpose.UPDATE_SERVER_CONFIG -> "Authorize Control server update"
-                AdminAuthPurpose.ROTATE_KEY -> "Authorize node key rotation"
-                AdminAuthPurpose.EXPORT_BUGREPORT -> getString(R.string.biometric_prompt_subtitle)
-                AdminAuthPurpose.RESET_IDENTITY -> "Authorize permanent erasure of local keys"
-            },
+            subtitle =
+                when (purpose) {
+                    AdminAuthPurpose.REVEAL_SPKI_PIN -> "Reveal Control server SPKI fingerprint"
+                    AdminAuthPurpose.UPDATE_SERVER_CONFIG -> "Authorize Control server update"
+                    AdminAuthPurpose.ROTATE_KEY -> "Authorize node key rotation"
+                    AdminAuthPurpose.EXPORT_BUGREPORT ->
+                        getString(
+                            R.string.biometric_prompt_subtitle,
+                        )
+                    AdminAuthPurpose.RESET_IDENTITY -> "Authorize permanent erasure of local keys"
+                },
             negativeButtonText = getString(R.string.biometric_prompt_negative),
         )
 
@@ -149,10 +158,11 @@ class MainActivity : FragmentActivity() {
 
     private fun startTunnelWithNotificationCheck() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val granted = ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.POST_NOTIFICATIONS,
-            ) == PackageManager.PERMISSION_GRANTED
+            val granted =
+                ContextCompat.checkSelfPermission(
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                ) == PackageManager.PERMISSION_GRANTED
             if (!granted) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                 return
@@ -171,17 +181,20 @@ class MainActivity : FragmentActivity() {
 
     private fun launchBugreportShareChooser(report: BugreportShareManager.PreparedBugreport) {
         val shareUri = report.shareUri ?: return
-        val sendIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "application/x-tar"
-            putExtra(Intent.EXTRA_STREAM, shareUri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+        val sendIntent =
+            Intent(Intent.ACTION_SEND).apply {
+                type = "application/x-tar"
+                putExtra(Intent.EXTRA_STREAM, shareUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
         val chooser = Intent.createChooser(sendIntent, getString(R.string.share_bugreport_chooser))
         try {
             bugreportShareLauncher.launch(chooser)
         } catch (err: Exception) {
             SafeLogger.w("MainActivity", "Unable to launch bugreport chooser", err)
-            (application as? MeshApplication)?.container?.bugreportManager
+            (application as? MeshApplication)
+                ?.container
+                ?.bugreportManager
                 ?.cleanupAllDiagnosticArtifacts()
         }
     }

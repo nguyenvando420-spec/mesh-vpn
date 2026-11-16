@@ -63,10 +63,11 @@ fun OnboardingScreen(
     modifier: Modifier = Modifier,
 ) {
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
+        modifier =
+            modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         OnboardingHeaderBanner(isBusy = screenState.session.isBusy)
@@ -122,8 +123,9 @@ private fun OnboardingHeaderBanner(isBusy: Boolean) {
         style = MaterialTheme.typography.headlineSmall,
     )
     Text(
-        text = "Scan an administrator QR or enter server fingerprint details. " +
-            "Automatic trust-on-first-use is disabled.",
+        text =
+            "Scan an administrator QR or enter server fingerprint details. " +
+                "Automatic trust-on-first-use is disabled.",
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -144,11 +146,12 @@ private fun OnboardingMethodTabs(
     selected: OnboardingMethod,
     onSelectMethod: (OnboardingMethod) -> Unit,
 ) {
-    val methods = listOf(
-        Triple(OnboardingMethod.SCAN_QR, "Scan QR", Icons.Outlined.QrCodeScanner),
-        Triple(OnboardingMethod.PASTE_URI, "Paste URI", Icons.Outlined.ContentPaste),
-        Triple(OnboardingMethod.MANUAL, "Manual", Icons.Outlined.Edit),
-    )
+    val methods =
+        listOf(
+            Triple(OnboardingMethod.SCAN_QR, "Scan QR", Icons.Outlined.QrCodeScanner),
+            Triple(OnboardingMethod.PASTE_URI, "Paste URI", Icons.Outlined.ContentPaste),
+            Triple(OnboardingMethod.MANUAL, "Manual", Icons.Outlined.Edit),
+        )
     TabRow(selectedTabIndex = methods.indexOfFirst { it.first == selected }.coerceAtLeast(0)) {
         methods.forEach { (method, label, icon) ->
             Tab(
@@ -185,9 +188,10 @@ private fun PasteUriSection(
             Button(
                 onClick = onPasteClipboard,
                 enabled = !isBusy,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("paste_clipboard_clear_button"),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("paste_clipboard_clear_button"),
             ) {
                 Text("Paste from Clipboard & Clear Immediately")
             }
@@ -196,14 +200,16 @@ private fun PasteUriSection(
                 onValueChange = { uriDraft = it },
                 label = { Text("Or enter mesh://join?... URI") },
                 visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Password,
-                    autoCorrectEnabled = false,
-                ),
+                keyboardOptions =
+                    KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        autoCorrectEnabled = false,
+                    ),
                 singleLine = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("paste_uri_input"),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("paste_uri_input"),
             )
             OutlinedButton(
                 onClick = {
@@ -246,9 +252,10 @@ private fun ManualJoinSection(
                 label = { Text("Control server (host:port)") },
                 placeholder = { Text("203.0.113.10:443") },
                 singleLine = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("manual_endpoint_input"),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("manual_endpoint_input"),
             )
             TlsModeSelector(
                 tlsMode = tlsMode,
@@ -259,45 +266,36 @@ private fun ManualJoinSection(
                     }
                 },
             )
-            if (tlsMode == MobileTlsAuthMode.SPKI_PIN) {
-                OutlinedTextField(
-                    value = spkiPin,
-                    onValueChange = { spkiPin = it },
-                    label = { Text("SPKI Pin (sha256:<64 hex>)") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("manual_pin_input"),
-                )
-            } else {
-                Text(
-                    text = "System CA validates DNS domain certificates using Android root store.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+            ManualSpkiOrSystemCaFields(
+                tlsMode = tlsMode,
+                spkiPin = spkiPin,
+                onPinChange = { spkiPin = it },
+            )
             OutlinedTextField(
                 value = preauthKeyDraft,
                 onValueChange = { preauthKeyDraft = it },
                 label = { Text("Pre-auth Key (mpk_...)") },
                 visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Password,
-                    autoCorrectEnabled = false,
-                ),
+                keyboardOptions =
+                    KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        autoCorrectEnabled = false,
+                    ),
                 singleLine = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("manual_preauth_input"),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("manual_preauth_input"),
             )
             OutlinedTextField(
                 value = nodeName,
                 onValueChange = { nodeName = it },
                 label = { Text("Device Name (optional RFC 1123)") },
                 singleLine = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("manual_nodename_input"),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("manual_nodename_input"),
             )
             Button(
                 onClick = {
@@ -306,13 +304,40 @@ private fun ManualJoinSection(
                     onSubmitManual(endpoint, tlsMode, spkiPin, keyChars, nodeName)
                 },
                 enabled = !isBusy,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("manual_submit_button"),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("manual_submit_button"),
             ) {
                 Text("Review Server & Continue")
             }
         }
+    }
+}
+
+@Composable
+private fun ManualSpkiOrSystemCaFields(
+    tlsMode: MobileTlsAuthMode,
+    spkiPin: String,
+    onPinChange: (String) -> Unit,
+) {
+    if (tlsMode == MobileTlsAuthMode.SPKI_PIN) {
+        OutlinedTextField(
+            value = spkiPin,
+            onValueChange = onPinChange,
+            label = { Text("SPKI Pin (sha256:<64 hex>)") },
+            singleLine = true,
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .testTag("manual_pin_input"),
+        )
+    } else {
+        Text(
+            text = "System CA validates DNS domain certificates using Android root store.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -336,12 +361,16 @@ private fun TlsModeSelector(
 }
 
 @Composable
-private fun ErrorOrInfoNotice(errorMessage: String?, infoMessage: String?) {
+private fun ErrorOrInfoNotice(
+    errorMessage: String?,
+    infoMessage: String?,
+) {
     if (!errorMessage.isNullOrBlank()) {
         Card(
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.errorContainer,
-            ),
+            colors =
+                CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                ),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(
@@ -354,9 +383,10 @@ private fun ErrorOrInfoNotice(errorMessage: String?, infoMessage: String?) {
     }
     if (!infoMessage.isNullOrBlank()) {
         Card(
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-            ),
+            colors =
+                CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                ),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(
@@ -383,11 +413,12 @@ private fun JoinConfirmationDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Endpoint: ${confirmation.serverEndpoint}")
-                val trustLabel = if (confirmation.tlsAuthMode == MobileTlsAuthMode.SPKI_PIN) {
-                    "Pinned SPKI SHA-256"
-                } else {
-                    "Android System CA (Domain Verified)"
-                }
+                val trustLabel =
+                    if (confirmation.tlsAuthMode == MobileTlsAuthMode.SPKI_PIN) {
+                        "Pinned SPKI SHA-256"
+                    } else {
+                        "Android System CA (Domain Verified)"
+                    }
                 Text("TLS Policy: $trustLabel")
                 confirmation.serverPin?.let { pin ->
                     Text(

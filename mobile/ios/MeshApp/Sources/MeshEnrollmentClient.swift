@@ -27,13 +27,13 @@ public struct LiveEnrollmentClient: EnrollmentClientProtocol, Sendable {
     public init() {}
 
     public func parseJoinUri(_ rawUri: String) throws -> MobileParsedJoinUri {
-        try parseMobileJoinUri(rawUri: rawUri)
+        try MeshCoreKit.parseMobileJoinUri(rawUri: rawUri)
     }
 
     public func createPendingJoinSession(
         _ rawPreauthKey: String
     ) throws -> MobilePendingJoinSession {
-        try createPendingJoinSession(rawPreauthKey: rawPreauthKey)
+        try MeshCoreKit.createPendingJoinSession(rawPreauthKey: rawPreauthKey)
     }
 
     public func enrollOrRotateNode(

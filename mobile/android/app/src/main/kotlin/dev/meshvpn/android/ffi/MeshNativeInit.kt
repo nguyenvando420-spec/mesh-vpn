@@ -29,16 +29,17 @@ object MeshNativeInit {
                 return true
             }
             if (!nativeLoaded.get()) {
-                val loaded = try {
-                    System.loadLibrary(NATIVE_LIB_NAME)
-                    true
-                } catch (err: UnsatisfiedLinkError) {
-                    SafeLogger.e(TAG, "Failed loading native library $NATIVE_LIB_NAME", err)
-                    false
-                } catch (err: SecurityException) {
-                    SafeLogger.e(TAG, "Security error loading $NATIVE_LIB_NAME", err)
-                    false
-                }
+                val loaded =
+                    try {
+                        System.loadLibrary(NATIVE_LIB_NAME)
+                        true
+                    } catch (err: UnsatisfiedLinkError) {
+                        SafeLogger.e(TAG, "Failed loading native library $NATIVE_LIB_NAME", err)
+                        false
+                    } catch (err: SecurityException) {
+                        SafeLogger.e(TAG, "Security error loading $NATIVE_LIB_NAME", err)
+                        false
+                    }
                 if (!loaded) {
                     return false
                 }
@@ -46,12 +47,13 @@ object MeshNativeInit {
             }
 
             val appContext = context.applicationContext ?: context
-            val initialized = try {
-                initPlatformVerifier(appContext)
-            } catch (err: UnsatisfiedLinkError) {
-                SafeLogger.e(TAG, "JNI symbol initPlatformVerifier unavailable", err)
-                false
-            }
+            val initialized =
+                try {
+                    initPlatformVerifier(appContext)
+                } catch (err: UnsatisfiedLinkError) {
+                    SafeLogger.e(TAG, "JNI symbol initPlatformVerifier unavailable", err)
+                    false
+                }
             if (initialized) {
                 verifierReady.set(true)
             } else {

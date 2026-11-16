@@ -19,9 +19,19 @@ import uniffi.mesh_mobile_ffi.MobileException
 
 interface KeyWrapBackend {
     fun hasWrappingKey(alias: String): Boolean
+
     fun createWrappingKey(alias: String)
-    fun wrapDek(alias: String, plainDek: ByteArray): ByteArray
-    fun unwrapDek(alias: String, wrappedBlob: ByteArray): ByteArray
+
+    fun wrapDek(
+        alias: String,
+        plainDek: ByteArray,
+    ): ByteArray
+
+    fun unwrapDek(
+        alias: String,
+        wrappedBlob: ByteArray,
+    ): ByteArray
+
     fun deleteWrappingKey(alias: String)
 }
 
@@ -38,21 +48,25 @@ class AndroidKeyStoreBackend : KeyWrapBackend {
 
     override fun createWrappingKey(alias: String) {
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
-        val spec = KeyGenParameterSpec.Builder(
-            alias,
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
-        )
-            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-            .setKeySize(AES_KEY_BITS)
-            .setRandomizedEncryptionRequired(true)
-            .setUserAuthenticationRequired(false)
-            .build()
+        val spec =
+            KeyGenParameterSpec
+                .Builder(
+                    alias,
+                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+                ).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(AES_KEY_BITS)
+                .setRandomizedEncryptionRequired(true)
+                .setUserAuthenticationRequired(false)
+                .build()
         generator.init(spec)
         generator.generateKey()
     }
 
-    override fun wrapDek(alias: String, plainDek: ByteArray): ByteArray {
+    override fun wrapDek(
+        alias: String,
+        plainDek: ByteArray,
+    ): ByteArray {
         val key = loadSecretKey(alias)
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key)
@@ -67,7 +81,10 @@ class AndroidKeyStoreBackend : KeyWrapBackend {
         return out
     }
 
-    override fun unwrapDek(alias: String, wrappedBlob: ByteArray): ByteArray {
+    override fun unwrapDek(
+        alias: String,
+        wrappedBlob: ByteArray,
+    ): ByteArray {
         if (wrappedBlob.size < MAGIC_HEADER.size + GCM_IV_LEN + GCM_TAG_LEN) {
             throw AEADBadTagException("Wrapped DEK blob truncated")
         }
@@ -98,8 +115,11 @@ class AndroidKeyStoreBackend : KeyWrapBackend {
 
     private fun loadSecretKey(alias: String): SecretKey {
         val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        val entry = ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry
-            ?: throw KeyPermanentlyInvalidatedException("AndroidKeyStore alias $alias is missing")
+        val entry =
+            ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry
+                ?: throw KeyPermanentlyInvalidatedException(
+                    "AndroidKeyStore alias $alias is missing",
+                )
         return entry.secretKey
     }
 
@@ -111,12 +131,13 @@ class AndroidKeyStoreBackend : KeyWrapBackend {
         private const val GCM_IV_LEN = 12
         private const val GCM_TAG_BITS = 128
         private const val GCM_TAG_LEN = 16
-        private val MAGIC_HEADER = byteArrayOf(
-            'S'.code.toByte(),
-            'D'.code.toByte(),
-            'K'.code.toByte(),
-            '1'.code.toByte(),
-        )
+        private val MAGIC_HEADER =
+            byteArrayOf(
+                'S'.code.toByte(),
+                'D'.code.toByte(),
+                'K'.code.toByte(),
+                '1'.code.toByte(),
+            )
         private val DEK_AAD = "mesh-android-dek-v1".toByteArray(Charsets.UTF_8)
     }
 }
@@ -197,54 +218,75 @@ class AndroidKeystoreDekManager(
 
     private fun unwrapExistingDek(dekFile: File): ByteArray {
         if (!keyWrapBackend.hasWrappingKey(KEYSTORE_ALIAS)) {
-            throw MobileException.KeystoreInvalidated(
-                errorCode = "E_KEYSTORE_INVALIDATED",
-                message = "Android Keystore key $KEYSTORE_ALIAS missing for existing dek.enc",
+            throw keystoreInvalidated(
+                "Android Keystore key $KEYSTORE_ALIAS missing for existing dek.enc",
             )
         }
-        val wrapped = try {
-            dekFile.readBytes()
-        } catch (err: Exception) {
-            throw MobileException.KeystoreInvalidated(
-                errorCode = "E_KEYSTORE_INVALIDATED",
-                message = "Unable to read dek.enc: ${err.message}",
-            )
-        }
-        val dek = try {
-            keyWrapBackend.unwrapDek(KEYSTORE_ALIAS, wrapped)
-        } catch (err: UserNotAuthenticatedException) {
-            throw MobileException.DeviceLocked(
-                errorCode = "E_DEVICE_LOCKED",
-                message = "Keystore authentication required before unlock: ${err.message}",
-            )
-        } catch (err: KeyPermanentlyInvalidatedException) {
-            throw MobileException.KeystoreInvalidated(
-                errorCode = "E_KEYSTORE_INVALIDATED",
-                message = "KeyPermanentlyInvalidatedException: ${err.message}",
-            )
-        } catch (err: AEADBadTagException) {
-            throw MobileException.KeystoreInvalidated(
-                errorCode = "E_KEYSTORE_INVALIDATED",
-                message = "AEADBadTagException decrypting dek.enc: ${err.message}",
-            )
-        } catch (err: GeneralSecurityException) {
-            throw MobileException.KeystoreInvalidated(
-                errorCode = "E_KEYSTORE_INVALIDATED",
-                message = "Keystore unwrap failed: ${err.message}",
-            )
-        } finally {
-            wrapped.fill(0)
-        }
+        val wrapped = readWrappedDekBytes(dekFile)
+        val dek =
+            try {
+                unwrapHandlingAuth(wrapped)
+            } finally {
+                wrapped.fill(0)
+            }
 
         if (dek.size != DEK_SIZE_BYTES) {
             dek.fill(0)
-            throw MobileException.KeystoreInvalidated(
-                errorCode = "E_KEYSTORE_INVALIDATED",
-                message = "Unwrapped DEK had invalid length ${dek.size}",
-            )
+            throw keystoreInvalidated("Unwrapped DEK had invalid length ${dek.size}")
         }
         return dek
     }
+
+    private fun readWrappedDekBytes(dekFile: File): ByteArray =
+        try {
+            dekFile.readBytes()
+        } catch (err: Exception) {
+            throw MobileException
+                .KeystoreInvalidated(
+                    errorCode = "E_KEYSTORE_INVALIDATED",
+                    message = "Unable to read dek.enc: ${err.message}",
+                ).apply { initCause(err) }
+        }
+
+    private fun unwrapHandlingAuth(wrapped: ByteArray): ByteArray =
+        try {
+            unwrapHandlingCipher(wrapped)
+        } catch (err: UserNotAuthenticatedException) {
+            throw MobileException
+                .DeviceLocked(
+                    errorCode = "E_DEVICE_LOCKED",
+                    message = "Keystore authentication required before unlock: ${err.message}",
+                ).apply { initCause(err) }
+        } catch (err: KeyPermanentlyInvalidatedException) {
+            throw MobileException
+                .KeystoreInvalidated(
+                    errorCode = "E_KEYSTORE_INVALIDATED",
+                    message = "KeyPermanentlyInvalidatedException: ${err.message}",
+                ).apply { initCause(err) }
+        }
+
+    private fun unwrapHandlingCipher(wrapped: ByteArray): ByteArray =
+        try {
+            keyWrapBackend.unwrapDek(KEYSTORE_ALIAS, wrapped)
+        } catch (err: AEADBadTagException) {
+            throw MobileException
+                .KeystoreInvalidated(
+                    errorCode = "E_KEYSTORE_INVALIDATED",
+                    message = "AEADBadTagException decrypting dek.enc: ${err.message}",
+                ).apply { initCause(err) }
+        } catch (err: GeneralSecurityException) {
+            throw MobileException
+                .KeystoreInvalidated(
+                    errorCode = "E_KEYSTORE_INVALIDATED",
+                    message = "Keystore unwrap failed: ${err.message}",
+                ).apply { initCause(err) }
+        }
+
+    private fun keystoreInvalidated(message: String): MobileException =
+        MobileException.KeystoreInvalidated(
+            errorCode = "E_KEYSTORE_INVALIDATED",
+            message = message,
+        )
 
     private fun generateAndSealFreshDek(): ByteArray {
         val freshDek = ByteArray(DEK_SIZE_BYTES)
@@ -259,15 +301,17 @@ class AndroidKeystoreDekManager(
             stateStore.saveStateFile(PrivateStateFileStore.DEK_FILE, sealed)
             return freshDek.copyOf()
         } catch (err: UserNotAuthenticatedException) {
-            throw MobileException.DeviceLocked(
-                errorCode = "E_DEVICE_LOCKED",
-                message = "Keystore unavailable while device is locked: ${err.message}",
-            )
+            throw MobileException
+                .DeviceLocked(
+                    errorCode = "E_DEVICE_LOCKED",
+                    message = "Keystore unavailable while device is locked: ${err.message}",
+                ).apply { initCause(err) }
         } catch (err: GeneralSecurityException) {
-            throw MobileException.KeystoreInvalidated(
-                errorCode = "E_KEYSTORE_INVALIDATED",
-                message = "Failed creating or wrapping Android Keystore DEK: ${err.message}",
-            )
+            throw MobileException
+                .KeystoreInvalidated(
+                    errorCode = "E_KEYSTORE_INVALIDATED",
+                    message = "Failed creating or wrapping Android Keystore DEK: ${err.message}",
+                ).apply { initCause(err) }
         } finally {
             freshDek.fill(0)
             wrapped?.fill(0)

@@ -29,25 +29,27 @@ class UniFfiMobileEngineHandle(
     private val native: MobileEngine,
 ) : MobileEngineHandle {
     override suspend fun startTunnel(cfg: UpParams): MobileStatusSnapshot {
-        val upConfig = MobileUpConfig(
-            serverEndpoint = cfg.serverEndpoint,
-            portOverride = cfg.portOverride,
-            tlsAuthMode = cfg.tlsAuthMode,
-            serverPin = cfg.serverPin,
-            pendingJoin = cfg.pendingJoin?.unwrapNative(),
-            nodeName = cfg.nodeName,
-            androidTunFd = cfg.androidTunFd,
-            tunInterfaceName = cfg.tunInterfaceName,
-        )
+        val upConfig =
+            MobileUpConfig(
+                serverEndpoint = cfg.serverEndpoint,
+                portOverride = cfg.portOverride,
+                tlsAuthMode = cfg.tlsAuthMode,
+                serverPin = cfg.serverPin,
+                pendingJoin = cfg.pendingJoin?.unwrapNative(),
+                nodeName = cfg.nodeName,
+                androidTunFd = cfg.androidTunFd,
+                tunInterfaceName = cfg.tunInterfaceName,
+            )
         return native.startTunnel(upConfig)
     }
 
     override suspend fun stopTunnel(): MobileStatusSnapshot = native.stopTunnel()
 
     override suspend fun rotateKey(pendingJoin: PendingJoinSessionHandle): MobileStatusSnapshot {
-        val nativeSession = requireNotNull(pendingJoin.unwrapNative()) {
-            "Pending join session is unavailable for native rotateKey"
-        }
+        val nativeSession =
+            requireNotNull(pendingJoin.unwrapNative()) {
+                "Pending join session is unavailable for native rotateKey"
+            }
         return native.rotateKey(MobileRotateKeyConfig(pendingJoin = nativeSession))
     }
 
@@ -74,7 +76,10 @@ class UniFfiMobileEngineHandle(
         native.completeRouteChange(opId, ok, newAndroidTunFd, errorMessage)
     }
 
-    override fun onNetworkChange(kind: MobileNetEventKind, underlay: MobileUnderlayState) {
+    override fun onNetworkChange(
+        kind: MobileNetEventKind,
+        underlay: MobileUnderlayState,
+    ) {
         native.onNetworkChange(kind, underlay)
     }
 

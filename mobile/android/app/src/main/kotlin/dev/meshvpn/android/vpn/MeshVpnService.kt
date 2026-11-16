@@ -71,7 +71,11 @@ class MeshVpnService : VpnService() {
         startStateObserver()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int,
+    ): Int {
         val action = intent?.action ?: SERVICE_INTERFACE
         SafeLogger.i(TAG, "MeshVpnService onStartCommand action=$action")
 
@@ -169,65 +173,72 @@ class MeshVpnService : VpnService() {
         if (networkCallback == null) {
             val cm = getSystemService(ConnectivityManager::class.java)
             if (cm != null) {
-                val callback = object : ConnectivityManager.NetworkCallback() {
-                    override fun onAvailable(network: Network) {
-                        handleUnderlayTransition(container, network, forcedLost = false)
-                    }
-
-                    override fun onCapabilitiesChanged(
-                        network: Network,
-                        networkCapabilities: NetworkCapabilities,
-                    ) {
-                        val notVpn = networkCapabilities.hasCapability(
-                            NetworkCapabilities.NET_CAPABILITY_NOT_VPN,
-                        )
-                        if (notVpn) {
+                val callback =
+                    object : ConnectivityManager.NetworkCallback() {
+                        override fun onAvailable(network: Network) {
                             handleUnderlayTransition(container, network, forcedLost = false)
                         }
-                    }
 
-                    override fun onLinkPropertiesChanged(
-                        network: Network,
-                        linkProperties: LinkProperties,
-                    ) {
-                        handleUnderlayTransition(container, network, forcedLost = false)
-                    }
+                        override fun onCapabilitiesChanged(
+                            network: Network,
+                            networkCapabilities: NetworkCapabilities,
+                        ) {
+                            val notVpn =
+                                networkCapabilities.hasCapability(
+                                    NetworkCapabilities.NET_CAPABILITY_NOT_VPN,
+                                )
+                            if (notVpn) {
+                                handleUnderlayTransition(container, network, forcedLost = false)
+                            }
+                        }
 
-                    override fun onLost(network: Network) {
-                        handleUnderlayTransition(
-                            container = container,
-                            explicitNetwork = null,
-                            forcedLost = true,
-                        )
+                        override fun onLinkPropertiesChanged(
+                            network: Network,
+                            linkProperties: LinkProperties,
+                        ) {
+                            handleUnderlayTransition(container, network, forcedLost = false)
+                        }
+
+                        override fun onLost(network: Network) {
+                            handleUnderlayTransition(
+                                container = container,
+                                explicitNetwork = null,
+                                forcedLost = true,
+                            )
+                        }
                     }
-                }
                 cm.registerDefaultNetworkCallback(callback)
                 networkCallback = callback
             }
         }
 
         if (systemEventsReceiver == null) {
-            val receiver = object : BroadcastReceiver() {
-                override fun onReceive(context: Context?, intent: Intent?) {
-                    val act = intent?.action ?: return
-                    when (act) {
-                        Intent.ACTION_SCREEN_OFF ->
-                            container.sessionRepository.setPowerSavingMode(true)
-                        Intent.ACTION_SCREEN_ON ->
-                            container.sessionRepository.setPowerSavingMode(false)
-                        PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
-                            val pm = getSystemService(PowerManager::class.java)
-                            val idle = pm?.isDeviceIdleMode ?: false
-                            container.sessionRepository.setPowerSavingMode(idle)
+            val receiver =
+                object : BroadcastReceiver() {
+                    override fun onReceive(
+                        context: Context?,
+                        intent: Intent?,
+                    ) {
+                        val act = intent?.action ?: return
+                        when (act) {
+                            Intent.ACTION_SCREEN_OFF ->
+                                container.sessionRepository.setPowerSavingMode(true)
+                            Intent.ACTION_SCREEN_ON ->
+                                container.sessionRepository.setPowerSavingMode(false)
+                            PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
+                                val pm = getSystemService(PowerManager::class.java)
+                                val idle = pm?.isDeviceIdleMode ?: false
+                                container.sessionRepository.setPowerSavingMode(idle)
+                            }
                         }
                     }
                 }
-            }
-            val filter = IntentFilter().apply {
-                addAction(Intent.ACTION_SCREEN_OFF)
-                addAction(Intent.ACTION_SCREEN_ON)
-                addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
-            }
+            val filter =
+                IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+                }
             ContextCompat.registerReceiver(
                 this,
                 receiver,
@@ -246,11 +257,12 @@ class MeshVpnService : VpnService() {
         val next = container.underlayCollector.collectUnderlayState(explicitNetwork)
         val prev = lastUnderlayState
         lastUnderlayState = next
-        val kind = if (forcedLost && !next.hasIpv4 && !next.hasIpv6) {
-            MobileNetEventKind.CONNECTIVITY_LOST
-        } else {
-            UnderlayStateClassifier.inferChangeKind(prev, next)
-        }
+        val kind =
+            if (forcedLost && !next.hasIpv4 && !next.hasIpv6) {
+                MobileNetEventKind.CONNECTIVITY_LOST
+            } else {
+                UnderlayStateClassifier.inferChangeKind(prev, next)
+            }
         container.sessionRepository.dispatchNetworkChange(kind, next)
     }
 
@@ -258,19 +270,23 @@ class MeshVpnService : VpnService() {
         if (unlockReceiver != null) {
             return
         }
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == Intent.ACTION_USER_UNLOCKED &&
-                    container.stateStore.isDeviceUnlocked()
+        val receiver =
+            object : BroadcastReceiver() {
+                override fun onReceive(
+                    context: Context?,
+                    intent: Intent?,
                 ) {
-                    SafeLogger.i(TAG, "Device unlocked after Direct Boot; resuming Mesh VPN")
-                    unregisterUnlockReceiver()
-                    container.sessionRepository.refreshFromDisk()
-                    registerNetworkAndPowerMonitors(container)
-                    startTunnelCoroutine(container)
+                    if (intent?.action == Intent.ACTION_USER_UNLOCKED &&
+                        container.stateStore.isDeviceUnlocked()
+                    ) {
+                        SafeLogger.i(TAG, "Device unlocked after Direct Boot; resuming Mesh VPN")
+                        unregisterUnlockReceiver()
+                        container.sessionRepository.refreshFromDisk()
+                        registerNetworkAndPowerMonitors(container)
+                        startTunnelCoroutine(container)
+                    }
                 }
             }
-        }
         val filter = IntentFilter(Intent.ACTION_USER_UNLOCKED)
         ContextCompat.registerReceiver(
             this,
@@ -334,13 +350,14 @@ class MeshVpnService : VpnService() {
 
     private fun startStateObserver() {
         val container = (application as? MeshApplication)?.container ?: return
-        stateObserverJob = serviceScope.launch {
-            container.sessionRepository.uiState.collectLatest { uiState ->
-                val nm = getSystemService(NotificationManager::class.java)
-                nm?.notify(NOTIFICATION_ID, buildStatusNotification(uiState))
-                MeshTileService.requestTileSync(applicationContext)
+        stateObserverJob =
+            serviceScope.launch {
+                container.sessionRepository.uiState.collectLatest { uiState ->
+                    val nm = getSystemService(NotificationManager::class.java)
+                    nm?.notify(NOTIFICATION_ID, buildStatusNotification(uiState))
+                    MeshTileService.requestTileSync(applicationContext)
+                }
             }
-        }
     }
 
     private fun promoteToForeground(notification: Notification) {
@@ -357,72 +374,82 @@ class MeshVpnService : VpnService() {
 
     private fun createNotificationChannels() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
-        val tunnelChannel = NotificationChannel(
-            CHANNEL_VPN_STATUS,
-            getString(R.string.notification_channel_vpn),
-            NotificationManager.IMPORTANCE_LOW,
-        )
-        val alertChannel = NotificationChannel(
-            CHANNEL_VPN_ALERTS,
-            getString(R.string.notification_channel_alerts),
-            NotificationManager.IMPORTANCE_HIGH,
-        )
+        val tunnelChannel =
+            NotificationChannel(
+                CHANNEL_VPN_STATUS,
+                getString(R.string.notification_channel_vpn),
+                NotificationManager.IMPORTANCE_LOW,
+            )
+        val alertChannel =
+            NotificationChannel(
+                CHANNEL_VPN_ALERTS,
+                getString(R.string.notification_channel_alerts),
+                NotificationManager.IMPORTANCE_HIGH,
+            )
         nm.createNotificationChannel(tunnelChannel)
         nm.createNotificationChannel(alertChannel)
     }
 
     private fun buildStatusNotification(uiState: MeshSessionUiState): Notification {
-        val contentIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val disconnectIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, MeshVpnService::class.java).setAction(ACTION_DISCONNECT_NOTIFICATION),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        val contentIntent =
+            PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        val disconnectIntent =
+            PendingIntent.getService(
+                this,
+                1,
+                Intent(this, MeshVpnService::class.java).setAction(ACTION_DISCONNECT_NOTIFICATION),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
 
-        val statusText = when {
-            !uiState.isDeviceUnlocked || uiState.daemonState == MobileDaemonState.DEVICE_LOCKED ->
-                getString(R.string.notification_status_waiting_unlock)
-            uiState.daemonState == MobileDaemonState.CONNECTED -> {
-                val ip = uiState.snapshot?.overlayIp
-                    ?: uiState.bootstrapSummary?.overlayIp
-                    ?: "mesh"
-                getString(R.string.notification_status_connected, ip)
+        val statusText =
+            when {
+                !uiState.isDeviceUnlocked ||
+                    uiState.daemonState == MobileDaemonState.DEVICE_LOCKED ->
+                    getString(R.string.notification_status_waiting_unlock)
+                uiState.daemonState == MobileDaemonState.CONNECTED -> {
+                    val ip =
+                        uiState.snapshot?.overlayIp
+                            ?: uiState.bootstrapSummary?.overlayIp
+                            ?: "mesh"
+                    getString(R.string.notification_status_connected, ip)
+                }
+                uiState.daemonState == MobileDaemonState.CONNECTING ->
+                    getString(R.string.notification_status_connecting)
+                uiState.daemonState == MobileDaemonState.DEGRADED ->
+                    getString(R.string.notification_status_degraded)
+                else -> getString(R.string.notification_status_stopped)
             }
-            uiState.daemonState == MobileDaemonState.CONNECTING ->
-                getString(R.string.notification_status_connecting)
-            uiState.daemonState == MobileDaemonState.DEGRADED ->
-                getString(R.string.notification_status_degraded)
-            else -> getString(R.string.notification_status_stopped)
-        }
 
-        val warningLines = buildList {
-            if (uiState.isLockdownEnabled) {
-                add(getString(R.string.notification_warning_lockdown))
+        val warningLines =
+            buildList {
+                if (uiState.isLockdownEnabled) {
+                    add(getString(R.string.notification_warning_lockdown))
+                }
+                if (uiState.isPrivateDnsStrict) {
+                    add(getString(R.string.notification_warning_private_dns))
+                }
             }
-            if (uiState.isPrivateDnsStrict) {
-                add(getString(R.string.notification_warning_private_dns))
-            }
-        }
         val channelId = if (warningLines.isNotEmpty()) CHANNEL_VPN_ALERTS else CHANNEL_VPN_STATUS
 
-        val builder = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(R.drawable.ic_vpn_key)
-            .setContentTitle(getString(R.string.notification_title))
-            .setContentText(warningLines.firstOrNull() ?: statusText)
-            .setContentIntent(contentIntent)
-            .setOngoing(uiState.daemonState != MobileDaemonState.STOPPED)
-            .setOnlyAlertOnce(warningLines.isEmpty())
-            .addAction(
-                R.drawable.ic_vpn_key,
-                getString(R.string.notification_action_disconnect),
-                disconnectIntent,
-            )
+        val builder =
+            NotificationCompat
+                .Builder(this, channelId)
+                .setSmallIcon(R.drawable.ic_vpn_key)
+                .setContentTitle(getString(R.string.notification_title))
+                .setContentText(warningLines.firstOrNull() ?: statusText)
+                .setContentIntent(contentIntent)
+                .setOngoing(uiState.daemonState != MobileDaemonState.STOPPED)
+                .setOnlyAlertOnce(warningLines.isEmpty())
+                .addAction(
+                    R.drawable.ic_vpn_key,
+                    getString(R.string.notification_action_disconnect),
+                    disconnectIntent,
+                )
 
         if (warningLines.isNotEmpty()) {
             val combined = (listOf(statusText) + warningLines).joinToString("\n")
@@ -444,14 +471,16 @@ class MeshVpnService : VpnService() {
             "dev.meshvpn.android.action.DISCONNECT_FROM_NOTIFICATION"
 
         fun startTunnelService(context: Context) {
-            val intent = Intent(context, MeshVpnService::class.java)
-                .setAction(ACTION_START_TUNNEL)
+            val intent =
+                Intent(context, MeshVpnService::class.java)
+                    .setAction(ACTION_START_TUNNEL)
             ContextCompat.startForegroundService(context, intent)
         }
 
         fun stopTunnelService(context: Context) {
-            val intent = Intent(context, MeshVpnService::class.java)
-                .setAction(ACTION_STOP_TUNNEL)
+            val intent =
+                Intent(context, MeshVpnService::class.java)
+                    .setAction(ACTION_STOP_TUNNEL)
             context.startService(intent)
         }
     }

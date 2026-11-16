@@ -38,18 +38,21 @@ object UnderlayStateClassifier {
 
     fun toMobileUnderlayState(raw: RawLinkSnapshot): MobileUnderlayState {
         val cleanInterface = raw.activeInterfaceName?.trim()?.takeIf { it.isNotEmpty() }
-        val cleanDns = raw.underlayDnsServers
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
-        val cleanSubnets = raw.physicalSubnets
-            .map { it.trim() }
-            .filter { it.contains("/") }
-            .distinct()
-        val strictPrivateDns = classifyPrivateDnsStrict(
-            isPrivateDnsActive = raw.isPrivateDnsActive,
-            privateDnsServerName = raw.privateDnsServerName,
-        )
+        val cleanDns =
+            raw.underlayDnsServers
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+        val cleanSubnets =
+            raw.physicalSubnets
+                .map { it.trim() }
+                .filter { it.contains("/") }
+                .distinct()
+        val strictPrivateDns =
+            classifyPrivateDnsStrict(
+                isPrivateDnsActive = raw.isPrivateDnsActive,
+                privateDnsServerName = raw.privateDnsServerName,
+            )
         val cleanServerName = raw.privateDnsServerName?.trim()?.takeIf { it.isNotEmpty() }
         return MobileUnderlayState(
             activeInterfaceName = cleanInterface,
@@ -88,18 +91,19 @@ object UnderlayStateClassifier {
         }
     }
 
-    fun emptyOfflineState(isLockdownEnabled: Boolean): MobileUnderlayState = MobileUnderlayState(
-        activeInterfaceName = null,
-        physicalIfIndex = null,
-        hasIpv4 = false,
-        hasIpv6 = false,
-        underlayDnsServers = emptyList(),
-        osNat64Prefix = null,
-        physicalSubnets = emptyList(),
-        isAndroidLockdownEnabled = isLockdownEnabled,
-        isAndroidPrivateDnsStrict = false,
-        privateDnsServerName = null,
-    )
+    fun emptyOfflineState(isLockdownEnabled: Boolean): MobileUnderlayState =
+        MobileUnderlayState(
+            activeInterfaceName = null,
+            physicalIfIndex = null,
+            hasIpv4 = false,
+            hasIpv6 = false,
+            underlayDnsServers = emptyList(),
+            osNat64Prefix = null,
+            physicalSubnets = emptyList(),
+            isAndroidLockdownEnabled = isLockdownEnabled,
+            isAndroidPrivateDnsStrict = false,
+            privateDnsServerName = null,
+        )
 }
 
 /**
@@ -111,14 +115,17 @@ class AndroidUnderlayStateCollector(
     private val lockdownProvider: () -> Boolean,
 ) {
     fun collectUnderlayState(explicitNetwork: Network? = null): MobileUnderlayState {
-        val cm = context.getSystemService(ConnectivityManager::class.java)
-            ?: return UnderlayStateClassifier.emptyOfflineState(lockdownProvider())
+        val cm =
+            context.getSystemService(ConnectivityManager::class.java)
+                ?: return UnderlayStateClassifier.emptyOfflineState(lockdownProvider())
 
-        val physicalNet = findBestPhysicalNetwork(cm, explicitNetwork)
-            ?: return UnderlayStateClassifier.emptyOfflineState(lockdownProvider())
+        val physicalNet =
+            findBestPhysicalNetwork(cm, explicitNetwork)
+                ?: return UnderlayStateClassifier.emptyOfflineState(lockdownProvider())
 
-        val lp = cm.getLinkProperties(physicalNet)
-            ?: return UnderlayStateClassifier.emptyOfflineState(lockdownProvider())
+        val lp =
+            cm.getLinkProperties(physicalNet)
+                ?: return UnderlayStateClassifier.emptyOfflineState(lockdownProvider())
 
         val raw = extractRawSnapshot(cm, lp)
         return UnderlayStateClassifier.toMobileUnderlayState(raw)
@@ -175,26 +182,29 @@ class AndroidUnderlayStateCollector(
         }
 
         val dnsServers = activeLp.dnsServers.mapNotNull { it.hostAddress }
-        val nat64Prefix = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            activeLp.nat64Prefix?.let { prefix ->
-                val addr = prefix.address.hostAddress
-                if (addr != null) "$addr/${prefix.prefixLength}" else null
+        val nat64Prefix =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                activeLp.nat64Prefix?.let { prefix ->
+                    val addr = prefix.address.hostAddress
+                    if (addr != null) "$addr/${prefix.prefixLength}" else null
+                }
+            } else {
+                null
             }
-        } else {
-            null
-        }
 
         val physicalSubnets = collectAllPhysicalSubnets(cm, activeLp)
-        val isPrivateDnsActive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            activeLp.isPrivateDnsActive
-        } else {
-            false
-        }
-        val privateDnsServerName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            activeLp.privateDnsServerName
-        } else {
-            null
-        }
+        val isPrivateDnsActive =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                activeLp.isPrivateDnsActive
+            } else {
+                false
+            }
+        val privateDnsServerName =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                activeLp.privateDnsServerName
+            } else {
+                null
+            }
 
         return RawLinkSnapshot(
             activeInterfaceName = ifName,

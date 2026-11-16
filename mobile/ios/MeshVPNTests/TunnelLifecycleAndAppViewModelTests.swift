@@ -1,4 +1,5 @@
 @testable import MeshApp
+import Darwin
 import MeshCoreKit
 import NetworkExtension
 import XCTest
@@ -89,11 +90,11 @@ private final class MockEnrollmentClient: EnrollmentClientProtocol, Sendable {
     let updateServerCalls = LockedBox(0)
 
     func parseJoinUri(_ rawUri: String) throws -> MobileParsedJoinUri {
-        try parseMobileJoinUri(rawUri: rawUri)
+        try MeshCoreKit.parseMobileJoinUri(rawUri: rawUri)
     }
 
     func createPendingJoinSession(_ rawPreauthKey: String) throws -> MobilePendingJoinSession {
-        try createPendingJoinSession(rawPreauthKey: rawPreauthKey)
+        try MeshCoreKit.createPendingJoinSession(rawPreauthKey: rawPreauthKey)
     }
 
     func enrollOrRotateNode(

@@ -18,14 +18,15 @@ class OnboardingInputValidatorTest {
         val keyChars = validPreauthKey.toCharArray()
 
         // Act
-        val result = OnboardingInputValidator.validateManualFields(
-            rawEndpoint = " 203.0.113.10:443 ",
-            tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
-            rawPin = validPin.uppercase(),
-            rawPreauthKey = keyChars,
-            rawNodeName = "Pixel-8",
-            requirePreauthKey = true,
-        )
+        val result =
+            OnboardingInputValidator.validateManualFields(
+                rawEndpoint = " 203.0.113.10:443 ",
+                tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
+                rawPin = validPin.uppercase(),
+                rawPreauthKey = keyChars,
+                rawNodeName = "Pixel-8",
+                requirePreauthKey = true,
+            )
 
         // Assert
         assertTrue(result.isValid)
@@ -44,14 +45,15 @@ class OnboardingInputValidatorTest {
         val keyChars = validPreauthKey.toCharArray()
 
         // Act
-        val result = OnboardingInputValidator.validateManualFields(
-            rawEndpoint = "203.0.113.10:443",
-            tlsAuthMode = MobileTlsAuthMode.SYSTEM_CA,
-            rawPin = "",
-            rawPreauthKey = keyChars,
-            rawNodeName = "android-phone",
-            requirePreauthKey = true,
-        )
+        val result =
+            OnboardingInputValidator.validateManualFields(
+                rawEndpoint = "203.0.113.10:443",
+                tlsAuthMode = MobileTlsAuthMode.SYSTEM_CA,
+                rawPin = "",
+                rawPreauthKey = keyChars,
+                rawNodeName = "android-phone",
+                requirePreauthKey = true,
+            )
 
         // Assert
         assertFalse(result.isValid)
@@ -64,14 +66,15 @@ class OnboardingInputValidatorTest {
         val keyChars = validPreauthKey.toCharArray()
 
         // Act
-        val result = OnboardingInputValidator.validateManualFields(
-            rawEndpoint = "vpn.example.com:443",
-            tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
-            rawPin = "",
-            rawPreauthKey = keyChars,
-            rawNodeName = "",
-            requirePreauthKey = true,
-        )
+        val result =
+            OnboardingInputValidator.validateManualFields(
+                rawEndpoint = "vpn.example.com:443",
+                tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
+                rawPin = "",
+                rawPreauthKey = keyChars,
+                rawNodeName = "",
+                requirePreauthKey = true,
+            )
 
         // Assert
         assertFalse(result.isValid)
@@ -84,14 +87,15 @@ class OnboardingInputValidatorTest {
         val shortKey = "mpk_short".toCharArray()
 
         // Act
-        val result = OnboardingInputValidator.validateManualFields(
-            rawEndpoint = "[2001:db8::1]:443",
-            tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
-            rawPin = validPin,
-            rawPreauthKey = shortKey,
-            rawNodeName = "localhost",
-            requirePreauthKey = true,
-        )
+        val result =
+            OnboardingInputValidator.validateManualFields(
+                rawEndpoint = "[2001:db8::1]:443",
+                tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
+                rawPin = validPin,
+                rawPreauthKey = shortKey,
+                rawNodeName = "localhost",
+                requirePreauthKey = true,
+            )
 
         // Assert
         assertFalse(result.isValid)

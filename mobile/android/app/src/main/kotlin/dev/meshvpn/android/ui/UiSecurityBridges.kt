@@ -24,7 +24,11 @@ class AndroidClipboardAccess(
         val manager = context.getSystemService(ClipboardManager::class.java) ?: return null
         return try {
             val item = manager.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
-            item?.coerceToText(context)?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            item
+                ?.coerceToText(context)
+                ?.toString()
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
         } finally {
             clearClipboardNow(manager)
         }
@@ -64,8 +68,9 @@ class ActivityBiometricBridge {
         subtitle: String,
         negativeButtonText: String,
     ): BiometricGateResult {
-        val current = delegate
-            ?: return BiometricGateResult.Unavailable("Authentication UI is not foregrounded.")
+        val current =
+            delegate
+                ?: return BiometricGateResult.Unavailable("Authentication UI is not foregrounded.")
         return current.authenticateAdminAction(title, subtitle, negativeButtonText)
     }
 }
@@ -76,13 +81,12 @@ class MeshMainViewModelFactory(
     private val authRequester: suspend (AdminAuthPurpose) -> BiometricGateResult,
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
-    override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        return MeshMainViewModel(
+    override fun <T : ViewModel> create(modelClass: Class<T>): T =
+        MeshMainViewModel(
             sessionRepository = appContainer.sessionRepository,
             ffiGateway = appContainer.ffiGateway,
             clipboardAccess = clipboardAccess,
             authRequester = authRequester,
             cleanupDiagnostics = { appContainer.bugreportManager.cleanupAllDiagnosticArtifacts() },
         ) as T
-    }
 }

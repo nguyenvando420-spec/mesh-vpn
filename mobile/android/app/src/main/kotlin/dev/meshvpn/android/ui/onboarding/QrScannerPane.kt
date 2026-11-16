@@ -66,14 +66,15 @@ fun QrScannerPane(
     }
     var cameraError by remember { mutableStateOf<String?>(null) }
 
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        hasCameraPermission = granted
-        if (!granted) {
-            cameraError = "Camera permission is required to scan join QR codes."
+    val permissionLauncher =
+        rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestPermission(),
+        ) { granted ->
+            hasCameraPermission = granted
+            if (!granted) {
+                cameraError = "Camera permission is required to scan join QR codes."
+            }
         }
-    }
 
     if (!hasCameraPermission) {
         CameraPermissionCard(
@@ -109,8 +110,9 @@ private fun CameraPermissionCard(
                 style = MaterialTheme.typography.titleMedium,
             )
             Text(
-                text = errorMessage
-                    ?: "Mesh VPN scans the administrator QR offline on-device using CameraX.",
+                text =
+                    errorMessage
+                        ?: "Mesh VPN scans the administrator QR offline on-device using CameraX.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Button(onClick = onRequestPermission) {
@@ -131,11 +133,12 @@ private fun CameraPreviewScanner(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
-    val previewView = remember {
-        PreviewView(context).apply {
-            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+    val previewView =
+        remember {
+            PreviewView(context).apply {
+                implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+            }
         }
-    }
     val pausedRef = remember { booleanArrayOf(paused) }.apply { this[0] = paused }
 
     DisposableEffect(lifecycleOwner) {
@@ -143,40 +146,44 @@ private fun CameraPreviewScanner(
         val mainExecutor = ContextCompat.getMainExecutor(context)
         val reader = createQrReader()
 
-        val listener = Runnable {
-            if (providerFuture.isCancelled) {
-                return@Runnable
-            }
-            try {
-                val provider = providerFuture.get()
-                val preview = Preview.Builder().build().also {
-                    it.surfaceProvider = previewView.surfaceProvider
+        val listener =
+            Runnable {
+                if (providerFuture.isCancelled) {
+                    return@Runnable
                 }
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-                analysis.setAnalyzer(analysisExecutor) { image ->
-                    decodeImageProxy(
-                        image = image,
-                        reader = reader,
-                        paused = pausedRef[0],
-                        onDecoded = { decoded ->
-                            mainExecutor.execute { onQrDecoded(decoded) }
-                        },
+                try {
+                    val provider = providerFuture.get()
+                    val preview =
+                        Preview.Builder().build().also {
+                            it.surfaceProvider = previewView.surfaceProvider
+                        }
+                    val analysis =
+                        ImageAnalysis
+                            .Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build()
+                    analysis.setAnalyzer(analysisExecutor) { image ->
+                        decodeImageProxy(
+                            image = image,
+                            reader = reader,
+                            paused = pausedRef[0],
+                            onDecoded = { decoded ->
+                                mainExecutor.execute { onQrDecoded(decoded) }
+                            },
+                        )
+                    }
+                    provider.unbindAll()
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis,
                     )
+                } catch (err: Exception) {
+                    SafeLogger.w("QrScannerPane", "Unable to start CameraX preview", err)
+                    onCameraError("Camera preview unavailable; use Paste URI or Manual tab.")
                 }
-                provider.unbindAll()
-                provider.bindToLifecycle(
-                    lifecycleOwner,
-                    CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview,
-                    analysis,
-                )
-            } catch (err: Exception) {
-                SafeLogger.w("QrScannerPane", "Unable to start CameraX preview", err)
-                onCameraError("Camera preview unavailable; use Paste URI or Manual tab.")
             }
-        }
         providerFuture.addListener(listener, mainExecutor)
 
         onDispose {
@@ -190,11 +197,12 @@ private fun CameraPreviewScanner(
     }
 
     Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(260.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(16.dp)),
+        modifier =
+            modifier
+                .fillMaxWidth()
+                .height(260.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(16.dp)),
         contentAlignment = Alignment.BottomCenter,
     ) {
         AndroidView(
@@ -202,11 +210,12 @@ private fun CameraPreviewScanner(
             modifier = Modifier.fillMaxSize(),
         )
         Text(
-            text = errorMessage ?: if (paused) {
-                "Review detected server details..."
-            } else {
-                "Point camera at Mesh administrator QR code"
-            },
+            text =
+                errorMessage ?: if (paused) {
+                    "Review detected server details..."
+                } else {
+                    "Point camera at Mesh administrator QR code"
+                },
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onPrimary,
             modifier = Modifier.padding(12.dp),
@@ -215,9 +224,10 @@ private fun CameraPreviewScanner(
 }
 
 private fun createQrReader(): MultiFormatReader {
-    val hints = mapOf(
-        DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
-    )
+    val hints =
+        mapOf(
+            DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+        )
     return MultiFormatReader().apply { setHints(hints) }
 }
 
@@ -232,22 +242,24 @@ private fun decodeImageProxy(
             return
         }
         val yPlane = image.planes.getOrNull(0) ?: return
-        val yBytes = extractLuminanceBytes(
-            buffer = yPlane.buffer,
-            rowStride = yPlane.rowStride,
-            width = image.width,
-            height = image.height,
-        )
-        val source = PlanarYUVLuminanceSource(
-            yBytes,
-            image.width,
-            image.height,
-            0,
-            0,
-            image.width,
-            image.height,
-            false,
-        )
+        val yBytes =
+            extractLuminanceBytes(
+                buffer = yPlane.buffer,
+                rowStride = yPlane.rowStride,
+                width = image.width,
+                height = image.height,
+            )
+        val source =
+            PlanarYUVLuminanceSource(
+                yBytes,
+                image.width,
+                image.height,
+                0,
+                0,
+                image.width,
+                image.height,
+                false,
+            )
         val bitmap = BinaryBitmap(HybridBinarizer(source))
         val text = reader.decodeWithState(bitmap).text
         if (!text.isNullOrBlank()) {

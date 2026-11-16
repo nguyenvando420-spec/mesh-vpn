@@ -62,10 +62,11 @@ data class MainUiScreenState(
     val pendingShareBugreport: BugreportShareManager.PreparedBugreport? = null,
 ) {
     val requireFlagSecure: Boolean
-        get() = !session.isEnrolled ||
-            pendingConfirmation != null ||
-            isAdminPinsRevealed ||
-            isSensitiveModalOpen
+        get() =
+            !session.isEnrolled ||
+                pendingConfirmation != null ||
+                isAdminPinsRevealed ||
+                isSensitiveModalOpen
 }
 
 /**
@@ -87,9 +88,10 @@ class MeshMainViewModel(
     @Volatile
     private var heldConfirmationRequest: PendingEnrollmentRequest? = null
 
-    private val _screenState = MutableStateFlow(
-        MainUiScreenState(session = sessionRepository.uiState.value),
-    )
+    private val _screenState =
+        MutableStateFlow(
+            MainUiScreenState(session = sessionRepository.uiState.value),
+        )
     val screenState: StateFlow<MainUiScreenState> = _screenState.asStateFlow()
 
     init {
@@ -145,24 +147,27 @@ class MeshMainViewModel(
         }
         _screenState.update { it.copy(inputError = null, infoBanner = null) }
         scope.launch {
-            val result = withContext(ioDispatcher) {
-                runCatching { ffiGateway.parseJoinUri(trimmed) }
-            }
-            result.onSuccess { parsed ->
-                val summary = parsed.summary
-                val req = PendingEnrollmentRequest(
-                    serverEndpoint = summary.serverEndpoint,
-                    tlsAuthMode = summary.tlsAuthMode,
-                    serverPin = summary.serverPin,
-                    nodeName = summary.nodeName,
-                    preauthKeyMasked = summary.preauthKeyMasked,
-                    session = parsed.session,
-                )
-                stageConfirmation(req)
-            }.onFailure { err ->
-                val mapped = FfiErrorMapper.mapThrowable(err)
-                _screenState.update { it.copy(inputError = mapped.detail) }
-            }
+            val result =
+                withContext(ioDispatcher) {
+                    runCatching { ffiGateway.parseJoinUri(trimmed) }
+                }
+            result
+                .onSuccess { parsed ->
+                    val summary = parsed.summary
+                    val req =
+                        PendingEnrollmentRequest(
+                            serverEndpoint = summary.serverEndpoint,
+                            tlsAuthMode = summary.tlsAuthMode,
+                            serverPin = summary.serverPin,
+                            nodeName = summary.nodeName,
+                            preauthKeyMasked = summary.preauthKeyMasked,
+                            session = parsed.session,
+                        )
+                    stageConfirmation(req)
+                }.onFailure { err ->
+                    val mapped = FfiErrorMapper.mapThrowable(err)
+                    _screenState.update { it.copy(inputError = mapped.detail) }
+                }
         }
     }
 
@@ -176,37 +181,41 @@ class MeshMainViewModel(
         _screenState.update { it.copy(inputError = null, infoBanner = null) }
         scope.launch {
             try {
-                val validation = OnboardingInputValidator.validateManualFields(
-                    rawEndpoint = rawEndpoint,
-                    tlsAuthMode = tlsAuthMode,
-                    rawPin = rawPin,
-                    rawPreauthKey = rawPreauthKey,
-                    rawNodeName = rawNodeName,
-                    requirePreauthKey = true,
-                )
-                val firstError = listOfNotNull(
-                    validation.endpointError,
-                    validation.pinError,
-                    validation.preauthKeyError,
-                    validation.nodeNameError,
-                ).firstOrNull()
+                val validation =
+                    OnboardingInputValidator.validateManualFields(
+                        rawEndpoint = rawEndpoint,
+                        tlsAuthMode = tlsAuthMode,
+                        rawPin = rawPin,
+                        rawPreauthKey = rawPreauthKey,
+                        rawNodeName = rawNodeName,
+                        requirePreauthKey = true,
+                    )
+                val firstError =
+                    listOfNotNull(
+                        validation.endpointError,
+                        validation.pinError,
+                        validation.preauthKeyError,
+                        validation.nodeNameError,
+                    ).firstOrNull()
                 if (!validation.isValid || firstError != null) {
                     _screenState.update {
                         it.copy(inputError = firstError ?: "Invalid onboarding configuration.")
                     }
                     return@launch
                 }
-                val session = withContext(ioDispatcher) {
-                    ffiGateway.createPendingSessionFromChars(rawPreauthKey)
-                }
-                val req = PendingEnrollmentRequest(
-                    serverEndpoint = validation.canonicalEndpoint ?: "",
-                    tlsAuthMode = tlsAuthMode,
-                    serverPin = validation.canonicalPin,
-                    nodeName = validation.canonicalNodeName,
-                    preauthKeyMasked = session.maskedPreview(),
-                    session = session,
-                )
+                val session =
+                    withContext(ioDispatcher) {
+                        ffiGateway.createPendingSessionFromChars(rawPreauthKey)
+                    }
+                val req =
+                    PendingEnrollmentRequest(
+                        serverEndpoint = validation.canonicalEndpoint ?: "",
+                        tlsAuthMode = tlsAuthMode,
+                        serverPin = validation.canonicalPin,
+                        nodeName = validation.canonicalNodeName,
+                        preauthKeyMasked = session.maskedPreview(),
+                        session = session,
+                    )
                 stageConfirmation(req)
             } catch (err: Throwable) {
                 val mapped = FfiErrorMapper.mapThrowable(err)
@@ -218,21 +227,23 @@ class MeshMainViewModel(
     }
 
     fun cancelPendingConfirmation() {
-        val cleared = synchronized(confirmationLock) {
-            val prev = heldConfirmationRequest
-            heldConfirmationRequest = null
-            prev
-        }
+        val cleared =
+            synchronized(confirmationLock) {
+                val prev = heldConfirmationRequest
+                heldConfirmationRequest = null
+                prev
+            }
         cleared?.session?.cancel()
         _screenState.update { it.copy(pendingConfirmation = null) }
     }
 
     fun confirmPendingJoin(onReadyForVpnService: () -> Unit) {
-        val req = synchronized(confirmationLock) {
-            val current = heldConfirmationRequest
-            heldConfirmationRequest = null
-            current
-        } ?: return
+        val req =
+            synchronized(confirmationLock) {
+                val current = heldConfirmationRequest
+                heldConfirmationRequest = null
+                current
+            } ?: return
 
         val connectNow = _screenState.value.connectOnConfirm
         _screenState.update { it.copy(pendingConfirmation = null, inputError = null) }
@@ -243,19 +254,23 @@ class MeshMainViewModel(
         } else {
             scope.launch {
                 val res = sessionRepository.enrollOnlyWithoutTunnel(req)
-                res.onSuccess {
-                    _screenState.update {
-                        it.copy(infoBanner = "Device enrolled. Tap Connect whenever ready.")
+                res
+                    .onSuccess {
+                        _screenState.update {
+                            it.copy(infoBanner = "Device enrolled. Tap Connect whenever ready.")
+                        }
+                    }.onFailure { err ->
+                        val mapped = FfiErrorMapper.mapThrowable(err)
+                        _screenState.update { it.copy(inputError = mapped.detail) }
                     }
-                }.onFailure { err ->
-                    val mapped = FfiErrorMapper.mapThrowable(err)
-                    _screenState.update { it.copy(inputError = mapped.detail) }
-                }
             }
         }
     }
 
-    fun onVpnConsentResult(granted: Boolean, onStartVpnService: () -> Unit) {
+    fun onVpnConsentResult(
+        granted: Boolean,
+        onStartVpnService: () -> Unit,
+    ) {
         if (granted) {
             onStartVpnService()
         } else {
@@ -271,9 +286,10 @@ class MeshMainViewModel(
         onStopService: () -> Unit,
     ) {
         val state = _screenState.value.session.daemonState
-        val active = state == MobileDaemonState.CONNECTED ||
-            state == MobileDaemonState.CONNECTING ||
-            state == MobileDaemonState.DEGRADED
+        val active =
+            state == MobileDaemonState.CONNECTED ||
+                state == MobileDaemonState.CONNECTING ||
+                state == MobileDaemonState.DEGRADED
         if (active) {
             onStopService()
         } else {
@@ -317,17 +333,18 @@ class MeshMainViewModel(
                 when (val auth = authRequester(AdminAuthPurpose.ROTATE_KEY)) {
                     BiometricGateResult.Authenticated -> {
                         val res = sessionRepository.rotateIdentityKey(rawPreauthKey.copyOf())
-                        res.onSuccess {
-                            _screenState.update {
-                                it.copy(
-                                    infoBanner = "Node key rotated successfully.",
-                                    isSensitiveModalOpen = false,
-                                )
+                        res
+                            .onSuccess {
+                                _screenState.update {
+                                    it.copy(
+                                        infoBanner = "Node key rotated successfully.",
+                                        isSensitiveModalOpen = false,
+                                    )
+                                }
+                            }.onFailure { err ->
+                                val msg = FfiErrorMapper.mapThrowable(err).detail
+                                _screenState.update { it.copy(inputError = msg) }
                             }
-                        }.onFailure { err ->
-                            val msg = FfiErrorMapper.mapThrowable(err).detail
-                            _screenState.update { it.copy(inputError = msg) }
-                        }
                     }
                     BiometricGateResult.Cancelled -> {
                         _screenState.update { it.copy(infoBanner = "Key rotation cancelled.") }
@@ -361,22 +378,24 @@ class MeshMainViewModel(
         scope.launch {
             when (val auth = authRequester(AdminAuthPurpose.UPDATE_SERVER_CONFIG)) {
                 BiometricGateResult.Authenticated -> {
-                    val res = sessionRepository.updateServerConfig(
-                        endpoint = canonicalEndpoint,
-                        tlsAuthMode = tlsAuthMode,
-                        pin = canonicalPin,
-                    )
-                    res.onSuccess {
-                        _screenState.update {
-                            it.copy(
-                                infoBanner = "Server configuration updated.",
-                                isSensitiveModalOpen = false,
-                            )
+                    val res =
+                        sessionRepository.updateServerConfig(
+                            endpoint = canonicalEndpoint,
+                            tlsAuthMode = tlsAuthMode,
+                            pin = canonicalPin,
+                        )
+                    res
+                        .onSuccess {
+                            _screenState.update {
+                                it.copy(
+                                    infoBanner = "Server configuration updated.",
+                                    isSensitiveModalOpen = false,
+                                )
+                            }
+                        }.onFailure { err ->
+                            val msg = FfiErrorMapper.mapThrowable(err).detail
+                            _screenState.update { it.copy(inputError = msg) }
                         }
-                    }.onFailure { err ->
-                        val msg = FfiErrorMapper.mapThrowable(err).detail
-                        _screenState.update { it.copy(inputError = msg) }
-                    }
                 }
                 BiometricGateResult.Cancelled -> {
                     _screenState.update { it.copy(infoBanner = "Server update cancelled.") }
@@ -393,12 +412,13 @@ class MeshMainViewModel(
             when (val auth = authRequester(AdminAuthPurpose.EXPORT_BUGREPORT)) {
                 BiometricGateResult.Authenticated -> {
                     val res = sessionRepository.exportScrubbedBugreport()
-                    res.onSuccess { prepared ->
-                        _screenState.update { it.copy(pendingShareBugreport = prepared) }
-                    }.onFailure { err ->
-                        val msg = FfiErrorMapper.mapThrowable(err).detail
-                        _screenState.update { it.copy(inputError = msg) }
-                    }
+                    res
+                        .onSuccess { prepared ->
+                            _screenState.update { it.copy(pendingShareBugreport = prepared) }
+                        }.onFailure { err ->
+                            val msg = FfiErrorMapper.mapThrowable(err).detail
+                            _screenState.update { it.copy(inputError = msg) }
+                        }
                 }
                 BiometricGateResult.Cancelled -> {
                     _screenState.update { it.copy(infoBanner = "Bugreport export cancelled.") }
@@ -444,7 +464,10 @@ class MeshMainViewModel(
         }
     }
 
-    fun pingPeer(target: String, forceDirect: Boolean = false) {
+    fun pingPeer(
+        target: String,
+        forceDirect: Boolean = false,
+    ) {
         scope.launch {
             val res = sessionRepository.pingPeer(target = target, forceDirect = forceDirect)
             res.onFailure { err ->
@@ -474,21 +497,23 @@ class MeshMainViewModel(
     }
 
     private fun stageConfirmation(req: PendingEnrollmentRequest) {
-        val prev = synchronized(confirmationLock) {
-            val old = heldConfirmationRequest
-            heldConfirmationRequest = req
-            old
-        }
+        val prev =
+            synchronized(confirmationLock) {
+                val old = heldConfirmationRequest
+                heldConfirmationRequest = req
+                old
+            }
         prev?.session?.cancel()
         _screenState.update {
             it.copy(
-                pendingConfirmation = JoinConfirmationUiModel(
-                    serverEndpoint = req.serverEndpoint,
-                    tlsAuthMode = req.tlsAuthMode,
-                    serverPin = req.serverPin,
-                    preauthKeyMasked = req.preauthKeyMasked,
-                    nodeName = req.nodeName,
-                ),
+                pendingConfirmation =
+                    JoinConfirmationUiModel(
+                        serverEndpoint = req.serverEndpoint,
+                        tlsAuthMode = req.tlsAuthMode,
+                        serverPin = req.serverPin,
+                        preauthKeyMasked = req.preauthKeyMasked,
+                        nodeName = req.nodeName,
+                    ),
                 inputError = null,
             )
         }

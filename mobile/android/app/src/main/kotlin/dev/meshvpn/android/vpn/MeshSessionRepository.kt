@@ -69,13 +69,14 @@ class MeshSessionRepository(
         val bootstrap = if (unlocked) stateStore.readBootstrapSummary() else null
         val alwaysOn = stateStore.getAlwaysOnHint()
         _uiState.update { current ->
-            val nextState = if (!unlocked) {
-                MobileDaemonState.DEVICE_LOCKED
-            } else if (current.daemonState == MobileDaemonState.DEVICE_LOCKED) {
-                MobileDaemonState.STOPPED
-            } else {
-                current.daemonState
-            }
+            val nextState =
+                if (!unlocked) {
+                    MobileDaemonState.DEVICE_LOCKED
+                } else if (current.daemonState == MobileDaemonState.DEVICE_LOCKED) {
+                    MobileDaemonState.STOPPED
+                } else {
+                    current.daemonState
+                }
             current.copy(
                 isEnrolled = enrolled,
                 isDeviceUnlocked = unlocked,
@@ -100,30 +101,36 @@ class MeshSessionRepository(
         }
     }
 
-    fun hasStagedPendingEnrollment(): Boolean = synchronized(pendingJoinLock) {
-        activePendingJoin != null
-    }
+    fun hasStagedPendingEnrollment(): Boolean =
+        synchronized(pendingJoinLock) {
+            activePendingJoin != null
+        }
 
     fun markDeviceLockedWaiting() {
         _uiState.update { current ->
-            val lockWarning = MobilePlatformWarning(
-                kind = MobileWarningKind.DEVICE_KEYSTORE_LOCKED,
-                message = "Waiting for first device unlock after reboot",
-            )
-            val merged = (current.activeWarnings.filterNot {
-                it.kind == MobileWarningKind.DEVICE_KEYSTORE_LOCKED
-            }) + lockWarning
+            val lockWarning =
+                MobilePlatformWarning(
+                    kind = MobileWarningKind.DEVICE_KEYSTORE_LOCKED,
+                    message = "Waiting for first device unlock after reboot",
+                )
+            val merged =
+                (
+                    current.activeWarnings.filterNot {
+                        it.kind == MobileWarningKind.DEVICE_KEYSTORE_LOCKED
+                    }
+                ) + lockWarning
             current.copy(
                 isDeviceUnlocked = false,
                 daemonState = MobileDaemonState.DEVICE_LOCKED,
                 activeWarnings = merged,
-                lastError = UiErrorInfo(
-                    kind = UiErrorKind.DEVICE_LOCKED,
-                    code = "E_DEVICE_LOCKED",
-                    title = "Device Locked (Direct Boot)",
-                    detail = "Credential-encrypted Keystore is locked until first unlock.",
-                    actionHint = "Unlock the device to start Mesh VPN automatically.",
-                ),
+                lastError =
+                    UiErrorInfo(
+                        kind = UiErrorKind.DEVICE_LOCKED,
+                        code = "E_DEVICE_LOCKED",
+                        title = "Device Locked (Direct Boot)",
+                        detail = "Credential-encrypted Keystore is locked until first unlock.",
+                        actionHint = "Unlock the device to start Mesh VPN automatically.",
+                    ),
             )
         }
     }
@@ -142,7 +149,10 @@ class MeshSessionRepository(
         }
     }
 
-    fun dispatchNetworkChange(kind: MobileNetEventKind, underlay: MobileUnderlayState) {
+    fun dispatchNetworkChange(
+        kind: MobileNetEventKind,
+        underlay: MobileUnderlayState,
+    ) {
         _uiState.update { current ->
             current.copy(
                 isLockdownEnabled = underlay.isAndroidLockdownEnabled,
@@ -160,116 +170,45 @@ class MeshSessionRepository(
 
     suspend fun enrollOnlyWithoutTunnel(
         pending: PendingEnrollmentRequest,
-    ): Result<MobileStatusSnapshot> = withContext(ioDispatcher) {
-        if (!nativeInitializer()) {
-            return@withContext Result.failure(
-                IllegalStateException("Native Mesh FFI library failed to initialize"),
-            )
-        }
-        if (!stateStore.isDeviceUnlocked()) {
-            markDeviceLockedWaiting()
-            return@withContext Result.failure(IllegalStateException("Device is locked"))
-        }
-
-        _uiState.update { it.copy(isBusy = true, lastError = null) }
-        try {
-            val bridge = createBridge(
-                socketProtector = { false },
-                tunEstablisher = null,
-                routeScope = null,
-            )
-            val snapshot = ffiGateway.enrollOrRotateNode(
-                init = MeshSessionStateHelper.buildInitConfig(stateStore, defaultNodeNameProvider),
-                bridge = bridge,
-                params = EnrollParams(
-                    serverEndpoint = pending.serverEndpoint,
-                    portOverride = null,
-                    tlsAuthMode = pending.tlsAuthMode,
-                    serverPin = pending.serverPin,
-                    pendingJoin = pending.session,
-                    nodeName = pending.nodeName,
-                    rotateExistingIdentity = false,
-                ),
-            )
-            applySnapshot(snapshot)
-            refreshFromDisk()
-            Result.success(snapshot)
-        } catch (err: Throwable) {
-            handleFfiFailure(err)
-            Result.failure(err)
-        } finally {
-            pending.session.cancel()
-            _uiState.update { it.copy(isBusy = false) }
-        }
-    }
-
-    suspend fun startServiceSession(
-        socketProtector: (Int) -> Boolean,
-        tunEstablisher: TunEstablisher,
-        routeScope: CoroutineScope,
-    ): Result<MobileStatusSnapshot> = withContext(ioDispatcher) {
-        if (!stateStore.isDeviceUnlocked()) {
-            markDeviceLockedWaiting()
-            return@withContext Result.failure(IllegalStateException("Direct Boot locked"))
-        }
-        if (!nativeInitializer()) {
-            val err = IllegalStateException("Native Mesh FFI library unavailable")
-            handleFfiFailure(err)
-            return@withContext Result.failure(err)
-        }
-
-        val staged = synchronized(pendingJoinLock) {
-            val current = activePendingJoin
-            activePendingJoin = null
-            current
-        }
-
-        _uiState.update { it.copy(isBusy = true, lastError = null) }
-        engineMutex.withLock {
-            try {
-                val engine = ensureEngineLocked(
-                    socketProtector = socketProtector,
-                    tunEstablisher = tunEstablisher,
-                    routeScope = routeScope,
+    ): Result<MobileStatusSnapshot> =
+        withContext(ioDispatcher) {
+            if (!nativeInitializer()) {
+                return@withContext Result.failure(
+                    IllegalStateException("Native Mesh FFI library failed to initialize"),
                 )
-                engine.setPowerSavingMode(activePowerSaving)
+            }
+            if (!stateStore.isDeviceUnlocked()) {
+                markDeviceLockedWaiting()
+                return@withContext Result.failure(IllegalStateException("Device is locked"))
+            }
 
-                val snapshot = if (staged != null) {
-                    try {
-                        engine.startTunnel(
-                            UpParams(
-                                serverEndpoint = staged.serverEndpoint,
-                                portOverride = null,
-                                tlsAuthMode = staged.tlsAuthMode,
-                                serverPin = staged.serverPin,
-                                pendingJoin = staged.session,
-                                nodeName = staged.nodeName,
-                                androidTunFd = null,
-                                tunInterfaceName = TUN_INTERFACE_HINT,
-                            ),
-                        )
-                    } finally {
-                        staged.session.cancel()
-                    }
-                } else {
-                    val bootstrap = stateStore.readBootstrapSummary()
-                    if (bootstrap == null) {
-                        throw IllegalStateException("No enrolled Mesh VPN profile found")
-                    }
-                    engine.startTunnel(
-                        UpParams(
-                            serverEndpoint = bootstrap.serverEndpoint,
-                            portOverride = null,
-                            tlsAuthMode = bootstrap.tlsAuthMode,
-                            serverPin = bootstrap.activePin,
-                            pendingJoin = null,
-                            nodeName = bootstrap.nodeName,
-                            androidTunFd = null,
-                            tunInterfaceName = TUN_INTERFACE_HINT,
-                        ),
+            _uiState.update { it.copy(isBusy = true, lastError = null) }
+            try {
+                val bridge =
+                    createBridge(
+                        socketProtector = { false },
+                        tunEstablisher = null,
+                        routeScope = null,
                     )
-                }
-
+                val snapshot =
+                    ffiGateway.enrollOrRotateNode(
+                        init =
+                            MeshSessionStateHelper.buildInitConfig(
+                                stateStore,
+                                defaultNodeNameProvider,
+                            ),
+                        bridge = bridge,
+                        params =
+                            EnrollParams(
+                                serverEndpoint = pending.serverEndpoint,
+                                portOverride = null,
+                                tlsAuthMode = pending.tlsAuthMode,
+                                serverPin = pending.serverPin,
+                                pendingJoin = pending.session,
+                                nodeName = pending.nodeName,
+                                rotateExistingIdentity = false,
+                            ),
+                    )
                 applySnapshot(snapshot)
                 refreshFromDisk()
                 Result.success(snapshot)
@@ -277,39 +216,133 @@ class MeshSessionRepository(
                 handleFfiFailure(err)
                 Result.failure(err)
             } finally {
-                staged?.session?.cancel()
+                pending.session.cancel()
                 _uiState.update { it.copy(isBusy = false) }
             }
         }
-    }
 
-    suspend fun stopAndShutdownEngine(): Result<Unit> = withContext(ioDispatcher) {
-        engineMutex.withLock {
-            val engine = activeEngine
-            activeEngine = null
-            if (engine == null) {
-                _uiState.update { it.copy(daemonState = MobileDaemonState.STOPPED, isBusy = false) }
-                return@withLock Result.success(Unit)
+    suspend fun startServiceSession(
+        socketProtector: (Int) -> Boolean,
+        tunEstablisher: TunEstablisher,
+        routeScope: CoroutineScope,
+    ): Result<MobileStatusSnapshot> =
+        withContext(ioDispatcher) {
+            if (!stateStore.isDeviceUnlocked()) {
+                markDeviceLockedWaiting()
+                return@withContext Result.failure(IllegalStateException("Direct Boot locked"))
             }
-            return@withLock try {
-                val snap = engine.stopTunnel()
-                applySnapshot(snap)
-                engine.shutdown()
-                engine.destroy()
-                Result.success(Unit)
-            } catch (err: Throwable) {
-                SafeLogger.w(TAG, "Error stopping tunnel cleanly; forcing shutdown", err)
-                try {
-                    engine.shutdown()
-                    engine.destroy()
-                } catch (_: Throwable) {
-                    // Best-effort cleanup within 5s teardown budget.
+            if (!nativeInitializer()) {
+                val err = IllegalStateException("Native Mesh FFI library unavailable")
+                handleFfiFailure(err)
+                return@withContext Result.failure(err)
+            }
+
+            val staged =
+                synchronized(pendingJoinLock) {
+                    val current = activePendingJoin
+                    activePendingJoin = null
+                    current
                 }
-                _uiState.update { it.copy(daemonState = MobileDaemonState.STOPPED, isBusy = false) }
-                Result.failure(err)
+
+            _uiState.update { it.copy(isBusy = true, lastError = null) }
+            engineMutex.withLock {
+                try {
+                    val engine =
+                        ensureEngineLocked(
+                            socketProtector = socketProtector,
+                            tunEstablisher = tunEstablisher,
+                            routeScope = routeScope,
+                        )
+                    engine.setPowerSavingMode(activePowerSaving)
+
+                    val snapshot =
+                        if (staged != null) {
+                            try {
+                                engine.startTunnel(
+                                    UpParams(
+                                        serverEndpoint = staged.serverEndpoint,
+                                        portOverride = null,
+                                        tlsAuthMode = staged.tlsAuthMode,
+                                        serverPin = staged.serverPin,
+                                        pendingJoin = staged.session,
+                                        nodeName = staged.nodeName,
+                                        androidTunFd = null,
+                                        tunInterfaceName = TUN_INTERFACE_HINT,
+                                    ),
+                                )
+                            } finally {
+                                staged.session.cancel()
+                            }
+                        } else {
+                            val bootstrap =
+                                checkNotNull(stateStore.readBootstrapSummary()) {
+                                    "No enrolled Mesh VPN profile found"
+                                }
+                            engine.startTunnel(
+                                UpParams(
+                                    serverEndpoint = bootstrap.serverEndpoint,
+                                    portOverride = null,
+                                    tlsAuthMode = bootstrap.tlsAuthMode,
+                                    serverPin = bootstrap.activePin,
+                                    pendingJoin = null,
+                                    nodeName = bootstrap.nodeName,
+                                    androidTunFd = null,
+                                    tunInterfaceName = TUN_INTERFACE_HINT,
+                                ),
+                            )
+                        }
+
+                    applySnapshot(snapshot)
+                    refreshFromDisk()
+                    Result.success(snapshot)
+                } catch (err: Throwable) {
+                    handleFfiFailure(err)
+                    Result.failure(err)
+                } finally {
+                    staged?.session?.cancel()
+                    _uiState.update { it.copy(isBusy = false) }
+                }
             }
         }
-    }
+
+    suspend fun stopAndShutdownEngine(): Result<Unit> =
+        withContext(ioDispatcher) {
+            engineMutex.withLock {
+                val engine = activeEngine
+                activeEngine = null
+                if (engine == null) {
+                    _uiState.update {
+                        it.copy(
+                            daemonState = MobileDaemonState.STOPPED,
+                            isBusy = false,
+                        )
+                    }
+                    return@withLock Result.success(Unit)
+                }
+                return@withLock try {
+                    val snap = engine.stopTunnel()
+                    applySnapshot(snap)
+                    engine.shutdown()
+                    engine.destroy()
+                    Result.success(Unit)
+                } catch (err: Throwable) {
+                    SafeLogger.w(TAG, "Error stopping tunnel cleanly; forcing shutdown", err)
+                    try {
+                        engine.shutdown()
+                        engine.destroy()
+                    } catch (_: Throwable) {
+                        // Best-effort cleanup within 5s teardown budget.
+                    }
+                    _uiState.update {
+                        it.copy(
+                            daemonState = MobileDaemonState.STOPPED,
+                            isBusy = false,
+                        )
+                    }
+                    Result.failure(err)
+                }
+            }
+        }
 
     suspend fun rotateIdentityKey(rawPreauthKey: CharArray): Result<MobileStatusSnapshot> =
         withContext(ioDispatcher) {
@@ -317,45 +350,50 @@ class MeshSessionRepository(
                 rawPreauthKey.fill('\u0000')
                 return@withContext Result.failure(IllegalStateException("Device is locked"))
             }
-            val session = try {
-                ffiGateway.createPendingSessionFromChars(rawPreauthKey)
-            } catch (err: Throwable) {
-                handleFfiFailure(err)
-                return@withContext Result.failure(err)
-            }
+            val session =
+                try {
+                    ffiGateway.createPendingSessionFromChars(rawPreauthKey)
+                } catch (err: Throwable) {
+                    handleFfiFailure(err)
+                    return@withContext Result.failure(err)
+                }
 
             _uiState.update { it.copy(isBusy = true, lastError = null) }
             try {
                 val runningEngine = activeEngine
-                val snapshot = if (runningEngine != null) {
-                    runningEngine.rotateKey(session)
-                } else {
-                    val bootstrap = stateStore.readBootstrapSummary()
-                        ?: throw IllegalStateException(
-                            "Device must be enrolled before rotating keys",
+                val snapshot =
+                    if (runningEngine != null) {
+                        runningEngine.rotateKey(session)
+                    } else {
+                        val bootstrap =
+                            checkNotNull(stateStore.readBootstrapSummary()) {
+                                "Device must be enrolled before rotating keys"
+                            }
+                        val bridge =
+                            createBridge(
+                                socketProtector = { false },
+                                tunEstablisher = null,
+                                routeScope = null,
+                            )
+                        ffiGateway.enrollOrRotateNode(
+                            init =
+                                MeshSessionStateHelper.buildInitConfig(
+                                    stateStore,
+                                    defaultNodeNameProvider,
+                                ),
+                            bridge = bridge,
+                            params =
+                                EnrollParams(
+                                    serverEndpoint = bootstrap.serverEndpoint,
+                                    portOverride = null,
+                                    tlsAuthMode = bootstrap.tlsAuthMode,
+                                    serverPin = bootstrap.activePin,
+                                    pendingJoin = session,
+                                    nodeName = bootstrap.nodeName,
+                                    rotateExistingIdentity = true,
+                                ),
                         )
-                    val bridge = createBridge(
-                        socketProtector = { false },
-                        tunEstablisher = null,
-                        routeScope = null,
-                    )
-                    ffiGateway.enrollOrRotateNode(
-                        init = MeshSessionStateHelper.buildInitConfig(
-                            stateStore,
-                            defaultNodeNameProvider,
-                        ),
-                        bridge = bridge,
-                        params = EnrollParams(
-                            serverEndpoint = bootstrap.serverEndpoint,
-                            portOverride = null,
-                            tlsAuthMode = bootstrap.tlsAuthMode,
-                            serverPin = bootstrap.activePin,
-                            pendingJoin = session,
-                            nodeName = bootstrap.nodeName,
-                            rotateExistingIdentity = true,
-                        ),
-                    )
-                }
+                    }
                 applySnapshot(snapshot)
                 refreshFromDisk()
                 Result.success(snapshot)
@@ -372,86 +410,100 @@ class MeshSessionRepository(
         endpoint: String,
         tlsAuthMode: MobileTlsAuthMode,
         pin: String?,
-    ): Result<MobileStatusSnapshot> = withContext(ioDispatcher) {
-        val engine = activeEngine
-            ?: return@withContext Result.failure(
-                IllegalStateException("Start VPN tunnel before updating server config"),
-            )
-        _uiState.update { it.copy(isBusy = true, lastError = null) }
-        try {
-            val snapshot = engine.updateServerConfig(
-                MobileSetConfig(
-                    serverEndpoint = endpoint,
-                    tlsAuthMode = tlsAuthMode,
-                    serverPin = pin,
-                ),
-            )
-            applySnapshot(snapshot)
-            refreshFromDisk()
-            Result.success(snapshot)
-        } catch (err: Throwable) {
-            handleFfiFailure(err)
-            Result.failure(err)
-        } finally {
-            _uiState.update { it.copy(isBusy = false) }
+    ): Result<MobileStatusSnapshot> =
+        withContext(ioDispatcher) {
+            val engine =
+                activeEngine
+                    ?: return@withContext Result.failure(
+                        IllegalStateException("Start VPN tunnel before updating server config"),
+                    )
+            _uiState.update { it.copy(isBusy = true, lastError = null) }
+            try {
+                val snapshot =
+                    engine.updateServerConfig(
+                        MobileSetConfig(
+                            serverEndpoint = endpoint,
+                            tlsAuthMode = tlsAuthMode,
+                            serverPin = pin,
+                        ),
+                    )
+                applySnapshot(snapshot)
+                refreshFromDisk()
+                Result.success(snapshot)
+            } catch (err: Throwable) {
+                handleFfiFailure(err)
+                Result.failure(err)
+            } finally {
+                _uiState.update { it.copy(isBusy = false) }
+            }
         }
-    }
 
     suspend fun pingPeer(
         target: String,
         count: Int = 4,
         forceDirect: Boolean = false,
         timeoutMs: Long = 2_000L,
-    ): Result<MobilePingResponse> = withContext(ioDispatcher) {
-        val engine = activeEngine
-            ?: return@withContext Result.failure(IllegalStateException("Tunnel is not running"))
-        return@withContext try {
-            val response = engine.pingPeer(
-                MobilePingRequest(
-                    target = target,
-                    count = count.coerceIn(1, 64).toUShort(),
-                    forceDirect = forceDirect,
-                    timeoutMs = timeoutMs.coerceIn(100L, 10_000L).toULong(),
-                ),
-            )
-            _uiState.update { it.copy(lastPingResult = response, lastError = null) }
-            Result.success(response)
-        } catch (err: Throwable) {
-            handleFfiFailure(err)
-            Result.failure(err)
+    ): Result<MobilePingResponse> =
+        withContext(ioDispatcher) {
+            val engine =
+                activeEngine
+                    ?: return@withContext Result.failure(
+                        IllegalStateException("Tunnel is not running"),
+                    )
+            return@withContext try {
+                val response =
+                    engine.pingPeer(
+                        MobilePingRequest(
+                            target = target,
+                            count = count.coerceIn(1, 64).toUShort(),
+                            forceDirect = forceDirect,
+                            timeoutMs = timeoutMs.coerceIn(100L, 10_000L).toULong(),
+                        ),
+                    )
+                _uiState.update { it.copy(lastPingResult = response, lastError = null) }
+                Result.success(response)
+            } catch (err: Throwable) {
+                handleFfiFailure(err)
+                Result.failure(err)
+            }
         }
-    }
 
-    suspend fun runNetcheck(): Result<MobileNetcheckResponse> = withContext(ioDispatcher) {
-        val engine = activeEngine
-            ?: return@withContext Result.failure(IllegalStateException("Tunnel is not running"))
-        _uiState.update { it.copy(isBusy = true) }
-        return@withContext try {
-            val result = engine.netcheck()
-            _uiState.update { it.copy(lastNetcheckResult = result, lastError = null) }
-            Result.success(result)
-        } catch (err: Throwable) {
-            handleFfiFailure(err)
-            Result.failure(err)
-        } finally {
-            _uiState.update { it.copy(isBusy = false) }
+    suspend fun runNetcheck(): Result<MobileNetcheckResponse> =
+        withContext(ioDispatcher) {
+            val engine =
+                activeEngine
+                    ?: return@withContext Result.failure(
+                        IllegalStateException("Tunnel is not running"),
+                    )
+            _uiState.update { it.copy(isBusy = true) }
+            return@withContext try {
+                val result = engine.netcheck()
+                _uiState.update { it.copy(lastNetcheckResult = result, lastError = null) }
+                Result.success(result)
+            } catch (err: Throwable) {
+                handleFfiFailure(err)
+                Result.failure(err)
+            } finally {
+                _uiState.update { it.copy(isBusy = false) }
+            }
         }
-    }
 
     suspend fun exportScrubbedBugreport(): Result<BugreportShareManager.PreparedBugreport> =
         withContext(ioDispatcher) {
-            val engine = activeEngine
-                ?: return@withContext Result.failure(
-                    IllegalStateException("Start VPN tunnel to export live bugreport"),
-                )
+            val engine =
+                activeEngine
+                    ?: return@withContext Result.failure(
+                        IllegalStateException("Start VPN tunnel to export live bugreport"),
+                    )
             _uiState.update { it.copy(isBusy = true) }
             return@withContext try {
                 val destFile = bugreportManager.nextExportDestination()
                 val res = engine.exportBugreportToFile(destFile.absolutePath)
-                val prepared = bugreportManager.prepareShareUri(
-                    archiveFile = destFile,
-                    reportedSizeBytes = res.sizeBytes.toLong(),
-                )
+                val prepared =
+                    bugreportManager.prepareShareUri(
+                        archiveFile = destFile,
+                        reportedSizeBytes = res.sizeBytes.toLong(),
+                    )
                 Result.success(prepared)
             } catch (err: Throwable) {
                 handleFfiFailure(err)
@@ -461,15 +513,16 @@ class MeshSessionRepository(
             }
         }
 
-    suspend fun resetLocalIdentity(): Result<Unit> = withContext(ioDispatcher) {
-        cancelStagedPendingEnrollment()
-        stopAndShutdownEngine()
-        dekManager.resetKeystoreAndDek()
-        stateStore.clearAllMeshState()
-        bugreportManager.cleanupAllDiagnosticArtifacts()
-        _uiState.value = MeshSessionStateHelper.loadInitialUiState(stateStore)
-        Result.success(Unit)
-    }
+    suspend fun resetLocalIdentity(): Result<Unit> =
+        withContext(ioDispatcher) {
+            cancelStagedPendingEnrollment()
+            stopAndShutdownEngine()
+            dekManager.resetKeystoreAndDek()
+            stateStore.clearAllMeshState()
+            bugreportManager.cleanupAllDiagnosticArtifacts()
+            _uiState.value = MeshSessionStateHelper.loadInitialUiState(stateStore)
+            Result.success(Unit)
+        }
 
     fun setAlwaysOnHint(enabled: Boolean) {
         stateStore.setAlwaysOnHint(enabled)
@@ -485,15 +538,17 @@ class MeshSessionRepository(
         if (existing != null) {
             return existing
         }
-        val bridge = createBridge(
-            socketProtector = socketProtector,
-            tunEstablisher = tunEstablisher,
-            routeScope = routeScope,
-        )
-        val created = ffiGateway.createEngine(
-            MeshSessionStateHelper.buildInitConfig(stateStore, defaultNodeNameProvider),
-            bridge,
-        )
+        val bridge =
+            createBridge(
+                socketProtector = socketProtector,
+                tunEstablisher = tunEstablisher,
+                routeScope = routeScope,
+            )
+        val created =
+            ffiGateway.createEngine(
+                MeshSessionStateHelper.buildInitConfig(stateStore, defaultNodeNameProvider),
+                bridge,
+            )
         activeEngine = created
         return created
     }
@@ -502,50 +557,21 @@ class MeshSessionRepository(
         socketProtector: (Int) -> Boolean,
         tunEstablisher: TunEstablisher?,
         routeScope: CoroutineScope?,
-    ): AndroidPlatformBridge = AndroidPlatformBridge(
-        socketProtector = socketProtector,
-        tunEstablisher = tunEstablisher,
-        engineProvider = { activeEngine },
-        routeScope = routeScope,
-        underlayProvider = underlayProvider,
-        dekManager = dekManager,
-        stateStore = stateStore,
-        statusSink = ::applySnapshot,
-        warningSink = ::applyWarning,
-    )
+    ): AndroidPlatformBridge =
+        AndroidPlatformBridge(
+            socketProtector = socketProtector,
+            tunEstablisher = tunEstablisher,
+            engineProvider = { activeEngine },
+            routeScope = routeScope,
+            underlayProvider = underlayProvider,
+            dekManager = dekManager,
+            stateStore = stateStore,
+            statusSink = ::applySnapshot,
+            warningSink = ::applyWarning,
+        )
 
     private fun applySnapshot(snapshot: MobileStatusSnapshot) {
-        val lastConnErr = snapshot.serverConnection?.lastError
-        val classifiedConnErr = FfiErrorMapper.classifyFromMessage(lastConnErr)
-        val stateError = when (snapshot.daemonState) {
-            MobileDaemonState.SERVER_UPGRADE_REQUIRED -> UiErrorInfo(
-                kind = UiErrorKind.SERVER_UPGRADE_REQUIRED,
-                code = "E_SERVER_UPGRADE_REQUIRED",
-                title = "Mesh Server Upgrade Required",
-                detail = SafeLogger.redact(
-                    snapshot.serverConnection?.lastError ?: "Server rejected Android client",
-                ),
-                actionHint = "Upgrade mesh-server VPS to v0.2.0 or newer.",
-            )
-            MobileDaemonState.REVOKED -> UiErrorInfo(
-                kind = UiErrorKind.NODE_REVOKED,
-                code = "E_NODE_REVOKED",
-                title = "Node Revoked",
-                detail = "This device was revoked by the administrator.",
-                actionHint = "Local session keys were cleared. Enroll again with a new key.",
-                requiresReenroll = true,
-            )
-            MobileDaemonState.REAUTH_REQUIRED -> UiErrorInfo(
-                kind = UiErrorKind.NODE_KEY_EXPIRED,
-                code = "E_KEY_EXPIRED",
-                title = "Node Key Expired",
-                detail = "Device identity key expired.",
-                actionHint = "Local session keys were cleared. Re-enroll with a new pre-auth key.",
-                requiresReenroll = true,
-            )
-            else -> classifiedConnErr
-        }
-
+        val stateError = MeshSessionStateHelper.resolveSnapshotStateError(snapshot)
         if (snapshot.daemonState == MobileDaemonState.REVOKED ||
             snapshot.daemonState == MobileDaemonState.REAUTH_REQUIRED
         ) {
@@ -553,35 +579,19 @@ class MeshSessionRepository(
         }
 
         _uiState.update { current ->
-            val lockdown = current.isLockdownEnabled ||
-                snapshot.warnings.any { it.kind == MobileWarningKind.ANDROID_LOCKDOWN_ACTIVE }
-            val privateDns = current.isPrivateDnsStrict ||
-                snapshot.warnings.any { it.kind == MobileWarningKind.ANDROID_PRIVATE_DNS_STRICT }
-            current.copy(
+            MeshSessionStateHelper.applySnapshotUpdate(
+                current = current,
+                snapshot = snapshot,
+                stateError = stateError,
                 isEnrolled = stateStore.hasEnrolledIdentity(),
                 isDeviceUnlocked = stateStore.isDeviceUnlocked(),
-                isLockdownEnabled = lockdown,
-                isPrivateDnsStrict = privateDns,
-                daemonState = snapshot.daemonState,
-                snapshot = snapshot,
-                activeWarnings = snapshot.warnings,
-                lastError = stateError ?: current.lastError?.takeIf {
-                    snapshot.daemonState != MobileDaemonState.CONNECTED
-                },
             )
         }
     }
 
     private fun applyWarning(warning: MobilePlatformWarning) {
         _uiState.update { current ->
-            val updated = current.activeWarnings.filterNot { it.kind == warning.kind } + warning
-            current.copy(
-                activeWarnings = updated,
-                isLockdownEnabled = current.isLockdownEnabled ||
-                    warning.kind == MobileWarningKind.ANDROID_LOCKDOWN_ACTIVE,
-                isPrivateDnsStrict = current.isPrivateDnsStrict ||
-                    warning.kind == MobileWarningKind.ANDROID_PRIVATE_DNS_STRICT,
-            )
+            MeshSessionStateHelper.applyWarningUpdate(current, warning)
         }
     }
 
@@ -594,17 +604,10 @@ class MeshSessionRepository(
             wipeKeysOnTerminalRevocation()
         }
         _uiState.update { current ->
-            val nextState = when (mapped.kind) {
-                UiErrorKind.SERVER_UPGRADE_REQUIRED -> MobileDaemonState.SERVER_UPGRADE_REQUIRED
-                UiErrorKind.NODE_REVOKED -> MobileDaemonState.REVOKED
-                UiErrorKind.NODE_KEY_EXPIRED -> MobileDaemonState.REAUTH_REQUIRED
-                UiErrorKind.DEVICE_LOCKED -> MobileDaemonState.DEVICE_LOCKED
-                else -> current.daemonState
-            }
-            current.copy(
+            MeshSessionStateHelper.applyFfiFailureUpdate(
+                current = current,
+                mapped = mapped,
                 isEnrolled = stateStore.hasEnrolledIdentity(),
-                daemonState = nextState,
-                lastError = mapped,
             )
         }
     }

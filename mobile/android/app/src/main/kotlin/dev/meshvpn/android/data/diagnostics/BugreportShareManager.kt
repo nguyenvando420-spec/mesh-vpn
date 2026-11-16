@@ -8,10 +8,12 @@ import java.io.IOException
 
 interface BugreportShareOps {
     fun nextExportDestination(): File
+
     fun prepareShareUri(
         archiveFile: File,
         reportedSizeBytes: Long,
     ): BugreportShareManager.PreparedBugreport
+
     fun cleanupAllDiagnosticArtifacts()
 }
 
@@ -40,7 +42,10 @@ class BugreportShareManager(
         return File(dir, "mesh-bugreport-$ts.tar")
     }
 
-    override fun prepareShareUri(archiveFile: File, reportedSizeBytes: Long): PreparedBugreport {
+    override fun prepareShareUri(
+        archiveFile: File,
+        reportedSizeBytes: Long,
+    ): PreparedBugreport {
         if (!archiveFile.exists() || !archiveFile.isFile) {
             throw IOException("Exported bugreport archive does not exist")
         }

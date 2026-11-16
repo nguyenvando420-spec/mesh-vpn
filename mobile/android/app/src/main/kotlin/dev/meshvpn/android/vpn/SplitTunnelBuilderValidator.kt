@@ -51,9 +51,10 @@ object SplitTunnelBuilderValidator {
             "includedRoutesCidr must contain at least one split-tunnel route"
         }
 
-        val parsedRoutes = config.includedRoutesCidr.map { rawCidr ->
-            parseSplitTunnelRoute(rawCidr)
-        }
+        val parsedRoutes =
+            config.includedRoutesCidr.map { rawCidr ->
+                parseSplitTunnelRoute(rawCidr)
+            }
 
         val dnsCovered = parsedRoutes.any { route -> cidrContains(route, dnsV4) }
         require(dnsCovered) {
@@ -102,8 +103,9 @@ object SplitTunnelBuilderValidator {
             "Invalid split-tunnel CIDR '$rawCidr'"
         }
         val ip = parseIpv4(parts[0], "route address")
-        val prefix = parts[1].toIntOrNull()
-            ?: throw IllegalArgumentException("Invalid CIDR prefix in '$rawCidr'")
+        val prefix =
+            parts[1].toIntOrNull()
+                ?: throw IllegalArgumentException("Invalid CIDR prefix in '$rawCidr'")
         require(prefix in 1..32) {
             "Forbidden route prefix /$prefix in '$rawCidr' (0.0.0.0/0 is disallowed)"
         }
@@ -114,14 +116,20 @@ object SplitTunnelBuilderValidator {
         )
     }
 
-    private fun cidrContains(route: ValidatedRouteCidr, target: Inet4Address): Boolean {
+    private fun cidrContains(
+        route: ValidatedRouteCidr,
+        target: Inet4Address,
+    ): Boolean {
         val routeNet = ipv4ToInt(parseIpv4(route.address, "validated route"))
         val targetInt = ipv4ToInt(target)
         val mask = prefixMaskInt(route.prefixLength)
         return (routeNet and mask) == (targetInt and mask)
     }
 
-    private fun parseIpv4(raw: String, label: String): Inet4Address {
+    private fun parseIpv4(
+        raw: String,
+        label: String,
+    ): Inet4Address {
         val trimmed = raw.trim()
         val parts = trimmed.split('.')
         require(parts.size == 4) { "Invalid IPv4 $label: $raw" }
@@ -149,8 +157,10 @@ object SplitTunnelBuilderValidator {
         return (-1) shl (32 - prefixLen)
     }
 
-    private fun maskIpv4(addr: Inet4Address, prefixLen: Int): Int =
-        ipv4ToInt(addr) and prefixMaskInt(prefixLen)
+    private fun maskIpv4(
+        addr: Inet4Address,
+        prefixLen: Int,
+    ): Int = ipv4ToInt(addr) and prefixMaskInt(prefixLen)
 
     private fun intToIpv4String(ipInt: Int): String =
         "${(ipInt ushr 24) and 0xFF}.${(ipInt ushr 16) and 0xFF}." +

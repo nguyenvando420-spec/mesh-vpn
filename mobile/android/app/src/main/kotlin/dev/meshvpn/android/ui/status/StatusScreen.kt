@@ -52,10 +52,11 @@ fun StatusScreen(
 ) {
     val session = screenState.session
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
+        modifier =
+            modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         StatusHeaderCard(session = session, onToggleTunnel = onToggleTunnel)
@@ -99,9 +100,10 @@ private fun StatusHeaderCard(
     session: MeshSessionUiState,
     onToggleTunnel: () -> Unit,
 ) {
-    val active = session.daemonState == MobileDaemonState.CONNECTED ||
-        session.daemonState == MobileDaemonState.CONNECTING ||
-        session.daemonState == MobileDaemonState.DEGRADED
+    val active =
+        session.daemonState == MobileDaemonState.CONNECTED ||
+            session.daemonState == MobileDaemonState.CONNECTING ||
+            session.daemonState == MobileDaemonState.DEGRADED
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -120,9 +122,10 @@ private fun StatusHeaderCard(
                 AssistChip(
                     onClick = {},
                     label = {
-                        val ip = session.snapshot?.overlayIp
-                            ?: session.bootstrapSummary?.overlayIp
-                            ?: "--"
+                        val ip =
+                            session.snapshot?.overlayIp
+                                ?: session.bootstrapSummary?.overlayIp
+                                ?: "--"
                         Text(ip)
                     },
                 )
@@ -138,9 +141,10 @@ private fun StatusHeaderCard(
             Button(
                 onClick = onToggleTunnel,
                 enabled = !session.isBusy && session.isDeviceUnlocked,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("toggle_tunnel_button"),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("toggle_tunnel_button"),
             ) {
                 Text(if (active) "Disconnect VPN" else "Connect VPN")
             }
@@ -196,9 +200,10 @@ private fun WarningCard(
     modifier: Modifier = Modifier,
 ) {
     Card(
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
-        ),
+        colors =
+            CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+            ),
         modifier = modifier.fillMaxWidth(),
     ) {
         Column(
@@ -246,9 +251,10 @@ private fun ActionableErrorSection(
 ) {
     if (!infoBanner.isNullOrBlank()) {
         Card(
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.secondaryContainer,
-            ),
+            colors =
+                CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                ),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(
@@ -259,23 +265,26 @@ private fun ActionableErrorSection(
         }
     }
 
-    val error = uiError ?: inputError?.let {
-        UiErrorInfo(
-            kind = UiErrorKind.INVALID_ARGUMENT,
-            code = "E_INPUT",
-            title = "Notice",
-            detail = it,
-            actionHint = "",
-        )
-    } ?: return
+    val error =
+        uiError ?: inputError?.let {
+            UiErrorInfo(
+                kind = UiErrorKind.INVALID_ARGUMENT,
+                code = "E_INPUT",
+                title = "Notice",
+                detail = it,
+                actionHint = "",
+            )
+        } ?: return
 
     Card(
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
-        ),
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("error_card"),
+        colors =
+            CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer,
+            ),
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .testTag("error_card"),
     ) {
         Column(
             modifier = Modifier.padding(12.dp),
@@ -299,20 +308,25 @@ private fun ActionableErrorSection(
                 )
             }
             when (error.kind) {
-                UiErrorKind.CLOCK_SKEW -> OutlinedButton(onClick = onOpenDateTimeSettings) {
-                    Text("Date & Time Settings")
-                }
-                UiErrorKind.CAPTIVE_PORTAL -> OutlinedButton(onClick = onOpenNetworkSettings) {
-                    Text("Network Settings")
-                }
-                UiErrorKind.PIN_MISMATCH -> OutlinedButton(onClick = onOpenSettingsTab) {
-                    Text("Review Server Pin")
-                }
+                UiErrorKind.CLOCK_SKEW ->
+                    OutlinedButton(onClick = onOpenDateTimeSettings) {
+                        Text("Date & Time Settings")
+                    }
+                UiErrorKind.CAPTIVE_PORTAL ->
+                    OutlinedButton(onClick = onOpenNetworkSettings) {
+                        Text("Network Settings")
+                    }
+                UiErrorKind.PIN_MISMATCH ->
+                    OutlinedButton(onClick = onOpenSettingsTab) {
+                        Text("Review Server Pin")
+                    }
                 UiErrorKind.NODE_REVOKED,
                 UiErrorKind.NODE_KEY_EXPIRED,
-                UiErrorKind.KEYSTORE_INVALIDATED -> OutlinedButton(onClick = onResetAndReenroll) {
-                    Text("Reset & Re-enroll")
-                }
+                UiErrorKind.KEYSTORE_INVALIDATED,
+                ->
+                    OutlinedButton(onClick = onResetAndReenroll) {
+                        Text("Reset & Re-enroll")
+                    }
                 else -> Unit
             }
         }
@@ -329,18 +343,20 @@ private fun SelfTelemetryCard(session: MeshSessionUiState) {
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text("Tunnel Telemetry", style = MaterialTheme.typography.titleMedium)
-            val endpoint = server?.controlEndpoint
-                ?: session.bootstrapSummary?.serverEndpoint
-                ?: "Not configured"
+            val endpoint =
+                server?.controlEndpoint
+                    ?: session.bootstrapSummary?.serverEndpoint
+                    ?: "Not configured"
             Text("Control: $endpoint")
             if (snap != null) {
                 val net = snap.selfNetwork
                 Text("NAT: ${net.natType.name} | UDP Port: ${net.localUdpPort}")
-                val relayState = if (server?.relayConnected == true) {
-                    "Connected (${server.relayRttMs ?: "-"} ms)"
-                } else {
-                    "Disconnected"
-                }
+                val relayState =
+                    if (server?.relayConnected == true) {
+                        "Connected (${server.relayRttMs ?: "-"} ms)"
+                    } else {
+                        "Disconnected"
+                    }
                 Text("Blind Relay: $relayState")
                 net.boundPhysicalInterface?.let { iface ->
                     Text("Physical Interface: $iface")
@@ -417,9 +433,10 @@ private fun PingSummaryCard(ping: MobilePingResponse) {
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            val avg = ping.avgRttMs?.let {
-                String.format(Locale.US, "%.1f ms", it)
-            } ?: "timeout"
+            val avg =
+                ping.avgRttMs?.let {
+                    String.format(Locale.US, "%.1f ms", it)
+                } ?: "timeout"
             Text(
                 text = "Last Ping: ${ping.peerName} (${ping.peerOverlayIp}) avg=$avg",
                 style = MaterialTheme.typography.titleMedium,
@@ -443,9 +460,10 @@ private fun PeerRowCard(
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -458,8 +476,9 @@ private fun PeerRowCard(
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Text(
-                    text = "${peer.activePath.name} | online=${peer.online} | " +
-                        "rtt=${peer.rttMs ?: "-"} ms",
+                    text =
+                        "${peer.activePath.name} | online=${peer.online} | " +
+                            "rtt=${peer.rttMs ?: "-"} ms",
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(

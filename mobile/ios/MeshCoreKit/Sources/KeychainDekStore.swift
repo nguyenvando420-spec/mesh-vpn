@@ -119,10 +119,11 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
             accessGroup: request.accessGroup
         )
         attrs[kSecAttrAccessible as String] = request.accessibleAttribute
-        let syncVal: Any = request.synchronizable
-            ? (kCFBooleanTrue ?? true)
-            : (kCFBooleanFalse ?? false)
-        attrs[kSecAttrSynchronizable as String] = syncVal
+        if let cfBool = request.synchronizable ? kCFBooleanTrue : kCFBooleanFalse {
+            attrs[kSecAttrSynchronizable as String] = cfBool
+        } else {
+            attrs[kSecAttrSynchronizable as String] = NSNumber(value: request.synchronizable)
+        }
         attrs[kSecValueData as String] = request.data
 
         let status = SecItemAdd(attrs as CFDictionary, nil)
@@ -318,7 +319,7 @@ public final class KeychainDekStore: Sendable {
 
     private func reloadExistingDekAfterRace() throws -> Data {
         switch client.readItem(service: service, account: account, accessGroup: accessGroup) {
-        case .found(var existing) where existing.count == MeshConstants.dekByteCount:
+        case .found(let existing) where existing.count == MeshConstants.dekByteCount:
             return existing
         case .found(var invalid):
             KeychainDekStore.zeroizeData(&invalid)

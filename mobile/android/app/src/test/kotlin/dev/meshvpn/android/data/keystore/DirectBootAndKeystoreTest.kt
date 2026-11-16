@@ -23,12 +23,18 @@ private class FakeKeyWrapBackend : KeyWrapBackend {
         aliases.add(alias)
     }
 
-    override fun wrapDek(alias: String, plainDek: ByteArray): ByteArray {
+    override fun wrapDek(
+        alias: String,
+        plainDek: ByteArray,
+    ): ByteArray {
         check(alias in aliases) { "Missing alias $alias" }
         return plainDek.map { (it.toInt() xor 0x5A).toByte() }.toByteArray()
     }
 
-    override fun unwrapDek(alias: String, wrappedBlob: ByteArray): ByteArray {
+    override fun unwrapDek(
+        alias: String,
+        wrappedBlob: ByteArray,
+    ): ByteArray {
         if (alias !in aliases) {
             throw AEADBadTagException("Key alias removed")
         }
@@ -52,10 +58,11 @@ class DirectBootAndKeystoreTest {
         // Arrange
         var unlocked = false
         val stateDir = tempFolder.newFolder("no_backup")
-        val store = PrivateStateFileStore(
-            stateDirProvider = { stateDir },
-            deviceUnlockChecker = DeviceUnlockChecker { unlocked },
-        )
+        val store =
+            PrivateStateFileStore(
+                stateDirProvider = { stateDir },
+                deviceUnlockChecker = DeviceUnlockChecker { unlocked },
+            )
         val dekManager = AndroidKeystoreDekManager(store, FakeKeyWrapBackend())
 
         // Act + Assert
@@ -73,10 +80,11 @@ class DirectBootAndKeystoreTest {
     fun keystoreDekInvalidatedKeyFailsClosedWithoutOverwriting() {
         // Arrange
         val stateDir = tempFolder.newFolder("no_backup_invalidated")
-        val store = PrivateStateFileStore(
-            stateDirProvider = { stateDir },
-            deviceUnlockChecker = DeviceUnlockChecker { true },
-        )
+        val store =
+            PrivateStateFileStore(
+                stateDirProvider = { stateDir },
+                deviceUnlockChecker = DeviceUnlockChecker { true },
+            )
         val backend = FakeKeyWrapBackend()
         val dekManager = AndroidKeystoreDekManager(store, backend)
         val originalDek = dekManager.loadOrCreatePlatformDek()
@@ -100,10 +108,11 @@ class DirectBootAndKeystoreTest {
     fun keystoreDekMissingDekWithExistingIdentityFailsClosed() {
         // Arrange
         val stateDir = tempFolder.newFolder("no_backup_orphan_identity")
-        val store = PrivateStateFileStore(
-            stateDirProvider = { stateDir },
-            deviceUnlockChecker = DeviceUnlockChecker { true },
-        )
+        val store =
+            PrivateStateFileStore(
+                stateDirProvider = { stateDir },
+                deviceUnlockChecker = DeviceUnlockChecker { true },
+            )
         store.saveStateFile(PrivateStateFileStore.SEALED_IDENTITY_FILE, byteArrayOf(1, 2, 3))
         val dekManager = AndroidKeystoreDekManager(store, FakeKeyWrapBackend())
 
@@ -119,10 +128,11 @@ class DirectBootAndKeystoreTest {
     fun keystoreUsePlatformDekZeroizesTransientBuffer() {
         // Arrange
         val stateDir = tempFolder.newFolder("no_backup_zeroize")
-        val store = PrivateStateFileStore(
-            stateDirProvider = { stateDir },
-            deviceUnlockChecker = DeviceUnlockChecker { true },
-        )
+        val store =
+            PrivateStateFileStore(
+                stateDirProvider = { stateDir },
+                deviceUnlockChecker = DeviceUnlockChecker { true },
+            )
         val dekManager = AndroidKeystoreDekManager(store, FakeKeyWrapBackend())
         var capturedRef: ByteArray? = null
 

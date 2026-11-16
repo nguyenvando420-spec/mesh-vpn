@@ -20,7 +20,9 @@ import uniffi.mesh_mobile_ffi.PlatformNetworkBridge
  */
 interface PendingJoinSessionHandle {
     fun maskedPreview(): String
+
     fun cancel()
+
     fun unwrapNative(): MobilePendingJoinSession?
 }
 
@@ -52,14 +54,23 @@ data class UpParams(
 
 interface MobileEngineHandle {
     suspend fun startTunnel(cfg: UpParams): MobileStatusSnapshot
+
     suspend fun stopTunnel(): MobileStatusSnapshot
+
     suspend fun rotateKey(pendingJoin: PendingJoinSessionHandle): MobileStatusSnapshot
+
     suspend fun updateServerConfig(cfg: MobileSetConfig): MobileStatusSnapshot
+
     suspend fun statusSnapshot(): MobileStatusSnapshot
+
     suspend fun pingPeer(req: MobilePingRequest): MobilePingResponse
+
     suspend fun netcheck(): MobileNetcheckResponse
+
     suspend fun exportBugreportToFile(destPath: String): MobileBugreportResult
+
     fun pushTunPackets(packets: List<ByteArray>): UInt
+
     fun completeRouteChange(
         opId: ULong,
         ok: Boolean,
@@ -67,16 +78,25 @@ interface MobileEngineHandle {
         errorMessage: String?,
     )
 
-    fun onNetworkChange(kind: MobileNetEventKind, underlay: MobileUnderlayState)
+    fun onNetworkChange(
+        kind: MobileNetEventKind,
+        underlay: MobileUnderlayState,
+    )
+
     fun setPowerSavingMode(enabled: Boolean)
+
     fun shutdown()
+
     fun destroy()
 }
 
 interface MeshFfiGateway {
     fun ffiVersion(): String
+
     fun parseJoinUri(rawUri: String): ParsedJoinSummary
+
     fun createPendingSessionFromChars(rawPreauthKey: CharArray): PendingJoinSessionHandle
+
     suspend fun enrollOrRotateNode(
         init: MobileEngineInitConfig,
         bridge: PlatformNetworkBridge,

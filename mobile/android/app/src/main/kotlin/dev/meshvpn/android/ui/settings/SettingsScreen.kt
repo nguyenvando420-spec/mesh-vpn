@@ -60,20 +60,23 @@ fun SettingsScreen(
     val session = screenState.session
     val snapshot = session.snapshot
     val bootstrap = session.bootstrapSummary
-    val currentEndpoint = snapshot?.serverConnection?.controlEndpoint
-        ?: bootstrap?.serverEndpoint
-        ?: ""
-    val currentTlsMode = snapshot?.serverConnection?.tlsAuthMode
-        ?: bootstrap?.tlsAuthMode
-        ?: MobileTlsAuthMode.SPKI_PIN
+    val currentEndpoint =
+        snapshot?.serverConnection?.controlEndpoint
+            ?: bootstrap?.serverEndpoint
+            ?: ""
+    val currentTlsMode =
+        snapshot?.serverConnection?.tlsAuthMode
+            ?: bootstrap?.tlsAuthMode
+            ?: MobileTlsAuthMode.SPKI_PIN
     val activePin = snapshot?.serverConnection?.activePin ?: bootstrap?.activePin
     val nextPin = snapshot?.serverConnection?.nextPin ?: bootstrap?.nextPin
 
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
+        modifier =
+            modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Settings & Security", style = MaterialTheme.typography.headlineSmall)
@@ -118,19 +121,60 @@ fun SettingsScreen(
         )
     }
 
+    SettingsDialogs(
+        showServerDialog = showServerDialog,
+        showRotateDialog = showRotateDialog,
+        showResetDialog = showResetDialog,
+        currentEndpoint = currentEndpoint,
+        currentTlsMode = currentTlsMode,
+        activePin = activePin,
+        onSensitiveModalChanged = onSensitiveModalChanged,
+        onDismissServerDialog = { showServerDialog = false },
+        onSubmitServerConfig = { ep, mode, pin ->
+            showServerDialog = false
+            onUpdateServerConfig(ep, mode, pin)
+        },
+        onDismissRotateDialog = { showRotateDialog = false },
+        onSubmitRotateKey = { chars ->
+            showRotateDialog = false
+            onRotateKey(chars)
+        },
+        onDismissResetDialog = { showResetDialog = false },
+        onConfirmResetIdentity = {
+            showResetDialog = false
+            onResetIdentity()
+        },
+    )
+}
+
+@Composable
+private fun SettingsDialogs(
+    showServerDialog: Boolean,
+    showRotateDialog: Boolean,
+    showResetDialog: Boolean,
+    currentEndpoint: String,
+    currentTlsMode: MobileTlsAuthMode,
+    activePin: String?,
+    onSensitiveModalChanged: (Boolean) -> Unit,
+    onDismissServerDialog: () -> Unit,
+    onSubmitServerConfig: (String, MobileTlsAuthMode, String) -> Unit,
+    onDismissRotateDialog: () -> Unit,
+    onSubmitRotateKey: (CharArray) -> Unit,
+    onDismissResetDialog: () -> Unit,
+    onConfirmResetIdentity: () -> Unit,
+) {
     if (showServerDialog) {
         UpdateServerConfigDialog(
             initialEndpoint = currentEndpoint,
             initialMode = currentTlsMode,
             initialPin = activePin.orEmpty(),
             onDismiss = {
-                showServerDialog = false
+                onDismissServerDialog()
                 onSensitiveModalChanged(false)
             },
             onSubmit = { ep, mode, pin ->
-                showServerDialog = false
                 onSensitiveModalChanged(false)
-                onUpdateServerConfig(ep, mode, pin)
+                onSubmitServerConfig(ep, mode, pin)
             },
         )
     }
@@ -138,24 +182,20 @@ fun SettingsScreen(
     if (showRotateDialog) {
         RotateKeyDialog(
             onDismiss = {
-                showRotateDialog = false
+                onDismissRotateDialog()
                 onSensitiveModalChanged(false)
             },
             onSubmit = { chars ->
-                showRotateDialog = false
                 onSensitiveModalChanged(false)
-                onRotateKey(chars)
+                onSubmitRotateKey(chars)
             },
         )
     }
 
     if (showResetDialog) {
         ResetIdentityConfirmDialog(
-            onDismiss = { showResetDialog = false },
-            onConfirm = {
-                showResetDialog = false
-                onResetIdentity()
-            },
+            onDismiss = onDismissResetDialog,
+            onConfirm = onConfirmResetIdentity,
         )
     }
 }
@@ -242,9 +282,10 @@ private fun IdentityManagementCard(
                 Button(
                     onClick = onOpenResetIdentity,
                     enabled = !isBusy,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                    ),
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                        ),
                 ) {
                     Text("Erase Identity")
                 }
@@ -300,8 +341,9 @@ private fun DiagnosticsCard(
         ) {
             Text("Scrubbed Diagnostics", style = MaterialTheme.typography.titleMedium)
             Text(
-                text = "Generates a bounded <= 1 MiB .tar archive with all private keys, " +
-                    "tokens, and credentials removed before sharing.",
+                text =
+                    "Generates a bounded <= 1 MiB .tar archive with all private keys, " +
+                        "tokens, and credentials removed before sharing.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Button(
@@ -398,10 +440,11 @@ private fun RotateKeyDialog(
                     onValueChange = { keyDraft = it },
                     label = { Text("New Pre-auth Key") },
                     visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Password,
-                        autoCorrectEnabled = false,
-                    ),
+                    keyboardOptions =
+                        KeyboardOptions(
+                            keyboardType = KeyboardType.Password,
+                            autoCorrectEnabled = false,
+                        ),
                     singleLine = true,
                 )
             }
@@ -441,9 +484,10 @@ private fun ResetIdentityConfirmDialog(
         confirmButton = {
             Button(
                 onClick = onConfirm,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error,
-                ),
+                colors =
+                    ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                    ),
             ) {
                 Text("Authorize & Erase")
             }

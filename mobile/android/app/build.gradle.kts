@@ -88,11 +88,12 @@ android {
     lint {
         warningsAsErrors = true
         abortOnError = true
-        disable += listOf(
-            "GradleDependency",
-            "AndroidGradlePluginVersion",
-            "NewerVersionAvailable",
-        )
+        disable +=
+            listOf(
+                "GradleDependency",
+                "AndroidGradlePluginVersion",
+                "NewerVersionAvailable",
+            )
     }
 
     testOptions {

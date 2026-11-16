@@ -25,8 +25,9 @@ class SafeLoggerTest {
     @Test
     fun safeLoggerRedactPrivateKeysAndBearerRemovesMaterial() {
         // Arrange
-        val raw = "node_privkey_hex=0123456789abcdef0123456789abcdef " +
-            "Authorization: Bearer topsecretTokenValue1234"
+        val raw =
+            "node_privkey_hex=0123456789abcdef0123456789abcdef " +
+                "Authorization: Bearer topsecretTokenValue1234"
 
         // Act
         val sanitized = SafeLogger.redact(raw)

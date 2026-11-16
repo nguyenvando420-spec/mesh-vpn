@@ -33,9 +33,10 @@ class MeshTileService : TileService() {
             return
         }
 
-        val isRunning = state.daemonState == MobileDaemonState.CONNECTED ||
-            state.daemonState == MobileDaemonState.CONNECTING ||
-            state.daemonState == MobileDaemonState.DEGRADED
+        val isRunning =
+            state.daemonState == MobileDaemonState.CONNECTED ||
+                state.daemonState == MobileDaemonState.CONNECTING ||
+                state.daemonState == MobileDaemonState.DEGRADED
 
         if (isRunning) {
             MeshVpnService.stopTunnelService(applicationContext)
@@ -53,36 +54,40 @@ class MeshTileService : TileService() {
         app.container.sessionRepository.refreshFromDisk()
         val state = app.container.sessionRepository.uiState.value
 
-        tile.state = when {
-            !state.isDeviceUnlocked || !state.isEnrolled -> Tile.STATE_UNAVAILABLE
-            state.daemonState == MobileDaemonState.CONNECTED ||
-                state.daemonState == MobileDaemonState.CONNECTING ||
-                state.daemonState == MobileDaemonState.DEGRADED -> Tile.STATE_ACTIVE
-            else -> Tile.STATE_INACTIVE
-        }
+        tile.state =
+            when {
+                !state.isDeviceUnlocked || !state.isEnrolled -> Tile.STATE_UNAVAILABLE
+                state.daemonState == MobileDaemonState.CONNECTED ||
+                    state.daemonState == MobileDaemonState.CONNECTING ||
+                    state.daemonState == MobileDaemonState.DEGRADED -> Tile.STATE_ACTIVE
+                else -> Tile.STATE_INACTIVE
+            }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.subtitle = when (state.daemonState) {
-                MobileDaemonState.CONNECTED -> state.snapshot?.overlayIp ?: "Connected"
-                MobileDaemonState.CONNECTING -> "Connecting"
-                MobileDaemonState.DEGRADED -> "P2P Only"
-                MobileDaemonState.DEVICE_LOCKED -> "Locked"
-                else -> if (state.isEnrolled) "Disconnected" else "Setup needed"
-            }
+            tile.subtitle =
+                when (state.daemonState) {
+                    MobileDaemonState.CONNECTED -> state.snapshot?.overlayIp ?: "Connected"
+                    MobileDaemonState.CONNECTING -> "Connecting"
+                    MobileDaemonState.DEGRADED -> "P2P Only"
+                    MobileDaemonState.DEVICE_LOCKED -> "Locked"
+                    else -> if (state.isEnrolled) "Disconnected" else "Setup needed"
+                }
         }
         tile.updateTile()
     }
 
     private fun openMainApp() {
-        val intent = Intent(this, MainActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val intent =
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            val pi = PendingIntent.getActivity(
-                this,
-                0,
-                intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
+            val pi =
+                PendingIntent.getActivity(
+                    this,
+                    0,
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
             startActivityAndCollapse(pi)
         } else {
             @Suppress("DEPRECATION")

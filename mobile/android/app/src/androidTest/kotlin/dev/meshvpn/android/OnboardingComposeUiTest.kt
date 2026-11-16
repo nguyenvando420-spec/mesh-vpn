@@ -46,15 +46,17 @@ class OnboardingComposeUiTest {
                         submittedEndpoint = ep
                         submittedKeyLen = chars.size
                         chars.fill('\u0000')
-                        screenState = screenState.copy(
-                            pendingConfirmation = JoinConfirmationUiModel(
-                                serverEndpoint = ep,
-                                tlsAuthMode = mode,
-                                serverPin = pin,
-                                preauthKeyMasked = "mpk_abcd...9999",
-                                nodeName = name.ifBlank { null },
-                            ),
-                        )
+                        screenState =
+                            screenState.copy(
+                                pendingConfirmation =
+                                    JoinConfirmationUiModel(
+                                        serverEndpoint = ep,
+                                        tlsAuthMode = mode,
+                                        serverPin = pin,
+                                        preauthKeyMasked = "mpk_abcd...9999",
+                                        nodeName = name.ifBlank { null },
+                                    ),
+                            )
                     },
                     onToggleConnectOnConfirm = {},
                     onConfirmJoin = {},
@@ -65,7 +67,8 @@ class OnboardingComposeUiTest {
 
         composeRule.onNodeWithTag("manual_endpoint_input").performTextInput("203.0.113.10:443")
         composeRule.onNodeWithTag("manual_pin_input").performTextInput(testPin)
-        composeRule.onNodeWithTag("manual_preauth_input")
+        composeRule
+            .onNodeWithTag("manual_preauth_input")
             .performTextInput("mpk_" + "A".repeat(44))
         composeRule.onNodeWithTag("manual_submit_button").performClick()
 
