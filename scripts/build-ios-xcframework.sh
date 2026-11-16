@@ -14,7 +14,7 @@ export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
 export CARGO_PROFILE_RELEASE_OPT_LEVEL="${CARGO_PROFILE_RELEASE_OPT_LEVEL:-z}"
 export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-fat}"
 
-MAX_STATIC_LIB_BYTES=6291456
+MAX_DYNAMIC_LIB_BYTES=6291456
 IOS_TARGETS=(
     "aarch64-apple-ios"
     "aarch64-apple-ios-sim"
@@ -37,15 +37,26 @@ DEV_LIB="${REPO_ROOT}/target/aarch64-apple-ios/release/libmesh_mobile_ffi.a"
 SIM_ARM_LIB="${REPO_ROOT}/target/aarch64-apple-ios-sim/release/libmesh_mobile_ffi.a"
 SIM_X86_LIB="${REPO_ROOT}/target/x86_64-apple-ios/release/libmesh_mobile_ffi.a"
 
+DEV_DYLIB="${REPO_ROOT}/target/aarch64-apple-ios/release/libmesh_mobile_ffi.dylib"
+SIM_ARM_DYLIB="${REPO_ROOT}/target/aarch64-apple-ios-sim/release/libmesh_mobile_ffi.dylib"
+SIM_X86_DYLIB="${REPO_ROOT}/target/x86_64-apple-ios/release/libmesh_mobile_ffi.dylib"
+
 for lib in "${DEV_LIB}" "${SIM_ARM_LIB}" "${SIM_X86_LIB}"; do
     if [ ! -f "${lib}" ]; then
         echo "ERROR: Expected static library missing: ${lib}" >&2
         exit 1
     fi
-    size_bytes="$(wc -c < "${lib}" | tr -d '[:space:]')"
-    echo "Static library ${lib}: ${size_bytes} bytes (limit ${MAX_STATIC_LIB_BYTES})"
-    if [ "${size_bytes}" -gt "${MAX_STATIC_LIB_BYTES}" ]; then
-        echo "ERROR: ${lib} (${size_bytes} B) exceeds 6 MiB limit (${MAX_STATIC_LIB_BYTES} B)" >&2
+done
+
+for dylib in "${DEV_DYLIB}" "${SIM_ARM_DYLIB}" "${SIM_X86_DYLIB}"; do
+    if [ ! -f "${dylib}" ]; then
+        echo "ERROR: Expected dynamic library slice missing: ${dylib}" >&2
+        exit 1
+    fi
+    size_bytes="$(wc -c < "${dylib}" | tr -d '[:space:]')"
+    echo "Mach-O slice ${dylib}: ${size_bytes} bytes (limit ${MAX_DYNAMIC_LIB_BYTES})"
+    if [ "${size_bytes}" -gt "${MAX_DYNAMIC_LIB_BYTES}" ]; then
+        echo "ERROR: ${dylib} (${size_bytes} B) exceeds 6 MiB limit (${MAX_DYNAMIC_LIB_BYTES} B)" >&2
         exit 1
     fi
 done
@@ -59,7 +70,7 @@ mkdir -p "${GENERATED_DIR}" "${FRAMEWORKS_DIR}"
 
 echo "Generating UniFFI 0.29.5 Swift bindings..."
 cargo run --locked -p mesh-uniffi-bindgen -- generate \
-    --library "${DEV_LIB}" \
+    --library "${DEV_DYLIB}" \
     --language swift \
     --out-dir "${GENERATED_DIR}"
 
