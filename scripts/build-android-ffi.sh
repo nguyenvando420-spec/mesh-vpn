@@ -300,13 +300,26 @@ main() {
             build --release --locked -p mesh-mobile-ffi
     )
 
-    local llvm_strip
-    llvm_strip="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -name llvm-strip -type f 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${llvm_strip}" ]]; then
-        "${llvm_strip}" --strip-unneeded \
-            "${JNI_LIBS_DIR}/arm64-v8a/libmesh_mobile_ffi.so" \
-            "${JNI_LIBS_DIR}/x86_64/libmesh_mobile_ffi.so"
+    local llvm_strip=""
+    for candidate in \
+        "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+        "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip" \
+        "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/darwin-arm64/bin/llvm-strip"; do
+        if [[ -x "${candidate}" ]]; then
+            llvm_strip="${candidate}"
+            break
+        fi
+    done
+    if [[ -z "${llvm_strip}" ]]; then
+        llvm_strip="$(find -L "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -name llvm-strip -type f 2>/dev/null | head -n 1 || true)"
     fi
+    if [[ -z "${llvm_strip}" ]]; then
+        echo "error: llvm-strip executable not found under ${ANDROID_NDK_HOME}" >&2
+        exit 1
+    fi
+    "${llvm_strip}" --strip-unneeded \
+        "${JNI_LIBS_DIR}/arm64-v8a/libmesh_mobile_ffi.so" \
+        "${JNI_LIBS_DIR}/x86_64/libmesh_mobile_ffi.so"
 
     verify_elf_and_size "${JNI_LIBS_DIR}/arm64-v8a/libmesh_mobile_ffi.so"
     verify_elf_and_size "${JNI_LIBS_DIR}/x86_64/libmesh_mobile_ffi.so"

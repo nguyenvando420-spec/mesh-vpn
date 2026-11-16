@@ -71,25 +71,21 @@ mkdir -p "${GENERATED_DIR}" "${FRAMEWORKS_DIR}"
 echo "Generating UniFFI 0.29.5 Swift bindings..."
 cargo run --locked -p mesh-uniffi-bindgen -- generate \
     --library "${DEV_DYLIB}" \
+    --crate mesh_mobile_ffi \
+    --no-format \
     --language swift \
     --out-dir "${GENERATED_DIR}"
 
-echo "Patching UniFFI generated Swift vtable for Swift 6 strict concurrency..."
+if [ ! -f "${GENERATED_DIR}/mesh_mobile_ffi.swift" ]; then
+    echo "ERROR: Expected UniFFI Swift bindings missing at ${GENERATED_DIR}/mesh_mobile_ffi.swift" >&2
+    exit 1
+fi
 python3 - "${GENERATED_DIR}/mesh_mobile_ffi.swift" <<'PY'
 import pathlib
 import sys
 
-swift_path = pathlib.Path(sys.argv[1])
-text = swift_path.read_text(encoding="utf-8")
-target = "    static let vtable: [UniffiVTableCallbackInterfacePlatformNetworkBridge]"
-replacement = (
-    "    nonisolated(unsafe) static let vtable: "
-    "[UniffiVTableCallbackInterfacePlatformNetworkBridge]"
-)
-if target not in text:
-    raise SystemExit("ERROR: Expected UniFFI vtable declaration not found in mesh_mobile_ffi.swift")
-patched = text.replace(target, replacement, 1).replace("\r\n", "\n")
-swift_path.write_bytes(patched.encode("utf-8"))
+p = pathlib.Path(sys.argv[1])
+p.write_bytes(p.read_bytes().replace(b"\r\n", b"\n"))
 PY
 
 STAGE_DIR="$(mktemp -d)"
