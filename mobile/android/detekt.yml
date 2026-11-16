@@ -1,0 +1,70 @@
+build:
+  maxIssues: 0
+
+config:
+  validation: true
+  warningsAsErrors: true
+
+complexity:
+  TooManyFunctions:
+    thresholdInFiles: 25
+    thresholdInClasses: 25
+    thresholdInInterfaces: 20
+    thresholdInObjects: 20
+  LongMethod:
+    threshold: 95
+  LongParameterList:
+    functionThreshold: 8
+    constructorThreshold: 10
+    ignoreDefaultParameters: true
+    ignoreDataClasses: true
+    ignoreAnnotated:
+      - 'Composable'
+  CyclomaticComplexMethod:
+    threshold: 20
+
+naming:
+  FunctionNaming:
+    ignoreAnnotated:
+      - 'Composable'
+
+style:
+  MaxLineLength:
+    maxLineLength: 100
+    excludePackageStatements: true
+    excludeImportStatements: true
+    excludeCommentStatements: false
+  MagicNumber:
+    active: false
+  ReturnCount:
+    max: 5
+  ForbiddenMethodCall:
+    active: true
+    methods:
+      - value: 'kotlinx.coroutines.GlobalScope'
+        reason: 'Use structured concurrency scopes instead of GlobalScope.'
+      - value: 'kotlin.io.println'
+        reason: 'Use SafeLogger instead of println.'
+      - value: 'android.util.Log.v'
+        reason: 'Use SafeLogger instead of calling android.util.Log directly.'
+      - value: 'android.util.Log.d'
+        reason: 'Use SafeLogger instead of calling android.util.Log directly.'
+      - value: 'android.util.Log.i'
+        reason: 'Use SafeLogger instead of calling android.util.Log directly.'
+      - value: 'android.util.Log.w'
+        reason: 'Use SafeLogger instead of calling android.util.Log directly.'
+      - value: 'android.util.Log.e'
+        reason: 'Use SafeLogger instead of calling android.util.Log directly.'
+  WildcardImport:
+    active: true
+
+exceptions:
+  SwallowedException:
+    active: true
+    allowedExceptionNameRegex: '^(_|(ignore|expected).*)'
+  TooGenericExceptionCaught:
+    active: false
+
+potential-bugs:
+  UnsafeCallOnNullableType:
+    active: true

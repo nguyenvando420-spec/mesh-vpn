@@ -1,0 +1,227 @@
+name: Mesh Android Native Build
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "crates/**"
+      - "tools/uniffi-bindgen/**"
+      - "mobile/android/**"
+      - "scripts/build-android-ffi.sh"
+      - ".github/workflows/mobile-android.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "tools/uniffi-bindgen/**"
+      - "mobile/android/**"
+      - "scripts/build-android-ffi.sh"
+      - ".github/workflows/mobile-android.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  android-native-ci:
+    name: Build & Verify Android APK/AAB (arm64-v8a + x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Android text hygiene & security invariants
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          errors = []
+          root = "mobile/android"
+          banned_binaries = (".jks", ".keystore", ".p12", ".apk", ".aab", ".so")
+          text_exts = (".kt", ".kts", ".xml", ".pro", ".yml", ".yaml", ".toml", ".sh", ".properties")
+
+          def check_file(path):
+              with open(path, "rb") as fh:
+                  raw = fh.read()
+              if raw.startswith(b"\xef\xbb\xbf"):
+                  errors.append(f"{path}: UTF-8 BOM forbidden")
+              if b"\r" in raw:
+                  errors.append(f"{path}: CRLF forbidden")
+              return raw.decode("utf-8")
+
+          for base in (root,):
+              for dirpath, _, filenames in os.walk(base):
+                  for fn in filenames:
+                      p = os.path.join(dirpath, fn).replace("\\", "/")
+                      if p.endswith(banned_binaries):
+                          errors.append(f"{p}: binary artifact must not be tracked")
+                      if p.endswith(text_exts):
+                          text = check_file(p)
+                          if p.endswith(".kt") or p.endswith(".kts"):
+                              for needle in ("!!", "GlobalScope", "EncryptedSharedPreferences", "com.google.mlkit", "com.google.android.gms", "ndk-context"):
+                                  if needle in text:
+                                      errors.append(f"{p}: forbidden Android pattern '{needle}'")
+
+          check_file("scripts/build-android-ffi.sh")
+          check_file(".github/workflows/mobile-android.yml")
+
+          manifest = open("mobile/android/app/src/main/AndroidManifest.xml", encoding="utf-8").read()
+          if 'android:allowBackup="false"' not in manifest:
+              errors.append("AndroidManifest.xml must set android:allowBackup=\"false\"")
+          if 'android:scheme="mesh"' in manifest:
+              errors.append("AndroidManifest.xml must not register mesh:// deep link intent-filter")
+
+          if errors:
+              print("\n".join(errors), file=sys.stderr)
+              sys.exit(1)
+          print("Android hygiene and manifest security checks passed.")
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK 35 & NDK r27c
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          yes | "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "${GITHUB_ENV}"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018" >> "${GITHUB_ENV}"
+
+      - name: Install Rust 1.94.1 & Android targets
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-ffi-v1
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@cargo-ndk
+
+      - name: Build Android JNI .so, Maven repo & UniFFI Kotlin bindings
+        run: bash scripts/build-android-ffi.sh
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+          build-scan-publish: false
+
+      - name: Decode optional release signing keystore
+        if: ${{ secrets.MESH_ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          MESH_ANDROID_KEYSTORE_BASE64: ${{ secrets.MESH_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import os
+          data = base64.b64decode(os.environ["MESH_ANDROID_KEYSTORE_BASE64"])
+          with open("/tmp/mesh-release.jks", "wb") as fh:
+              fh.write(data)
+          os.chmod("/tmp/mesh-release.jks", 0o600)
+          PY
+          echo "MESH_ANDROID_KEYSTORE_PATH=/tmp/mesh-release.jks" >> "${GITHUB_ENV}"
+
+      - name: Run ktlint, detekt, Android Lint, unit tests & APK/AAB build
+        working-directory: mobile/android
+        env:
+          RUSTLS_PLATFORM_VERIFIER_REPO: ${{ github.workspace }}/mobile/android/.m2
+          MESH_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.MESH_ANDROID_KEYSTORE_PASSWORD }}
+          MESH_ANDROID_KEY_ALIAS: ${{ secrets.MESH_ANDROID_KEY_ALIAS }}
+          MESH_ANDROID_KEY_PASSWORD: ${{ secrets.MESH_ANDROID_KEY_PASSWORD }}
+        run: |
+          gradle --no-daemon \
+            ktlintCheck \
+            detekt \
+            lintDebug \
+            testDebugUnitTest \
+            assembleDebug \
+            bundleRelease \
+            assembleRelease \
+            -PrustlsPlatformVerifierRepo="${RUSTLS_PLATFORM_VERIFIER_REPO}"
+
+      - name: Wipe temporary signing keystore
+        if: always()
+        run: rm -f /tmp/mesh-release.jks
+
+      - name: Verify APK native ABIs, page alignment & R8 output
+        run: |
+          python3 - <<'PY'
+          import glob
+          import struct
+          import sys
+          import zipfile
+
+          apks = glob.glob("mobile/android/app/build/outputs/apk/**/*.apk", recursive=True)
+          if not apks:
+              raise SystemExit("error: no APK outputs produced")
+
+          max_so_bytes = 6 * 1024 * 1024
+          for apk in apks:
+              with zipfile.ZipFile(apk, "r") as zf:
+                  names = set(zf.namelist())
+                  for abi in ("arm64-v8a", "x86_64"):
+                      entry = f"lib/{abi}/libmesh_mobile_ffi.so"
+                      if entry not in names:
+                          raise SystemExit(f"error: {apk} missing {entry}")
+                      raw = zf.read(entry)
+                      if len(raw) > max_so_bytes:
+                          raise SystemExit(f"error: {apk} {entry} size {len(raw)} > {max_so_bytes}")
+                      e_phoff = struct.unpack_from("<Q", raw, 32)[0]
+                      e_phentsize = struct.unpack_from("<H", raw, 54)[0]
+                      e_phnum = struct.unpack_from("<H", raw, 56)[0]
+                      for idx in range(e_phnum):
+                          off = e_phoff + idx * e_phentsize
+                          p_type = struct.unpack_from("<I", raw, off)[0]
+                          p_align = struct.unpack_from("<Q", raw, off + 48)[0]
+                          if p_type == 1 and p_align < 16384:
+                              raise SystemExit(f"error: {apk} {entry} p_align={p_align} < 16384")
+              print(f"Verified APK {apk}: ABIs present, size <= 6 MiB, 16 KB aligned.")
+          PY
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-android-debug-apk
+          path: mobile/android/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Upload Release AAB & APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-android-release-artifacts
+          path: |
+            mobile/android/app/build/outputs/bundle/release/*.aab
+            mobile/android/app/build/outputs/apk/release/*.apk
+          retention-days: 14
+
+      - name: Upload lint, detekt, ktlint & test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-android-reports
+          path: mobile/android/app/build/reports/**
+          retention-days: 14

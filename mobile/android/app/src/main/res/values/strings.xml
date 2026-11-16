@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Mesh VPN</string>
+    <string name="qs_tile_label">Mesh VPN</string>
+    <string name="notification_channel_vpn">Mesh VPN Tunnel</string>
+    <string name="notification_channel_alerts">Mesh VPN Alerts</string>
+    <string name="notification_title">Mesh VPN</string>
+    <string name="notification_status_connected">Connected (%1$s)</string>
+    <string name="notification_status_connecting">Connecting to Mesh...</string>
+    <string name="notification_status_degraded">Control offline; P2P active</string>
+    <string name="notification_status_stopped">Disconnected</string>
+    <string name="notification_status_waiting_unlock">Waiting for device unlock to load VPN keys</string>
+    <string name="notification_action_disconnect">Disconnect</string>
+    <string name="notification_warning_lockdown">Lockdown active: non-VPN internet is blocked by Android</string>
+    <string name="notification_warning_private_dns">Strict Private DNS active: .mesh.internal may bypass Split-DNS</string>
+    <string name="biometric_prompt_title">Verify identity</string>
+    <string name="biometric_prompt_subtitle">Authenticate to perform sensitive Mesh VPN action</string>
+    <string name="biometric_prompt_negative">Cancel</string>
+    <string name="share_bugreport_chooser">Share scrubbed Mesh VPN diagnostics</string>
+</resources>

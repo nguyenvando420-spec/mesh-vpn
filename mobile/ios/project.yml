@@ -1,0 +1,126 @@
+name: MeshApp
+options:
+  bundleIdPrefix: dev.meshvpn.ios
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CLANG_ENABLE_MODULES: "YES"
+    INFOPLIST_OUTPUT_FORMAT: xml
+targets:
+  MeshCoreKit:
+    type: framework
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: MeshCoreKit/Sources
+      - path: Generated/mesh_mobile_ffi.swift
+    info:
+      path: MeshCoreKit/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.ios.MeshCoreKit
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
+        DEFINES_MODULE: "YES"
+        SKIP_INSTALL: "YES"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@executable_path/../../Frameworks"
+    dependencies:
+      - framework: Frameworks/MeshMobileFFI.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: Network.framework
+      - sdk: NetworkExtension.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CoreFoundation.framework
+  MeshPacketTunnel:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: MeshPacketTunnel/Sources
+    info:
+      path: MeshPacketTunnel/Info.plist
+    entitlements:
+      path: Entitlements/MeshPacketTunnel.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.ios.PacketTunnel
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
+        SKIP_INSTALL: "YES"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "@executable_path/../../Frameworks"
+    dependencies:
+      - target: MeshCoreKit
+        embed: false
+  MeshApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: MeshApp/Sources
+      - path: MeshApp/Resources
+    info:
+      path: MeshApp/Info.plist
+    entitlements:
+      path: Entitlements/MeshApp.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.ios
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        DEVELOPMENT_ASSET_PATHS: ""
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+    dependencies:
+      - target: MeshCoreKit
+        embed: true
+      - target: MeshPacketTunnel
+        embed: true
+      - sdk: LocalAuthentication.framework
+      - sdk: AVFoundation.framework
+  MeshVPNTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: MeshVPNTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.ios.tests
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/MeshApp.app/MeshApp"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+    dependencies:
+      - target: MeshApp
+      - target: MeshCoreKit
+schemes:
+  MeshApp:
+    build:
+      targets:
+        MeshCoreKit: all
+        MeshPacketTunnel: all
+        MeshApp: all
+        MeshVPNTests:
+          - test
+    test:
+      gatherCoverageData: false
+      targets:
+        - name: MeshVPNTests

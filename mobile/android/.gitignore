@@ -1,0 +1,12 @@
+.gradle/
+.m2/
+build/
+app/build/
+app/src/main/jniLibs/
+local.properties
+*.apk
+*.aab
+*.so
+*.jks
+*.keystore
+*.p12

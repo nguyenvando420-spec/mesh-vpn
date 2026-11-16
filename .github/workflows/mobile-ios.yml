@@ -1,0 +1,189 @@
+name: Mobile iOS CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "feat/**"
+      - "fix/**"
+      - "sprint/**"
+    paths:
+      - "mobile/ios/**"
+      - "crates/mesh-mobile-ffi/**"
+      - "crates/mesh-client/**"
+      - "crates/mesh-core/**"
+      - "crates/mesh-crypto/**"
+      - "crates/mesh-datapath/**"
+      - "crates/mesh-net/**"
+      - "crates/mesh-proto/**"
+      - "crates/mesh-sys/**"
+      - "tools/uniffi-bindgen/**"
+      - "scripts/build-ios-xcframework.sh"
+      - ".github/workflows/mobile-ios.yml"
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - "mobile/ios/**"
+      - "crates/mesh-mobile-ffi/**"
+      - "crates/mesh-client/**"
+      - "crates/mesh-core/**"
+      - "crates/mesh-crypto/**"
+      - "crates/mesh-datapath/**"
+      - "crates/mesh-net/**"
+      - "crates/mesh-proto/**"
+      - "crates/mesh-sys/**"
+      - "tools/uniffi-bindgen/**"
+      - "scripts/build-ios-xcframework.sh"
+      - ".github/workflows/mobile-ios.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  ios-simulator-ci:
+    name: Build XCFramework, SwiftLint & iOS Simulator XCTest ($0)
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Static Hygiene, Security & UTF-8 No-BOM LF Check
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          errors = []
+          allowed_suffixes = {
+              ".swift", ".yml", ".yaml", ".plist", ".entitlements",
+              ".xcstrings", ".json", ".sh", ".md"
+          }
+          scan_files = [
+              pathlib.Path("scripts/build-ios-xcframework.sh"),
+              pathlib.Path(".github/workflows/mobile-ios.yml"),
+          ]
+          ios_root = pathlib.Path("mobile/ios")
+          for p in sorted(ios_root.rglob("*")):
+              if p.is_dir():
+                  if p.suffix in {".xcodeproj", ".xcframework"}:
+                      errors.append(f"Forbidden checked-in Apple build artifact: {p}")
+                  continue
+              if p.suffix.lower() in {".p12", ".mobileprovision", ".ipa"}:
+                  errors.append(f"Forbidden signing/archive artifact in git: {p}")
+              if p.suffix.lower() in allowed_suffixes:
+                  scan_files.append(p)
+
+          prod_dirs = {"MeshCoreKit", "MeshApp", "MeshPacketTunnel"}
+          for path in scan_files:
+              raw = path.read_bytes()
+              if raw.startswith(b"\xef\xbb\xbf"):
+                  errors.append(f"UTF-8 BOM detected: {path}")
+              if b"\r\n" in raw or b"\r" in raw:
+                  errors.append(f"CR/CRLF line ending detected (expected LF): {path}")
+              text = raw.decode("utf-8")
+
+              if path.suffix.lower() in {".plist", ".entitlements"}:
+                  if "NSAllowsArbitraryLoads" in text:
+                      errors.append(f"Forbidden NSAllowsArbitraryLoads in {path}")
+                  if "CFBundleURLTypes" in text:
+                      errors.append(f"Forbidden CFBundleURLTypes deep-link scheme in {path}")
+
+              if path.suffix.lower() == ".swift" and any(d in path.parts for d in prod_dirs):
+                  for idx, line in enumerate(text.splitlines(), start=1):
+                      stripped = line.strip()
+                      if stripped.startswith("//") or stripped.startswith("/*"):
+                          continue
+                      if re.search(r"\bfatalError\s*\(", line):
+                          errors.append(f"Forbidden fatalError in {path}:{idx}")
+                      if re.search(r"\b(try|as)!", line):
+                          errors.append(f"Forbidden try!/as! in {path}:{idx}")
+
+          if errors:
+              for err in errors:
+                  print(err, file=sys.stderr)
+              sys.exit(1)
+          print(f"Static hygiene checks passed across {len(scan_files)} iOS files.")
+          PY
+
+      - name: Install Rust 1.94.1 with iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+
+      - name: Cache Cargo registry and iOS build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen and SwiftLint
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          if ! command -v swiftlint >/dev/null 2>&1; then
+            brew install swiftlint
+          fi
+
+      - name: Build MeshMobileFFI.xcframework and UniFFI Swift bindings
+        run: bash scripts/build-ios-xcframework.sh
+
+      - name: Generate Xcode project via XcodeGen
+        run: xcodegen generate --spec mobile/ios/project.yml
+
+      - name: Run SwiftLint (--strict)
+        run: |
+          cd mobile/ios
+          swiftlint lint --strict
+
+      - name: Select available iPhone Simulator and run xcodebuild build test ($0)
+        run: |
+          set -euo pipefail
+          SIM_UDID="$(python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          raw = subprocess.check_output(
+              ["xcrun", "simctl", "list", "devices", "available", "-j"],
+              text=True,
+          )
+          data = json.loads(raw)
+          preferred = []
+          fallback = []
+          for runtime, devices in data.get("devices", {}).items():
+              if "iOS" not in runtime:
+                  continue
+              for dev in devices:
+                  if not dev.get("isAvailable"):
+                      continue
+                  name = dev.get("name", "")
+                  if name == "iPhone 16":
+                      preferred.append((runtime, dev["udid"]))
+                  elif name.startswith("iPhone"):
+                      fallback.append((runtime, dev["udid"]))
+          chosen = sorted(preferred, reverse=True) or sorted(fallback, reverse=True)
+          if not chosen:
+              print("ERROR: No available iPhone Simulator found", file=sys.stderr)
+              sys.exit(1)
+          print(chosen[0][1])
+          PY
+          )"
+          echo "Using iOS Simulator UDID: ${SIM_UDID}"
+          xcodebuild \
+            -project mobile/ios/MeshApp.xcodeproj \
+            -scheme MeshApp \
+            -destination "platform=iOS Simulator,id=${SIM_UDID}" \
+            CODE_SIGNING_ALLOWED=NO \
+            build test

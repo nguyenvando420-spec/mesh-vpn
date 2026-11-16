@@ -1,0 +1,74 @@
+included:
+  - MeshCoreKit
+  - MeshApp
+  - MeshPacketTunnel
+  - MeshVPNTests
+
+excluded:
+  - Generated
+  - Frameworks
+  - MeshApp.xcodeproj
+
+opt_in_rules:
+  - empty_count
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+  - private_outlet
+  - unneeded_parentheses_in_closure_argument
+
+force_unwrapping: error
+force_try: error
+force_cast: error
+fatal_error_message: error
+implicitly_unwrapped_optional: error
+
+line_length:
+  warning: 100
+  error: 120
+  ignores_urls: true
+  ignores_interpolated_strings: true
+
+identifier_name:
+  min_length:
+    warning: 2
+  excluded:
+    - id
+    - ip
+    - tx
+    - rx
+    - os
+    - ui
+    - qr
+    - ok
+
+function_body_length:
+  warning: 80
+  error: 120
+
+type_body_length:
+  warning: 350
+  error: 500
+
+file_length:
+  warning: 600
+  error: 900
+
+cyclomatic_complexity:
+  warning: 15
+  error: 25
+
+nesting:
+  type_level: 2
+  function_level: 3
+
+custom_rules:
+  no_fatal_error:
+    name: "No fatalError"
+    regex: '\bfatalError\s*\('
+    message: "fatalError is forbidden in Mesh iOS targets."
+    severity: error
+  no_print_statements:
+    name: "No print statements"
+    regex: '^\s*(print|debugPrint)\s*\('
+    message: "Use MeshLogger (os.Logger) instead of print/debugPrint."
+    severity: error

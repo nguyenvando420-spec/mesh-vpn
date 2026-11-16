@@ -1,0 +1,136 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Confirm Server" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Xác nhận máy chủ"
+          }
+        }
+      }
+    },
+    "Connect" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kết nối"
+          }
+        }
+      }
+    },
+    "Connected" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Đã kết nối"
+          }
+        }
+      }
+    },
+    "Disconnect" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ngắt kết nối"
+          }
+        }
+      }
+    },
+    "Disconnected" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Đã ngắt kết nối"
+          }
+        }
+      }
+    },
+    "Enroll Mesh VPN" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Đăng ký Mesh VPN"
+          }
+        }
+      }
+    },
+    "Export Redacted Bugreport" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Xuất báo lỗi đã che bí mật"
+          }
+        }
+      }
+    },
+    "Mesh VPN" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mesh VPN"
+          }
+        }
+      }
+    },
+    "On-Demand Auto-Connect" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tự động kết nối On-Demand"
+          }
+        }
+      }
+    },
+    "Peers" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thiết bị cùng mạng"
+          }
+        }
+      }
+    },
+    "Reset Device Identity" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Đặt lại danh tính thiết bị"
+          }
+        }
+      }
+    },
+    "Rotate Node Key" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Xoay vòng khóa nút"
+          }
+        }
+      }
+    },
+    "Scan Enrollment QR Code" : {
+      "localizations" : {
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quét mã QR đăng ký"
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.0"
+}
