@@ -1,5 +1,6 @@
 package dev.meshvpn.android.vpn
 
+import dev.meshvpn.android.data.diagnostics.BugreportShareManager
 import dev.meshvpn.android.data.diagnostics.BugreportShareOps
 import dev.meshvpn.android.data.diagnostics.SafeLogger
 import dev.meshvpn.android.data.keystore.AndroidKeystoreDekManager

@@ -3,7 +3,9 @@ import Foundation
 import MeshCoreKit
 import Network
 import NetworkExtension
+#if canImport(os.proc) && !targetEnvironment(simulator)
 import os.proc
+#endif
 
 /// Thread-safe one-shot wrapper bridging Objective-C reply closures to Swift 6 tasks.
 private final class IpcReplyBox: @unchecked Sendable {
@@ -326,7 +328,7 @@ private extension PacketTunnelProvider {
     }
 
     func handleMemoryPressure() {
-        let availableBytes = os_proc_available_memory()
+        let availableBytes = Self.queryAvailableMemoryBytes()
         let availableMiB = Double(availableBytes) / (1024.0 * 1024.0)
         let ctx = stateLock.read {
             MemoryPressureContext(
@@ -564,5 +566,14 @@ private extension PacketTunnelProvider {
         }
 
         logger.notice("tunnel_stopped_cleanly", detail: reason)
+    }
+
+    static func queryAvailableMemoryBytes() -> Int {
+        #if canImport(os.proc) && !targetEnvironment(simulator)
+        return Int(os_proc_available_memory())
+        #else
+        // iOS Simulator runs on the macOS host kernel without Jetsam memory watermarks.
+        return 50 * 1024 * 1024
+        #endif
     }
 }
