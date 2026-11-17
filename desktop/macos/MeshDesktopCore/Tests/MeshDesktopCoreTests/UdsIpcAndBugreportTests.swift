@@ -212,11 +212,11 @@ final class UdsIpcAndBugreportTests: XCTestCase {
         let installScript = try goodHelper.buildAppleScript(
             for: .installOrUpdateService(firewallOptIn: true)
         )
-        let uninstallKeepScript = try goodHelper.buildShellCommand(
+        let uninstallKeepScript = try AdminPrivilegeHelper.buildShellCommand(
             for: .uninstallService(purgeData: false),
             bundleResourceURL: tempRes
         )
-        let uninstallPurgeScript = try goodHelper.buildShellCommand(
+        let uninstallPurgeScript = try AdminPrivilegeHelper.buildShellCommand(
             for: .uninstallService(purgeData: true),
             bundleResourceURL: tempRes
         )
