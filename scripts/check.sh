@@ -43,7 +43,10 @@ BOM_FILES=$(find . -type f \
   -not -path './mobile/android/*/build/*' \
   -not -path './mobile/ios/.build/*' \
   -not -path './mobile/ios/DerivedData/*' \
-  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.xml' -o -name '*.pbxproj' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
+  -not -path './desktop/macos/.build/*' \
+  -not -path './desktop/macos/DerivedData/*' \
+  -not -path './desktop/macos/*.xcodeproj/*' \
+  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.ps1' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.entitlements' -o -name '*.strings' -o -name '*.xcstrings' -o -name '*.service' -o -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.xml' -o -name '*.pbxproj' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
   -exec awk 'BEGIN { bom = sprintf("%c%c%c", 239, 187, 191) } FNR == 1 && index($0, bom) == 1 { print FILENAME }' {} +)
 
 if [ -n "$BOM_FILES" ]; then
@@ -61,7 +64,10 @@ CRLF_FILES=$(find . -type f \
   -not -path './mobile/android/*/build/*' \
   -not -path './mobile/ios/.build/*' \
   -not -path './mobile/ios/DerivedData/*' \
-  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.service' -o -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.xml' -o -name '*.pbxproj' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
+  -not -path './desktop/macos/.build/*' \
+  -not -path './desktop/macos/DerivedData/*' \
+  -not -path './desktop/macos/*.xcodeproj/*' \
+  \( -name '*.rs' -o -name '*.toml' -o -name '*.md' -o -name '*.sh' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.entitlements' -o -name '*.strings' -o -name '*.xcstrings' -o -name '*.service' -o -name '*.kt' -o -name '*.kts' -o -name '*.swift' -o -name '*.xml' -o -name '*.pbxproj' -o -name '.editorconfig' -o -name '.gitignore' -o -name '.gitattributes' \) \
   -exec awk 'BEGIN { cr = sprintf("%c", 13) } index($0, cr) > 0 { if (!seen[FILENAME]++) print FILENAME }' {} +)
 
 if [ -n "$CRLF_FILES" ]; then
@@ -130,6 +136,77 @@ if [ -d "mobile" ]; then
   if [ -n "$ATS_HITS" ]; then
     echo "ERROR: Forbidden ATS bypass 'NSAllowsArbitraryLoads' in plist:" >&2
     echo "$ATS_HITS" >&2
+    exit 1
+  fi
+fi
+
+# 2d. Desktop macOS & Gatekeeper hygiene (desktop/macos/, scripts/, crates/)
+SPCTL_DIRS=""
+[ -d "desktop/macos" ] && SPCTL_DIRS="desktop/macos"
+[ -d "scripts" ] && SPCTL_DIRS="$SPCTL_DIRS scripts"
+[ -d "crates" ] && SPCTL_DIRS="$SPCTL_DIRS crates"
+if [ -n "$SPCTL_DIRS" ]; then
+  # shellcheck disable=SC2086
+  SPCTL_HITS=$(find $SPCTL_DIRS -type f \
+    -not -path 'desktop/macos/.build/*' \
+    -not -path 'desktop/macos/DerivedData/*' \
+    -not -path 'desktop/macos/*.xcodeproj/*' \
+    -not -path 'scripts/check.ps1' \
+    -not -path 'scripts/check.sh' \
+    \( -name '*.rs' -o -name '*.swift' -o -name '*.sh' -o -name '*.ps1' -o -name '*.yml' -o -name '*.yaml' -o -name '*.plist' -o -name '*.entitlements' -o -name '*.toml' -o -name '*.md' \) \
+    -exec grep -HnE 'spctl[[:space:]]+--master-disable' {} + || true)
+  if [ -n "$SPCTL_HITS" ]; then
+    echo "ERROR: Forbidden Gatekeeper bypass 'spctl --master-disable' detected:" >&2
+    echo "$SPCTL_HITS" >&2
+    exit 1
+  fi
+fi
+
+if [ -d "desktop/macos" ]; then
+  FORBIDDEN_DESKTOP=$(find desktop/macos \
+    -not -path 'desktop/macos/.build/*' \
+    -not -path 'desktop/macos/DerivedData/*' \
+    -not -path 'desktop/macos/*.xcodeproj/*' \
+    \( -name '*.p12' -o -name '*.mobileprovision' -o -name '*.cer' -o -name '*.dmg' -o -name '*.pkg' -o -name '*.app' \) || true)
+  if [ -n "$FORBIDDEN_DESKTOP" ]; then
+    echo "ERROR: Forbidden desktop macOS signing/distribution artifact in repository:" >&2
+    echo "$FORBIDDEN_DESKTOP" >&2
+    exit 1
+  fi
+
+  SANDBOX_HITS=$(find desktop/macos -type f \
+    -not -path 'desktop/macos/.build/*' \
+    -not -path 'desktop/macos/DerivedData/*' \
+    -not -path 'desktop/macos/*.xcodeproj/*' \
+    \( -name '*.entitlements' -o -name '*.plist' -o -name '*.yml' -o -name '*.yaml' \) \
+    -exec grep -Hn 'com\.apple\.security\.app-sandbox' {} + || true)
+  if [ -n "$SANDBOX_HITS" ]; then
+    echo "ERROR: Forbidden App Sandbox entitlement in desktop/macos:" >&2
+    echo "$SANDBOX_HITS" >&2
+    exit 1
+  fi
+
+  URL_SCHEME_HITS=$(find desktop/macos -type f \
+    -not -path 'desktop/macos/.build/*' \
+    -not -path 'desktop/macos/DerivedData/*' \
+    -not -path 'desktop/macos/*.xcodeproj/*' \
+    \( -name '*.plist' -o -name '*.yml' -o -name '*.yaml' \) \
+    -exec grep -HnE '(CFBundleURLTypes|NSAllowsArbitraryLoads)' {} + || true)
+  if [ -n "$URL_SCHEME_HITS" ]; then
+    echo "ERROR: Forbidden 'CFBundleURLTypes' or 'NSAllowsArbitraryLoads' in desktop/macos:" >&2
+    echo "$URL_SCHEME_HITS" >&2
+    exit 1
+  fi
+
+  UIKIT_HITS=$(find desktop/macos -type f \
+    -not -path 'desktop/macos/.build/*' \
+    -not -path 'desktop/macos/DerivedData/*' \
+    -not -path 'desktop/macos/*.xcodeproj/*' \
+    -name '*.swift' \
+    -exec grep -HnE '^[[:space:]]*import[[:space:]]+UIKit([^a-zA-Z0-9_]|$)' {} + || true)
+  if [ -n "$UIKIT_HITS" ]; then
+    echo "ERROR: Forbidden iOS-only 'import UIKit' in desktop/macos:" >&2
+    echo "$UIKIT_HITS" >&2
     exit 1
   fi
 fi

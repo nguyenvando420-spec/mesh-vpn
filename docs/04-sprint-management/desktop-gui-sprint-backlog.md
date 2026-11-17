@@ -128,9 +128,9 @@ flowchart TD
   - *Đầu vào*: Codebase `feat/desktop-gui` hiện hành, Gate 1 `OQ-DGUI-01..03`, Gate 2 `ADR-020..026`, `desktop-gui-coding-standards.md`, `desktop-gui-ipc-and-ui-contracts.md`.
   - *Mở khóa*: `WP-D-A1` và `WP-D-A2` chạy song song ngay sau khi `WP-D-A0` đạt DoD.
 - **Phạm vi File Sở hữu Độc quyền (`Exclusive File Ownership List`)**:
-  - `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `.gitignore`, `.editorconfig`
+  - `Cargo.toml`, `Cargo.lock`, `crates/{mesh-client,mesh-datapath,mesh-mobile-ffi,mesh-net,mesh-proto}/Cargo.toml` *(đồng bộ `version = "0.3.0"` cho internal path deps)*, `Dockerfile`, `.gitignore`, `.editorconfig`
   - `scripts/check.ps1`, `scripts/check.sh`
-  - `crates/mesh-core/src/{defaults.rs,lib.rs}`
+  - `crates/mesh-core/src/{defaults.rs,lib.rs,mobile_uri.rs}` *(mở `pub fn validate_preauth_key`)*, `crates/mesh-core/tests/**`
   - `crates/mesh-crypto/src/lib.rs`
   - `crates/mesh-proto/src/agent_ipc.rs`, `crates/mesh-proto/tests/**`
   - `crates/mesh/Cargo.toml`
@@ -401,9 +401,9 @@ Bảng dưới đây xác nhận mọi tệp/thư mục được tạo mới ho�
 
 | Nhóm File / Đường dẫn | Chủ sở hữu | Wave thực thi | Ghi chú khóa xung đột |
 |---|---|---|---|
-| `Cargo.toml`, `Cargo.lock`, `Dockerfile`, `.gitignore`, `.editorconfig` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Nâng `[workspace.package] version = "0.3.0"`, khóa `crates/mesh-gui`, giữ `deny.toml` (`0` thay đổi), cập nhật `Dockerfile` Stage 1 `cargo fetch --locked`, neo `.gitignore` cho `desktop/macos/` |
+| `Cargo.toml`, `Cargo.lock`, `crates/{mesh-client,mesh-datapath,mesh-mobile-ffi,mesh-net,mesh-proto}/Cargo.toml`, `Dockerfile`, `.gitignore`, `.editorconfig` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Nâng `[workspace.package] version = "0.3.0"` & path deps nội bộ, khóa `crates/mesh-gui`, giữ `deny.toml` (`0` thay đổi), cập nhật `Dockerfile` Stage 1 `cargo fetch --locked`, neo `.gitignore` cho `desktop/macos/` |
 | `scripts/check.ps1`, `scripts/check.sh` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Mở rộng `[2/5]` quét `desktop/macos/`, giữ nguyên allowlist `unsafe` (`mesh-sys`) & `.expose_secret()` (`4` crates) |
-| `crates/mesh-core/src/{defaults.rs,lib.rs}` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Bổ sung `MAX_BUGREPORT_ARCHIVE_BYTES` (`20_971_520`) và re-export `validate_preauth_key` + helper chuẩn hóa dùng chung |
+| `crates/mesh-core/src/{defaults.rs,lib.rs,mobile_uri.rs}`, `crates/mesh-core/tests/**` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Bổ sung `MAX_BUGREPORT_ARCHIVE_BYTES` (`20_971_520`) và `pub fn validate_preauth_key` + helper chuẩn hóa dùng chung |
 | `crates/mesh-crypto/src/lib.rs` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Export helper `sha256_digest`, `ct_eq_bytes`, `verify_file_sha256` phục vụ `mesh-gui` (cấm `sha2`/`subtle` trực tiếp ngoài `mesh-crypto`) |
 | `crates/mesh-proto/src/agent_ipc.rs`, `crates/mesh-proto/tests/**` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Giữ nguyên 13 trường `AgentStatusResponse` (`deny_unknown_fields`), thêm `AgentVersionResponse` & `AgentResetIdentityRequest` |
 | `crates/mesh/Cargo.toml` | **`WP-D-A0`** | Wave D-A.0 (Tuần tự) | Thêm `[target.'cfg(windows)'.dependencies] mesh-sys.workspace = true` cho `WP-D-A2` |

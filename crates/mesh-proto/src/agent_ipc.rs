@@ -357,6 +357,23 @@ pub struct BugreportResponse {
 /// Canonical alias for [`BugreportResponse`].
 pub type AgentBugreportResponse = BugreportResponse;
 
+/// Agent daemon version metadata returned from `GET /v1/agent/version` (`ADR-024`, `US-101`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentVersionResponse {
+    /// Bare SemVer version of the running daemon binary (e.g. `"0.3.0"`).
+    pub agent_version: String,
+    /// Control/IPC protocol version supported by the daemon.
+    pub protocol_version: u16,
+    /// Daemon binary identifier (e.g. `"meshd"`).
+    pub binary_name: String,
+}
+
+/// Privileged request sent to `POST /v1/agent/reset-identity` (`ADR-024`, `US-101`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResetIdentityRequest {}
+
 #[cfg(test)]
 mod tests {
     use super::{AgentRotateKeyRequest, AgentSetRequest};

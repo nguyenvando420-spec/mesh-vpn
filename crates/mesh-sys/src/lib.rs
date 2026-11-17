@@ -30,12 +30,16 @@ pub mod tun_windows;
 
 pub mod memory_ios;
 
+#[cfg(target_os = "windows")]
+pub mod gui_windows;
 #[cfg(target_os = "linux")]
 pub mod ipc_linux;
 #[cfg(target_os = "macos")]
 pub mod ipc_macos;
 #[cfg(target_os = "windows")]
 pub mod ipc_windows;
+#[cfg(target_os = "windows")]
+pub mod process_windows;
 
 #[cfg(target_os = "linux")]
 pub mod netmon_linux;

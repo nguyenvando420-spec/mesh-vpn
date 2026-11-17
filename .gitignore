@@ -62,3 +62,13 @@ coverage.*
 *.mobileprovision
 *.p12
 *.mobile/generated/
+
+# Desktop macOS build, XcodeGen, and distribution artifacts
+desktop/macos/*.xcodeproj/
+desktop/macos/build/
+desktop/macos/.build/
+desktop/macos/DerivedData/
+*.xcworkspace/
+*.dmg
+*.pkg
+Mesh VPN.app/

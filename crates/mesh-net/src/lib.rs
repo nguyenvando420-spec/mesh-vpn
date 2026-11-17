@@ -8,6 +8,8 @@ pub mod firewall_linux;
 pub mod firewall_macos;
 #[cfg(all(feature = "desktop-os", target_os = "windows"))]
 pub mod firewall_windows;
+#[cfg(feature = "desktop-ipc")]
+pub mod gui_handoff;
 #[cfg(feature = "desktop-os")]
 pub mod hosts;
 #[cfg(all(feature = "desktop-os", target_os = "linux"))]
@@ -65,9 +67,16 @@ pub use hosts::{
 };
 #[cfg(feature = "desktop-ipc")]
 pub use ipc::{
-    CallerPrivilege, DefaultPrivilegeIpc, FakeIpcPeerVerifier, FakePrivilegeIpc, IpcChannelKind,
-    IpcPeerVerifier, PeerIdentity, PrivilegeIpc, UnixSocketAuthPolicy, send_ipc_json_request,
-    serve_ipc_http_connection,
+    AgentVersionStatus, CallerPrivilege, DefaultPrivilegeIpc, FakeIpcPeerVerifier,
+    FakePrivilegeIpc, HEADER_MESH_AGENT_VERSION, HEADER_MESH_ARCHIVE_BYTES,
+    HEADER_MESH_SCRUBBED_ITEMS, IPC_ADMIN_MUTATION_TIMEOUT, IPC_CONNECT_BUDGET_CAP,
+    IPC_CONNECT_TIMEOUT, IPC_NETCHECK_TIMEOUT, IPC_PING_MAX_TIMEOUT, IPC_RO_QUERY_TIMEOUT,
+    IPC_STREAM_CHUNK_IDLE_TIMEOUT, IpcChannelKind, IpcConnectFailureKind, IpcJsonResponse,
+    IpcOperationTier, IpcPeerVerifier, PeerIdentity, PrivilegeIpc, StreamedBugreportMetadata,
+    UnixSocketAuthPolicy, classify_agent_version_probe, classify_cli_version_probe_exit_code,
+    classify_ipc_io_error_kind, connect_with_pipe_busy_retry, map_ipc_connect_error,
+    ping_request_timeout, send_ipc_json_request, send_ipc_json_request_with_timeout,
+    send_ipc_json_with_meta, serve_ipc_http_connection, stream_ipc_bugreport,
 };
 pub use keystore::{KeysFileStore, StoredNodeIdentity};
 #[cfg(feature = "desktop-os")]

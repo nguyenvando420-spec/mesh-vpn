@@ -19,6 +19,8 @@ pub use logging::{
 };
 pub use mobile_uri::{
     MAX_MOBILE_JOIN_URI_LEN, MOBILE_JOIN_URI_HOST, MOBILE_JOIN_URI_SCHEME, MOBILE_JOIN_URI_VERSION,
-    MOBILE_SYSTEM_CA_PIN, MobileJoinTlsAuth, MobileJoinUri, format_join_uri, parse_join_uri,
+    MOBILE_SYSTEM_CA_PIN, MobileJoinTlsAuth, MobileJoinUri, NormalizedControlEndpoint,
+    format_join_uri, is_ip_literal_host, normalize_control_endpoint, parse_join_uri,
+    validate_desktop_tls_policy, validate_preauth_key,
 };
 pub use types::{KeyId, NodeId, NodeName, OverlayCidr, OverlayIp, Port, PublicKey, SpkiPin};

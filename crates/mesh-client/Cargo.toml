@@ -16,10 +16,10 @@ mobile-platform-verifier = ["mesh-crypto/mobile-platform-verifier"]
 
 [dependencies]
 mesh-core.workspace = true
-mesh-crypto = { path = "../mesh-crypto", version = "0.1.0", default-features = false }
+mesh-crypto = { path = "../mesh-crypto", version = "0.3.0", default-features = false }
 mesh-proto.workspace = true
-mesh-net = { path = "../mesh-net", version = "0.1.0", default-features = false }
-mesh-datapath = { path = "../mesh-datapath", version = "0.1.0", default-features = false }
+mesh-net = { path = "../mesh-net", version = "0.3.0", default-features = false }
+mesh-datapath = { path = "../mesh-datapath", version = "0.3.0", default-features = false }
 base64.workspace = true
 bytes.workspace = true
 rustls.workspace = true
@@ -36,6 +36,6 @@ tracing.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-mesh-crypto = { path = "../mesh-crypto", version = "0.1.0", features = ["certgen"] }
+mesh-crypto = { path = "../mesh-crypto", version = "0.3.0", features = ["certgen"] }
 proptest.workspace = true
 tempfile.workspace = true

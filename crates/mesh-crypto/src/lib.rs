@@ -31,9 +31,10 @@ pub use disco_box::{
 };
 pub use hash::{ct_eq_bytes, sha256_digest, sha256_hex, verify_file_sha256};
 pub use keys::{
-    DiscoKeypair, NodeKeypair, PreAuthToken, extract_tls_exporter_binding, random_bytes,
+    DiscoKeypair, NodeKeypair, PreAuthToken, extract_tls_exporter_binding, mask_preauth_token,
+    random_bytes,
 };
-pub use secret::Secret;
+pub use secret::{Secret, Zeroizing};
 pub use tlspin::{
     PinSet, SpkiPinVerifier, build_pinned_client_config, build_system_ca_client_config,
     classify_rustls_error, extract_spki_pin_from_der,

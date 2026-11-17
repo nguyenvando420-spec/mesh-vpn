@@ -16,7 +16,7 @@ desktop-os = ["desktop-ipc", "dep:windows-service", "mesh-crypto/desktop-certs"]
 
 [dependencies]
 mesh-core.workspace = true
-mesh-crypto = { path = "../mesh-crypto", version = "0.1.0", default-features = false }
+mesh-crypto = { path = "../mesh-crypto", version = "0.3.0", default-features = false }
 mesh-proto.workspace = true
 mesh-sys.workspace = true
 axum = { workspace = true, optional = true }

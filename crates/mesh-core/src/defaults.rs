@@ -148,3 +148,6 @@ pub const DEFAULT_MOBILE_COALESCED_HEARTBEAT_MS: u64 = 45_000;
 
 /// Maximum streamed mobile bugreport archive size in bytes (1 MiB, `ADR-016`).
 pub const DEFAULT_MOBILE_MAX_BUGREPORT_BYTES: usize = 1_048_576;
+
+/// Maximum desktop diagnostic bugreport archive size in bytes (`20 MiB`, `ADR-023`).
+pub const MAX_BUGREPORT_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;

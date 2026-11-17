@@ -49,7 +49,7 @@ try {
     Write-Host "==> [2/5] Enforcing static repository & security rules..." -ForegroundColor Cyan
 
     # 2a. Check for UTF-8 BOM (0xEF 0xBB 0xBF) and LF line endings across text files
-    $TextExtensions = @(".rs", ".toml", ".md", ".ps1", ".sh", ".json", ".yml", ".yaml", ".plist", ".service", ".kt", ".kts", ".swift", ".xml", ".pbxproj", ".editorconfig", ".gitattributes", ".gitignore")
+    $TextExtensions = @(".rs", ".toml", ".md", ".ps1", ".sh", ".json", ".yml", ".yaml", ".plist", ".entitlements", ".strings", ".xcstrings", ".service", ".kt", ".kts", ".swift", ".xml", ".pbxproj", ".editorconfig", ".gitattributes", ".gitignore")
     $AllFiles = Get-ChildItem -Path $RepoRoot -Recurse -File -Force | Where-Object {
         $_.FullName -notlike "*\.git\*" -and
         $_.FullName -notlike "*\target\*" -and
@@ -58,7 +58,10 @@ try {
         $_.FullName -notlike "*\mobile\android\build\*" -and
         $_.FullName -notlike "*\mobile\android\*\build\*" -and
         $_.FullName -notlike "*\mobile\ios\.build\*" -and
-        $_.FullName -notlike "*\mobile\ios\DerivedData\*"
+        $_.FullName -notlike "*\mobile\ios\DerivedData\*" -and
+        $_.FullName -notlike "*\desktop\macos\.build\*" -and
+        $_.FullName -notlike "*\desktop\macos\DerivedData\*" -and
+        $_.FullName -notmatch "\\desktop\\macos\\[^\\]+\.xcodeproj(\\|$)"
     }
 
     $BomFailures = @()
@@ -145,6 +148,75 @@ try {
                 $plistRaw = Get-Content -Path $mf.FullName -Raw
                 if ($plistRaw -match "NSAllowsArbitraryLoads") {
                     Write-Error "Forbidden ATS bypass 'NSAllowsArbitraryLoads' in plist: $rel"
+                    exit 1
+                }
+            }
+        }
+    }
+
+    # 2d. Desktop macOS & Gatekeeper hygiene (desktop/macos/, scripts/, crates/)
+    $SpctlScanDirs = @("desktop/macos", "scripts", "crates") | ForEach-Object { Join-Path $RepoRoot $_ } | Where-Object { Test-Path $_ }
+    if ($SpctlScanDirs.Count -gt 0) {
+        $SpctlTargets = Get-ChildItem -Path $SpctlScanDirs -Recurse -File -Force | Where-Object {
+            $_.FullName -notlike "*\desktop\macos\.build\*" -and
+            $_.FullName -notlike "*\desktop\macos\DerivedData\*" -and
+            $_.FullName -notmatch "\\desktop\\macos\\[^\\]+\.xcodeproj(\\|$)"
+        }
+        foreach ($tf in $SpctlTargets) {
+            $rel = $tf.FullName.Substring($RepoRoot.Length + 1).Replace("\", "/")
+            if ($rel -eq "scripts/check.ps1" -or $rel -eq "scripts/check.sh") {
+                continue
+            }
+            $ext = $tf.Extension.ToLowerInvariant()
+            if (@(".rs", ".swift", ".sh", ".ps1", ".yml", ".yaml", ".plist", ".entitlements", ".toml", ".md") -contains $ext) {
+                $raw = Get-Content -Path $tf.FullName -Raw
+                if ($raw -match "spctl\s+--master-disable") {
+                    Write-Error "Forbidden Gatekeeper bypass 'spctl --master-disable' detected in: $rel"
+                    exit 1
+                }
+            }
+        }
+    }
+
+    $DesktopMacosDir = Join-Path $RepoRoot "desktop\macos"
+    if (Test-Path $DesktopMacosDir) {
+        $ForbiddenDesktopExts = @(".p12", ".mobileprovision", ".cer", ".dmg", ".pkg", ".app")
+        $DesktopEntries = Get-ChildItem -Path $DesktopMacosDir -Recurse -Force | Where-Object {
+            $_.FullName -notlike "*\desktop\macos\.build\*" -and
+            $_.FullName -notlike "*\desktop\macos\DerivedData\*" -and
+            $_.FullName -notmatch "\\desktop\\macos\\[^\\]+\.xcodeproj(\\|$)"
+        }
+        foreach ($entry in $DesktopEntries) {
+            $rel = $entry.FullName.Substring($RepoRoot.Length + 1).Replace("\", "/")
+            $ext = $entry.Extension.ToLowerInvariant()
+            if ($ForbiddenDesktopExts -contains $ext) {
+                Write-Error "Forbidden desktop macOS signing/distribution artifact in repository: $rel"
+                exit 1
+            }
+            if ($entry.PSIsContainer) {
+                continue
+            }
+            if (@(".entitlements", ".plist", ".yml", ".yaml") -contains $ext) {
+                $cfgRaw = Get-Content -Path $entry.FullName -Raw
+                if ($cfgRaw -match "com\.apple\.security\.app-sandbox") {
+                    Write-Error "Forbidden App Sandbox entitlement 'com.apple.security.app-sandbox' in desktop/macos: $rel"
+                    exit 1
+                }
+                if ($ext -ne ".entitlements") {
+                    if ($cfgRaw -match "CFBundleURLTypes") {
+                        Write-Error "Forbidden URL scheme handler 'CFBundleURLTypes' in desktop/macos: $rel"
+                        exit 1
+                    }
+                    if ($cfgRaw -match "NSAllowsArbitraryLoads") {
+                        Write-Error "Forbidden ATS bypass 'NSAllowsArbitraryLoads' in desktop/macos: $rel"
+                        exit 1
+                    }
+                }
+            }
+            if ($ext -eq ".swift") {
+                $swiftRaw = Get-Content -Path $entry.FullName -Raw
+                if ($swiftRaw -match "(?m)^\s*import\s+UIKit\b") {
+                    Write-Error "Forbidden iOS-only 'import UIKit' in desktop/macos: $rel"
                     exit 1
                 }
             }

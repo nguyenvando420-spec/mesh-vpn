@@ -318,6 +318,148 @@ pub fn format_join_uri(
     Ok(uri)
 }
 
+/// Normalized `<host>:<effective_port>` Control endpoint and host classification (`US-102`, `ADR-025`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedControlEndpoint {
+    /// Canonical `<host>:<port>` or `[<ipv6>]:<port>` endpoint string ready for IPC/config.
+    pub endpoint: String,
+    /// Normalized host without brackets or port.
+    pub host: String,
+    /// Effective TCP port (`port_override`, embedded port, or `DEFAULT_CONTROL_TCP_PORT`).
+    pub port: Port,
+    /// `true` when [`Self::host`] is an IPv4 or IPv6 literal (`System CA` must be locked off).
+    pub is_ip_literal: bool,
+}
+
+/// Returns `true` when `raw_host` (optionally bracketed for IPv6) is an IPv4 or IPv6 literal.
+#[must_use]
+pub fn is_ip_literal_host(raw_host: &str) -> bool {
+    let trimmed = raw_host.trim();
+    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        return Ipv6Addr::from_str(inner).is_ok();
+    }
+    IpAddr::from_str(trimmed).is_ok()
+}
+
+/// Normalizes a manual Desktop/Mobile Control endpoint into `<host>:<effective_port>` (or
+/// `[<ipv6>]:<effective_port>`), filling `port_override` or `DEFAULT_CONTROL_TCP_PORT` when
+/// omitted and rejecting schemes, control characters, and shell metacharacters (`US-102`).
+pub fn normalize_control_endpoint(
+    raw: &str,
+    port_override: Option<Port>,
+) -> AppResult<NormalizedControlEndpoint> {
+    if raw.bytes().any(|b| b.is_ascii_control()) {
+        return Err(AppError::invalid_argument(
+            "control endpoint contains invalid control characters",
+        ));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::invalid_argument(
+            "control endpoint must not be empty",
+        ));
+    }
+    if trimmed.contains("://")
+        || trimmed.bytes().any(|b| b.is_ascii_whitespace())
+        || trimmed.contains([
+            '/', '\\', '@', '?', '#', ';', '|', '&', '$', '(', ')', '\'', '"', '`',
+        ])
+    {
+        return Err(AppError::invalid_argument(
+            "control endpoint must be <host> or <host>:<port> without URL scheme or shell characters",
+        ));
+    }
+
+    let (host, parsed_port, is_ip_literal) = if let Some(after_open) = trimmed.strip_prefix('[') {
+        let Some((host_inner, rest)) = after_open.split_once(']') else {
+            return Err(AppError::invalid_argument(
+                "missing closing `]` in IPv6 control endpoint",
+            ));
+        };
+        let ipv6 = Ipv6Addr::from_str(host_inner).map_err(|_| {
+            AppError::invalid_argument("invalid bracketed IPv6 literal in endpoint")
+        })?;
+        let parsed_port = if rest.is_empty() {
+            None
+        } else {
+            let Some(port_str) = rest.strip_prefix(':') else {
+                return Err(AppError::invalid_argument(
+                    "invalid suffix after bracketed IPv6 endpoint host",
+                ));
+            };
+            Some(parse_strict_port(port_str)?)
+        };
+        (ipv6.to_string(), parsed_port, true)
+    } else if let Ok(ipv6) = Ipv6Addr::from_str(trimmed) {
+        (ipv6.to_string(), None, true)
+    } else if let Some((host_raw, port_str)) = trimmed.rsplit_once(':') {
+        if host_raw.is_empty() || host_raw.contains(':') {
+            return Err(AppError::invalid_argument(
+                "unbracketed IPv6 or extra colon in control endpoint host",
+            ));
+        }
+        let parsed_port = parse_strict_port(port_str)?;
+        if let Ok(ipv4) = Ipv4Addr::from_str(host_raw) {
+            (ipv4.to_string(), Some(parsed_port), true)
+        } else {
+            validate_dns_hostname(host_raw)?;
+            (host_raw.to_ascii_lowercase(), Some(parsed_port), false)
+        }
+    } else if let Ok(ipv4) = Ipv4Addr::from_str(trimmed) {
+        (ipv4.to_string(), None, true)
+    } else {
+        validate_dns_hostname(trimmed)?;
+        (trimmed.to_ascii_lowercase(), None, false)
+    };
+
+    let effective_port = port_override
+        .or(parsed_port)
+        .unwrap_or_else(crate::defaults::default_control_port);
+    let endpoint = if host.contains(':') {
+        format!("[{host}]:{effective_port}")
+    } else {
+        format!("{host}:{effective_port}")
+    };
+
+    Ok(NormalizedControlEndpoint {
+        endpoint,
+        host,
+        port: effective_port,
+        is_ip_literal,
+    })
+}
+
+/// Normalizes `raw_endpoint` and enforces zero-TOFU TLS rules (`SystemCa` forbidden on IP
+/// literals; `SpkiPin` required for IP endpoints, `SEC-04`, `US-102`).
+pub fn validate_desktop_tls_policy(
+    raw_endpoint: &str,
+    port_override: Option<Port>,
+    tls_auth: MobileJoinTlsAuth,
+) -> AppResult<NormalizedControlEndpoint> {
+    let normalized = normalize_control_endpoint(raw_endpoint, port_override)?;
+    if normalized.is_ip_literal && matches!(tls_auth, MobileJoinTlsAuth::SystemCa) {
+        return Err(AppError::invalid_argument(
+            "system-ca TLS mode cannot be paired with an IP literal control endpoint (SEC-04)",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn parse_strict_port(port_str: &str) -> AppResult<Port> {
+    if port_str.is_empty()
+        || !port_str.bytes().all(|b| b.is_ascii_digit())
+        || port_str.starts_with('0')
+    {
+        return Err(AppError::invalid_argument(
+            "control endpoint port must be a decimal number 1..=65535 without leading zeros",
+        ));
+    }
+    let port_num: u16 = port_str
+        .parse()
+        .map_err(|_| AppError::invalid_argument("control endpoint port out of range 1..=65535"))?;
+    Port::from_u16(port_num)
+}
+
 fn validate_control_endpoint(raw: &str) -> AppResult<(bool, String)> {
     if raw.is_empty()
         || raw.contains('/')
@@ -427,7 +569,9 @@ fn validate_dns_hostname(host: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_preauth_key(key: &str) -> AppResult<()> {
+/// Validates a pre-authentication token syntax (`mpk_` prefix + >= 32 bytes base64url entropy,
+/// max 256 chars, zeroizing decoded buffer) (`ADR-019`, `US-102`).
+pub fn validate_preauth_key(key: &str) -> AppResult<()> {
     if key.len() > MAX_PREAUTH_KEY_LEN
         || key
             .bytes()
