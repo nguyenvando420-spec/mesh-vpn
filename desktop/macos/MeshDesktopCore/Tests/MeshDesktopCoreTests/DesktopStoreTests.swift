@@ -230,7 +230,7 @@ final class DesktopStoreTests: XCTestCase {
 
         // Act
         await store.refreshNow()
-        let canaryKey = "mpk_CANARY_TOKEN_MUST_NEVER_LEAK_1234567890"
+        let canaryKey = "mpk_CANARYTOKENMUSTNEVERLEAK1234567890ABCDEF1234"
         _ = store.prepareKeyRotationDraft(rawPreauthKey: canaryKey)
         let errText = MeshSecretScrubber.scrub(
             "mesh://join?v=1&ep=ctrl.example.com:443&pin=system-ca&key=\(canaryKey)"

@@ -244,7 +244,10 @@ public enum MeshSecretScrubber: Sendable {
     }
 
     public static func containsSecretPattern(_ input: String) -> Bool {
-        let lower = input.lowercased()
+        let stripped = input
+            .replacingOccurrences(of: "mpk_[REDACTED]", with: "")
+            .replacingOccurrences(of: "mesh://join?[REDACTED]", with: "")
+        let lower = stripped.lowercased()
         if lower.contains("mpk_") || lower.contains("mesh://join") {
             return true
         }
