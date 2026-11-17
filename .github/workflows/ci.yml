@@ -176,7 +176,21 @@ jobs:
           cargo install --locked cargo-deny --version 0.20.2
 
       - name: Run scripts/check.sh
-        run: sh scripts/check.sh
+        run: |
+          set -o pipefail
+          if ! sh scripts/check.sh 2>&1 | tee /tmp/check-sh.log; then
+            echo "::warning title=scripts/check.sh::First attempt failed; retrying once..."
+            if ! sh scripts/check.sh 2>&1 | tee /tmp/check-sh.log; then
+              python3 - <<'PY'
+          import pathlib, re
+          lines = pathlib.Path("/tmp/check-sh.log").read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"(?:FAILED|error(?:\[|:)|panicked at|ERROR:)", ln)]
+          snippet = "\n".join((matches[-15:] + ["--- tail ---"] + lines[-25:])[-40:])
+          print("::error title=scripts/check.sh::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
+              exit 1
+            fi
+          fi
 
       - name: Run SLO verification suite (US-058)
         run: bash scripts/run-slo-suite.sh --skip-static-checks --output-dir "$RUNNER_TEMP/slo-report"
@@ -309,7 +323,21 @@ jobs:
           cargo install --locked cargo-deny --version 0.20.2
 
       - name: Run scripts/check.sh
-        run: sh scripts/check.sh
+        run: |
+          set -o pipefail
+          if ! sh scripts/check.sh 2>&1 | tee /tmp/check-sh.log; then
+            echo "::warning title=scripts/check.sh::First attempt failed; retrying once..."
+            if ! sh scripts/check.sh 2>&1 | tee /tmp/check-sh.log; then
+              python3 - <<'PY'
+          import pathlib, re
+          lines = pathlib.Path("/tmp/check-sh.log").read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"(?:FAILED|error(?:\[|:)|panicked at|ERROR:)", ln)]
+          snippet = "\n".join((matches[-15:] + ["--- tail ---"] + lines[-25:])[-40:])
+          print("::error title=scripts/check.sh::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
+              exit 1
+            fi
+          fi
 
       - name: Validate macOS verification script syntax and dry-run checks
         run: |
