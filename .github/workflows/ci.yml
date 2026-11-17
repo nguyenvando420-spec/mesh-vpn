@@ -654,6 +654,7 @@ jobs:
           Write-Output "Verified Wintun 0.14.1 SHA-256 and exported MESH_WINTUN_SHA256=$dllSha256"
 
       - name: Build release binaries (${{ matrix.target }})
+        shell: bash
         run: |
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
             cargo build --release --locked --target ${{ matrix.target }} --bin MeshVPN --bin mesh --bin meshd --bin mesh-server
