@@ -28,8 +28,7 @@ public enum JoinUriParser: Sendable {
             )
         }
         if EndpointNormalizer.containsAsciiControl(trimmed)
-            || EndpointNormalizer.containsAsciiWhitespace(trimmed)
-        {
+            || EndpointNormalizer.containsAsciiWhitespace(trimmed) {
             throw DesktopValidationError.invalidArgument(
                 "mobile join URI contains invalid whitespace or control characters"
             )
@@ -92,8 +91,7 @@ public enum JoinUriParser: Sendable {
             || raw.contains("#")
             || raw.contains(" ")
             || raw.contains("\t")
-            || EndpointNormalizer.containsAsciiControl(raw)
-        {
+            || EndpointNormalizer.containsAsciiControl(raw) {
             throw DesktopValidationError.invalidArgument(
                 "invalid node name: contains forbidden whitespace or comment characters"
             )
@@ -276,8 +274,7 @@ public enum JoinUriParser: Sendable {
             || raw.contains("#")
             || raw.contains("://")
             || EndpointNormalizer.containsAsciiControl(raw)
-            || EndpointNormalizer.containsAsciiWhitespace(raw)
-        {
+            || EndpointNormalizer.containsAsciiWhitespace(raw) {
             throw DesktopValidationError.invalidArgument("invalid `ep` control endpoint syntax")
         }
 

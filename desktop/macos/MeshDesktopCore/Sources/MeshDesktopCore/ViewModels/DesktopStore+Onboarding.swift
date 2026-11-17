@@ -1,5 +1,31 @@
 import Foundation
 
+/// Manual onboarding form inputs passed to `DesktopStore.prepareDraftFromManualForm` (`US-110`).
+public struct ManualOnboardingInput: Equatable, Sendable {
+    public let rawEndpoint: String
+    public let rawPortOverride: String
+    public let tlsAuthMode: TlsAuthMode
+    public let rawServerPin: String
+    public let rawPreauthKey: String
+    public let rawNodeName: String
+
+    public init(
+        rawEndpoint: String,
+        rawPortOverride: String = "",
+        tlsAuthMode: TlsAuthMode,
+        rawServerPin: String = "",
+        rawPreauthKey: String,
+        rawNodeName: String = ""
+    ) {
+        self.rawEndpoint = rawEndpoint
+        self.rawPortOverride = rawPortOverride
+        self.tlsAuthMode = tlsAuthMode
+        self.rawServerPin = rawServerPin
+        self.rawPreauthKey = rawPreauthKey
+        self.rawNodeName = rawNodeName
+    }
+}
+
 /// Onboarding draft validation, enrollment confirmation, and connection control actions.
 extension DesktopStore {
     public func handlePastedOnboardingInput(_ pastedText: String) -> EnrollmentConfirmationDraft? {
@@ -42,32 +68,27 @@ extension DesktopStore {
     }
 
     public func prepareDraftFromManualForm(
-        rawEndpoint: String,
-        rawPortOverride: String,
-        tlsAuthMode: TlsAuthMode,
-        rawServerPin: String,
-        rawPreauthKey: String,
-        rawNodeName: String
+        _ input: ManualOnboardingInput
     ) -> EnrollmentConfirmationDraft? {
         lastActionError = nil
         do {
-            let trimmedPort = rawPortOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedPort = input.rawPortOverride.trimmingCharacters(in: .whitespacesAndNewlines)
             let parsedPort: UInt16? = trimmedPort.isEmpty
                 ? nil
                 : try EndpointNormalizer.parseStrictPort(trimmedPort)
             let policy = try EndpointNormalizer.validateDesktopTlsPolicy(
-                rawEndpoint: rawEndpoint,
+                rawEndpoint: input.rawEndpoint,
                 portOverride: parsedPort,
-                tlsAuthMode: tlsAuthMode,
-                rawServerPin: rawServerPin
+                tlsAuthMode: input.tlsAuthMode,
+                rawServerPin: input.rawServerPin
             )
-            let trimmedKey = rawPreauthKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedKey = input.rawPreauthKey.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedKey.isEmpty else {
                 throw DesktopValidationError.invalidArgument("Pre-auth key is required.")
             }
             try JoinUriParser.validatePreauthKey(trimmedKey)
 
-            let trimmedNode = rawNodeName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedNode = input.rawNodeName.trimmingCharacters(in: .whitespacesAndNewlines)
             let validatedNode: String? = trimmedNode.isEmpty
                 ? nil
                 : try JoinUriParser.validateNodeName(trimmedNode)

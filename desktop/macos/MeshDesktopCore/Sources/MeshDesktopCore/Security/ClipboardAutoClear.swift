@@ -69,7 +69,14 @@ public final class ClipboardAutoClear {
         guard !trimmed.isEmpty else { return }
 
         wipeTask?.cancel()
-        let digest = Self.sha256Data(for: text)
+        let rawToHash: String
+        if let currentClip = pasteboard.stringContent(),
+           currentClip.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed {
+            rawToHash = currentClip
+        } else {
+            rawToHash = text
+        }
+        let digest = Self.sha256Data(for: rawToHash)
         pendingWipe = PendingWipe(
             recordedChangeCount: pasteboard.changeCount,
             sha256Digest: digest

@@ -43,8 +43,7 @@ struct PeersTableView: View {
 
     private var selectedPeer: AgentPeerStatus? {
         if let selectedPeerId,
-           let matched = filteredPeers.first(where: { $0.nodeId == selectedPeerId })
-        {
+           let matched = filteredPeers.first(where: { $0.nodeId == selectedPeerId }) {
             return matched
         }
         return filteredPeers.first
@@ -100,8 +99,7 @@ struct PeersTableView: View {
                     Divider()
                     inspectorActions(peer)
                     if let ping = store.latestPing,
-                       ping.targetOverlayIp == peer.overlayIp || ping.targetName == peer.name
-                    {
+                       ping.targetOverlayIp == peer.overlayIp || ping.targetName == peer.name {
                         Divider()
                         pingSummaryBox(ping)
                     }

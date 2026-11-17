@@ -127,8 +127,7 @@ public enum DaemonVersionBannerState: Equatable, Sendable {
 
 /// Redacted enrollment draft displayed in confirmation modal before calling `up` or `rotate-key`.
 public struct EnrollmentConfirmationDraft:
-    Identifiable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible
-{
+    Identifiable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     public let id: UUID
     public let serverEndpoint: String
     public let portOverride: UInt16?

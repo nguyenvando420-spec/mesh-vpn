@@ -105,7 +105,7 @@ public struct AdminPrivilegeHelper: AdminPrivilegeExecuting, Sendable {
             try requireRegularFile(at: "\(resDir)/install-macos.sh")
             let scriptPath = posixSingleQuoted("\(resDir)/install-macos.sh")
             let purgeFlag = purgeData ? " --purge" : ""
-            return "/bin/sh \(scriptPath) --uninstall\(purgeFlag)"
+            return "/bin/sh \(scriptPath) --uninstall --keep-app\(purgeFlag)"
         }
     }
 
@@ -196,8 +196,7 @@ public struct AdminPrivilegeHelper: AdminPrivilegeExecuting, Sendable {
             let lower = errText.lowercased()
             if lower.contains("-128")
                 || lower.contains("user canceled")
-                || lower.contains("user cancelled")
-            {
+                || lower.contains("user cancelled") {
                 throw AdminPrivilegeError.userCancelled
             }
             let fallback = "osascript exited with status \(process.terminationStatus)"

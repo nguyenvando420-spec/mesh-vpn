@@ -99,8 +99,7 @@ public actor UdsIpcClient: DesktopIpcTransport {
         endpointResult: Result<AgentVersionResponse, Error>
     ) throws -> AgentVersionStatus {
         if let header = headerVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !header.isEmpty
-        {
+           !header.isEmpty {
             return .version(header)
         }
         switch endpointResult {
@@ -110,8 +109,7 @@ public actor UdsIpcClient: DesktopIpcTransport {
         case .failure(let error):
             if let ipcErr = error as? IpcClientError,
                case .remoteError(let code, let env) = ipcErr,
-               code == 404 || env.kind == .notFound
-            {
+               code == 404 || env.kind == .notFound {
                 return .legacyPre030
             }
             throw error
@@ -299,17 +297,17 @@ public actor UdsIpcClient: DesktopIpcTransport {
             totalTimeout: adminMutationTimeoutSeconds,
             chunkIdleTimeout: streamChunkIdleTimeoutSeconds
         )
+        let spec = UdsStreamRequestSpec(
+            socketPath: socketPath,
+            method: "POST",
+            path: "/v1/agent/bugreport/stream",
+            bodyData: Data("{}".utf8),
+            timeouts: timeouts
+        )
         return try await withCheckedThrowingContinuation { continuation in
             ioQueue.async {
                 do {
-                    let meta = try PosixUdsHttpTransport.executeStream(
-                        socketPath: socketPath,
-                        method: "POST",
-                        path: "/v1/agent/bugreport/stream",
-                        bodyData: Data("{}".utf8),
-                        timeouts: timeouts,
-                        onChunk: onChunk
-                    )
+                    let meta = try PosixUdsHttpTransport.executeStream(spec, onChunk: onChunk)
                     continuation.resume(returning: meta)
                 } catch {
                     continuation.resume(throwing: error)
@@ -336,18 +334,18 @@ public actor UdsIpcClient: DesktopIpcTransport {
         bodyData: Data?,
         responseTimeoutSeconds: TimeInterval
     ) async throws -> IpcResponseWithMeta<Resp> {
-        let connectBudget = connectTimeoutSeconds
+        let spec = UdsJsonRequestSpec(
+            socketPath: socketPath,
+            method: method,
+            path: path,
+            bodyData: bodyData,
+            connectTimeout: connectTimeoutSeconds,
+            responseTimeout: responseTimeoutSeconds
+        )
         return try await withCheckedThrowingContinuation { continuation in
             ioQueue.async {
                 do {
-                    let raw = try PosixUdsHttpTransport.executeJson(
-                        socketPath: socketPath,
-                        method: method,
-                        path: path,
-                        bodyData: bodyData,
-                        connectTimeout: connectBudget,
-                        responseTimeout: responseTimeoutSeconds
-                    )
+                    let raw = try PosixUdsHttpTransport.executeJson(spec)
                     let decoded = try JSONDecoder().decode(Resp.self, from: raw.body)
                     continuation.resume(
                         returning: IpcResponseWithMeta(

@@ -15,18 +15,12 @@ let package = Package(
     targets: [
         .target(
             name: "MeshDesktopCore",
-            path: "Sources/MeshDesktopCore",
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency")
-            ]
+            path: "Sources/MeshDesktopCore"
         ),
         .testTarget(
             name: "MeshDesktopCoreTests",
             dependencies: ["MeshDesktopCore"],
-            path: "Tests/MeshDesktopCoreTests",
-            swiftSettings: [
-                .enableUpcomingFeature("StrictConcurrency")
-            ]
+            path: "Tests/MeshDesktopCoreTests"
         )
     ]
 )

@@ -151,8 +151,10 @@ mod tests {
     };
     use crate::clipboard::ClipboardSecretGuard;
     use crate::elevation_worker::{
-        GuiLaunchMode, parse_gui_launch_args, parse_sha256_sidecar_hex,
+        GuiLaunchMode, INSTALL_DIR_SDDL, PROGRAM_DATA_DIR_SDDL, WINDOWS_BUNDLE_REMOVAL_LIST,
+        is_locked_binary_replace_error, parse_gui_launch_args, parse_sha256_sidecar_hex,
         resolve_expected_wintun_sha256, resolve_program_files_mesh_dir, verify_wintun_path_sha256,
+        windows_paths_equivalent,
     };
     use crate::ipc_poller::{
         DASHBOARD_POLL_INTERVAL_MS, PollingControl, TRAY_IDLE_POLL_INTERVAL_MS,
@@ -259,5 +261,52 @@ mod tests {
         assert!(clip.evaluate_clear(77, Some("mpk_bin_test_guard")));
         clip.disarm();
         assert!(!clip.is_armed());
+    }
+
+    #[test]
+    fn test_elevation_worker_sddl_oici_self_copy_guard_and_uninstall_bundle_list() {
+        // Arrange & Act & Assert: SDDL enforces OICI inheritance matching install-windows.ps1
+        assert_eq!(PROGRAM_DATA_DIR_SDDL, "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)");
+        assert_eq!(
+            INSTALL_DIR_SDDL,
+            "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;AU)"
+        );
+
+        // Bundle removal list covers all staged binaries and Wintun legal assets
+        for required in [
+            "MeshVPN.exe",
+            "MeshVPN.exe.new",
+            "meshd.exe",
+            "mesh.exe",
+            "mesh-server.exe",
+            "wintun.dll",
+            "wintun.dll.sha256",
+            "WINTUN-LICENSE.txt",
+            "README-WINTUN.md",
+        ] {
+            assert!(
+                WINDOWS_BUNDLE_REMOVAL_LIST.contains(&required),
+                "WINDOWS_BUNDLE_REMOVAL_LIST missing `{required}`"
+            );
+        }
+
+        // Self-copy path equivalence normalization (case, slashes, verbatim prefix)
+        assert!(windows_paths_equivalent(
+            Path::new(r"C:\Program Files\Mesh\MeshVPN.exe"),
+            Path::new(r"\\?\c:/program files/mesh/meshvpn.exe")
+        ));
+        assert!(!windows_paths_equivalent(
+            Path::new(r"C:\Users\Alice\Downloads\MeshVPN.exe"),
+            Path::new(r"C:\Program Files\Mesh\MeshVPN.exe")
+        ));
+
+        // Locked binary replace detects ERROR_ACCESS_DENIED (5) & ERROR_SHARING_VIOLATION (32)
+        assert!(is_locked_binary_replace_error(Some(5), "Access is denied"));
+        assert!(is_locked_binary_replace_error(
+            Some(32),
+            "The process cannot access the file"
+        ));
+        assert!(is_locked_binary_replace_error(None, "sharing violation"));
+        assert!(!is_locked_binary_replace_error(Some(2), "file not found"));
     }
 }

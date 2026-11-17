@@ -18,8 +18,7 @@ struct DashboardBannersView: View {
                 errorBanner(err)
             }
             if let conflict = store.status?.selfNetwork.overlayConflictWarning,
-               !conflict.isEmpty
-            {
+               !conflict.isEmpty {
                 DashboardWarningBanner(
                     icon: "exclamationmark.triangle.fill",
                     color: .orange,

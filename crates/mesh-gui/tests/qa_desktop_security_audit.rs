@@ -810,6 +810,94 @@ fn test_macos_bundle_swift_packaging_and_windows_installer_invariants() -> Resul
 }
 
 #[test]
+fn test_gate3_remediation_sddl_oici_keep_app_darwin_rename_swift6_and_poller_suspend()
+-> Result<(), String> {
+    // 1. `Package.swift` uses Swift 6.0 without redundant `StrictConcurrency` upcoming feature
+    let package_swift = read_repo_file("desktop/macos/MeshDesktopCore/Package.swift")?;
+    assert!(package_swift.contains("// swift-tools-version: 6.0"));
+    assert!(
+        !package_swift.contains("StrictConcurrency"),
+        "Package.swift must not pass .enableUpcomingFeature(\"StrictConcurrency\") under Swift 6.0"
+    );
+
+    // 2. `AdminPrivilegeHelper.swift` passes `--keep-app` on service uninstall (`ADR-026`)
+    let admin_helper = read_repo_file(
+        "desktop/macos/MeshDesktopCore/Sources/MeshDesktopCore/Security/AdminPrivilegeHelper.swift",
+    )?;
+    assert!(
+        admin_helper.contains("--uninstall --keep-app"),
+        "AdminPrivilegeHelper.swift must pass --keep-app when uninstalling background service"
+    );
+
+    // 3. `BugreportStreamWriter.swift` commits via atomic POSIX `Darwin.rename` (`ADR-023`)
+    let bug_writer = read_repo_file(
+        "desktop/macos/MeshDesktopCore/Sources/MeshDesktopCore/Storage/BugreportStreamWriter.swift",
+    )?;
+    assert!(bug_writer.contains("Darwin.rename(partURL.path, destURL.path)"));
+    assert!(!bug_writer.contains("replaceItemAt("));
+
+    // 4. `DesktopStore+DiagnosticsAndErrors.swift` refreshes outside `withSuspendedPolling`
+    let store_diag_path = concat!(
+        "desktop/macos/MeshDesktopCore/Sources/MeshDesktopCore/",
+        "ViewModels/DesktopStore+DiagnosticsAndErrors.swift",
+    );
+    let store_diag = read_repo_file(store_diag_path)?;
+    let suspend_start = store_diag
+        .find("let succeeded = await withSuspendedPolling")
+        .ok_or_else(|| "missing withSuspendedPolling result binding".to_owned())?;
+    let refresh_after = store_diag
+        .get(suspend_start..)
+        .and_then(|s| s.find("await self.refreshStatus(probeVersionIfNeeded: true)"))
+        .ok_or_else(|| "missing post-suspend refreshStatus".to_owned())?;
+    let try_exec = store_diag
+        .get(suspend_start..)
+        .and_then(|s| s.find("try await self.privilegeHelper.execute(action)"))
+        .ok_or_else(|| "missing privilegeHelper.execute".to_owned())?;
+    assert!(try_exec < refresh_after);
+
+    // 5. `scripts/run-desktop-qa.sh` invokes `swiftlint` inside `desktop/macos`
+    let qa_sh = read_repo_file("scripts/run-desktop-qa.sh")?;
+    assert!(qa_sh.contains("cd \"$REPO_ROOT/desktop/macos\" && swiftlint lint --strict"));
+
+    // 6. Windows `elevation_worker.rs` enforces OICI SDDL, self-copy guard, and bundle list
+    let worker_rs = read_repo_file("crates/mesh-gui/src/elevation_worker.rs")?;
+    assert!(worker_rs.contains(r#""D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)""#));
+    assert!(worker_rs.contains(r#""D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;AU)""#));
+    assert!(worker_rs.contains("windows_paths_equivalent"));
+    assert!(worker_rs.contains("Some(5 | 32)"));
+    for asset in [
+        "\"MeshVPN.exe.new\"",
+        "\"mesh-server.exe\"",
+        "\"WINTUN-LICENSE.txt\"",
+        "\"README-WINTUN.md\"",
+        "\"netmap-cache.json\"",
+        "\"bugreports\"",
+    ] {
+        assert!(
+            worker_rs.contains(asset),
+            "elevation_worker.rs missing uninstall/purge asset {asset}"
+        );
+    }
+
+    // 7. `ipc_poller.rs` suspends RO polling in both handoff and bugreport spawns
+    let poller_rs = read_repo_file("crates/mesh-gui/src/ipc_poller.rs")?;
+    assert_eq!(
+        poller_rs
+            .matches("let _pause_guard = poll_control.suspend();")
+            .count(),
+        2,
+        "ipc_poller.rs must acquire PollingSuspensionGuard in both handoff & bugreport spawns"
+    );
+
+    // 8. `release.yml` generates randomized ephemeral keychain password
+    let rel_yml = read_repo_file(".github/workflows/release.yml")?;
+    assert!(rel_yml.contains("openssl rand -hex 24"));
+    assert!(!rel_yml.contains("mesh-ephemeral-kc-pass"));
+
+    Ok(())
+}
+
+#[test]
 fn test_ui_state_machine_and_no_secrets_in_outputs_comprehensive() {
     let canary = "mpk_U0VDVVJJVFlfQVVESVRfQ0FOQVJZXzAxMjM0NTY3ODkw";
     let secret = Secret::new(canary.to_owned());

@@ -231,8 +231,7 @@ public final class DesktopStore: ObservableObject {
             lastConnectError = ipcErr
             if serviceFilesPresent,
                case .serviceUnavailable = ipcErr,
-               probeVersionIfNeeded || versionBanner == .unknown
-            {
+               probeVersionIfNeeded || versionBanner == .unknown {
                 if let offline = await transport.probeOfflineDaemonVersion(
                     binaryPath: daemonBinaryPath
                 ) {
@@ -329,8 +328,7 @@ public final class DesktopStore: ObservableObject {
         probeEndpointIfMissing: Bool
     ) async {
         if let header = headerVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !header.isEmpty
-        {
+           !header.isEmpty {
             applyVersionStatus(.version(header))
             return
         }

@@ -80,8 +80,7 @@ public enum EndpointNormalizer: Sendable {
         }
         if trimmed.contains("://")
             || containsAsciiWhitespace(trimmed)
-            || trimmed.rangeOfCharacter(from: forbiddenCharacters) != nil
-        {
+            || trimmed.rangeOfCharacter(from: forbiddenCharacters) != nil {
             throw DesktopValidationError.invalidArgument(
                 "control endpoint must be <host> or <host>:<port> without scheme or shell chars"
             )
@@ -284,9 +283,13 @@ public enum EndpointNormalizer: Sendable {
         return rendered
     }
 
-    private static func parseHostAndPort(
-        _ trimmed: String
-    ) throws -> (host: String, port: UInt16?, isIpLiteral: Bool) {
+    private struct HostPortParts: Sendable {
+        let host: String
+        let port: UInt16?
+        let isIpLiteral: Bool
+    }
+
+    private static func parseHostAndPort(_ trimmed: String) throws -> HostPortParts {
         if trimmed.hasPrefix("[") {
             guard let closeIdx = trimmed.firstIndex(of: "]") else {
                 throw DesktopValidationError.invalidArgument(
@@ -303,7 +306,7 @@ public enum EndpointNormalizer: Sendable {
             let afterClose = trimmed.index(after: closeIdx)
             let rest = String(trimmed[afterClose...])
             if rest.isEmpty {
-                return (canonicalV6, nil, true)
+                return HostPortParts(host: canonicalV6, port: nil, isIpLiteral: true)
             }
             guard rest.hasPrefix(":") else {
                 throw DesktopValidationError.invalidArgument(
@@ -311,11 +314,11 @@ public enum EndpointNormalizer: Sendable {
                 )
             }
             let port = try parseStrictPort(String(rest.dropFirst()))
-            return (canonicalV6, port, true)
+            return HostPortParts(host: canonicalV6, port: port, isIpLiteral: true)
         }
 
         if let canonicalV6 = parseCanonicalIPv6(trimmed) {
-            return (canonicalV6, nil, true)
+            return HostPortParts(host: canonicalV6, port: nil, isIpLiteral: true)
         }
 
         if let colonIdx = trimmed.lastIndex(of: ":") {
@@ -328,17 +331,17 @@ public enum EndpointNormalizer: Sendable {
             }
             let parsedPort = try parseStrictPort(portStr)
             if let canonicalV4 = parseStrictIPv4(hostRaw) {
-                return (canonicalV4, parsedPort, true)
+                return HostPortParts(host: canonicalV4, port: parsedPort, isIpLiteral: true)
             }
             try validateDnsHostname(hostRaw)
-            return (hostRaw.lowercased(), parsedPort, false)
+            return HostPortParts(host: hostRaw.lowercased(), port: parsedPort, isIpLiteral: false)
         }
 
         if let canonicalV4 = parseStrictIPv4(trimmed) {
-            return (canonicalV4, nil, true)
+            return HostPortParts(host: canonicalV4, port: nil, isIpLiteral: true)
         }
         try validateDnsHostname(trimmed)
-        return (trimmed.lowercased(), nil, false)
+        return HostPortParts(host: trimmed.lowercased(), port: nil, isIpLiteral: false)
     }
 
     static func containsAsciiControl(_ text: String) -> Bool {

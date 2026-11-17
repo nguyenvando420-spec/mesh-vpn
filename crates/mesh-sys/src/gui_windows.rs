@@ -2,6 +2,7 @@
 //! anti-TOCTOU DLL locking, single-instance coordination, and registry/shortcut helpers
 //! (`ADR-020`, `ADR-021`, `ADR-023`, `ADR-026`, `BLK-DGUI-G2-02/04/05`).
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString, c_void};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -2374,6 +2375,7 @@ struct WindowBridge<'a> {
     handler: *const (dyn WindowEventHandler + 'a),
     activate_msg: u32,
     taskbar_created_msg: u32,
+    claimed_by_hwnd: *const Cell<bool>,
 }
 
 /// Registers the Win32 window class, creates the main Dashboard window, and runs the message loop.
@@ -2405,16 +2407,18 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
         return Err(SysError::io(OP, io::Error::last_os_error()));
     }
 
+    let bridge_claimed = Cell::new(false);
     let bridge = Box::new(WindowBridge {
         handler: std::ptr::from_ref(handler),
         activate_msg: spec.activate_msg,
         taskbar_created_msg: spec.taskbar_created_msg,
+        claimed_by_hwnd: &raw const bridge_claimed,
     });
     let bridge_ptr = Box::into_raw(bridge);
 
     // SAFETY: `class_wide` and `title_wide` are NUL-terminated UTF-16 strings; `bridge_ptr` is
-    // transferred to `WM_NCCREATE` and reclaimed unconditionally on `WM_NCDESTROY` (or below if
-    // `CreateWindowExW` returns null before `WM_NCCREATE`).
+    // transferred to `WM_NCCREATE` and reclaimed on `WM_NCDESTROY` (or below if `CreateWindowExW`
+    // fails before `WM_NCCREATE` sets `bridge_claimed`).
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_CONTROLPARENT,
@@ -2433,11 +2437,11 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
     };
     if hwnd.is_null() {
         let err = io::Error::last_os_error();
-        // SAFETY: Window creation failed; if `WM_NCCREATE` never freed `bridge_ptr`, reclaim if
-        // still owned here? Note `WM_NCCREATE` does not reclaim; only `WM_NCDESTROY` reclaims.
-        // Wait: if `CreateWindowExW` failed AFTER `WM_NCCREATE`, `WM_NCDESTROY` already ran!
-        // Only if `WM_NCCREATE` failed early would `bridge_ptr` not be freed; in practice
-        // `RegisterClassExW` succeeded so `WM_NCCREATE` + `WM_NCDESTROY` run symmetrically.
+        if !bridge_claimed.get() {
+            // SAFETY: `CreateWindowExW` failed before `WM_NCCREATE` attached `bridge_ptr` to
+            // `GWLP_USERDATA`, so `WM_NCDESTROY` did not run and `bridge_ptr` remains owned here.
+            let _reclaimed = unsafe { Box::from_raw(bridge_ptr) };
+        }
         return Err(SysError::io(OP, err));
     }
 
@@ -2474,6 +2478,8 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
     Ok(())
 }
 
+// SAFETY: Win32 window procedure invoked synchronously by Windows message dispatch on the GUI
+// thread with a valid `HWND`; `GWLP_USERDATA` holds either null or a live `WindowBridge` pointer.
 unsafe extern "system" fn gui_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -2485,6 +2491,14 @@ unsafe extern "system" fn gui_wnd_proc(
         if !cs_ptr.is_null() {
             // SAFETY: `lparam` on `WM_NCCREATE` points to a valid `CREATESTRUCTW`.
             let lp = unsafe { (*cs_ptr).lpCreateParams };
+            let bridge_ptr = lp.cast::<WindowBridge<'_>>();
+            if !bridge_ptr.is_null() {
+                // SAFETY: `bridge_ptr` points to the live `WindowBridge` allocated in
+                // `run_gui_window` on this UI thread, and `claimed_by_hwnd` stays on its stack.
+                unsafe {
+                    (*(*bridge_ptr).claimed_by_hwnd).set(true);
+                }
+            }
             // SAFETY: Associates `WindowBridge` raw pointer with `hwnd` user data.
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp as isize) };
         }

@@ -1,37 +1,47 @@
 import Darwin
 import Foundation
 
+internal struct UdsJsonRequestSpec: Sendable {
+    let socketPath: String
+    let method: String
+    let path: String
+    let bodyData: Data?
+    let connectTimeout: TimeInterval
+    let responseTimeout: TimeInterval
+}
+
+internal struct UdsStreamRequestSpec: Sendable {
+    let socketPath: String
+    let method: String
+    let path: String
+    let bodyData: Data?
+    let timeouts: StreamTimeoutConfig
+}
+
 /// Low-level non-blocking POSIX `AF_UNIX` stream transport with 3-tier deadlines (`ADR-023`).
 internal enum PosixUdsHttpTransport {
-    static func executeJson(
-        socketPath: String,
-        method: String,
-        path: String,
-        bodyData: Data?,
-        connectTimeout: TimeInterval,
-        responseTimeout: TimeInterval
-    ) throws -> RawHttpResponse {
-        let fd = try openAndConnect(socketPath: socketPath, timeout: connectTimeout)
+    static func executeJson(_ spec: UdsJsonRequestSpec) throws -> RawHttpResponse {
+        let fd = try openAndConnect(socketPath: spec.socketPath, timeout: spec.connectTimeout)
         defer { Darwin.close(fd) }
 
-        let deadline = ContinuousClock.now + .milliseconds(Int(responseTimeout * 1000))
+        let deadline = ContinuousClock.now + .milliseconds(Int(spec.responseTimeout * 1000))
         let requestBytes = HttpUdsWireCodec.buildHttpRequest(
-            method: method,
-            path: path,
-            bodyData: bodyData
+            method: spec.method,
+            path: spec.path,
+            bodyData: spec.bodyData
         )
         try writeAll(fd: fd, data: requestBytes, deadline: deadline)
 
         let head = try HttpUdsWireCodec.readHttpHead(
             fd: fd,
             deadline: deadline,
-            idleTimeout: responseTimeout
+            idleTimeout: spec.responseTimeout
         )
         var body = Data()
         let context = BodyStreamContext(
             fd: fd,
             totalDeadline: deadline,
-            chunkIdleTimeout: responseTimeout
+            chunkIdleTimeout: spec.responseTimeout
         )
         try HttpUdsWireCodec.readBodyStreaming(
             context: context,
@@ -53,33 +63,33 @@ internal enum PosixUdsHttpTransport {
     }
 
     static func executeStream(
-        socketPath: String,
-        method: String,
-        path: String,
-        bodyData: Data?,
-        timeouts: StreamTimeoutConfig,
+        _ spec: UdsStreamRequestSpec,
         onChunk: (Data) throws -> Void
     ) throws -> StreamedBugreportMetadata {
-        let fd = try openAndConnect(socketPath: socketPath, timeout: timeouts.connectTimeout)
+        let fd = try openAndConnect(
+            socketPath: spec.socketPath,
+            timeout: spec.timeouts.connectTimeout
+        )
         defer { Darwin.close(fd) }
 
-        let deadline = ContinuousClock.now + .milliseconds(Int(timeouts.totalTimeout * 1000))
+        let deadline = ContinuousClock.now
+            + .milliseconds(Int(spec.timeouts.totalTimeout * 1000))
         let requestBytes = HttpUdsWireCodec.buildHttpRequest(
-            method: method,
-            path: path,
-            bodyData: bodyData
+            method: spec.method,
+            path: spec.path,
+            bodyData: spec.bodyData
         )
         try writeAll(fd: fd, data: requestBytes, deadline: deadline)
 
         let head = try HttpUdsWireCodec.readHttpHead(
             fd: fd,
             deadline: deadline,
-            idleTimeout: timeouts.totalTimeout
+            idleTimeout: spec.timeouts.totalTimeout
         )
         let context = BodyStreamContext(
             fd: fd,
             totalDeadline: deadline,
-            chunkIdleTimeout: timeouts.chunkIdleTimeout
+            chunkIdleTimeout: spec.timeouts.chunkIdleTimeout
         )
         if !(200...299).contains(head.statusCode) {
             var errBody = Data()

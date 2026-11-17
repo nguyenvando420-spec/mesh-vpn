@@ -5,11 +5,8 @@ import XCTest
 
 @MainActor
 final class DesktopStoreTests: XCTestCase {
-    func testDesktopStateMapper_All8StatesAndSubStates_MapsDeterministically() {
-        // Arrange
-        let baseConn = ServerConnectionStatus(controlEndpoint: "ctrl.example.com:443")
-
-        // Act & Assert
+    func testDesktopStateMapper_OfflineAndUnconfiguredStates_MapsDeterministically() {
+        // Arrange & Act & Assert
         XCTAssertEqual(
             DesktopStateMapper.compute(
                 serviceFilesPresent: false,
@@ -46,6 +43,13 @@ final class DesktopStoreTests: XCTestCase {
             ).uiState,
             .unconfigured
         )
+    }
+
+    func testDesktopStateMapper_ActiveAndLifecycleStates_MapsDeterministically() {
+        // Arrange
+        let baseConn = ServerConnectionStatus(controlEndpoint: "ctrl.example.com:443")
+
+        // Act & Assert
         XCTAssertEqual(
             DesktopStateMapper.compute(
                 serviceFilesPresent: true,
@@ -201,6 +205,7 @@ final class DesktopStoreTests: XCTestCase {
         XCTAssertFalse(store.isPollingSuspended)
         XCTAssertEqual(countDuringStart, countMidStream)
         XCTAssertNotNil(exported)
+        XCTAssertEqual(try Data(contentsOf: dest), Data("TAR_BYTES".utf8))
     }
 
     func testDesktopStore_LegacyPre030AndSecretsCanary_TriggersBannerAndRedactsSecrets() async {
@@ -263,6 +268,46 @@ final class DesktopStoreTests: XCTestCase {
         XCTAssertTrue(transport.didCallResetIdentity)
         XCTAssertTrue(transport.didCallBringDown)
         XCTAssertNil(pasteboard.stringContent())
+    }
+
+    func testDesktopStore_StartOrRepairServiceAndManualInput_RefreshesStatusAfterResume() async {
+        // Arrange
+        let transport = MockDesktopIpcTransport()
+        transport.setState(
+            AgentStatusResponse(
+                daemonState: .connected,
+                nodeId: "n-live",
+                serverConnection: ServerConnectionStatus(controlEndpoint: "ctrl.example.com:443")
+            )
+        )
+        let store = DesktopStore(
+            transport: transport,
+            privilegeHelper: MockAdminPrivilegeExecutor(),
+            serviceChecker: MockServicePresenceChecker(installed: true),
+            launchAtLogin: MockLaunchAtLoginController()
+        )
+        let validKey = "mpk_" + Data((0..<32).map { UInt8($0) })
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let manualInput = ManualOnboardingInput(
+            rawEndpoint: "ctrl.example.com",
+            tlsAuthMode: .systemCa,
+            rawPreauthKey: validKey,
+            rawNodeName: "mac-manual"
+        )
+
+        // Act
+        let draft = store.prepareDraftFromManualForm(manualInput)
+        let started = await store.startOrRepairService()
+
+        // Assert
+        XCTAssertEqual(draft?.serverEndpoint, "ctrl.example.com:443")
+        XCTAssertTrue(started)
+        XCTAssertEqual(transport.fetchStatusCount, 1)
+        XCTAssertEqual(store.uiState, .connected)
+        XCTAssertFalse(store.isPollingSuspended)
     }
 }
 

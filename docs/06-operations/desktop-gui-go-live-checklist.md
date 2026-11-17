@@ -3,92 +3,82 @@
 | Trường thông tin | Chi tiết |
 | :--- | :--- |
 | **Tên dự án** | Mesh VPN — Self-Hosted Secure Mesh Overlay Network |
-| **Phiên bản phát hành** | `v0.3.0` (Sprint 5 — Native Desktop GUI & Tray Companion cho Windows 10/11 & macOS 13+) |
+| **Phiên bản phát hành** | `v0.3.0` (`EP-17..EP-20`, `US-100..US-117 = 78 SP`, `7` Work Packages `WP-D-A0..WP-D-C2`) |
 | **Mã tài liệu** | `OPS-GLC-DGUI-001` |
-| **Phiên bản tài liệu** | `1.0` |
+| **Phiên bản tài liệu** | `1.1` |
 | **Ngày cập nhật** | `2026-11-17` |
-| **Tác giả** | Release & QA Engineering (`@qa-d-c2` / `WP-D-C2` — `US-116`) |
+| **Tác giả** | Release & QA Engineering (`WP-D-C2` — `US-116`) |
 | **Tài liệu tham chiếu** | `docs/05-quality-assurance/desktop-gui-{test-plan,dod-verification}.md`, `docs/06-operations/desktop-gui-{hardware-acceptance-protocol,operational-runbook}.md` |
-| **Quyết định Gate 3** | **AUTOMATED GATES READY (`GO`) — CONDITIONAL ON CI RUNNER & PHYSICAL HARDWARE UAT SIGN-OFF** |
+| **Trạng thái Gate 3** | **3-BUCKET RELEASE GATE (`VERIFIED_ON_WINDOWS_HOST` + `PENDING_CI_RUNNER` + `hardware_signoff_required`)** |
 
 ---
 
-## 1. Tóm tắt Điều kiện Go / No-Go cho Bản Phát hành `v0.3.0`
-
-Để gắn thẻ phát hành chính thức `git tag v0.3.0` và xuất bản gói cài đặt Desktop GUI cho người dùng cuối, bản dựng phải vượt qua **5 Cổng Kiểm soát Chất lượng & Vận hành (Release Gates)** dưới đây.
+## 1. Kiến trúc 5 Cổng Phát hành (Release Gates)
 
 ```mermaid
 flowchart LR
-    G1["Cổng 1: Chất lượng Mã & Kiểm thử Tự động ($0 Host)<br/>Status: VERIFIED_ON_WINDOWS_HOST (PASS)"]
-    G2["Cổng 2: Kiểm toán Bảo mật Khóa, IPC & Đóng gói<br/>Status: VERIFIED_ON_WINDOWS_HOST (PASS)"]
-    G3["Cổng 3: Ngân sách Nhị phân & Hiệu năng<br/>Status: Binary PASS / RAM-CPU UAT Pending"]
-    G4["Cổng 4: Ma trận CI/CD Đa Hệ điều hành<br/>Status: PENDING_CI_RUNNER (macos-15 & windows-latest)"]
-    G5["Cổng 5: Nghiệm thu Phần cứng Vật lý (Win 10/11 & Mac)<br/>Status: hardware_signoff_required"]
+    G1["Cong 1: Chat luong Ma & Automated QA\nStatus: VERIFIED_ON_WINDOWS_HOST"]
+    G2["Cong 2: Bao mat Khoa, IPC & Dong goi\nStatus: VERIFIED_ON_WINDOWS_HOST"]
+    G3["Cong 3: Ngan sach Nhi phan & Uninstall\nStatus: Binary/Dry-Run VERIFIED / RAM-CPU UAT Pending"]
+    G4["Cong 4: Ma tran GitHub Actions CI/Release\nStatus: PENDING_CI_RUNNER (desktop-macos, check-windows, verify-and-build, package-macos-desktop)"]
+    G5["Cong 5: Nghiem thu Phan cung Vat ly\nStatus: hardware_signoff_required (WIN-UAT-01..16, MAC-UAT-01..16)"]
 
     G1 --> G2 --> G3 --> G4 --> G5
 ```
 
 ---
 
-## 2. Danh mục Kiểm tra Chi tiết theo Từng Cổng (Gate-by-Gate Checklist)
+## 2. Danh mục Kiểm tra Chi tiết Theo Cổng
 
-### 2.1. Cổng 1 — Chất lượng Mã Nguồn & Kiểm thử Tự động (`Code Quality & Automated QA`)
+### 2.1. Cổng 1 — Chất lượng Mã nguồn & Kiểm thử Tự động
+| Mã | Tiêu chí | Lệnh / Tệp xác minh | Trạng thái |
+|---|---|---|---|
+| **GL-CODE-01** | `cargo fmt --all -- --check` sạch `100%` | `scripts/run-desktop-qa.ps1` / `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-CODE-02** | `cargo clippy --workspace --all-targets --all-features -- -D warnings` đạt `0` warnings/errors | `scripts/run-desktop-qa.ps1` / `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-CODE-03** | `cargo deny check advisories bans licenses sources` xanh `100%` (`0` thay đổi `deny.toml`, `0` WebView2/Electron/Tauri) | `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-CODE-04** | Bộ kiểm thử `mesh-gui` (`3` bin + `10` `gui_unit_tests` + `9` `qa_desktop_security_audit` + `1` `qa_desktop_e2e_ipc` = **`23`** tests) xanh `100%` | `cargo test -p mesh-gui --all-targets --all-features` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-CODE-05** | Bộ kiểm thử `mesh` (`4` `qa_desktop_cli_launcher`), `mesh-net` (`5` `desktop_ipc_contract` + `8` inline), `mesh-client` (`1` `desktop_session_wp_d_a1`), `meshd` (`1` `daemon_version_cli`), `mesh-core` (`7` `desktop_onboarding_validation`), `mesh-sys` (`5` `windows::tests`) xanh `100%` | `scripts/run-desktop-qa.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-CODE-06** | UTF-8 Không BOM, CRLF chỉ cho `.ps1/.bat/.cmd`, LF cho `.rs/.swift/.sh/.yml/.md` | `scripts/check.ps1 -Cross` | `[x] VERIFIED_ON_WINDOWS_HOST` |
 
-| Mã kiểm tra | Tiêu chí bắt buộc | Bằng chứng / Lệnh xác minh | Trạng thái hiện tại |
-| :--- | :--- | :--- | :--- |
-| **GL-CODE-01** | `cargo fmt --all -- --check` đạt `100%` không sai lệch định dạng | `scripts/run-desktop-qa.ps1` / `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-CODE-02** | `cargo clippy --workspace --all-targets --all-features -- -D warnings` đạt `0` cảnh báo, `0` lỗi | `scripts/run-desktop-qa.ps1` / `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-CODE-03** | `cargo deny check advisories bans licenses sources` xanh `100%` (`0` crate C/WebView/Tauri/AGPL/GPL) | `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-CODE-04** | Bộ kiểm thử `mesh-gui` (`54` lib + `20` unit + `8` security audit + `1` E2E IPC = `83` tests) xanh `100%` | `cargo test -p mesh-gui --all-targets --all-features` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-CODE-05** | Bộ kiểm thử `mesh` CLI launcher (`8/8`), `mesh-net` (`25/25`), `mesh-client` (`14/14`), `mesh-core` (`21/21`), `mesh-sys` (`16/16`) xanh `100%` | `scripts/run-desktop-qa.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-CODE-06** | Quy ước kết thúc dòng nghiêm ngặt (`CRLF` cho `.ps1`/`.bat`/`.cmd`, `LF` cho `.rs`/`.sh`/`.md`/`.swift`/`.yml`, `0` UTF-8 BOM) | `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+### 2.2. Cổng 2 — Bảo mật Khóa, IPC & Ranh giới Đặc quyền
+| Mã | Tiêu chí | Bằng chứng | Trạng thái |
+|---|---|---|---|
+| **GL-SEC-01** | `0` `.expose_secret()` và `0` `unsafe` trong `crates/mesh-gui/src/*.rs` (`SEC-01`) | `qa_desktop_security_audit` + `audit-desktop-security.sh` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-SEC-02** | `100%` khối `unsafe` và hàm `unsafe` callback trong `crates/mesh-sys/src/{gui_windows,process_windows}.rs` có `// SAFETY:` (và thu hồi an toàn `WindowBridge` nếu `CreateWindowExW` fail trước `WM_NCCREATE`) | `qa_desktop_security_audit` + `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-SEC-03** | Giao thức `MGH1` (`9 B` LE `<= 64 KiB`, `0x00 WorkerHello` `13 B`, allowlist pipe `\\.\pipe\mesh-gui-handoff-<32_hex>`, `SQOS SecurityIdentification`, `Zeroizing`) | `qa_desktop_security_audit` + `desktop_ipc_contract` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-SEC-04** | `Zero-TOFU` IPv4/IPv6 + `validate_preauth_key` (`mpk_` + `>= 32 B` base64url) đồng nhất Rust/Swift | `qa_desktop_security_audit` + `desktop_onboarding_validation` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-SEC-05** | `ClipboardGuard` nguyên tử trên Windows & `ClipboardAutoClear` trên macOS (kèm xử lý trailing `\n` khi `Cmd+V`), và `PollingControl::suspend()` trong cả `spawn_handoff_action` lẫn `spawn_bugreport_export` | `qa_desktop_security_audit` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-SEC-06** | *Unprivileged Sink Write*: `UnprivilegedSinkWriter` (`MoveFileExW`) trên Windows & `BugreportStreamWriter` (`Darwin.rename`) trên macOS (cả tệp `.tar` mới và Replace) | `qa_desktop_e2e_ipc` + `UdsIpcAndBugreportTests.swift` | `[x] VERIFIED_ON_WINDOWS_HOST` (Rust) / `[ ] PENDING_CI_RUNNER` (Swift) |
+| **GL-SEC-07** | `desktop/macos/**` có `0` `app-sandbox`, `0` `CFBundleURLTypes`, `0` `NSAllowsArbitraryLoads`, `0` `import UIKit`, `0` force-unwrap, và `Package.swift` dùng Swift `6.0` không truyền `StrictConcurrency` | `qa_desktop_security_audit` + `audit-desktop-security.sh` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-SEC-08** | `scripts/package-macos-app.sh` tuân thủ thứ tự 3 bước `ADR-026` (không `--deep`), `0` tắt Gatekeeper (`spctl` + `--master-disable`), `AdminPrivilegeHelper.swift` truyền `--uninstall --keep-app` | `qa_desktop_security_audit` + `audit-desktop-security.sh` | `[x] VERIFIED_ON_WINDOWS_HOST` |
 
-### 2.2. Cổng 2 — Kiểm toán Bảo mật Khóa, IPC & Đóng gói (`Security & Privacy Gate`)
+### 2.3. Cổng 3 — Ngân sách Nhị phân, Cài đặt & Gỡ cài đặt
+| Mã | Tiêu chí | Bằng chứng | Trạng thái |
+|---|---|---|---|
+| **GL-PERF-01** | `target/release/MeshVPN.exe` `<= 6_291_456` bytes (`6 MiB`, mục tiêu `<= 4 MiB`) và `PE Subsystem == 2` | `scripts/run-desktop-qa.ps1` (`DGUI-QA-03`) | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-PERF-02** | `lab/desktop/verify-desktop-uninstall.ps1 -DryRun` đạt `8/8` (`UNINST-01..08`); `elevation_worker.rs` đồng bộ SDDL `OICI`, self-copy guard, `Some(5 \| 32)` và đủ 12 tệp bundle | `scripts/run-desktop-qa.ps1` (`DGUI-QA-04`) + `main.rs::tests` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-PERF-03** | Ngân sách RAM/CPU/Thoát thực tế trên Windows (`<= 15 MiB` Tray, `<= 30 MiB` Open, `< 0.5%` CPU, `<= 2 s` Quit) & macOS (`<= 35 MiB` Menu Bar, `<= 60 MiB` Open, `<= 2 s` Quit) | `WIN-UAT-16` & `MAC-UAT-16` (`desktop-gui-hardware-acceptance-protocol.md`) | `[ ] hardware_signoff_required` |
 
-| Mã kiểm tra | Tiêu chí bắt buộc | Bằng chứng / Lệnh xác minh | Trạng thái hiện tại |
-| :--- | :--- | :--- | :--- |
-| **GL-SEC-01** | `0` lệnh gọi `.expose_secret()` và `0` khối `unsafe` trong `crates/mesh-gui/src/*.rs` (`SEC-01`) | `qa_desktop_security_audit::test_rust_gui_zero_expose_secret_zero_unsafe_and_mesh_sys_safety_comments` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-SEC-02** | `100%` khối `unsafe` trong `crates/mesh-sys/src/{gui_windows,process_windows}.rs` có chú thích `// SAFETY:` đầy đủ | `qa_desktop_security_audit` + `scripts/check.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-SEC-03** | Khung nhị phân `MGH1` bắt buộc kiểm tra `0x00 WorkerHello` (`13 B`, `version = 1`), allowlist `\\.\pipe\mesh-gui-handoff-<32-hex>`, và xóa bộ đệm bằng `Zeroizing` (`ADR-021`, `IG-DGUI-WA-02`) | `qa_desktop_security_audit::test_mgh1_framing_security_*` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-SEC-04** | Khóa cứng `Pinned SPKI` cho cả IPv4 & IPv6 literal (`Zero-TOFU` — `SEC-04`) và `validate_preauth_key` (`mpk_` + `>= 32 B` base64url) đồng nhất giữa Rust và Swift (`IG-DGUI-WA-06`) | `qa_desktop_security_audit::test_zero_tofu_and_preauth_key_parity_across_rust_and_macos_swift` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-SEC-05** | Giữ khóa `OpenClipboard` (`ClipboardGuard`) nguyên tử xuyên suốt kiểm tra `GetClipboardSequenceNumber()` và SHA-256 trước khi xóa clipboard sau `30s` (`IG-DGUI-WA-01`) | `qa_desktop_security_audit::test_atomic_clipboard_guard_and_post_dialog_polling_suspension_contracts` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-SEC-06** | Ghi bugreport trực tiếp bằng quyền người dùng thường qua `UnprivilegedSinkWriter` (`.part` + atomic `Replace`), tự động xóa `.part` khi lỗi giữa dòng (`BLK-DGUI-G2-06`) | `qa_desktop_e2e_ipc::test_e2e_desktop_ipc_lifecycle_*` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-SEC-07** | `desktop/macos/**` có `0` `com.apple.security.app-sandbox`, `0` `CFBundleURLTypes`, `0` `NSAllowsArbitraryLoads`, `0` `import UIKit`, `0` force-unwrap trong mã sản xuất | `qa_desktop_security_audit` + `lab/desktop/audit-desktop-security.sh` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-SEC-08** | `scripts/package-macos-app.sh` tuân thủ thứ tự ký 3 bước bất biến `ADR-026` (không dùng `--deep`) và `0` lệnh tắt Gatekeeper (`spctl` `--master-disable`) | `qa_desktop_security_audit` + `lab/desktop/audit-desktop-security.sh` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+### 2.4. Cổng 4 — Ma trận CI/CD & Đóng gói GitHub Actions
+| Mã | Tiêu chí | Job GitHub Actions thực tế | Trạng thái |
+|---|---|---|---|
+| **GL-CI-01** | Cấu hình `.github/workflows/{ci,release}.yml` hợp lệ (`0` tab, `SHA256SUMS` tường minh 5 tệp Windows, `KC_PASS="$(openssl rand -hex 24)"`, danh sách file release khớp thực tế không fail unmatched `.pkg`) | Static audit `qa_desktop_security_audit` & `verify-desktop-uninstall.ps1` | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-CI-02** | Job `desktop-macos` & `package-macos-desktop` xanh trên `macos-15` (`swift test` `21` XCTests, `xcodegen`, `(cd desktop/macos && swiftlint lint --strict)`, `xcodebuild test`, `package-macos-app.sh`) | `.github/workflows/ci.yml` (`desktop-macos`) & `release.yml` (`package-macos-desktop`) | `[ ] PENDING_CI_RUNNER` |
+| **GL-CI-03** | Job `check-windows` & `verify-and-build` (Windows MSVC + GNU compatibility check) xanh trên `windows-latest` | `.github/workflows/ci.yml` (`check-windows`) & `release.yml` (`verify-and-build`) | `[ ] PENDING_CI_RUNNER` |
 
-### 2.3. Cổng 3 — Ngân sách Nhị phân, Gỡ cài đặt & Vòng đời (`Binary Budget & Lifecycle Gate`)
-
-| Mã kiểm tra | Tiêu chí bắt buộc | Bằng chứng / Lệnh xác minh | Trạng thái hiện tại |
-| :--- | :--- | :--- | :--- |
-| **GL-PERF-01** | Dung lượng `target/release/MeshVPN.exe` `<= 6,291,456` bytes (`6 MiB`, mục tiêu `<= 4 MiB`) | `scripts/run-desktop-qa.ps1` (`DGUI-QA-03`) | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-PERF-02** | Trường PE `Subsystem` của `MeshVPN.exe` bằng `2` (`IMAGE_SUBSYSTEM_WINDOWS_GUI` — không mở cửa sổ console đen) | `scripts/run-desktop-qa.ps1` (`DGUI-QA-03`) | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-PERF-03** | Kịch bản gỡ cài đặt & nâng cấp Windows (`lab/desktop/verify-desktop-uninstall.ps1 -DryRun`) vượt qua `8/8` cổng (`UNINST-01..08`) | `scripts/run-desktop-qa.ps1` (`DGUI-QA-04`) | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-PERF-04** | Ngân sách RAM/CPU thực tế trên Windows (`<= 15 MiB` Tray, `<= 30 MiB` Open, `0%` CPU idle, thoát `<= 2s`) và macOS (`<= 35 MiB` Menu Bar, `<= 60 MiB` Open, thoát `<= 2s`) | `WIN-UAT-16` & `MAC-UAT-16` trong `desktop-gui-hardware-acceptance-protocol.md` | `[ ] hardware_signoff_required` |
-
-### 2.4. Cổng 4 — Ma trận CI/CD & Đóng gói Đa Nền tảng (`CI/CD & Packaging Matrix Gate`)
-
-| Mã kiểm tra | Tiêu chí bắt buộc | Bằng chứng / Lệnh xác minh | Trạng thái hiện tại |
-| :--- | :--- | :--- | :--- |
-| **GL-CI-01** | Cấu hình `.github/workflows/ci.yml` (`macos-desktop-gui`, `windows-gui-smoke`) và `.github/workflows/release.yml` (manifest `SHA256SUMS` tường minh 5 tệp trên Windows + `.dmg` macOS) hợp lệ | `qa_desktop_security_audit` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-CI-02** | Thực thi xanh job `macos-desktop-gui` trên runner `macos-15` (`swift test`, `xcodegen`, `swiftlint --strict`, `xcodebuild test`, `install-macos.sh --dry-run`, `package-macos-app.sh --dry-run`) | GitHub Actions `ci.yml` (`DGUI-CI-MAC-01`) | `[ ] PENDING_CI_RUNNER` |
-| **GL-CI-03** | Thực thi xanh job `windows-gui-smoke` & `build-windows-msvc` trên runner `windows-latest` | GitHub Actions `ci.yml` (`DGUI-CI-WIN-MSVC-01`) | `[ ] PENDING_CI_RUNNER` |
-
-### 2.5. Cổng 5 — Nghiệm thu Phần cứng Vật lý & Tài liệu Vận hành (`Physical UAT & Docs Gate`)
-
-| Mã kiểm tra | Tiêu chí bắt buộc | Bằng chứng / Tài liệu | Trạng thái hiện tại |
-| :--- | :--- | :--- | :--- |
-| **GL-DOC-01** | Kế hoạch kiểm thử (`desktop-gui-test-plan.md`) & Báo cáo xác minh DoD (`desktop-gui-dod-verification.md`) đầy đủ cho 18 Stories (`78 SP`) và 43 `DGUI-*` | `docs/05-quality-assurance/desktop-gui-{test-plan,dod-verification}.md` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-DOC-02** | Giao thức nghiệm thu phần cứng (`desktop-gui-hardware-acceptance-protocol.md`) & Sổ tay vận hành (`desktop-gui-operational-runbook.md`) hoàn chỉnh | `docs/06-operations/desktop-gui-{hardware-acceptance-protocol,operational-runbook}.md` | `[x] VERIFIED_ON_WINDOWS_HOST` |
-| **GL-UAT-01** | Hoàn thành và ký duyệt `WIN-UAT-01..16` trên máy thật Windows 10/11 | Sổ cái ký duyệt mục 5 trong `desktop-gui-hardware-acceptance-protocol.md` | `[ ] hardware_signoff_required` |
-| **GL-UAT-02** | Hoàn thành và ký duyệt `MAC-UAT-01..16` trên máy thật Mac (`arm64` / `x86_64`) chạy macOS 13+ | Sổ cái ký duyệt mục 5 trong `desktop-gui-hardware-acceptance-protocol.md` | `[ ] hardware_signoff_required` |
+### 2.5. Cổng 5 — Tài liệu Gate 3 & Nghiệm thu Phần cứng Vật lý
+| Mã | Tiêu chí | Bằng chứng | Trạng thái |
+|---|---|---|---|
+| **GL-DOC-01** | 5 tài liệu `WP-D-C2` (`test-plan`, `dod-verification`, `hardware-acceptance-protocol`, `operational-runbook`, `go-live-checklist`) khớp 100% số liệu, lệnh CLI, tên file, Bundle ID `dev.meshvpn.macos` và `US-100..117 = 78 SP` | Đối chiếu chéo Gate 3 (`desktop-gui-gate-3-critique.md`) | `[x] VERIFIED_ON_WINDOWS_HOST` |
+| **GL-UAT-01** | Hoàn thành và ký duyệt `WIN-UAT-01..16` trên máy thật Windows 10/11 | `docs/06-operations/desktop-gui-hardware-acceptance-protocol.md` | `[ ] hardware_signoff_required` |
+| **GL-UAT-02** | Hoàn thành và ký duyệt `MAC-UAT-01..16` trên máy thật Mac (`arm64` / `x86_64`) | `docs/06-operations/desktop-gui-hardware-acceptance-protocol.md` | `[ ] hardware_signoff_required` |
 
 ---
 
-## 3. Quy trình Khôi phục Khẩn cấp khi Phát hành (`Release Rollback Plan`)
+## 3. Kế hoạch Khôi phục Khẩn cấp (`Release Rollback Plan`)
 
-Nếu phát hiện lỗi nghiêm trọng (`P0/P1`) trên gói Desktop GUI sau khi phát hành `v0.3.0`:
-1. **Cô lập Tức thời trên Máy trạm**:
-   - Người dùng có thể đóng ngay tiến trình GUI (`Quit Mesh VPN` hoặc `Local\MeshVpnGuiShutdownEvent`) và tiếp tục sử dụng `mesh up` / `mesh down` / `mesh status` qua CLI mà **không làm gián đoạn đường hầm VPN đang kết nối** (`meshd` chạy độc lập với GUI).
-2. **Hạ cấp / Gỡ bỏ Gói GUI Giữ nguyên Định danh Node**:
-   - Trên Windows: chạy `scripts/install-windows.ps1 -Uninstall` (không có `-PurgeData`) để gỡ `MeshVPN.exe` và giữ nguyên `C:\ProgramData\Mesh\keys.json`.
-   - Trên macOS: xóa `/Applications/Mesh VPN.app` và tiếp tục điều khiển `internal.mesh.meshd` qua `/usr/local/bin/mesh`.
+Nếu phát hiện lỗi nghiêm trọng (`P0/P1`) sau khi phát hành `v0.3.0`:
+1. **Giữ Tunnel Chạy qua CLI**: Đóng `MeshVPN.exe` / `Mesh VPN.app` (`Quit Mesh VPN (Keep Connected in Background)`) — `meshd` tiếp tục duy trì kết nối và điều khiển được bằng `mesh status`, `mesh up`, `mesh down`.
+2. **Gỡ GUI An toàn Bảo toàn `keys.json`**:
+   - Windows: `powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -Uninstall` (không `-PurgeData`).
+   - macOS: `sudo /bin/sh "/Applications/Mesh VPN.app/Contents/Resources/install-macos.sh" --uninstall --keep-app` (hoặc xóa `/Applications/Mesh VPN.app` nếu chỉ gỡ giao diện và dùng `/usr/local/bin/mesh`).

@@ -63,16 +63,26 @@ use zeroize::Zeroizing;
 #[cfg(target_os = "windows")]
 const ADMIN_DATA_DIR: &str = r"C:\ProgramData\Mesh";
 
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const PROGRAM_DATA_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const INSTALL_DIR_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)(A;OICI;GRGX;;;AU)";
+
 #[cfg(target_os = "windows")]
 const MAX_HTTP_HEADER_BLOCK_BYTES: usize = 8 * 1024;
 
-#[cfg(target_os = "windows")]
-const WINDOWS_BUNDLE_REMOVAL_LIST: &[&str] = &[
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WINDOWS_BUNDLE_REMOVAL_LIST: &[&str] = &[
     "MeshVPN.exe",
+    "MeshVPN.exe.new",
     "meshd.exe",
     "mesh.exe",
+    "mesh-server.exe",
     "wintun.dll",
     "wintun.dll.sha256",
+    "WINTUN-LICENSE.txt",
+    "README-WINTUN.md",
     "LICENSE",
     "NOTICE",
     "README.txt",
@@ -83,8 +93,43 @@ const PROGRAM_DATA_PURGE_FILES: &[&str] = &[
     "keys.json",
     "bootstrap.toml",
     "ledger.json",
+    "netmap-cache.json",
     "meshd-state.redb",
 ];
+
+#[cfg(target_os = "windows")]
+const PROGRAM_DATA_EPHEMERAL_FILES: &[&str] = &["ledger.json", "netmap-cache.json"];
+
+/// Normalizes two Windows filesystem paths (resolving symlinks if present, stripping `\\?\`,
+/// normalizing separators, and ignoring ASCII case) so self-copy checks never fail on casing or
+/// trailing slashes (`HR-DGUI-G3-02`).
+#[cfg(any(target_os = "windows", test))]
+#[must_use]
+pub(crate) fn windows_paths_equivalent(lhs: &Path, rhs: &Path) -> bool {
+    fn norm(path: &Path) -> String {
+        let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let text = resolved.to_string_lossy().replace('/', r"\");
+        let stripped = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        stripped.trim_end_matches('\\').to_ascii_lowercase()
+    }
+    norm(lhs) == norm(rhs)
+}
+
+/// Returns `true` when replacing a running `MeshVPN.exe` failed due to Windows file locking
+/// (`ERROR_ACCESS_DENIED (5)` | `ERROR_SHARING_VIOLATION (32)`), using `raw_os_error()` first
+/// with a textual fallback (`HR-DGUI-G3-02`).
+#[cfg(any(target_os = "windows", test))]
+#[must_use]
+pub(crate) fn is_locked_binary_replace_error(raw_os_error: Option<i32>, err_msg: &str) -> bool {
+    if matches!(raw_os_error, Some(5 | 32)) {
+        return true;
+    }
+    let lower = err_msg.to_ascii_lowercase();
+    lower.contains("sharing violation")
+        || lower.contains("access is denied")
+        || lower.contains("os error 5")
+        || lower.contains("os error 32")
+}
 
 /// Parsed `MeshVPN.exe` invocation mode (`--minimized` vs `--elevated-worker --pipe`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,19 +675,16 @@ async fn execute_install_or_start_service(
                 install_dir.display()
             ))
         })?;
+        set_directory_sddl_acl(&install_dir, INSTALL_DIR_SDDL)
+            .map_err(|err| AppError::internal(err.to_string()))?;
         verify_and_optionally_copy_wintun(&src_path, &install_dir, false)?;
-        for exe in ["meshd.exe", "mesh.exe", "MeshVPN.exe"] {
-            let src_file = src_path.join(exe);
-            if src_file.exists() {
-                copy_file_anti_toctou(&src_file, &install_dir.join(exe))?;
-            }
-        }
+        install_or_stage_bundle_exes(&src_path, &install_dir)?;
     }
 
     let data_dir = Path::new(ADMIN_DATA_DIR);
     fs::create_dir_all(data_dir)
         .map_err(|err| AppError::internal(format!("failed creating {ADMIN_DATA_DIR}: {err}")))?;
-    set_directory_sddl_acl(data_dir, "D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+    set_directory_sddl_acl(data_dir, PROGRAM_DATA_DIR_SDDL)
         .map_err(|err| AppError::internal(err.to_string()))?;
 
     let meshd_cmd = format_service_bin_cmd(&install_dir.join("meshd.exe"));
@@ -663,6 +705,26 @@ async fn execute_install_or_start_service(
 }
 
 #[cfg(target_os = "windows")]
+fn install_or_stage_bundle_exes(src_path: &Path, install_dir: &Path) -> AppResult<()> {
+    for exe in ["meshd.exe", "mesh.exe", "MeshVPN.exe"] {
+        let src_file = src_path.join(exe);
+        let dst_file = install_dir.join(exe);
+        if !src_file.exists() || windows_paths_equivalent(&src_file, &dst_file) {
+            continue;
+        }
+        if let Err((err, raw_code)) = copy_file_anti_toctou_with_os_code(&src_file, &dst_file) {
+            if exe == "MeshVPN.exe" && is_locked_binary_replace_error(raw_code, &err.to_string()) {
+                let pending = install_dir.join("MeshVPN.exe.new");
+                copy_file_anti_toctou(&src_file, &pending)?;
+            } else {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 async fn execute_update_service(
     source_dir: &str,
     old_gui_pid: Option<u32>,
@@ -678,25 +740,14 @@ async fn execute_update_service(
     let install_dir = resolve_program_files_mesh_dir(program_files_env.as_deref());
     fs::create_dir_all(&install_dir)
         .map_err(|err| AppError::internal(format!("failed creating install dir: {err}")))?;
+    set_directory_sddl_acl(&install_dir, INSTALL_DIR_SDDL)
+        .map_err(|err| AppError::internal(err.to_string()))?;
 
     verify_and_optionally_copy_wintun(&src_path, &install_dir, false)?;
     stop_and_optionally_delete_windows_service(WINDOWS_SERVICE_NAME, false)
         .map_err(|err| AppError::unavailable(err.to_string()))?;
 
-    for exe in ["meshd.exe", "mesh.exe", "MeshVPN.exe"] {
-        let src_file = src_path.join(exe);
-        if src_file.exists() {
-            let dst_file = install_dir.join(exe);
-            if let Err(err) = copy_file_anti_toctou(&src_file, &dst_file) {
-                if exe == "MeshVPN.exe" && err.to_string().contains("sharing violation") {
-                    let pending = install_dir.join("MeshVPN.exe.new");
-                    copy_file_anti_toctou(&src_file, &pending)?;
-                } else {
-                    return Err(err);
-                }
-            }
-        }
-    }
+    install_or_stage_bundle_exes(&src_path, &install_dir)?;
 
     let meshd_cmd = format_service_bin_cmd(&install_dir.join("meshd.exe"));
     ensure_and_start_windows_service(
@@ -729,7 +780,7 @@ async fn execute_uninstall_service(purge_keys: bool) -> AppResult<HandoffRespons
             if err.kind() == std::io::ErrorKind::NotFound {
                 continue;
             }
-            if err.raw_os_error() == Some(32) {
+            if matches!(err.raw_os_error(), Some(5 | 32)) {
                 let _scheduled = schedule_delete_on_reboot(&target);
             } else {
                 return Err(AppError::internal(format!(
@@ -739,9 +790,10 @@ async fn execute_uninstall_service(purge_keys: bool) -> AppResult<HandoffRespons
             }
         }
     }
+    let _rm_install_dir = fs::remove_dir(&install_dir);
 
+    let data_dir = Path::new(ADMIN_DATA_DIR);
     if purge_keys {
-        let data_dir = Path::new(ADMIN_DATA_DIR);
         for file_name in PROGRAM_DATA_PURGE_FILES {
             let target = data_dir.join(file_name);
             if let Err(err) = fs::remove_file(&target)
@@ -750,6 +802,43 @@ async fn execute_uninstall_service(purge_keys: bool) -> AppResult<HandoffRespons
                 tracing::warn!(
                     component = "mesh-gui-worker",
                     event = "purge_file_failed",
+                    path = %target.display(),
+                    error = %err
+                );
+            }
+        }
+        for subdir in ["logs", "bugreports"] {
+            let sub_path = data_dir.join(subdir);
+            if let Err(err) = fs::remove_dir_all(&sub_path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    component = "mesh-gui-worker",
+                    event = "purge_dir_failed",
+                    path = %sub_path.display(),
+                    error = %err
+                );
+            }
+        }
+        if let Err(err) = fs::remove_dir_all(data_dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                component = "mesh-gui-worker",
+                event = "purge_data_dir_failed",
+                path = %data_dir.display(),
+                error = %err
+            );
+        }
+    } else {
+        for file_name in PROGRAM_DATA_EPHEMERAL_FILES {
+            let target = data_dir.join(file_name);
+            if let Err(err) = fs::remove_file(&target)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    component = "mesh-gui-worker",
+                    event = "uninstall_ephemeral_cleanup_failed",
                     path = %target.display(),
                     error = %err
                 );
@@ -792,7 +881,7 @@ fn verify_and_optionally_copy_wintun(
     // and stream copy, preventing TOCTOU substitution (`ADR-026`).
     verify_wintun_path_sha256(&src_wintun, &expected_hex).map_err(AppError::invalid_argument)?;
 
-    if !verify_only_existing && src_dir != dst_dir {
+    if !verify_only_existing && !windows_paths_equivalent(src_dir, dst_dir) {
         let dst_wintun = dst_dir.join("wintun.dll");
         let tmp_dst = dst_dir.join("wintun.dll.part");
         let mut out = File::create(&tmp_dst).map_err(|err| {
@@ -815,21 +904,57 @@ fn verify_and_optionally_copy_wintun(
 
 #[cfg(target_os = "windows")]
 fn copy_file_anti_toctou(src: &Path, dst: &Path) -> AppResult<()> {
-    let mut locked = open_anti_toctou_read_locked(src)
-        .map_err(|err| AppError::unavailable(format!("failed locking {}: {err}", src.display())))?;
+    copy_file_anti_toctou_with_os_code(src, dst).map_err(|(app_err, _code)| app_err)
+}
+
+#[cfg(target_os = "windows")]
+fn copy_file_anti_toctou_with_os_code(
+    src: &Path,
+    dst: &Path,
+) -> Result<(), (AppError, Option<i32>)> {
+    if windows_paths_equivalent(src, dst) {
+        return Ok(());
+    }
+    let mut locked = open_anti_toctou_read_locked(src).map_err(|err| {
+        (
+            AppError::unavailable(format!("failed locking {}: {err}", src.display())),
+            None,
+        )
+    })?;
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     let file_name = dst.file_name().and_then(|s| s.to_str()).unwrap_or("binary");
     let tmp = parent.join(format!("{file_name}.part"));
-    let mut out = File::create(&tmp)
-        .map_err(|err| AppError::internal(format!("failed creating {}: {err}", tmp.display())))?;
-    std::io::copy(&mut locked, &mut out)
-        .map_err(|err| AppError::internal(format!("failed copying {}: {err}", src.display())))?;
-    out.sync_all()
-        .map_err(|err| AppError::internal(format!("failed syncing {}: {err}", tmp.display())))?;
+    let mut out = File::create(&tmp).map_err(|err| {
+        let code = err.raw_os_error();
+        (
+            AppError::internal(format!("failed creating {}: {err}", tmp.display())),
+            code,
+        )
+    })?;
+    std::io::copy(&mut locked, &mut out).map_err(|err| {
+        let code = err.raw_os_error();
+        let _rm = fs::remove_file(&tmp);
+        (
+            AppError::internal(format!("failed copying {}: {err}", src.display())),
+            code,
+        )
+    })?;
+    out.sync_all().map_err(|err| {
+        let code = err.raw_os_error();
+        let _rm = fs::remove_file(&tmp);
+        (
+            AppError::internal(format!("failed syncing {}: {err}", tmp.display())),
+            code,
+        )
+    })?;
     drop(out);
     fs::rename(&tmp, dst).map_err(|err| {
+        let code = err.raw_os_error();
         let _rm = fs::remove_file(&tmp);
-        AppError::internal(format!("failed replacing {}: {err}", dst.display()))
+        (
+            AppError::internal(format!("failed replacing {}: {err}", dst.display())),
+            code,
+        )
     })?;
     Ok(())
 }

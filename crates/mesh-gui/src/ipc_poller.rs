@@ -307,6 +307,7 @@ impl BackgroundIpcController {
         let _spawned = std::thread::Builder::new()
             .name("mesh-gui-uac".to_owned())
             .spawn(move || {
+                let _pause_guard = poll_control.suspend();
                 let res = run_privileged_handoff(payload).map(|resp| {
                     resp.message
                         .unwrap_or_else(|| "Operation completed".to_owned())
@@ -317,6 +318,7 @@ impl BackgroundIpcController {
                         result: res,
                     });
                 }
+                drop(_pause_guard);
                 poll_control.trigger_refresh();
                 post_app_message(hwnd, WM_APP_WORKER_DONE, 0, 0);
             });

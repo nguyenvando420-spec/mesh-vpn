@@ -46,7 +46,7 @@ public enum BugreportWriterError: Error, Equatable, Sendable, LocalizedError {
 /// `parent/.mesh-bugreport-<128bit_hex>.tar.part` (`O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`,
 /// `0600`), verifies `expectedBytes > 0 && cumulative == expectedBytes <= 20_971_520`, calls
 /// `fsync()`, closes the descriptor, re-verifies the destination, and atomically commits via
-/// `FileManager.default.replaceItemAt(destURL, withItemAt: partURL)`.
+/// POSIX `Darwin.rename(partURL.path, destURL.path)` (`ADR-023`).
 public enum BugreportStreamWriter: Sendable {
     private static let forbiddenSystemPrefixes = [
         "/System",
@@ -158,12 +158,11 @@ public enum BugreportStreamWriter: Sendable {
     }
 
     private static func rejectSystemPath(_ path: String) throws {
-        for prefix in forbiddenSystemPrefixes {
-            if path == prefix || path.hasPrefix(prefix + "/") {
-                throw BugreportWriterError.forbiddenSystemDirectory(
-                    "Writing bugreport into protected system directory `\(prefix)` is forbidden"
-                )
-            }
+        for prefix in forbiddenSystemPrefixes
+        where path == prefix || path.hasPrefix(prefix + "/") {
+            throw BugreportWriterError.forbiddenSystemDirectory(
+                "Writing bugreport into protected system directory `\(prefix)` is forbidden"
+            )
         }
     }
 
@@ -262,12 +261,12 @@ private final class AtomicPartFileSink: Sendable {
         }
 
         try BugreportStreamWriter.validateExistingDestinationIfPresent(destPath: destURL.path)
-        _ = try FileManager.default.replaceItemAt(
-            destURL,
-            withItemAt: partURL,
-            backupItemName: nil,
-            options: []
-        )
+        guard Darwin.rename(partURL.path, destURL.path) == 0 else {
+            let errCode = errno
+            throw BugreportWriterError.ioFailure(
+                "Failed committing bugreport archive atomically (errno=\(errCode))"
+            )
+        }
         state.withLock { current in
             current.isCommitted = true
         }

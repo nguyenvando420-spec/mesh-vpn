@@ -2,8 +2,7 @@ import Foundation
 
 /// Validated `mesh://join?v=1&...` onboarding URI with secret redaction (`SEC-01`, `US-102`).
 public struct ParsedJoinUri:
-    Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible
-{
+    Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     public let version: UInt8
     public let controlEndpoint: String
     public let tlsAuthMode: TlsAuthMode

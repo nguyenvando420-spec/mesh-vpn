@@ -125,6 +125,22 @@ final class UdsIpcAndBugreportTests: XCTestCase {
         defer { server.stop() }
         let client = UdsIpcClient()
 
+        let freshDestURL = tempDir.appendingPathComponent("brand-new.tar")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: freshDestURL.path))
+
+        // Act 0: Atomic commit succeeds when destination .tar does not exist yet (Darwin.rename)
+        let freshResult = try await BugreportStreamWriter.exportStream(
+            transport: client,
+            adminSocketPath: sockPath,
+            destinationURL: freshDestURL
+        )
+
+        // Assert 0
+        XCTAssertEqual(freshResult.totalBytes, UInt64(tarBody.count))
+        XCTAssertEqual(try Data(contentsOf: freshDestURL), tarBody)
+        let freshFiles = try FileManager.default.contentsOfDirectory(atPath: tempDir.path)
+        XCTAssertFalse(freshFiles.contains { $0.contains(".part") })
+
         // Act 1: Atomic commit overwrites existing file cleanly without leaving .part
         let result = try await BugreportStreamWriter.exportStream(
             transport: client,
@@ -196,9 +212,20 @@ final class UdsIpcAndBugreportTests: XCTestCase {
         let installScript = try goodHelper.buildAppleScript(
             for: .installOrUpdateService(firewallOptIn: true)
         )
+        let uninstallKeepScript = try goodHelper.buildShellCommand(
+            for: .uninstallService(purgeData: false),
+            bundleResourceURL: tempRes
+        )
+        let uninstallPurgeScript = try goodHelper.buildShellCommand(
+            for: .uninstallService(purgeData: true),
+            bundleResourceURL: tempRes
+        )
         XCTAssertTrue(kickstartScript.contains("with administrator privileges"))
         XCTAssertTrue(kickstartScript.contains(AgentDefaults.launchdLabel))
         XCTAssertTrue(installScript.contains("--yes-firewall"))
+        XCTAssertTrue(uninstallKeepScript.contains("--uninstall --keep-app"))
+        XCTAssertFalse(uninstallKeepScript.contains("--purge"))
+        XCTAssertTrue(uninstallPurgeScript.contains("--uninstall --keep-app --purge"))
     }
 
     private func makeShortTempDir() throws -> URL {

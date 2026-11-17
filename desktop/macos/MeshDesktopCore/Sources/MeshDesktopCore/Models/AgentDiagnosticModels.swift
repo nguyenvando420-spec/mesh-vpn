@@ -155,8 +155,7 @@ public struct NetcheckResponse: Codable, Equatable, Sendable {
 
 /// Privileged request sent to `POST /v1/agent/up` (`meshd-admin`).
 public struct AgentUpRequest:
-    Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible
-{
+    Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     public let serverEndpoint: String
     public let portOverride: UInt16?
     public let serverPin: String?
@@ -213,8 +212,7 @@ public struct AgentSetRequest: Codable, Equatable, Sendable {
 
 /// Privileged request sent to `POST /v1/agent/rotate-key` (`meshd-admin`).
 public struct AgentRotateKeyRequest:
-    Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible
-{
+    Codable, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     public let preauthKey: String
 
     public enum CodingKeys: String, CodingKey {

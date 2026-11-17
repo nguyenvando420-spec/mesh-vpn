@@ -234,7 +234,7 @@ struct OnboardingSheetView: View {
             HStack {
                 Spacer()
                 Button("Review Connection Details") {
-                    _ = store.prepareDraftFromManualForm(
+                    let input = ManualOnboardingInput(
                         rawEndpoint: rawEndpoint,
                         rawPortOverride: rawPortOverride,
                         tlsAuthMode: isCurrentEndpointIpLiteral ? .spkiPin : tlsAuthMode,
@@ -242,6 +242,7 @@ struct OnboardingSheetView: View {
                         rawPreauthKey: rawPreauthKey,
                         rawNodeName: rawNodeName
                     )
+                    _ = store.prepareDraftFromManualForm(input)
                 }
                 .buttonStyle(.borderedProminent)
             }

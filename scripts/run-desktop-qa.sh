@@ -15,7 +15,7 @@
 #   4. On Darwin (macOS 13+ / macos-15 CI):
 #      - swift test --package-path desktop/macos/MeshDesktopCore
 #      - xcodegen generate --spec desktop/macos/project.yml (if xcodegen installed)
-#      - swiftlint lint --strict --config desktop/macos/.swiftlint.yml (if swiftlint installed)
+#      - (cd desktop/macos && swiftlint lint --strict) (if swiftlint installed)
 #      - xcodebuild test -project desktop/macos/MeshVPNApp.xcodeproj -scheme MeshVPNApp
 #        -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO (if xcodebuild + project present)
 #      - sh scripts/install-macos.sh --dry-run
@@ -94,7 +94,7 @@ if [ "$HOST_OS" = "Darwin" ]; then
 
   if command -v swiftlint >/dev/null 2>&1; then
     echo "  --> Running SwiftLint (--strict)..."
-    swiftlint lint --strict --config "$REPO_ROOT/desktop/macos/.swiftlint.yml"
+    (cd "$REPO_ROOT/desktop/macos" && swiftlint lint --strict)
   fi
 
   if command -v xcodegen >/dev/null 2>&1; then

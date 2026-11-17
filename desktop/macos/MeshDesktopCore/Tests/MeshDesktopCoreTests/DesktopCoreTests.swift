@@ -108,8 +108,7 @@ final class DesktopCoreTests: XCTestCase {
     func testAgentIpcModels_GoldenJsonDecoding_DecodesExact13FieldsAndVersion() throws {
         // Arrange
         let json = """
-        {
-          "daemon_state": "connected",
+        { "daemon_state": "connected",
           "node_id": "node-123",
           "node_name": "macbook-pro",
           "fqdn": "macbook-pro.mesh.internal",
@@ -187,6 +186,24 @@ final class DesktopCoreTests: XCTestCase {
 
         // Assert 2
         XCTAssertEqual(fakePasteboard.stringContent(), "unrelated user text")
+    }
+
+    @MainActor
+    func testClipboardAutoClear_TrailingNewlineFromTerminal_ArmsAndWipes() async throws {
+        // Arrange: Simulate copying a token with trailing newline and Cmd+V into SecureField
+        let fakePasteboard = InMemoryPasteboardProvider()
+        let cleaner = ClipboardAutoClear(pasteboard: fakePasteboard, delaySeconds: 0.05)
+        let rawToken = "mpk_QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE"
+        fakePasteboard.setStringContent("\(rawToken)\n")
+
+        // Act
+        cleaner.scheduleWipeIfClipboardMatchesFieldText(rawToken)
+        XCTAssertTrue(cleaner.hasPendingWipe)
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // Assert
+        XCTAssertNil(fakePasteboard.stringContent())
+        XCTAssertFalse(cleaner.hasPendingWipe)
     }
 
     private func base64UrlNoPadEncode(_ data: Data) -> String {

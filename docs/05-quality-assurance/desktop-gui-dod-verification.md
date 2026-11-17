@@ -3,107 +3,86 @@
 | Trường thông tin | Chi tiết |
 | :--- | :--- |
 | **Tên dự án** | Mesh VPN — Self-Hosted Secure Mesh Overlay Network |
-| **Phiên bản mục tiêu** | `v0.3.0` (Sprint 5 — Native Desktop GUI & Tray Companion cho Windows 10/11 & macOS 13+) |
+| **Phiên bản mục tiêu** | `v0.3.0` (`EP-17..EP-20`, `US-100..US-117 = 78 SP`, `43/43` `DGUI-*`, `ADR-020..026`) |
 | **Mã tài liệu** | `QA-DOD-DGUI-001` |
-| **Phiên bản tài liệu** | `1.0` |
+| **Phiên bản tài liệu** | `1.1` |
 | **Ngày cập nhật** | `2026-11-17` |
-| **Người thực hiện** | QA & Security Verification Engineer (`@qa-d-c2` / `WP-D-C2` — `US-116`) |
-| **Tài liệu đối chiếu** | `docs/01-discovery/desktop-gui-readiness-requirements.md` (`43 DGUI-*`, `5 D-GNFR-*`), `docs/02-product-planning/desktop-gui-product-backlog.md` (`US-100..US-117 = 78 SP`), `docs/04-sprint-management/desktop-gui-sprint-backlog.md` (`7 Work Packages`), `docs/05-quality-assurance/critique-reviews/desktop-gui-wave-a-critique.md` (`8 BLK-DGUI-G2-*`, `6 IG-DGUI-WA-*`) |
-| **Trạng thái Gate 3** | **AUTOMATED GATES 100% PASS (`VERIFIED_ON_WINDOWS_HOST`) — READY FOR CI RUNNER & PHYSICAL HARDWARE UAT SIGN-OFF** |
+| **Người thực hiện** | QA & Security Verification (`WP-D-C2` — `US-116`) |
+| **Tài liệu đối chiếu** | `docs/01-discovery/desktop-gui-readiness-requirements.md` v1.1, `docs/02-product-planning/desktop-gui-product-backlog.md` v1.1, `docs/04-sprint-management/desktop-gui-sprint-backlog.md` v1.1, `docs/05-quality-assurance/critique-reviews/desktop-gui-gate-3-critique.md` |
+| **Trạng thái Gate 3** | **3-BUCKET EVIDENCE SEPARATION (`VERIFIED_ON_WINDOWS_HOST` + `PENDING_CI_RUNNER` + `hardware_signoff_required`)** |
 
 ---
 
-## 1. Tóm tắt Điều hành & Phân loại Trạng thái Xác minh (Executive Verification Summary)
+## 1. Nguyên tắc Trung thực Bằng chứng (3-Bucket Strict Separation)
 
-Tài liệu này cung cấp bằng chứng kiểm định chi tiết cho toàn bộ **7 Work Packages (`WP-D-A0`..`WP-D-C2`)**, **18 User Stories (`US-100..US-117` = `78 SP`)**, **43 yêu cầu chức năng (`DGUI-01..43`)**, và **5 yêu cầu phi chức năng (`D-GNFR-01..05`)** của phân hệ Desktop GUI `v0.3.0`.
-
-> [!IMPORTANT]
-> **Nguyên tắc Trung thực Bằng chứng (Strict Evidence Separation)**:
-> Báo cáo này tách bạch tuyệt đối 3 cấp độ bằng chứng, không bao giờ giả lập kết quả phần cứng hoặc kết quả máy build macOS khi chạy trên host Windows:
-> 1. **`VERIFIED_ON_WINDOWS_HOST` / `VERIFIED_AT_CI_$0`**: Đã chạy thực tế và xanh 100% trên máy trạm kiểm định Windows (`1.94.1-x86_64-pc-windows-gnu`) thông qua `scripts/run-desktop-qa.ps1` và `scripts/check.ps1 -Cross`.
-> 2. **`PENDING_CI_RUNNER`**: Mã nguồn, cấu hình dự án (`Package.swift`, `project.yml`, `.swiftlint.yml`), kịch bản đóng gói (`install-macos.sh`, `package-macos-app.sh`) và workflow CI (`.github/workflows/{ci,release}.yml`) đã hoàn thiện và vượt qua kiểm toán tĩnh `100%`, chờ thực thi trực tiếp trên runner GitHub Actions `macos-15` (cho `swift test`, `xcodegen`, `swiftlint --strict`, `xcodebuild test`) và `windows-latest` (cho MSVC native build).
-> 3. **`hardware_signoff_required`**: Các hạng mục tương tác giao diện vật lý (khay hệ thống Windows Explorer / macOS Menu Bar, hộp thoại UAC `runas` / `osascript`, cắm rút cáp mạng, đo RAM/CPU thực tế) bắt buộc nghiệm thu theo `docs/06-operations/desktop-gui-hardware-acceptance-protocol.md`.
+Báo cáo DoD này tách bạch nghiêm ngặt 3 mức độ xác minh theo `US-116 AC3 & AC5`, tuyệt đối không suy diễn kết quả runner macOS/MSVC hay phần cứng vật lý từ máy kiểm định Windows:
+1. **`VERIFIED_ON_WINDOWS_HOST`**: Kết quả chạy thực tế trên host Windows (`+1.94.1-x86_64-pc-windows-gnu`) qua `scripts/run-desktop-qa.ps1` và `scripts/check.ps1 -Cross`.
+2. **`PENDING_CI_RUNNER`**: Các kiểm thử cần runner GitHub Actions đích: `macos-15` (`desktop-macos` & `package-macos-desktop` cho `swift test`, `xcodegen`, `swiftlint --strict`, `xcodebuild test`, `install-macos.sh --dry-run`, `package-macos-app.sh --dry-run`) và `windows-latest` (`check-windows` & `verify-and-build` MSVC native build).
+3. **`hardware_signoff_required`**: Nghiệm thu tương tác OS vật lý (Explorer Tray, macOS Menu Bar `gid = 80`, hộp thoại UAC/`osascript`, DPI, đo RAM/CPU/Quit thực tế) ghi vào sổ cái tại `docs/06-operations/desktop-gui-hardware-acceptance-protocol.md`.
 
 ---
 
-## 2. Kết quả Thực thi Cổng Kiểm định Tự động trên Host (`VERIFIED_ON_WINDOWS_HOST`)
+## 2. Kết quả Cổng Kiểm định Tự động trên Host (`VERIFIED_ON_WINDOWS_HOST`)
 
-| Mã cổng | Hạng mục kiểm định | Lệnh thực thi | Kết quả trên Host |
-| :--- | :--- | :--- | :--- |
-| **DGUI-QA-01** | Định dạng mã nguồn & Workspace Clippy (`-D warnings`) | `cargo fmt --all -- --check` & `cargo clippy --workspace --all-targets --all-features -- -D warnings` | **`PASS`** (`0` warnings, `0` errors) |
-| **DGUI-QA-02A** | Bộ kiểm thử `mesh-gui` (`lib`, `gui_unit_tests`, `qa_desktop_security_audit`, `qa_desktop_e2e_ipc`) | `cargo test -p mesh-gui --all-targets --all-features` | **`PASS`** (`83/83` tests passed: `54` lib + `20` unit + `8` security audit + `1` full E2E IPC lifecycle) |
-| **DGUI-QA-02B** | Bộ kiểm thử tích hợp CLI `mesh gui` (`qa_desktop_cli_launcher`) | `cargo test -p mesh --test qa_desktop_cli_launcher --all-features` | **`PASS`** (`8/8` tests passed) |
-| **DGUI-QA-02C** | Bộ kiểm thử hợp đồng IPC & Handoff `MGH1` (`desktop_ipc_contract`) | `cargo test -p mesh-net --test desktop_ipc_contract --all-features` | **`PASS`** (`25/25` tests passed) |
-| **DGUI-QA-02D** | Bộ kiểm thử phiên Desktop (`desktop_session_wp_d_a1`) | `cargo test -p mesh-client --test desktop_session_wp_d_a1 --all-features` | **`PASS`** (`14/14` tests passed) |
-| **DGUI-QA-02E** | Bộ kiểm thử xác thực Onboarding & Zero-TOFU (`desktop_onboarding_validation`) | `cargo test -p mesh-core --test desktop_onboarding_validation --all-features` | **`PASS`** (`21/21` tests passed) |
-| **DGUI-QA-02F** | Bộ kiểm thử Win32 FFI & RAII (`gui_windows::tests`, `process_windows::tests`) | `cargo test -p mesh-sys --lib --all-features -- windows::tests` | **`PASS`** (`16/16` tests passed) |
-| **DGUI-QA-03** | Ngân sách nhị phân Release `MeshVPN.exe` (`<= 6 MiB`) & PE Subsystem (`== 2`) | `cargo build --release -p mesh-gui --bin MeshVPN` | **`PASS`** (`<= 4.00 MiB` mục tiêu & `<= 6.00 MiB` trần cứng; `PE Subsystem = 2` `IMAGE_SUBSYSTEM_WINDOWS_GUI`) |
-| **DGUI-QA-04** | Kiểm chứng Gỡ cài đặt & Nâng cấp Windows (`UNINST-01..08`) | `powershell -File lab/desktop/verify-desktop-uninstall.ps1 -DryRun` | **`PASS`** (`8/8` checks passed) |
-| **DGUI-QA-05** | Kiểm toán Bảo mật Tĩnh Đa Nền tảng (`DGUI-AUDIT-01..10`) | `qa_desktop_security_audit.rs` + `lab/desktop/audit-desktop-security.sh` | **`PASS`** (`10/10` invariants verified) |
+| Mã cổng | Hạng mục kiểm định | Lệnh thực thi | Số lượng test thật trong repo |
+|---|---|---|:-:|
+| **DGUI-QA-01** | Workspace `fmt` & `clippy` (`-D warnings`) | `cargo fmt --all -- --check` & `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `0` warnings / `0` errors |
+| **DGUI-QA-02A** | Bộ kiểm thử `mesh-gui` (`main.rs::tests` + `gui_unit_tests` + `qa_desktop_security_audit` + `qa_desktop_e2e_ipc`) | `cargo test -p mesh-gui --all-targets --all-features` | **`23`** (`3` bin + `10` unit + `9` audit + `1` E2E 8 pha) |
+| **DGUI-QA-02B** | Bộ kiểm thử CLI launcher (`qa_desktop_cli_launcher`) | `cargo test -p mesh --test qa_desktop_cli_launcher --all-features` | **`4`** tests |
+| **DGUI-QA-02C** | Bộ kiểm thử hợp đồng IPC & `MGH1` (`desktop_ipc_contract`) | `cargo test -p mesh-net --test desktop_ipc_contract --all-features` | **`5`** *(+ `8` inline `ipc.rs`/`gui_handoff.rs`)* |
+| **DGUI-QA-02D** | Bộ kiểm thử phiên & CLI version (`desktop_session_wp_d_a1` + `daemon_version_cli`) | `cargo test -p mesh-client --test desktop_session_wp_d_a1 --all-features` & `-p meshd --test daemon_version_cli` | **`1`** + **`1`** = **`2`** |
+| **DGUI-QA-02E** | Bộ kiểm thử Onboarding & Zero-TOFU (`desktop_onboarding_validation`) | `cargo test -p mesh-core --test desktop_onboarding_validation --all-features` | **`7`** (`4` unit + `3` `proptest!`) |
+| **DGUI-QA-02F** | Bộ kiểm thử Win32 FFI & Explorer (`gui_windows::tests` + `process_windows::tests`) | `cargo test -p mesh-sys --lib --all-features -- windows::tests` | **`3`** + **`2`** = **`5`** |
+| **DGUI-QA-03** | Ngân sách release `MeshVPN.exe` & PE Subsystem | `cargo build --release -p mesh-gui --bin MeshVPN` | `<= 6 MiB` (mục tiêu `<= 4 MiB`), `PE Subsystem == 2` |
+| **DGUI-QA-04** | Gỡ cài đặt & nâng cấp Windows (`UNINST-01..08`) | `powershell -File lab/desktop/verify-desktop-uninstall.ps1 -DryRun` | **`8/8`** checks |
+| **DGUI-QA-05** | Kiểm toán tĩnh bảo mật đa nền tảng (`DGUI-AUDIT-01..10`) | `qa_desktop_security_audit.rs` + `lab/desktop/audit-desktop-security.sh` | **`10/10`** checks |
 
 ---
 
-## 3. Bảng Xác minh 7 Work Packages (`WP-D-A0` .. `WP-D-C2`)
+## 3. Bảng Xác minh 7 Work Packages (`WP-D-A0` .. `WP-D-C2` — `78 SP`)
 
-| Work Package | Tên gói công việc | Stories | SP | Trạng thái Mã & Test Tự động | Trạng thái CI / Phần cứng |
-| :--- | :--- | :--- | :---: | :--- | :--- |
-| **WP-D-A0** | Desktop IPC v0.3.0 Evolution, MGH1 Binary Handoff & Unprivileged Sink | `US-102`, `US-103`, `US-105`, `US-106`, `US-107`, `US-109`, `US-110` | `14` | `VERIFIED_ON_WINDOWS_HOST` (`desktop_ipc_contract`, `qa_desktop_e2e_ipc`) | `hardware_signoff_required` (`WIN-UAT-04`, `MAC-UAT-04`) |
-| **WP-D-A1** | Shared Onboarding Validation, Zero-TOFU Rules, Log Sanitizer & Desktop Session | `US-104`, `US-105`, `US-110`, `US-111` | `8` | `VERIFIED_ON_WINDOWS_HOST` (`desktop_onboarding_validation`, `desktop_session_wp_d_a1`) | `VERIFIED_AT_CI_$0` |
-| **WP-D-B1** | Windows Win32 Safe FFI Primitives, DPI/GDI RAII, Dark Mode & MGH1 Worker Pipe | `US-100`, `US-103`, `US-108`, `US-111`, `US-113`, `US-115` | `12` | `VERIFIED_ON_WINDOWS_HOST` (`mesh-sys::gui_windows::tests`, `qa_desktop_security_audit`) | `PENDING_CI_RUNNER` (`windows-latest` MSVC) + `hardware_signoff_required` |
-| **WP-D-B2** | `crates/mesh-gui` (`MeshVPN.exe`) Windows Tray, Dashboard, Onboarding & Diagnostics | `US-100`, `US-102..111`, `US-113` | `18` | `VERIFIED_ON_WINDOWS_HOST` (`83` tests in `mesh-gui`, release `MeshVPN.exe` built & verified) | `PENDING_CI_RUNNER` (`windows-latest` MSVC) + `hardware_signoff_required` |
-| **WP-D-B3** | macOS SwiftUI Menu Bar Extra & AppKit Dashboard (`desktop/macos/Mesh VPN.app`) | `US-101..111`, `US-113`, `US-114` | `14` | `VERIFIED_ON_WINDOWS_HOST` (static audit of Swift/Plist/Entitlements & Zero-TOFU parity) | `PENDING_CI_RUNNER` (`macos-15` `swift test` + `xcodebuild test`) + `hardware_signoff_required` |
-| **WP-D-C1** | CLI `mesh gui` Subcommand, Installers/Uninstallers & Multi-OS CI/Release Matrix | `US-112`, `US-114`, `US-115`, `US-117` | `7` | `VERIFIED_ON_WINDOWS_HOST` (`qa_desktop_cli_launcher`, `verify-desktop-uninstall.ps1`) | `PENDING_CI_RUNNER` (`macos-15` packaging dry-run) + `hardware_signoff_required` |
-| **WP-D-C2** | Desktop GUI E2E IPC Harness, Security Audit, QA Runners & Gate 3 Operations Docs | `US-116` | `5` | `VERIFIED_ON_WINDOWS_HOST` (`qa_desktop_security_audit`, `qa_desktop_e2e_ipc`, `run-desktop-qa.{ps1,sh}`, 5 Gate 3 docs) | `hardware_signoff_required` (Sign-off ledger in `desktop-gui-hardware-acceptance-protocol.md`) |
-| **TỔNG CỘNG** | **7 Work Packages** | **18 Stories (`US-100..117`)** | **78 SP** | **100% Automated Host Checks PASS** | **Ready for CI Runner & Physical UAT** |
+| Work Package | Phạm vi thực tế theo `desktop-gui-sprint-backlog.md` v1.1 | Stories (`SP`) | Trạng thái tự động / CI / Phần cứng |
+|---|---|:-:|:---|
+| **`WP-D-A0`** *(Wave D-A.0)* | Workspace `v0.3.0`, `Dockerfile`, `scripts/check.{ps1,sh}`, `mesh-core` (`validate_preauth_key`, `MAX_BUGREPORT_ARCHIVE_BYTES`), `mesh-crypto`, `mesh-proto`, `mesh/Cargo.toml`, `mesh-sys` features/stubs, `mesh-net` (`ipc.rs`, `gui_handoff.rs` `MGH1`), `mesh-gui` skeleton | `US-102` (`3` Must) | `VERIFIED_ON_WINDOWS_HOST` (`desktop_onboarding_validation`, `scripts/check.ps1`) + `PENDING_CI_RUNNER` (`windows-latest` MSVC) |
+| **`WP-D-A1`** *(Wave D-A.1)* | `mesh-client` (`delete_identity`, `execute_reset_identity`, `update_bootstrap_trust_preserving_next_pin`), `mesh-mobile-ffi/src/bridge.rs` (`FfiStateStore::delete_identity`), `meshd` (`--version`, `/v1/agent/version`, `X-Mesh-Agent-Version`, `/v1/agent/reset-identity`, `/v1/agent/bugreport/stream` `GuardedBugreportStream`) | `US-101` (`5` Must) | `VERIFIED_ON_WINDOWS_HOST` (`desktop_session_wp_d_a1`, `desktop_ipc_contract`, `daemon_version_cli`) |
+| **`WP-D-A2`** *(Wave D-A.1)* | `crates/mesh-sys/src/process_windows.rs` (3-condition Explorer double-click + `CREATE_NEW_PROCESS_GROUP \| DETACHED_PROCESS`), `crates/mesh` (`mesh gui`, `mesh reset-identity [--yes]`, 0-arg exit `2`) | `US-100` (`3` Must) | `VERIFIED_ON_WINDOWS_HOST` (`qa_desktop_cli_launcher`, `process_windows::tests`) + `hardware_signoff_required` (`WIN-UAT-13`, `MAC-UAT-13`) |
+| **`WP-D-B1`** *(Wave D-B1)* | `crates/mesh-sys/src/gui_windows.rs` + `crates/mesh-gui/src/**` (`MeshVPN.exe` Tray + Dashboard 8 states, Onboarding, 1-Click Reconnect, UAC `MGH1` `9 B` LE `<= 64 KiB` + `0x00 WorkerHello` `13 B`, `elevation_worker.rs` SDDL `OICI`/self-copy/`5 \| 32`, `UnprivilegedSinkWriter`, `Local\MeshVpnGuiSingleInstance`, `HKCU\...\Run\MeshVPN`) | `US-103..108` (`26` Must + `3` Should = **`29`**) | `VERIFIED_ON_WINDOWS_HOST` (`mesh-gui` `23` tests, `gui_windows::tests`) + `PENDING_CI_RUNNER` (`check-windows` MSVC) + `hardware_signoff_required` (`WIN-UAT-01..16`) |
+| **`WP-D-B2`** *(Wave D-B2)* | `desktop/macos/**` (`Package.swift` Swift 6, `project.yml` `dev.meshvpn.macos`, `.swiftlint.yml`, `MeshDesktopCore` `19` XCTests + `MeshVPNAppTests` `2` XCTests, `LSUIElement`, single `Window("Mesh VPN", id: "dashboard")`, Non-Sandboxed, `0` `UIKit`, UDS `gid = 80`, `ClipboardAutoClear` trim `\n`, `AdminPrivilegeHelper` `--uninstall --keep-app`, `BugreportStreamWriter` `Darwin.rename`, `SafeOsLogger` `%{private}@`) + `scripts/install-macos.sh` | `US-109..113` (`18` Must + `3` Should = **`21`**) | `VERIFIED_ON_WINDOWS_HOST` (static audit `qa_desktop_security_audit`, `audit-desktop-security.sh`) + `PENDING_CI_RUNNER` (`desktop-macos` `21` XCTests + `swiftlint --strict` + `xcodebuild test`) + `hardware_signoff_required` (`MAC-UAT-01..16`) |
+| **`WP-D-C1`** *(Wave D-C.0)* | `.github/workflows/{ci,release}.yml`, `scripts/package-macos-app.sh` (3-step `ADR-026` không `--deep`), `scripts/install-windows.ps1` (SDDL `OICI`, `Local\MeshVpnGuiShutdownEvent`, 12 bundle files cleanup, giữ `keys.json` mặc định) | `US-114, 115, 117` (`10` Must + `2` Could = **`12`**) | `VERIFIED_ON_WINDOWS_HOST` (`verify-desktop-uninstall.ps1`, `qa_desktop_security_audit`) + `PENDING_CI_RUNNER` (`desktop-macos`, `package-macos-desktop`, `verify-and-build`) + `hardware_signoff_required` |
+| **`WP-D-C2`** *(Wave D-C.1)* | `qa_desktop_{security_audit,e2e_ipc}.rs`, `lab/desktop/{audit-desktop-security.sh,verify-desktop-uninstall.ps1}`, `scripts/run-desktop-qa.{ps1,sh}`, 5 tài liệu QA & Ops Gate 3 | `US-116` (`5` Must) | `VERIFIED_ON_WINDOWS_HOST` (automated QA suites) + `hardware_signoff_required` (physical UAT ledger) |
+| **TỔNG** | **`7` Work Packages (`4` Epics `EP-17..20`)** | **`18` Stories (`78 SP`)** | **`70` Must + `6` Should + `2` Could = `78 SP`** |
 
 ---
 
 ## 4. Bảng Xác minh Chi tiết 18 User Stories (`US-100..US-117` = `78 SP`)
 
-| Story | Tên User Story | SP | Bằng chứng Kiểm thử Tự động (`VERIFIED_ON_WINDOWS_HOST`) | Cổng CI / UAT Phần cứng (`PENDING_CI_RUNNER` / `hardware_signoff_required`) |
-| :--- | :--- | :---: | :--- | :--- |
-| **US-100** | Windows System Tray App Lifecycle & Single-Instance Guard | `5` | `crates/mesh-gui/src/main.rs` (`#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]`), `PE Subsystem == 2`, `Local\MeshVpnGuiSingleInstanceMutex`, `Local\MeshVpnGuiShutdownEvent`, `TaskbarCreated` re-registration trong `gui_windows.rs` | `WIN-UAT-01`, `WIN-UAT-02` (`hardware_signoff_required`) |
-| **US-101** | macOS Menu Bar Extra (`LSUIElement`) & Lifecycle | `5` | Kiểm toán tĩnh `Info.plist` (`LSUIElement = true`), `MeshApp.swift` (`MenuBarExtra`, `Window("Mesh VPN", id: "dashboard")` duy nhất, `initialStore.startMonitoring()`, chuyển đổi `.regular`/`.accessory`, ẩn `Cmd+N`) | `macos-15` `xcodebuild test` (`PENDING_CI_RUNNER`) + `MAC-UAT-01`, `MAC-UAT-02` (`hardware_signoff_required`) |
-| **US-102** | Main Status Dashboard & 1-Click Connect/Disconnect | `5` | `qa_desktop_e2e_ipc` kiểm chứng chu trình `Connected` -> `Down` -> `1-Click Reconnect` bảo toàn `last_server_endpoint` & `last_spki_pin` (`IG-DGUI-WA-04`); `PollingSuspensionGuard` (`IG-DGUI-WA-03`) | `WIN-UAT-03`, `MAC-UAT-03` (`hardware_signoff_required`) |
-| **US-103** | Zero-Leak Privilege Elevation & Admin IPC Bridge | `8` | `qa_desktop_security_audit` xác minh `0` `.expose_secret()` trong `mesh-gui`, khung `MGH1` `0x00 WorkerHello` (`13 B`), allowlist `\\.\pipe\mesh-gui-handoff-<32 hex>`, `Zeroizing<Vec<u8>>`; `PrivilegeHelper.swift` trên macOS | `WIN-UAT-04` (UAC `runas`), `MAC-UAT-04` (`gid=80` zero-prompt & `osascript`) (`hardware_signoff_required`) |
-| **US-104** | `mesh://join` URI Paste & Clipboard Import Onboarding | `5` | `desktop_onboarding_validation`, `qa_desktop_security_audit` kiểm chứng `clear_clipboard_if_seq_and_predicate` giữ `ClipboardGuard` nguyên tử + SHA-256 (`IG-DGUI-WA-01`) và xóa sau `30s` | `WIN-UAT-05`, `MAC-UAT-05` (`hardware_signoff_required`) |
-| **US-105** | Manual Enrollment Form with Zero-TOFU Validation | `3` | `qa_desktop_security_audit::test_zero_tofu_and_preauth_key_parity_across_rust_and_macos_swift` xác nhận khóa cứng `Pinned SPKI` cho IPv4 & IPv6 literal (`[::1]:443`, `[2001:db8::1]`) và `validate_preauth_key` (`>= 32 B` base64url) trên cả Rust và Swift | `WIN-UAT-06`, `MAC-UAT-06` (`hardware_signoff_required`) |
-| **US-106** | Searchable Peer List, Copy IP & Quick Ping | `5` | `qa_desktop_e2e_ipc` kiểm chứng `fetch_ipc_peers` với **50 peers** (`> 4 KiB`, `<= 64 KiB` — `BLK-DGUI-G2-04`) và `POST /v1/agent/ping`; `gui_unit_tests` kiểm chứng bộ lọc tìm kiếm peer theo tên/IP/relay | `WIN-UAT-07`, `MAC-UAT-07` (`hardware_signoff_required`) |
-| **US-107** | Exit Node & Full-Tunnel Selector with Loop Guard Status | `3` | `qa_desktop_e2e_ipc` kiểm chứng `POST /v1/agent/set` chọn và gỡ Exit Node; `gui_unit_tests` kiểm chứng hiển thị trạng thái `Loop Guard Active` (`REL-09`) | `WIN-UAT-08`, `MAC-UAT-08` (`hardware_signoff_required`) |
-| **US-108** | Preferences & Settings Panel (Auto-Start, MagicDNS, Language) | `3` | `mesh-sys::gui_windows::tests` kiểm chứng `validate_registry_value_name` cho `HKCU\...\Run\MeshVPN`; `gui_unit_tests` kiểm chứng chuyển đổi ngôn ngữ VI/EN và cờ `accept_dns` | `WIN-UAT-09`, `MAC-UAT-09` (`hardware_signoff_required`) |
-| **US-109** | Key Rotation, Enrollment Reset & Re-Authentication UX | `3` | `qa_desktop_e2e_ipc` kiểm chứng `POST /v1/agent/rotate-key` và `POST /v1/agent/reset-identity` giữ daemon sống và đưa về `Unconfigured` (`BLK-DGUI-G2-05`); `PollingSuspensionGuard` bảo vệ hộp thoại xác nhận | `WIN-UAT-10`, `MAC-UAT-10` (`hardware_signoff_required`) |
-| **US-110** | Netcheck Diagnostics, Live Log Viewer & 1-Click Bugreport | `5` | `qa_desktop_e2e_ipc` kiểm chứng `POST /v1/agent/netcheck`, `stream_ipc_bugreport` từng khúc `<= 64 KiB` qua `UnprivilegedSinkWriter` (`.part` + atomic `MoveFileExW` Replace + xóa `.part` khi lỗi giữa dòng — `BLK-DGUI-G2-06`), và `LogSanitizer` che `[REDACTED]` | `WIN-UAT-11`, `MAC-UAT-11` (`hardware_signoff_required`) |
-| **US-111** | Native OS Notifications & Actionable Error Banners | `3` | `qa_desktop_security_audit` kiểm chứng `SEC-05` (`ErrorKind::Unauthenticated` -> `"authentication failed"`), bộ đệm chống bão thông báo (cooldown `60s`), và biểu ngữ `LegacyPre030` (`BLK-DGUI-G2-03`) | `WIN-UAT-12`, `MAC-UAT-12` (`hardware_signoff_required`) |
-| **US-112** | CLI-to-GUI Integration (`mesh gui`) & Coexistence | `3` | `crates/mesh/tests/qa_desktop_cli_launcher.rs` (`8/8` tests) kiểm chứng `mesh gui [open|status]`, `--json`, kiểm tra `codesign -v`, và mã thoát `EX_UNAVAILABLE (69)` | `WIN-UAT-13`, `MAC-UAT-13` (`hardware_signoff_required`) |
-| **US-113** | Accessibility, High-DPI, Dark/Light Theme & i18n (VI/EN) | `5` | `gui_windows.rs` (`WM_DPICHANGED`, `DwmSetWindowAttribute`, `WS_TABSTOP`), `gui_unit_tests` kiểm chứng bảng chuỗi song ngữ Việt/Anh đầy đủ | `WIN-UAT-14`, `MAC-UAT-14` (`hardware_signoff_required`) |
-| **US-114** | macOS `.app` Bundle, Universal Binary & `.dmg` Packaging | `5` | `qa_desktop_security_audit` & `audit-desktop-security.sh` kiểm chứng thứ tự ký 3 bước `ADR-026` trong `scripts/package-macos-app.sh` (0 `--deep`, 0 `spctl` `--master-disable`) và `scripts/install-macos.sh --from-app-bundle` | `macos-15` packaging dry-run (`PENDING_CI_RUNNER`) + `MAC-UAT-15` (`hardware_signoff_required`) |
-| **US-115** | Windows Unified Installer, Shortcuts & Clean Uninstall | `3` | `lab/desktop/verify-desktop-uninstall.ps1 -DryRun` (`8/8` checks: `Local\MeshVpnGuiShutdownEvent`, `mesh.exe cleanup`, dừng `MeshVpnAgent`, xóa `HKCU\...\Run\MeshVPN`, bảo toàn `keys.json` trừ khi có `-PurgeData`) | `WIN-UAT-15` (`hardware_signoff_required`) |
-| **US-116** | Desktop GUI E2E IPC Harness, Security Audit & UAT Protocol | `5` | `qa_desktop_security_audit.rs`, `qa_desktop_e2e_ipc.rs`, `audit-desktop-security.sh`, `verify-desktop-uninstall.ps1`, `run-desktop-qa.{ps1,sh}`, và 5 tài liệu Gate 3 QA/Operations | Hoàn tất 100% trong `WP-D-C2` (`VERIFIED_ON_WINDOWS_HOST`) |
-| **US-117** | Multi-OS Desktop GUI CI/CD Build & Release Matrix | `4` | `qa_desktop_security_audit` xác minh `.github/workflows/ci.yml` (`macos-desktop-gui`, `windows-gui-smoke`) và `.github/workflows/release.yml` (manifest `SHA256SUMS` tường minh 5 tệp trên Windows + `MeshVPN-macos-universal.dmg`) | `PENDING_CI_RUNNER` (chờ chạy trên nhánh PR/tag GitHub Actions) |
+| Story | Tên theo `desktop-gui-product-backlog.md` v1.1 | SP / MoSCoW | Bằng chứng Tự động (`VERIFIED_ON_WINDOWS_HOST` / `PENDING_CI_RUNNER`) | Phần cứng (`hardware_signoff_required`) |
+|---|---|:---:|---|---|
+| **US-100** | Lệnh `mesh gui`, bảo toàn CLI `0-arg` tự động hóa & fallback Explorer 3 điều kiện | `3` / `Must` | `qa_desktop_cli_launcher` (`4/4` tests), `cli::tests`, `process_windows::tests` (`2/2`) | `WIN-UAT-13`, `MAC-UAT-13` |
+| **US-101** | Hợp đồng IPC Dual-Channel, Stream Bugreport `<= 20 MiB`, Reset Identity, Bảo toàn `next_pin`, `agent_version` & Timeout 3 Tầng | `5` / `Must` | `desktop_ipc_contract` (`5/5` + `8` inline `mesh-net`), `desktop_session_wp_d_a1` (`1/1`), `daemon_version_cli` (`1/1`) | `WIN-UAT-04/10/11`, `MAC-UAT-03/10/11` |
+| **US-102** | Kiểm chứng Onboarding Desktop (Chuẩn hóa `<host>:<port>`, Zero-TOFU) & Hàng rào Tĩnh `scripts/check.{ps1,sh}` | `3` / `Must` | `desktop_onboarding_validation` (`7/7`), `qa_desktop_security_audit` (Zero-TOFU + `mpk_` parity Rust/Swift), `scripts/check.ps1` | `WIN-UAT-05/06`, `MAC-UAT-04/05` |
+| **US-103** | Win32 FFI An toàn trong `crates/mesh-sys` & Khung `MeshVPN.exe` (MSVC + MinGW `gnu` + Non-Windows CI, DPI-Aware, Tray Lifecycle) | `5` / `Must` | `mesh-gui` `#![windows_subsystem = "windows"]`, `0` `unsafe` trong `mesh-gui`, `100%` `// SAFETY:` trong `gui_windows.rs`, `DGUI-QA-03` (`<= 6 MiB`, `PE = 2`), `PENDING_CI_RUNNER` (`check-windows` MSVC) | `WIN-UAT-01/02/14/16` |
+| **US-104** | Tray Menu, Full Dashboard Windows, Onboarding `mesh://join`, 1-Click Reconnect vs Confirmation & Phục hồi `Revoked`/`ReauthRequired` | `5` / `Must` | `gui_unit_tests` (8 states + `LegacyPre030` + `ClipboardSecretGuard`), `qa_desktop_e2e_ipc` (`50` peers, `1-Click Reconnect` giữ `next_pin`, `RotateKey`, `ResetIdentity`), `SEC-05` | `WIN-UAT-03/05/06/07/10/12` |
+| **US-105** | Cầu nối Nâng quyền `ShellExecuteExW("runas")`, Handoff `mpk_*` (`0` `argv`), Unprivileged Bridge & Bảo toàn `ADMIN_PIPE_SDDL` | `8` / `Must` | `qa_desktop_security_audit` (`MGH1` `9 B` LE, `0x00 WorkerHello` `13 B`, `SQOS`, `Zeroizing`), `gui_windows::tests`, `ipc_poller.rs` (`suspend()` trên `spawn_handoff_action`) | `WIN-UAT-04` |
+| **US-106** | 1-Click Cài đặt, Nâng cấp & Khởi động `MeshVpnAgent` (`MESH_WINTUN_SHA256`, Anti-TOCTOU, Chống `ERROR_SHARING_VIOLATION`) | `5` / `Must` | `main.rs::tests` (`OICI` SDDL, `windows_paths_equivalent` self-copy guard, `Some(5 \| 32)` -> `.new`), `open_anti_toctou_read_locked` | `WIN-UAT-08` |
+| **US-107** | Xuất Bugreport Unprivileged Sink Write (Stream `<= 20 MiB`) & Structured GUI Logging Windows | `3` / `Must` | `qa_desktop_e2e_ipc` + `gui_unit_tests` (`UnprivilegedSinkWriter` Replace & abort + `test_no_secrets_in_outputs` + `prop_sanitize_gui_log_*`) | `WIN-UAT-11` |
+| **US-108** | Single-Instance Guard (`Local\`), Nâng cấp Êm & Tự Khởi chạy Đăng nhập (Opt-in) trên Windows | `3` / `Should` | `gui_unit_tests` (`SemVerTriple`, `should_request_upgrade_shutdown`, `format_autostart_command_line`), `Local\MeshVpnGuiSingleInstance` & `Local\MeshVpnGuiShutdownEvent` | `WIN-UAT-02/09` |
+| **US-109** | Khung `Mesh VPN.app` (`LSUIElement`, Single-Window, Non-Sandboxed, Swift 6) & Menu Bar `NSStatusItem` | `5` / `Must` | `qa_desktop_security_audit` & `audit-desktop-security.sh` (`MeshApp.swift` single `Window("Mesh VPN", id: "dashboard")`, `startMonitoring()`, `.regular`/`.accessory`, `0` `UIKit`/`app-sandbox`/`CFBundleURLTypes`/`NSAllowsArbitraryLoads`, `Package.swift` Swift `6.0`), `PENDING_CI_RUNNER` (`desktop-macos`) | `MAC-UAT-01/02/16` |
+| **US-110** | Tầng Giao tiếp UDS (`meshd-ro`/`meshd-admin`, `gid=80` `0`-Mật khẩu) & SwiftUI Dashboard (Khắc phục 3 Lỗi `MeshApp`) | `5` / `Must` | `DesktopCoreTests.swift` (`7` tests incl. trailing `\n` clipboard wipe), `DesktopStoreTests.swift` (`7` tests incl. `ManualOnboardingInput` & `startOrRepairService` refresh), `UdsIpcAndBugreportTests.swift` (`5` tests) (`PENDING_CI_RUNNER` trên `macos-15`) | `MAC-UAT-03..07/10/12` |
+| **US-111** | 1-Click Cài đặt / Khởi động `LaunchDaemon` qua `osascript` (`root:wheel`), Bảo toàn Chữ ký & `socketfilterfw` Opt-In | `5` / `Must` | `UdsIpcAndBugreportTests.swift` (`AdminPrivilegeHelper`), `audit-desktop-security.sh` (`codesign -v`, `/usr/local/libexec/mesh/meshd`, `0` Gatekeeper disable) (`PENDING_CI_RUNNER` trên `macos-15`) | `MAC-UAT-03/08` |
+| **US-112** | Xuất Bugreport Streaming An toàn (Unprivileged Sink Write `0` Mật khẩu) & `OSLog` Secret Hygiene trên macOS | `3` / `Must` | `BugreportStreamWriter.swift` (`Darwin.rename(partURL.path, destURL.path)`), `SafeOsLogger` `%{private}@`, `UdsIpcAndBugreportTests.swift` (tệp mới + ghi đè + abort) (`PENDING_CI_RUNNER` trên `macos-15`) | `MAC-UAT-11` |
+| **US-113** | Phát hiện Lệch Phiên bản Bundle ↔ Daemon (`agent_version` & `meshd --version`) & Nâng cấp 1-Click trên macOS | `3` / `Should` | `DesktopStoreTests.swift` (`LegacyPre030`), `daemon_version_cli` (`1/1`), `UdsIpcClient.classifyVersionProbe` (`PENDING_CI_RUNNER` trên `macos-15`) | `MAC-UAT-12` |
+| **US-114** | Mở rộng `.github/workflows/{ci,release}.yml` Đóng gói `MeshVPN.exe` & `Mesh VPN.app` (`$0` Mode, Đúng Thứ tự `SHA256SUMS`) | `5` / `Must` | `qa_desktop_security_audit`, `verify-desktop-uninstall.ps1` (`UNINST-07/08`), `audit-desktop-security.sh` (`DGUI-AUDIT-09/10`), `PENDING_CI_RUNNER` (`desktop-macos`, `package-macos-desktop`) | `WIN-UAT-01`, `MAC-UAT-01` |
+| **US-115** | Nâng cấp & Gỡ cài đặt Sạch qua `ResourceLedger` (`G4`), Dọn Sạch Dấu vết GUI & Giữ `keys.json` Mặc định | `5` / `Must` | `verify-desktop-uninstall.ps1` (`8/8`), `main.rs::tests` (`WINDOWS_BUNDLE_REMOVAL_LIST` 12 items + `netmap-cache.json` + `logs`/`bugreports` purge), `AdminPrivilegeHelper.swift` (`--uninstall --keep-app`) | `WIN-UAT-15`, `MAC-UAT-15` |
+| **US-116** | Bộ Kiểm toán Bảo mật Đa Nền tảng (`$0` CI), Giao thức Nghiệm thu Phần cứng & Sổ tay Vận hành Desktop GUI | `5` / `Must` | `scripts/run-desktop-qa.{ps1,sh}`, `qa_desktop_security_audit` (`9/9`), `qa_desktop_e2e_ipc` (`1/1`), `audit-desktop-security.sh` (`10/10`), 5 tài liệu QA/Ops | `WIN-UAT-01..16`, `MAC-UAT-01..16` |
+| **US-117** | Sẵn sàng Chữ ký Số Thương mại Có Điều kiện (Authenticode / Apple Developer ID & Notarization) | `2` / `Could` | `.github/workflows/release.yml` (fallback `$0` sạch sẽ, `KC_PASS="$(openssl rand -hex 24)"`, `files:` khớp artifact thực tế) | `paid_cert_required` (tùy chọn khi cấp cert) |
 
 ---
 
-## 5. Bảng Kiểm chứng 43 Yêu cầu Chức năng (`DGUI-01..43`) & 5 Yêu cầu Phi Chức năng (`D-GNFR-01..05`)
+## 5. Tổng kết Cổng Kiểm chứng 43 `DGUI-*` & 5 `D-GNFR-*`
 
-| Nhóm yêu cầu | Mã yêu cầu | Trạng thái Kiểm thử Tự động | Bằng chứng Cốt lõi |
-| :--- | :--- | :--- | :--- |
-| **Khay hệ thống & Vòng đời** | `DGUI-01..08` | `VERIFIED_ON_WINDOWS_HOST` | `gui_windows.rs` (`Shell_NotifyIconW`, `TaskbarCreated`, `Local\MeshVpnGuiSingleInstanceMutex`, `Local\MeshVpnGuiShutdownEvent`), `MeshApp.swift` (`MenuBarExtra`, `Window(id: "dashboard")`, `startMonitoring()`, `.regular`/`.accessory`) |
-| **Bảng điều khiển & Nâng quyền** | `DGUI-09..16` | `VERIFIED_ON_WINDOWS_HOST` | `qa_desktop_e2e_ipc.rs` (`1-Click Reconnect`, `MGH1` `WorkerHello` + `HandoffRequest`), `PrivilegeHelper.swift` (`osascript` + `install-macos.sh --from-app-bundle`) |
-| **Onboarding & Zero-TOFU** | `DGUI-17..23` | `VERIFIED_ON_WINDOWS_HOST` | `desktop_onboarding_validation.rs`, `qa_desktop_security_audit.rs` (Zero-TOFU IPv4/IPv6 + `mpk_` `>= 32 B` parity + `ClipboardGuard` SHA-256 `30s` auto-clear) |
-| **Peer List, Ping & Exit Node** | `DGUI-24..30` | `VERIFIED_ON_WINDOWS_HOST` | `qa_desktop_e2e_ipc.rs` (`50 peers` `<= 64 KiB`, `/v1/agent/ping`, `/v1/agent/set` Exit Node), `gui_unit_tests.rs` |
-| **Cài đặt, Khóa & Chẩn đoán** | `DGUI-31..38` | `VERIFIED_ON_WINDOWS_HOST` | `qa_desktop_e2e_ipc.rs` (`/v1/agent/rotate-key`, `/v1/agent/reset-identity`, `/v1/agent/netcheck`, `stream_ipc_bugreport` + `UnprivilegedSinkWriter`), `LogSanitizer` |
-| **Thông báo, CLI & Trợ năng** | `DGUI-39..43` | `VERIFIED_ON_WINDOWS_HOST` | `qa_desktop_cli_launcher.rs` (`8/8` tests), `gui_unit_tests.rs` (`SEC-05`, cooldown `60s`, VI/EN i18n, `LegacyPre030` banner) |
-| **Ngân sách Tài nguyên (`D-GNFR-01`)** | `D-GNFR-01` | `VERIFIED_ON_WINDOWS_HOST` (Binary Size) / `hardware_signoff_required` (RAM/CPU) | `target/release/MeshVPN.exe` `<= 4 MiB` (trần `6 MiB`), `PE Subsystem == 2`; đo RAM/CPU thực tế tại `WIN-UAT-16` & `MAC-UAT-16` |
-| **Tự chủ `$0` & Không WebView (`D-GNFR-02`)** | `D-GNFR-02` | `VERIFIED_ON_WINDOWS_HOST` | `0` Tauri/Electron/WebView2/CEF trong `Cargo.toml` và `project.yml`; hỗ trợ `$0 Ad-Hoc Mode` và `Commercial Signed Mode` |
-| **Bảo mật Khóa & IPC (`D-GNFR-03`)** | `D-GNFR-03` | `VERIFIED_ON_WINDOWS_HOST` | `0` `.expose_secret()` trong `mesh-gui`, `MGH1` `Zeroizing`, `UnprivilegedSinkWriter`, `SEC-04`, `SEC-05`, `SEC-14` |
-| **Độ tin cậy & Thoát sạch (`D-GNFR-04`)** | `D-GNFR-04` | `VERIFIED_ON_WINDOWS_HOST` | `0` `.unwrap()`/`.expect()`/`panic!()` trong `mesh-gui` & production Swift; `PollingSuspensionGuard`; thoát sạch `<= 2s` |
-| **Khả năng Bảo trì & Lint (`D-GNFR-05`)** | `D-GNFR-05` | `VERIFIED_ON_WINDOWS_HOST` | `cargo clippy --workspace --all-targets --all-features -- -D warnings` xanh 100%; `desktop/macos/.swiftlint.yml` nghiêm ngặt |
-
----
-
-## 6. Kết luận Gate 3 (Gate 3 Sign-Off Decision)
-
-1. **Cổng Kiểm định Tự động (`$0` Host Verification)**: **ĐẠT 100% (`VERIFIED_ON_WINDOWS_HOST`)** — toàn bộ 6 crate Rust liên quan đến Desktop GUI, bộ kiểm toán bảo mật tĩnh, bài kiểm thử vòng đời E2E IPC 50 peers + `UnprivilegedSinkWriter`, nhị phân release `MeshVPN.exe`, và kịch bản gỡ cài đặt `-DryRun` đều vượt qua không một lỗi hay cảnh báo.
-2. **Điều kiện Mở khóa Phát hành Chính thức (`Release Gate Conditions`)**:
-   - Thực thi xanh workflow `.github/workflows/ci.yml` trên runner `macos-15` và `windows-latest` (`PENDING_CI_RUNNER`).
-   - Thực thi và điền đầy đủ bảng ký duyệt phần cứng vật lý trong `docs/06-operations/desktop-gui-hardware-acceptance-protocol.md` (`hardware_signoff_required`).
+- **`DGUI-UX-01..07`, `DGUI-WIN-01..07`, `DGUI-MAC-01..07`, `DGUI-SEC-01..08`, `DGUI-IPC-01..05`, `DGUI-OPS-01..05`, `DGUI-PERF-01..04` (`43/43`)** và **`D-GNFR-01..05` (`5/5`)** đều được ánh xạ đầy đủ vào `7` Work Packages (`WP-D-A0..WP-D-C2`) và `18` Stories (`US-100..US-117` = `78 SP`).
+- **Điều kiện hoàn tất phát hành `v0.3.0`**:
+  1. `VERIFIED_ON_WINDOWS_HOST`: Toàn bộ bộ kiểm định Rust (`mesh-gui`, `mesh`, `mesh-net`, `mesh-client`, `meshd`, `mesh-core`, `mesh-sys`) + `scripts/check.ps1 -Cross` + `scripts/run-desktop-qa.ps1` xanh `100%`.
+  2. `PENDING_CI_RUNNER`: Runner GitHub Actions `macos-15` (`desktop-macos`, `package-macos-desktop`) và `windows-latest` (`check-windows`, `verify-and-build`) hoàn tất xanh `100%`.
+  3. `hardware_signoff_required`: Ký duyệt sổ cái UAT máy thật Windows 10/11 & macOS 13+ trong `docs/06-operations/desktop-gui-hardware-acceptance-protocol.md`.

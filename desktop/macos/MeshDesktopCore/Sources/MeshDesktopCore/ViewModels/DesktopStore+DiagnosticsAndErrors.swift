@@ -174,11 +174,10 @@ extension DesktopStore {
             busyMessage = nil
         }
 
-        return await withSuspendedPolling {
+        let succeeded = await withSuspendedPolling {
             do {
                 try await self.privilegeHelper.execute(action)
                 self.lastToastMessage = successToast
-                await self.refreshStatus(probeVersionIfNeeded: true)
                 return true
             } catch AdminPrivilegeError.userCancelled {
                 self.lastToastMessage = "Administrator authorization was cancelled."
@@ -190,6 +189,10 @@ extension DesktopStore {
                 return false
             }
         }
+        if succeeded {
+            await self.refreshStatus(probeVersionIfNeeded: true)
+        }
+        return succeeded
     }
 
     func mapErrorToUserFacing(_ error: Error) -> DesktopUserFacingError {

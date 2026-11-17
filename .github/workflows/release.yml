@@ -440,7 +440,7 @@ jobs:
               os.chmod(p8_path, 0o600)
           PY
           KEYCHAIN="/tmp/mesh-apple-signing/build.keychain-db"
-          KC_PASS="mesh-ephemeral-kc-pass"
+          KC_PASS="$(openssl rand -hex 24)"
           security create-keychain -p "${KC_PASS}" "${KEYCHAIN}"
           security set-keychain-settings -lut 21600 "${KEYCHAIN}"
           security unlock-keychain -p "${KC_PASS}" "${KEYCHAIN}"
@@ -524,6 +524,7 @@ jobs:
           merge-multiple: true
 
       - name: Generate unified SHA256SUMS
+        id: dist_files
         run: |
           set -euo pipefail
           cd release-dist
@@ -535,8 +536,17 @@ jobs:
               fi
             done
           done
+          test "${#files[@]}" -gt 0
           sha256sum "${files[@]}" > SHA256SUMS
           cat SHA256SUMS
+          {
+            echo "files<<EOF"
+            for f in "${files[@]}"; do
+              echo "release-dist/${f}"
+            done
+            echo "release-dist/SHA256SUMS"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -552,9 +562,4 @@ jobs:
             - **Windows**: Extract `mesh-windows-x86_64-msvc.zip` and launch `MeshVPN.exe` (or run `scripts/install-windows.ps1` as Administrator).
             - **macOS (`$0` Ad-Hoc Signed)**: Open `MeshVPN-macos-universal.dmg`, drag `Mesh VPN.app` to `/Applications`, and on first launch **Right-click -> Open** (or allow in *System Settings -> Privacy & Security*) to acknowledge Gatekeeper for unsigned/ad-hoc builds.
             - Verify all downloads against `SHA256SUMS`.
-          files: |
-            release-dist/*.tar.gz
-            release-dist/*.zip
-            release-dist/*.dmg
-            release-dist/*.pkg
-            release-dist/SHA256SUMS
+          files: ${{ steps.dist_files.outputs.files }}
