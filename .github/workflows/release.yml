@@ -34,13 +34,13 @@ jobs:
             archive_ext: tar.gz
             bin_ext: ""
             platform: linux
-          - os: macos-15
+          - os: macos-latest
             target: aarch64-apple-darwin
             pkg_name: mesh-darwin-arm64
             archive_ext: tar.gz
             bin_ext: ""
             platform: macos
-          - os: macos-15
+          - os: macos-latest
             target: x86_64-apple-darwin
             pkg_name: mesh-darwin-x86_64
             archive_ext: tar.gz
@@ -391,10 +391,22 @@ jobs:
   package-macos-desktop:
     name: Package Universal macOS Mesh VPN.app & DMG
     needs: [verify-and-build]
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Ensure Xcode 16 (Swift 6.0) toolchain is active
+        run: |
+          set -euo pipefail
+          if ! swift --version | grep -q "Swift version 6\."; then
+            XCODE16="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+            if [ -n "$XCODE16" ]; then
+              sudo xcode-select -s "$XCODE16/Contents/Developer"
+            fi
+          fi
+          swift --version
+          xcodebuild -version
 
       - name: Download arm64 & x86_64 Darwin binaries
         uses: actions/download-artifact@v4
