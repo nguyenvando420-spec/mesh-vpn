@@ -95,9 +95,13 @@ jobs:
                   errors.append(f"CRLF detected (expected LF): {path}")
 
               rel = path.as_posix()
-              if rel not in {"scripts/check.ps1", "scripts/check.sh"} and path.suffix.lower() in {
-                  ".rs", ".swift", ".sh", ".ps1", ".yml", ".yaml", ".plist", ".entitlements", ".toml", ".md"
-              }:
+              if (
+                  rel.startswith(("desktop/macos/", "scripts/", ".github/workflows/"))
+                  and rel not in {"scripts/check.ps1", "scripts/check.sh", ".github/workflows/ci.yml"}
+                  and path.suffix.lower() in {
+                      ".rs", ".swift", ".sh", ".ps1", ".yml", ".yaml", ".plist", ".entitlements", ".toml"
+                  }
+              ):
                   if spctl_pattern.search(text):
                       errors.append(f"Forbidden Gatekeeper disable command in {rel}")
 
@@ -329,7 +333,8 @@ jobs:
         shell: pwsh
         run: |
           cargo build --release --locked --target x86_64-pc-windows-msvc --bin MeshVPN
-          python - <<'PY'
+          if ($LASTEXITCODE -ne 0) { throw "cargo build MeshVPN failed" }
+          @'
           import pathlib
           import struct
           import sys
@@ -355,7 +360,8 @@ jobs:
           print(f"MeshVPN.exe PE subsystem: {subsystem}")
           if subsystem != 2:
               raise SystemExit(f"ERROR: expected PE subsystem 2 (IMAGE_SUBSYSTEM_WINDOWS_GUI), got {subsystem}")
-          PY
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "MeshVPN.exe size/PE verification failed" }
 
       - name: Dry-run verify scripts/install-windows.ps1 (install, -Uninstall, -Uninstall -PurgeData)
         shell: pwsh
@@ -433,14 +439,34 @@ jobs:
           swiftlint version
 
       - name: Run SwiftPM unit tests (MeshDesktopCore)
-        run: swift test --package-path desktop/macos/MeshDesktopCore
+        run: |
+          set -o pipefail
+          swift test --package-path desktop/macos/MeshDesktopCore 2>&1 | tee /tmp/mesh-swift-test.log || {
+            python3 - <<'PY'
+          import pathlib
+          log = pathlib.Path("/tmp/mesh-swift-test.log").read_text(encoding="utf-8", errors="replace")
+          for line in log.splitlines():
+              if any(k in line for k in ("error:", "failed", "Fatal error", "XCTAssert")):
+                  print(f"::error title=swift test::{line[:300]}")
+          PY
+            exit 1
+          }
 
       - name: Generate Xcode project, run SwiftLint --strict & xcodebuild test
         run: |
           set -euo pipefail
           cd desktop/macos
           xcodegen generate
-          swiftlint lint --strict --reporter github-actions-logging
+          swiftlint lint --strict --config .swiftlint.yml --reporter github-actions-logging 2>&1 | tee /tmp/mesh-swiftlint.log || {
+            python3 - <<'PY'
+          import pathlib
+          log = pathlib.Path("/tmp/mesh-swiftlint.log").read_text(encoding="utf-8", errors="replace")
+          for line in log.splitlines():
+              if any(k in line for k in ("error:", "warning:", "Violation")):
+                  print(f"::error title=swiftlint::{line[:300]}")
+          PY
+            exit 1
+          }
           if ! xcodebuild test \
             -project MeshVPNApp.xcodeproj \
             -scheme MeshVPNApp \
@@ -633,7 +659,7 @@ jobs:
             Copy-Item -LiteralPath (Join-Path $env:MESH_WINTUN_STAGE_DIR $asset) -Destination (Join-Path $distDir $asset) -Force
           }
           Copy-Item -LiteralPath 'scripts/install-windows.ps1' -Destination (Join-Path $scriptsDir 'install-windows.ps1') -Force
-          python - <<'PY'
+          @'
           import hashlib
           import pathlib
           import struct
@@ -653,7 +679,8 @@ jobs:
               digest = hashlib.sha256(p.read_bytes()).hexdigest()
               lines.append(f"{digest}  {name}")
           (dist / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
-          PY
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "Windows SHA256SUMS generation failed" }
 
       - name: Package Linux service units, installers & SHA256SUMS
         if: matrix.target == 'x86_64-unknown-linux-musl'

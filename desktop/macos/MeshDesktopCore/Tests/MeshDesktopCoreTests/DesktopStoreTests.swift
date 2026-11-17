@@ -192,13 +192,13 @@ final class DesktopStoreTests: XCTestCase {
         try await Task.sleep(nanoseconds: 80_000_000)
 
         // Act: Begin export AFTER destination is decided -> polling suspends while streaming
-        async let exportTask = store.exportBugreport(to: dest)
+        let exportTask = Task { await store.exportBugreport(to: dest) }
         try await Task.sleep(nanoseconds: 40_000_000)
         let suspendedDuringStream = store.isPollingSuspended
         let countDuringStart = transport.fetchStatusCount
         try await Task.sleep(nanoseconds: 80_000_000)
         let countMidStream = transport.fetchStatusCount
-        let exported = await exportTask
+        let exported = await exportTask.value
 
         // Assert
         XCTAssertTrue(suspendedDuringStream)
@@ -330,7 +330,7 @@ private final class MockAdminPrivilegeExecutor: AdminPrivilegeExecuting {
 }
 
 private final class MockDesktopIpcTransport: DesktopIpcTransport {
-    private struct State {
+    private struct State: Sendable {
         var status = AgentStatusResponse(daemonState: .stopped)
         var version = AgentVersionResponse(
             agentVersion: "0.3.0",
@@ -348,20 +348,20 @@ private final class MockDesktopIpcTransport: DesktopIpcTransport {
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    var fetchStatusCount: Int { state.withLock(\.fetchCount) }
-    var lastUpRequest: AgentUpRequest? { state.withLock(\.lastUp) }
-    var didCallResetIdentity: Bool { state.withLock(\.resetCalled) }
-    var didCallBringDown: Bool { state.withLock(\.downCalled) }
+    var fetchStatusCount: Int { state.withLock { $0.fetchCount } }
+    var lastUpRequest: AgentUpRequest? { state.withLock { $0.lastUp } }
+    var didCallResetIdentity: Bool { state.withLock { $0.resetCalled } }
+    var didCallBringDown: Bool { state.withLock { $0.downCalled } }
     var simulateLegacy404Version: Bool {
-        get { state.withLock(\.legacy404) }
+        get { state.withLock { $0.legacy404 } }
         set { state.withLock { $0.legacy404 = newValue } }
     }
     var nextUpError: Error? {
-        get { state.withLock(\.upError) }
+        get { state.withLock { $0.upError } }
         set { state.withLock { $0.upError = newValue } }
     }
     var streamDelayNs: UInt64 {
-        get { state.withLock(\.streamDelayNs) }
+        get { state.withLock { $0.streamDelayNs } }
         set { state.withLock { $0.streamDelayNs = newValue } }
     }
 
@@ -457,7 +457,7 @@ private final class MockDesktopIpcTransport: DesktopIpcTransport {
         socketPath: String,
         onChunk: @escaping @Sendable (Data) throws -> Void
     ) async throws -> StreamedBugreportMetadata {
-        let delay = state.withLock(\.streamDelayNs)
+        let delay = state.withLock { $0.streamDelayNs }
         if delay > 0 {
             try await Task.sleep(nanoseconds: delay)
         }

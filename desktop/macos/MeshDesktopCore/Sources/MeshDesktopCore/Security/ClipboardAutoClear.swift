@@ -52,10 +52,10 @@ public final class ClipboardAutoClear {
     private var wipeTask: Task<Void, Never>?
 
     public init(
-        pasteboard: any PasteboardProviding = SystemPasteboardProvider(),
+        pasteboard: (any PasteboardProviding)? = nil,
         delaySeconds: TimeInterval = AgentDefaults.clipboardWipeDelaySeconds
     ) {
-        self.pasteboard = pasteboard
+        self.pasteboard = pasteboard ?? SystemPasteboardProvider()
         self.delaySeconds = delaySeconds
     }
 

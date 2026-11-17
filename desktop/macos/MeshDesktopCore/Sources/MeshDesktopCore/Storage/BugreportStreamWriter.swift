@@ -173,8 +173,9 @@ public enum BugreportStreamWriter: Sendable {
     }
 
     private static func makeTempPartURL(nextTo destURL: URL) throws -> URL {
-        var randomBytes = [UInt8](repeating: 0, count: 16)
-        let status = SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes)
+        let byteCount = 16
+        var randomBytes = [UInt8](repeating: 0, count: byteCount)
+        let status = SecRandomCopyBytes(kSecRandomDefault, byteCount, &randomBytes)
         guard status == errSecSuccess else {
             throw BugreportWriterError.ioFailure(
                 "CSPRNG failure generating temporary bugreport name (status=\(status))"
@@ -292,7 +293,7 @@ private final class AtomicPartFileSink: Sendable {
         while offset < data.count {
             let written = data.withUnsafeBytes { rawPtr -> Int in
                 guard let base = rawPtr.baseAddress else { return -1 }
-                return Darwin.write(fd, base.advanced(by: offset), data.count - offset)
+                return Darwin.write(fd, base.advanced(by: offset), rawPtr.count - offset)
             }
             if written > 0 {
                 offset += written

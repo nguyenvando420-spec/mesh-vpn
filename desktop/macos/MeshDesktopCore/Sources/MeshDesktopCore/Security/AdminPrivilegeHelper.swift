@@ -54,8 +54,7 @@ public struct AdminPrivilegeHelper: AdminPrivilegeExecuting, Sendable {
 
     public func execute(_ action: PrivilegedDaemonAction) async throws {
         let script = try buildAppleScript(for: action)
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+        let _: Void = try await withCheckedThrowingContinuation { continuation in
             ioQueue.async {
                 do {
                     try Self.runOsascript(script: script)

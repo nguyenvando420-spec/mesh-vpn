@@ -223,7 +223,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          python - <<'PY'
+          @'
           import pathlib
           import struct
 
@@ -244,7 +244,8 @@ jobs:
           subsystem = struct.unpack_from("<H", raw, e_lfanew + 24 + 68)[0]
           if subsystem != 2:
               raise SystemExit(f"ERROR: MeshVPN.exe PE subsystem={subsystem}, expected 2 (IMAGE_SUBSYSTEM_WINDOWS_GUI)")
-          PY
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "MeshVPN.exe size/PE verification failed" }
 
       - name: Conditional Windows Authenticode signing (US-117, graceful $0 fallback)
         if: matrix.platform == 'windows'

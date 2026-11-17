@@ -355,8 +355,12 @@ private final class TestUnixHttpServer: Sendable {
     }
 
     private func handleConnection(_ clientFd: Int32, handler: @Sendable (String) -> TestHttpReply) {
-        var reqBuf = [UInt8](repeating: 0, count: 4_096)
-        let readCount = Darwin.read(clientFd, &reqBuf, reqBuf.count)
+        let bufCap = 4_096
+        var reqBuf = [UInt8](repeating: 0, count: bufCap)
+        let readCount = reqBuf.withUnsafeMutableBytes { ptr -> Int in
+            guard let base = ptr.baseAddress else { return -1 }
+            return Darwin.read(clientFd, base, bufCap)
+        }
         guard readCount > 0 else { return }
         let reqText = String(bytes: reqBuf[0..<readCount], encoding: .utf8) ?? ""
         let firstLine = reqText.split(separator: "\r\n", maxSplits: 1).first ?? ""
@@ -388,7 +392,7 @@ private final class TestUnixHttpServer: Sendable {
         }
         _ = rawOut.withUnsafeBytes { ptr in
             if let base = ptr.baseAddress {
-                return Darwin.write(clientFd, base, rawOut.count)
+                return Darwin.write(clientFd, base, ptr.count)
             }
             return 0
         }
