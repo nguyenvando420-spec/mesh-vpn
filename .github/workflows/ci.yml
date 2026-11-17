@@ -42,10 +42,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify UTF-8 No BOM and LF line endings on DevOps/CI/Lab files
+      - name: Verify UTF-8 No BOM, LF line endings & Desktop macOS static invariants
         run: |
           python3 - <<'PY'
           import pathlib
+          import plistlib
+          import re
           import sys
 
           targets = []
@@ -60,23 +62,68 @@ jobs:
                           continue
                       targets.append(p)
 
+          macos_root = pathlib.Path("desktop/macos")
+          forbidden_macos_exts = {".p12", ".mobileprovision", ".cer", ".dmg", ".pkg", ".app"}
           errors = []
+          if macos_root.exists():
+              for p in sorted(macos_root.rglob("*")):
+                  rel = p.as_posix()
+                  if (
+                      ".build" in p.parts
+                      or "DerivedData" in p.parts
+                      or any(part.endswith(".xcodeproj") for part in p.parts)
+                  ):
+                      continue
+                  if p.suffix.lower() in forbidden_macos_exts:
+                      errors.append(f"Forbidden macOS artifact in git: {rel}")
+                      continue
+                  if not p.is_file():
+                      continue
+                  targets.append(p)
+
+          spctl_pattern = re.compile("spctl" + r"\s+--master-disable")
           for path in targets:
               data = path.read_bytes()
               if data.startswith(b"\xef\xbb\xbf"):
                   errors.append(f"UTF-8 BOM detected: {path}")
               try:
-                  data.decode("utf-8")
+                  text = data.decode("utf-8")
               except UnicodeDecodeError as exc:
                   errors.append(f"Invalid UTF-8 in {path}: {exc}")
+                  continue
               if path.suffix.lower() not in {".ps1", ".bat", ".cmd"} and b"\r\n" in data:
                   errors.append(f"CRLF detected (expected LF): {path}")
+
+              rel = path.as_posix()
+              if rel not in {"scripts/check.ps1", "scripts/check.sh"} and path.suffix.lower() in {
+                  ".rs", ".swift", ".sh", ".ps1", ".yml", ".yaml", ".plist", ".entitlements", ".toml", ".md"
+              }:
+                  if spctl_pattern.search(text):
+                      errors.append(f"Forbidden Gatekeeper disable command in {rel}")
+
+              if rel.startswith("desktop/macos/"):
+                  if path.suffix.lower() in {".entitlements", ".plist", ".yml", ".yaml"}:
+                      if "com.apple.security.app-sandbox" in text:
+                          errors.append(f"Forbidden App Sandbox in {rel}")
+                      if path.suffix.lower() != ".entitlements":
+                          if "CFBundleURLTypes" in text:
+                              errors.append(f"Forbidden CFBundleURLTypes in {rel}")
+                          if "NSAllowsArbitraryLoads" in text:
+                              errors.append(f"Forbidden NSAllowsArbitraryLoads in {rel}")
+                  if path.suffix.lower() == ".swift" and re.search(r"^\s*import\s+UIKit\b", text, re.MULTILINE):
+                      errors.append(f"Forbidden iOS UIKit import in {rel}")
+
+              if path.suffix.lower() in {".plist", ".entitlements"}:
+                  try:
+                      plistlib.loads(data)
+                  except Exception as exc:
+                      errors.append(f"Invalid plist XML in {rel}: {exc}")
 
           if errors:
               for err in errors:
                   print(err, file=sys.stderr)
               sys.exit(1)
-          print(f"Verified UTF-8 No BOM and LF across {len(targets)} files.")
+          print(f"Verified UTF-8 No BOM, LF, and static security invariants across {len(targets)} files.")
           PY
 
       - name: Check bash syntax on all shell scripts
@@ -246,6 +293,77 @@ jobs:
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
 
+      - name: Run Windows Desktop GUI unit tests (gui_unit_tests)
+        shell: pwsh
+        run: cargo test --locked -p mesh-gui --all-features --all-targets
+
+      - name: Verify MeshVPN compiles on x86_64-pc-windows-gnu
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo check --locked --target x86_64-pc-windows-gnu --bin MeshVPN
+
+      - name: Download & verify Wintun 0.14.1 for MESH_WINTUN_SHA256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
+          $expectedZipSha256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          $tmpDir = Join-Path $env:RUNNER_TEMP 'wintun-ci-win'
+          New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+          $zipPath = Join-Path $tmpDir 'wintun-0.14.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          $actualZip = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualZip -ne $expectedZipSha256) {
+            throw "Wintun archive SHA-256 mismatch: expected $expectedZipSha256, got $actualZip"
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $tmpDir -Force
+          $dllPath = Join-Path $tmpDir 'wintun\bin\amd64\wintun.dll'
+          $dllSha256 = (Get-FileHash -LiteralPath $dllPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($dllSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "Invalid computed wintun.dll SHA-256: $dllSha256"
+          }
+          "MESH_WINTUN_SHA256=$dllSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build release MeshVPN.exe and verify size <= 6 MiB & PE subsystem == 2
+        shell: pwsh
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc --bin MeshVPN
+          python - <<'PY'
+          import pathlib
+          import struct
+          import sys
+
+          exe = pathlib.Path("target/x86_64-pc-windows-msvc/release/MeshVPN.exe")
+          if not exe.is_file():
+              raise SystemExit(f"ERROR: missing {exe}")
+          raw = exe.read_bytes()
+          size_bytes = len(raw)
+          max_bytes = 6_291_456
+          goal_bytes = 4 * 1024 * 1024
+          print(f"MeshVPN.exe size: {size_bytes} bytes ({size_bytes / 1048576:.2f} MiB)")
+          if size_bytes > max_bytes:
+              raise SystemExit(f"ERROR: MeshVPN.exe exceeds 6 MiB hard limit ({size_bytes} > {max_bytes})")
+          if size_bytes > goal_bytes:
+              print(f"::warning file={exe}::MeshVPN.exe ({size_bytes / 1048576:.2f} MiB) exceeds 4.00 MiB design target")
+
+          e_lfanew = struct.unpack_from("<I", raw, 0x3C)[0]
+          if raw[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+              raise SystemExit("ERROR: invalid PE signature in MeshVPN.exe")
+          opt_offset = e_lfanew + 24
+          subsystem = struct.unpack_from("<H", raw, opt_offset + 68)[0]
+          print(f"MeshVPN.exe PE subsystem: {subsystem}")
+          if subsystem != 2:
+              raise SystemExit(f"ERROR: expected PE subsystem 2 (IMAGE_SUBSYSTEM_WINDOWS_GUI), got {subsystem}")
+          PY
+
+      - name: Dry-run verify scripts/install-windows.ps1 (install, -Uninstall, -Uninstall -PurgeData)
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -DryRun
+          powershell -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -Uninstall -DryRun
+          powershell -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -Uninstall -PurgeData -DryRun
+
       - name: Run SLO verification suite (US-058)
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File scripts/run-slo-suite.ps1 -SkipStaticChecks -OutputDir "$env:RUNNER_TEMP\slo-report"
@@ -273,9 +391,85 @@ jobs:
           path: ${{ runner.temp }}/slo-report/*
           if-no-files-found: ignore
 
+  desktop-macos:
+    name: Desktop macOS (MeshDesktopCore + XcodeGen + SwiftLint + XCTest)
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-deny 0.20.2
+        id: cache-deny
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-macos-desktop-${{ runner.arch }}
+
+      - name: Install cargo-deny 0.20.2 if not cached
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Run scripts/check.sh
+        run: sh scripts/check.sh
+
+      - name: Install or verify XcodeGen and SwiftLint
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          if ! command -v swiftlint >/dev/null 2>&1; then
+            brew install swiftlint
+          fi
+          xcodegen --version
+          swiftlint version
+
+      - name: Run SwiftPM unit tests (MeshDesktopCore)
+        run: swift test --package-path desktop/macos/MeshDesktopCore
+
+      - name: Generate Xcode project, run SwiftLint --strict & xcodebuild test
+        run: |
+          set -euo pipefail
+          cd desktop/macos
+          xcodegen generate
+          swiftlint lint --strict --reporter github-actions-logging
+          if ! xcodebuild test \
+            -project MeshVPNApp.xcodeproj \
+            -scheme MeshVPNApp \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /tmp/macos-desktop-xcodebuild.log; then
+            python3 - <<'PY'
+          import pathlib, re
+          lines = pathlib.Path("/tmp/macos-desktop-xcodebuild.log").read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"(?:error:|fatal error:|BUILD FAILED|Test Case .* failed)", ln)]
+          snippet = "\n".join((matches[-10:] + ["--- tail ---"] + lines[-25:])[-36:])
+          print("::error title=macos xcodebuild test::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
+            exit 1
+          fi
+
+      - name: Lint plists, validate shell scripts & run macOS packaging/installer dry-runs
+        run: |
+          set -euo pipefail
+          plutil -lint deploy/launchd/internal.mesh.meshd.plist
+          plutil -lint desktop/macos/MeshVPNApp/Resources/Info.plist
+          plutil -lint desktop/macos/MeshVPNApp/Resources/MeshVPN.entitlements
+          bash -n scripts/install-macos.sh scripts/package-macos-app.sh
+          sh scripts/package-macos-app.sh --dry-run
+          sh scripts/install-macos.sh --dry-run
+          sh scripts/install-macos.sh --uninstall --dry-run
+
   release-build-matrix:
     name: Build 4-Target Release Matrix (${{ matrix.target }})
-    needs: [static-and-lab-lint, check-linux, check-macos, check-windows]
+    needs: [static-and-lab-lint, check-linux, check-macos, check-windows, desktop-macos]
     strategy:
       fail-fast: false
       matrix:
@@ -286,13 +480,13 @@ jobs:
             ext: ""
             codesign: "false"
             check_gnu: "false"
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             bins: "mesh meshd mesh-server"
             ext: ""
             codesign: "true"
             check_gnu: "false"
-          - os: macos-latest
+          - os: macos-15
             target: x86_64-apple-darwin
             bins: "mesh meshd mesh-server"
             ext: ""
@@ -300,7 +494,7 @@ jobs:
             check_gnu: "false"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bins: "mesh meshd mesh-server"
+            bins: "MeshVPN mesh meshd mesh-server"
             ext: ".exe"
             codesign: "false"
             check_gnu: "true"
@@ -371,11 +565,16 @@ jobs:
           Write-Output "Verified Wintun 0.14.1 SHA-256 and exported MESH_WINTUN_SHA256=$dllSha256"
 
       - name: Build release binaries (${{ matrix.target }})
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin mesh --bin meshd --bin mesh-server
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+            cargo build --release --locked --target ${{ matrix.target }} --bin MeshVPN --bin mesh --bin meshd --bin mesh-server
+          else
+            cargo build --release --locked --target ${{ matrix.target }} --bin mesh --bin meshd --bin mesh-server
+          fi
 
       - name: Verify x86_64-pc-windows-gnu target compilation
         if: matrix.check_gnu == 'true'
-        run: cargo check --locked --target x86_64-pc-windows-gnu --bin mesh --bin meshd --bin mesh-server
+        run: cargo check --locked --target x86_64-pc-windows-gnu --bin MeshVPN --bin mesh --bin meshd --bin mesh-server
 
       - name: Ad-hoc codesign macOS binaries
         if: matrix.codesign == 'true'
@@ -387,12 +586,14 @@ jobs:
             codesign -v "$bin_path"
           done
 
-      - name: Enforce binary size ceiling and report against 6 MiB goal
+      - name: Enforce binary size ceiling and report against goals
         shell: bash
         run: |
           set -euo pipefail
           MAX_BYTES=$((16 * 1024 * 1024))
           GOAL_BYTES=$((6 * 1024 * 1024))
+          GUI_MAX_BYTES=$((6 * 1024 * 1024))
+          GUI_GOAL_BYTES=$((4 * 1024 * 1024))
           mkdir -p dist/${{ matrix.target }}
           for b in ${{ matrix.bins }}; do
             src="target/${{ matrix.target }}/release/${b}${{ matrix.ext }}"
@@ -400,17 +601,27 @@ jobs:
             size_bytes="$(wc -c < "$src" | tr -d '[:space:]')"
             size_mib="$(awk "BEGIN { printf \"%.2f\", $size_bytes / 1048576 }")"
             echo "${b} (${{ matrix.target }}): ${size_bytes} bytes (${size_mib} MiB)"
-            if [ "$size_bytes" -gt "$MAX_BYTES" ]; then
-              echo "ERROR: ${src} exceeds hard 16 MiB gate (${size_bytes} > ${MAX_BYTES})" >&2
-              exit 1
-            fi
-            if [ "$size_bytes" -gt "$GOAL_BYTES" ]; then
-              echo "::warning file=${src}::Binary ${b} (${size_mib} MiB) exceeds 6.00 MiB design target"
+            if [ "$b" = "MeshVPN" ]; then
+              if [ "$size_bytes" -gt "$GUI_MAX_BYTES" ]; then
+                echo "ERROR: ${src} exceeds hard 6 MiB gate (${size_bytes} > ${GUI_MAX_BYTES})" >&2
+                exit 1
+              fi
+              if [ "$size_bytes" -gt "$GUI_GOAL_BYTES" ]; then
+                echo "::warning file=${src}::Binary ${b} (${size_mib} MiB) exceeds 4.00 MiB design target"
+              fi
+            else
+              if [ "$size_bytes" -gt "$MAX_BYTES" ]; then
+                echo "ERROR: ${src} exceeds hard 16 MiB gate (${size_bytes} > ${MAX_BYTES})" >&2
+                exit 1
+              fi
+              if [ "$size_bytes" -gt "$GOAL_BYTES" ]; then
+                echo "::warning file=${src}::Binary ${b} (${size_mib} MiB) exceeds 6.00 MiB design target"
+              fi
             fi
             cp "$src" "dist/${{ matrix.target }}/"
           done
 
-      - name: Package Windows Wintun runtime & installer assets
+      - name: Package Windows Wintun runtime, installer assets & SHA256SUMS
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh
         run: |
@@ -422,6 +633,27 @@ jobs:
             Copy-Item -LiteralPath (Join-Path $env:MESH_WINTUN_STAGE_DIR $asset) -Destination (Join-Path $distDir $asset) -Force
           }
           Copy-Item -LiteralPath 'scripts/install-windows.ps1' -Destination (Join-Path $scriptsDir 'install-windows.ps1') -Force
+          python - <<'PY'
+          import hashlib
+          import pathlib
+          import struct
+
+          dist = pathlib.Path("dist/x86_64-pc-windows-msvc")
+          exe = dist / "MeshVPN.exe"
+          raw = exe.read_bytes()
+          e_lfanew = struct.unpack_from("<I", raw, 0x3C)[0]
+          subsystem = struct.unpack_from("<H", raw, e_lfanew + 24 + 68)[0]
+          if subsystem != 2:
+              raise SystemExit(f"ERROR: MeshVPN.exe PE subsystem={subsystem}, expected 2")
+
+          explicit_files = ["MeshVPN.exe", "mesh.exe", "meshd.exe", "mesh-server.exe", "wintun.dll"]
+          lines = []
+          for name in explicit_files:
+              p = dist / name
+              digest = hashlib.sha256(p.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {name}")
+          (dist / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+          PY
 
       - name: Package Linux service units, installers & SHA256SUMS
         if: matrix.target == 'x86_64-unknown-linux-musl'
