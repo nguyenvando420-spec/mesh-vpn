@@ -361,6 +361,38 @@ impl ClientRuntimeState {
         };
         assemble_status_response(snap, dp_snapshot.as_ref())
     }
+
+    /// Resets in-memory identity, bootstrap, Netmap, and error fields to an unconfigured
+    /// `Stopped` baseline while keeping `meshd` IPC listeners and underlay handles alive
+    /// (`ADR-024`, `US-101`).
+    pub async fn reset_identity_state(&self) {
+        let mut g = self.inner.write().await;
+        g.daemon_state = DaemonState::Stopped;
+        g.bootstrap = BootstrapConfig::default();
+        g.tun_interface_name = None;
+        g.local_udp_port = 0;
+        g.node_id = None;
+        g.node_name = None;
+        g.fqdn = None;
+        g.overlay_ip = None;
+        g.overlay_cidr = None;
+        g.overlay_dns_ip = None;
+        g.key_expires_at_ms = None;
+        g.latest_netmap = None;
+        g.control_connected = false;
+        g.relay_rtt_ms = None;
+        g.last_error = None;
+        g.protocol_incompatible = false;
+        g.migration_pending_endpoint = None;
+        g.overlay_conflict_warning = None;
+        g.macos_firewall_warning = None;
+        g.lockdown_warning = None;
+        g.private_dns_warning = None;
+        g.local_candidates.clear();
+        g.datapath_handle = None;
+        g.rebind_handle = None;
+        g.relay_handle = None;
+    }
 }
 
 struct StatusReadSnapshot {

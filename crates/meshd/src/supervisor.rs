@@ -1027,6 +1027,11 @@ impl DaemonSupervisor {
         self.client.stop_active_session_and_cleanup().await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn execute_reset_identity(&mut self) -> AppResult<AgentActionResponse> {
+        self.client.execute_reset_identity().await
+    }
+
     /// Runs desktop IPC listeners plus the shared client supervisor lifecycle until
     /// `root_shutdown` fires, guaranteeing teardown completes in `<= 5 s` (`US-055`).
     pub(crate) async fn run(
@@ -2130,5 +2135,41 @@ mod tests {
             assert_eq!(status_after.daemon_state, DaemonState::ReauthRequired);
             assert_eq!(status_after.key_expires_at_ms, Some(key_expiry_ms));
         }
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_execute_reset_identity_cleans_keystore_bootstrap_and_runtime()
+    -> Result<(), String> {
+        // Arrange
+        let dir = tempdir().map_err(|e| e.to_string())?;
+        let adapters = Arc::new(InMemoryPlatformAdapters::default());
+        let Some(mut supervisor) =
+            setup_enrolled_supervisor_in_tempdir(dir.path(), "reset_id", &adapters).await
+        else {
+            return Err("failed setting up enrolled supervisor".to_owned());
+        };
+        let root_shutdown = CancellationToken::new();
+        supervisor
+            .start_enrolled_session(&root_shutdown, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert!(supervisor.has_active_session());
+
+        // Act
+        let resp = supervisor
+            .execute_reset_identity()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Assert
+        assert_eq!(resp.state, DaemonState::Stopped);
+        assert!(!supervisor.has_active_session());
+        assert!(!dir.path().join("keys.json").exists());
+        let status = supervisor.runtime_state().build_status_response().await;
+        assert_eq!(status.daemon_state, DaemonState::Stopped);
+        assert_eq!(status.node_id, None);
+        assert_eq!(status.server_connection, None);
+        assert!(status.peers.is_empty());
+        Ok(())
     }
 }

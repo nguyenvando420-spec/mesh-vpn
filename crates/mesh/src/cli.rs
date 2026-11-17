@@ -10,7 +10,8 @@ use crate::client_cmds::ClientCommand;
 #[command(
     name = "mesh",
     version,
-    about = "Mesh VPN unified node & server administration CLI"
+    about = "Mesh VPN unified node & server administration CLI",
+    after_help = "Hint: run 'mesh gui' or open MeshVPN.exe / Mesh VPN.app for the desktop interface."
 )]
 pub(crate) struct Cli {
     /// Output machine-readable JSON instead of human tables.
@@ -132,5 +133,36 @@ mod tests {
                         if r.file == "snap.tar" && r.min_netmap_version == Some(12) && r.force_repin
                 )
         ));
+    }
+
+    #[test]
+    fn test_cli_zero_arg_fails_with_exit_2_and_parses_gui_and_reset_identity() -> Result<(), String>
+    {
+        // Arrange & Act
+        let Err(zero_arg_err) = Cli::try_parse_from(["mesh"]) else {
+            return Err("0-arg CLI must fail with missing subcommand".to_owned());
+        };
+        let gui = Cli::try_parse_from(["mesh", "gui"]).map_err(|e| e.to_string())?;
+        let reset_default =
+            Cli::try_parse_from(["mesh", "reset-identity"]).map_err(|e| e.to_string())?;
+        let reset_yes =
+            Cli::try_parse_from(["mesh", "reset-identity", "--yes"]).map_err(|e| e.to_string())?;
+
+        // Assert
+        assert_eq!(zero_arg_err.exit_code(), 2);
+        assert!(zero_arg_err.to_string().contains("Hint: run 'mesh gui'"));
+        assert!(matches!(
+            gui.command,
+            TopCommand::Client(ClientCommand::Gui)
+        ));
+        assert!(matches!(
+            reset_default.command,
+            TopCommand::Client(ClientCommand::ResetIdentity { yes: false })
+        ));
+        assert!(matches!(
+            reset_yes.command,
+            TopCommand::Client(ClientCommand::ResetIdentity { yes: true })
+        ));
+        Ok(())
     }
 }

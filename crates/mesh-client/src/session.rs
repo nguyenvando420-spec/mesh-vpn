@@ -107,6 +107,12 @@ pub enum ClientCommand {
         /// Reply channel receiving archive path, size, and redaction count.
         reply: oneshot::Sender<AppResult<BugreportResponse>>,
     },
+    /// Clears persisted node identity, bootstrap, and cache while keeping daemon IPC alive
+    /// (`POST /v1/agent/reset-identity`, `ADR-024`, `US-101`).
+    ResetIdentity {
+        /// Reply channel receiving reset outcome.
+        reply: oneshot::Sender<AppResult<AgentActionResponse>>,
+    },
 }
 
 /// Request for standalone zero-TUN Control enrollment or key rotation (`ADR-014`).
@@ -617,6 +623,9 @@ impl ClientSessionSupervisor {
                 send_reply(reply, self.enroll_or_rotate_only(req).await);
             }
             ClientCommand::Bugreport { reply } => send_reply(reply, self.execute_bugreport().await),
+            ClientCommand::ResetIdentity { reply } => {
+                send_reply(reply, self.execute_reset_identity().await);
+            }
         }
     }
 
@@ -675,9 +684,13 @@ impl ClientSessionSupervisor {
         let now_ms = self.clock.now_unix_ms();
         let mut identity = self.state_store.load_or_create_identity(now_ms)?;
         let mut bootstrap = { self.runtime.inner.read().await.bootstrap.clone() };
-        bootstrap.server_endpoint = Some(endpoint);
-        bootstrap.tls_auth_mode = tls_auth_mode;
-        apply_pin_selection(&mut bootstrap, req.server_pin);
+        update_bootstrap_trust_preserving_next_pin(
+            &mut bootstrap,
+            &endpoint,
+            tls_auth_mode,
+            req.server_pin,
+            req.preauth_key.is_some(),
+        );
 
         let desired_name = resolve_desired_node_name(req.node_name.as_ref(), &bootstrap)?;
         let initial_reg = if req.preauth_key.is_some() || bootstrap.node_id.is_none() {
@@ -735,6 +748,21 @@ impl ClientSessionSupervisor {
         })
     }
 
+    /// Stops any active session, clears persisted identity/bootstrap/netmap cache, and resets
+    /// in-memory state to unconfigured `Stopped` while keeping `meshd` alive (`ADR-024`, `US-101`).
+    pub async fn execute_reset_identity(&mut self) -> AppResult<AgentActionResponse> {
+        self.stop_active_session_and_cleanup().await?;
+        self.state_store.clear_netmap_cache()?;
+        self.state_store
+            .save_bootstrap(&BootstrapConfig::default())?;
+        self.state_store.delete_identity()?;
+        self.runtime.reset_identity_state().await;
+        Ok(AgentActionResponse {
+            state: DaemonState::Stopped,
+            message: "node identity reset cleanly; ready for enrollment".to_owned(),
+        })
+    }
+
     /// Updates Control endpoint & pins atomically and wakes active Control / Relay tasks.
     pub async fn execute_set(&mut self, req: AgentSetRequest) -> AppResult<AgentActionResponse> {
         let tls_auth_mode = if req.server_pin.is_some() {
@@ -747,9 +775,13 @@ impl ClientSessionSupervisor {
         let (updated_bootstrap, relay_update) = {
             let mut g = self.runtime.inner.write().await;
             let prev_server_ep = g.bootstrap.server_endpoint.clone();
-            g.bootstrap.server_endpoint = Some(req.server_endpoint.clone());
-            g.bootstrap.tls_auth_mode = tls_auth_mode;
-            apply_pin_selection(&mut g.bootstrap, req.server_pin);
+            update_bootstrap_trust_preserving_next_pin(
+                &mut g.bootstrap,
+                &req.server_endpoint,
+                tls_auth_mode,
+                req.server_pin,
+                false,
+            );
             g.migration_pending_endpoint = None;
             g.protocol_incompatible = false;
             g.state_store.save_bootstrap(&g.bootstrap)?;
@@ -1085,9 +1117,13 @@ impl ClientSessionSupervisor {
         validate_tls_trust_policy(&endpoint, tls_auth_mode, req.server_pin)?;
 
         let mut bootstrap = { self.runtime.inner.read().await.bootstrap.clone() };
-        bootstrap.server_endpoint = Some(endpoint);
-        bootstrap.tls_auth_mode = tls_auth_mode;
-        apply_pin_selection(&mut bootstrap, req.server_pin);
+        update_bootstrap_trust_preserving_next_pin(
+            &mut bootstrap,
+            &endpoint,
+            tls_auth_mode,
+            req.server_pin,
+            req.preauth_key.is_some(),
+        );
 
         let preauth_key = req.preauth_key.take().ok_or_else(|| {
             AppError::invalid_argument("enrollment or rotation requires pre-authentication key")
@@ -2217,6 +2253,39 @@ pub async fn persist_bootstrap_and_runtime(
     Ok(())
 }
 
+/// Updates Control endpoint and TLS trust policy while preserving staged `bootstrap.next_pin`
+/// when the target trust tuple is unchanged (`SEC-04(d)`, `HR-DGUI-G2-04`, `ADR-024`).
+pub fn update_bootstrap_trust_preserving_next_pin(
+    bootstrap: &mut BootstrapConfig,
+    endpoint: &str,
+    tls_auth_mode: TlsAuthMode,
+    req_pin: Option<mesh_core::SpkiPin>,
+    is_re_enrollment: bool,
+) {
+    let same_trust = bootstrap.server_endpoint.as_deref() == Some(endpoint)
+        && bootstrap.tls_auth_mode == tls_auth_mode
+        && bootstrap.active_pin == req_pin;
+
+    bootstrap.server_endpoint = Some(endpoint.to_owned());
+    bootstrap.tls_auth_mode = tls_auth_mode;
+
+    if is_re_enrollment {
+        apply_pin_selection(bootstrap, req_pin);
+        return;
+    }
+    if same_trust {
+        return;
+    }
+    let promoted_next_pin =
+        tls_auth_mode == TlsAuthMode::SpkiPin && req_pin.is_some() && req_pin == bootstrap.next_pin;
+    if promoted_next_pin {
+        bootstrap.active_pin = req_pin;
+        bootstrap.next_pin = None;
+    } else {
+        apply_pin_selection(bootstrap, req_pin);
+    }
+}
+
 fn apply_pin_selection(bootstrap: &mut BootstrapConfig, pin: Option<mesh_core::SpkiPin>) {
     match pin {
         Some(p) => {
@@ -2470,5 +2539,249 @@ mod tests {
         apply_registration_to_bootstrap(&mut bootstrap, &fake_reg);
         assert_eq!(bootstrap.acked_endpoint_version, 3);
         assert!(supervisor.stop_active_session_and_cleanup().await.is_ok());
+    }
+
+    #[test]
+    fn test_update_bootstrap_trust_preserving_next_pin_handles_same_promote_and_reset() {
+        // Arrange
+        let pin_a = SpkiPin::from_sha256_bytes([1; 32]);
+        let pin_b = SpkiPin::from_sha256_bytes([2; 32]);
+        let pin_c = SpkiPin::from_sha256_bytes([3; 32]);
+        let base = BootstrapConfig {
+            server_endpoint: Some("203.0.113.10:8443".to_owned()),
+            tls_auth_mode: TlsAuthMode::SpkiPin,
+            active_pin: Some(pin_a),
+            next_pin: Some(pin_b),
+            ..BootstrapConfig::default()
+        };
+
+        // Act & Assert 1: same trust on reconnect / set preserves next_pin
+        let mut same = base.clone();
+        super::update_bootstrap_trust_preserving_next_pin(
+            &mut same,
+            "203.0.113.10:8443",
+            TlsAuthMode::SpkiPin,
+            Some(pin_a),
+            false,
+        );
+        assert_eq!(same.active_pin, Some(pin_a));
+        assert_eq!(same.next_pin, Some(pin_b));
+
+        // Act & Assert 2: explicit re-enrollment clears staged next_pin
+        let mut re_enroll = base.clone();
+        super::update_bootstrap_trust_preserving_next_pin(
+            &mut re_enroll,
+            "203.0.113.10:8443",
+            TlsAuthMode::SpkiPin,
+            Some(pin_a),
+            true,
+        );
+        assert_eq!(re_enroll.active_pin, Some(pin_a));
+        assert_eq!(re_enroll.next_pin, None);
+
+        // Act & Assert 3: promoting next_pin moves next_pin -> active_pin and clears next_pin
+        let mut promoted = base.clone();
+        super::update_bootstrap_trust_preserving_next_pin(
+            &mut promoted,
+            "203.0.113.10:8443",
+            TlsAuthMode::SpkiPin,
+            Some(pin_b),
+            false,
+        );
+        assert_eq!(promoted.active_pin, Some(pin_b));
+        assert_eq!(promoted.next_pin, None);
+
+        // Act & Assert 4: changing pin to unrelated pin_c clears next_pin
+        let mut changed_pin = base.clone();
+        super::update_bootstrap_trust_preserving_next_pin(
+            &mut changed_pin,
+            "203.0.113.10:8443",
+            TlsAuthMode::SpkiPin,
+            Some(pin_c),
+            false,
+        );
+        assert_eq!(changed_pin.active_pin, Some(pin_c));
+        assert_eq!(changed_pin.next_pin, None);
+
+        // Act & Assert 5: changing endpoint clears next_pin even if pin matches
+        let mut changed_ep = base.clone();
+        super::update_bootstrap_trust_preserving_next_pin(
+            &mut changed_ep,
+            "203.0.113.20:8443",
+            TlsAuthMode::SpkiPin,
+            Some(pin_a),
+            false,
+        );
+        assert_eq!(changed_ep.active_pin, Some(pin_a));
+        assert_eq!(changed_ep.next_pin, None);
+
+        // Act & Assert 6: switching to SystemCa clears both active_pin and next_pin
+        let mut sys_ca = base;
+        super::update_bootstrap_trust_preserving_next_pin(
+            &mut sys_ca,
+            "vpn.example.com:8443",
+            TlsAuthMode::SystemCa,
+            None,
+            false,
+        );
+        assert_eq!(sys_ca.tls_auth_mode, TlsAuthMode::SystemCa);
+        assert_eq!(sys_ca.active_pin, None);
+        assert_eq!(sys_ca.next_pin, None);
+    }
+
+    #[tokio::test]
+    async fn test_execute_up_reconnect_and_execute_set_preserve_next_pin() {
+        // Arrange
+        let hooks = Arc::new(InMemoryClientPlatformHooks::default());
+        let store = Arc::new(InMemoryClientStateStore::new());
+        let mut supervisor = build_enrolled_in_memory_supervisor(&hooks, &store, false);
+        let pin_a = SpkiPin::from_sha256_bytes([2; 32]);
+        let pin_b = SpkiPin::from_sha256_bytes([7; 32]);
+        let rt = supervisor.runtime_state();
+        {
+            let mut g = rt.inner.write().await;
+            g.bootstrap.next_pin = Some(pin_b);
+            assert!(g.state_store.save_bootstrap(&g.bootstrap).is_ok());
+        }
+
+        // Act 1: execute_set with identical endpoint + active_pin preserves next_pin
+        let set_res = supervisor
+            .execute_set(AgentSetRequest {
+                server_endpoint: "203.0.113.10:8443".to_owned(),
+                server_pin: Some(pin_a),
+            })
+            .await;
+        assert!(set_res.is_ok());
+        assert_eq!(
+            store.load_bootstrap().ok().and_then(|b| b.next_pin),
+            Some(pin_b)
+        );
+
+        // Act 2: 1-click reconnect execute_up (`preauth_key: None`) preserves next_pin
+        let shutdown = CancellationToken::new();
+        let up_res = supervisor
+            .execute_up(
+                mesh_proto::agent_ipc::AgentUpRequest {
+                    server_endpoint: "203.0.113.10:8443".to_owned(),
+                    port_override: None,
+                    server_pin: Some(pin_a),
+                    preauth_key: None,
+                    node_name: None,
+                },
+                &shutdown,
+            )
+            .await;
+        assert!(up_res.is_ok());
+        assert_eq!(
+            store.load_bootstrap().ok().and_then(|b| b.next_pin),
+            Some(pin_b)
+        );
+        let status = supervisor.runtime_state().build_status_response().await;
+        assert_eq!(
+            status.server_connection.and_then(|s| s.next_pin),
+            Some(pin_b)
+        );
+        assert!(supervisor.stop_active_session_and_cleanup().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_reset_identity_clears_disk_and_ram_and_recovers_from_revoked()
+    -> Result<(), String> {
+        // Arrange
+        let hooks = Arc::new(InMemoryClientPlatformHooks::default());
+        let store = Arc::new(InMemoryClientStateStore::new());
+        let mut supervisor = build_enrolled_in_memory_supervisor(&hooks, &store, false);
+        let t0 = 1_700_000_000_000_u64;
+        let overlay_cidr = "100.115.0.0/16".parse().map_err(|e| format!("{e}"))?;
+        let snap = NetmapSnapshot {
+            netmap_version: 9,
+            generated_at_ms: t0,
+            overlay_cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: RelayMap {
+                endpoint_version: 1,
+                control_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                relay_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                stun_udp_endpoints: vec![],
+            },
+            pin_set: PinSetDto {
+                active_pin: SpkiPin::from_sha256_bytes([2; 32]),
+                next_pin: None,
+            },
+            peers: vec![PeerEntry {
+                node_id: NodeId::new_v7(t0 + 1),
+                name: "peer-1".parse().map_err(|e| format!("{e}"))?,
+                fqdn: "peer-1.mesh.internal".to_owned(),
+                overlay_ip: "100.115.0.20".parse().map_err(|e| format!("{e}"))?,
+                node_pubkey: NodeKeypair::generate().public_key(),
+                disco_pubkey: DiscoKeypair::generate().public_key(),
+                endpoints: vec![],
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            }],
+        };
+        let cache = NetmapCacheFile::new_signed(
+            mesh_core::Port::from_u16(51820).map_err(|e| format!("{e}"))?,
+            snap.clone(),
+            t0,
+            None,
+        )
+        .map_err(|e| format!("{e}"))?;
+        assert!(store.save_netmap_cache(&cache).is_ok());
+
+        let shutdown = CancellationToken::new();
+        assert!(
+            supervisor
+                .start_enrolled_session(&shutdown, None)
+                .await
+                .is_ok()
+        );
+        let rt = supervisor.runtime_state();
+        {
+            let mut g = rt.inner.write().await;
+            g.latest_netmap = Some(snap);
+        }
+        supervisor
+            .handle_verified_identity_termination(
+                TerminationReason::NodeRevoked,
+                "revoked by admin",
+            )
+            .await;
+        assert_eq!(
+            supervisor
+                .runtime_state()
+                .build_status_response()
+                .await
+                .daemon_state,
+            DaemonState::Revoked
+        );
+
+        // Act
+        let resp = supervisor.execute_reset_identity().await;
+
+        // Assert
+        assert_eq!(
+            resp.ok(),
+            Some(mesh_proto::agent_ipc::AgentActionResponse {
+                state: DaemonState::Stopped,
+                message: "node identity reset cleanly; ready for enrollment".to_owned(),
+            })
+        );
+        assert!(!supervisor.has_active_session());
+        assert!(!store.has_netmap_cache());
+        assert!(store.load_existing_identity().ok().flatten().is_none());
+        assert_eq!(
+            store.load_bootstrap().ok(),
+            Some(BootstrapConfig::default())
+        );
+
+        let status = supervisor.runtime_state().build_status_response().await;
+        assert_eq!(status.daemon_state, DaemonState::Stopped);
+        assert_eq!(status.node_id, None);
+        assert_eq!(status.node_name, None);
+        assert!(status.peers.is_empty());
+        assert_eq!(status.server_connection, None);
+        Ok(())
     }
 }

@@ -165,6 +165,10 @@ pub trait ClientStateStore: Send + Sync + std::fmt::Debug {
     /// Removes any persisted Netmap cache entry.
     fn clear_netmap_cache(&self) -> AppResult<()>;
 
+    /// Atomically removes persisted node identity material (`keys.json` / sealed identity and temp
+    /// siblings), ignoring `NotFound` (`ADR-024`, `BLK-DGUI-G2-01`).
+    fn delete_identity(&self) -> AppResult<()>;
+
     /// Optional filesystem state directory used for desktop diagnostics log discovery.
     fn state_dir(&self) -> Option<&Path> {
         None
@@ -253,8 +257,65 @@ impl ClientStateStore for FileClientStateStore {
         self.netmap_cache.clear()
     }
 
+    fn delete_identity(&self) -> AppResult<()> {
+        delete_identity_files(self.keys.path())
+    }
+
     fn state_dir(&self) -> Option<&Path> {
         Some(&self.state_dir)
+    }
+}
+
+fn delete_identity_files(keys_path: &Path) -> AppResult<()> {
+    remove_file_ignore_not_found(keys_path)?;
+    let Some(parent) = keys_path.parent() else {
+        return Ok(());
+    };
+    let Some(file_name) = keys_path.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    let tmp_exact = format!("{file_name}.tmp");
+    let tmp_pid_prefix = format!("{file_name}.tmp.");
+    let dot_tmp_prefix = format!(".{file_name}.");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(iter) => iter,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(AppError::internal(format!(
+                "failed scanning keystore directory {}: {err}",
+                parent.display()
+            )));
+        }
+    };
+    for entry_res in entries {
+        let entry = entry_res.map_err(|err| {
+            AppError::internal(format!(
+                "failed reading entry in keystore directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        let is_temp_identity = name == tmp_exact
+            || name.starts_with(&tmp_pid_prefix)
+            || (name.starts_with(&dot_tmp_prefix) && name.ends_with(".tmp"));
+        if is_temp_identity {
+            remove_file_ignore_not_found(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_file_ignore_not_found(path: &Path) -> AppResult<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(AppError::internal(format!(
+            "failed removing identity file {}: {err}",
+            path.display()
+        ))),
     }
 }
 
@@ -768,7 +829,72 @@ impl ClientStateStore for InMemoryClientStateStore {
         Ok(())
     }
 
+    fn delete_identity(&self) -> AppResult<()> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|_| AppError::internal("InMemoryClientStateStore lock poisoned"))?;
+        g.identity = None;
+        Ok(())
+    }
+
     fn state_dir(&self) -> Option<&Path> {
         self.state_dir.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{ClientStateStore, FileClientStateStore, InMemoryClientStateStore};
+    use crate::config::BootstrapConfig;
+
+    #[test]
+    fn test_file_state_store_delete_identity_removes_keys_and_temps_and_ignores_not_found() {
+        // Arrange
+        let Ok(dir) = tempdir() else {
+            assert!(tempdir().is_ok());
+            return;
+        };
+        let store = FileClientStateStore::from_dir(dir.path().to_path_buf());
+        let id = store.load_or_create_identity(1_700_000_000_000);
+        assert!(id.is_ok());
+        assert!(store.save_bootstrap(&BootstrapConfig::default()).is_ok());
+        let tmp_plain = dir.path().join("keys.json.tmp");
+        let tmp_pid = dir.path().join("keys.json.tmp.99999");
+        let tmp_dot = dir.path().join(".keys.json.99999.tmp");
+        assert!(fs::write(&tmp_plain, b"tmp1").is_ok());
+        assert!(fs::write(&tmp_pid, b"tmp2").is_ok());
+        assert!(fs::write(&tmp_dot, b"tmp3").is_ok());
+
+        // Act
+        let first_delete = store.delete_identity();
+        let second_delete = store.delete_identity();
+
+        // Assert
+        assert!(first_delete.is_ok());
+        assert!(second_delete.is_ok());
+        assert!(!dir.path().join("keys.json").exists());
+        assert!(!tmp_plain.exists());
+        assert!(!tmp_pid.exists());
+        assert!(!tmp_dot.exists());
+        assert!(dir.path().join("bootstrap.toml").exists());
+        assert!(store.load_existing_identity().ok().flatten().is_none());
+    }
+
+    #[test]
+    fn test_in_memory_state_store_delete_identity_is_idempotent() {
+        // Arrange
+        let store = InMemoryClientStateStore::new();
+        assert!(store.load_or_create_identity(1_700_000_000_000).is_ok());
+        assert!(store.load_existing_identity().ok().flatten().is_some());
+
+        // Act & Assert
+        assert!(store.delete_identity().is_ok());
+        assert!(store.load_existing_identity().ok().flatten().is_none());
+        assert!(store.delete_identity().is_ok());
     }
 }

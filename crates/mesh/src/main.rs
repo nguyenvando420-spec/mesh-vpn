@@ -48,7 +48,70 @@ async fn dispatch_cli(parsed: Cli) -> AppResult<()> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn is_env_flag_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|val| !val.is_empty())
+}
+
+#[cfg(any(target_os = "windows", test))]
+const fn should_attempt_explorer_autolaunch(
+    argc: usize,
+    stdin_tty: bool,
+    stdout_tty: bool,
+    stderr_tty: bool,
+    ci_set: bool,
+    no_autolaunch_set: bool,
+) -> bool {
+    argc == 1 && stdin_tty && stdout_tty && stderr_tty && !ci_set && !no_autolaunch_set
+}
+
+#[cfg(target_os = "windows")]
+fn try_windows_explorer_gui_autolaunch() -> bool {
+    use std::io::IsTerminal as _;
+
+    // Condition (i): 0-arg, interactive TTY on stdin/stdout/stderr, and no CI/opt-out env vars.
+    let argc = std::env::args_os().count();
+    let stdin_tty = std::io::stdin().is_terminal();
+    let stdout_tty = std::io::stdout().is_terminal();
+    let stderr_tty = std::io::stderr().is_terminal();
+    let ci_set = is_env_flag_set("CI");
+    let no_autolaunch_set = is_env_flag_set("MESH_NO_GUI_AUTOLAUNCH");
+    if !should_attempt_explorer_autolaunch(
+        argc,
+        stdin_tty,
+        stdout_tty,
+        stderr_tty,
+        ci_set,
+        no_autolaunch_set,
+    ) {
+        return false;
+    }
+
+    // Condition (ii): launched directly via interactive Windows Explorer double-click.
+    if !matches!(
+        mesh_sys::process_windows::is_interactive_explorer_double_click(),
+        Ok(true)
+    ) {
+        return false;
+    }
+
+    // Condition (iii): valid MeshVPN.exe exists next to mesh.exe or in %ProgramFiles%\Mesh\.
+    let Some(gui_exe) = client_cmds::find_windows_gui_executable() else {
+        return false;
+    };
+
+    mesh_sys::process_windows::spawn_detached_gui(&gui_exe).is_ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+const fn try_windows_explorer_gui_autolaunch() -> bool {
+    false
+}
+
 fn main() -> ExitCode {
+    if try_windows_explorer_gui_autolaunch() {
+        return ExitCode::SUCCESS;
+    }
     let parsed = Cli::parse();
     let runtime = match Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -77,7 +140,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_subsystem_labels;
+    use super::{collect_subsystem_labels, should_attempt_explorer_autolaunch};
 
     #[test]
     fn test_mesh_cli_subsystems_compile_cleanly() {
@@ -94,5 +157,31 @@ mod tests {
                 "output:ready",
             ]
         );
+    }
+
+    #[test]
+    fn test_explorer_autolaunch_condition_requires_zero_arg_tty_and_no_optout() {
+        // Arrange / Act / Assert
+        assert!(should_attempt_explorer_autolaunch(
+            1, true, true, true, false, false
+        ));
+        assert!(!should_attempt_explorer_autolaunch(
+            2, true, true, true, false, false
+        ));
+        assert!(!should_attempt_explorer_autolaunch(
+            1, false, true, true, false, false
+        ));
+        assert!(!should_attempt_explorer_autolaunch(
+            1, true, false, true, false, false
+        ));
+        assert!(!should_attempt_explorer_autolaunch(
+            1, true, true, false, false, false
+        ));
+        assert!(!should_attempt_explorer_autolaunch(
+            1, true, true, true, true, false
+        ));
+        assert!(!should_attempt_explorer_autolaunch(
+            1, true, true, true, false, true
+        ));
     }
 }

@@ -224,6 +224,11 @@ impl ClientStateStore for FfiStateStore {
             .map_err(|err| err.to_app_error())
     }
 
+    fn delete_identity(&self) -> AppResult<()> {
+        self.run_bridge_io(|bridge| bridge.delete_state_file(SEALED_IDENTITY_FILENAME.to_owned()))
+            .map_err(|err| err.to_app_error())
+    }
+
     fn state_dir(&self) -> Option<&Path> {
         self.state_dir.as_deref()
     }
@@ -1555,6 +1560,39 @@ mod tests {
         // Assert 2: Converts cleanly into KeystoreInvalidated mobile error.
         let mobile_err = MobileError::from(wrong_dek_err);
         assert!(mobile_err.is_keystore_invalidated());
+        Ok(())
+    }
+
+    #[test]
+    fn test_ffi_state_store_delete_identity_removes_sealed_identity_only() -> Result<(), String> {
+        // Arrange
+        let bridge = Arc::new(FakeBridge::default());
+        let store = FfiStateStore::new(bridge.clone(), None);
+        let _created = store
+            .load_or_create_identity(1_700_000_000_000)
+            .map_err(|e| e.to_string())?;
+        store
+            .save_bootstrap(&BootstrapConfig::default())
+            .map_err(|e| e.to_string())?;
+
+        // Act
+        store.delete_identity().map_err(|e| e.to_string())?;
+        store.delete_identity().map_err(|e| e.to_string())?;
+
+        // Assert
+        let files = bridge
+            .files
+            .lock()
+            .map_err(|_| "lock poisoned".to_owned())?;
+        assert!(!files.contains_key("identity.sealed.bin"));
+        assert!(files.contains_key("bootstrap.toml"));
+        drop(files);
+        assert!(
+            store
+                .load_existing_identity()
+                .map_err(|e| e.to_string())?
+                .is_none()
+        );
         Ok(())
     }
 

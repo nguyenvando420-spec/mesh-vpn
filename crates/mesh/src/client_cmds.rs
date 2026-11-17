@@ -1,10 +1,9 @@
 //! Client-side CLI subcommands routed exclusively over local `meshd-ro` and `meshd-admin` IPC
 //! (`US-004`, `US-039`, `US-040`, `US-055`, `HR-G2-04`).
 
-use std::io::Read as _;
+use std::io::{BufRead as _, IsTerminal as _, Read as _, Write as _};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -18,12 +17,16 @@ use mesh_core::defaults::{UNIX_AGENT_ADMIN_SOCKET, UNIX_AGENT_RO_SOCKET};
 use mesh_core::defaults::{WINDOWS_AGENT_ADMIN_PIPE, WINDOWS_AGENT_RO_PIPE};
 use mesh_core::{AppError, AppResult, ErrorKind, NodeName, Port, SpkiPin};
 use mesh_crypto::PreAuthToken;
-use mesh_net::ipc::send_ipc_json_request;
+#[cfg(windows)]
+use mesh_net::ipc::connect_agent_named_pipe;
+#[cfg(unix)]
+use mesh_net::ipc::connect_agent_unix_socket;
+use mesh_net::ipc::{IpcOperationTier, send_ipc_json_request_with_timeout};
 use mesh_net::ledger::{LedgerCleanupOps, ResourceLedger};
 use mesh_proto::agent_ipc::{
-    AgentActionResponse, AgentRotateKeyRequest, AgentSetRequest, AgentStatusResponse,
-    AgentUpRequest, BugreportResponse, DaemonState, NetcheckResponse, PingRequest, PingResponse,
-    PingVia,
+    AgentActionResponse, AgentResetIdentityRequest, AgentRotateKeyRequest, AgentSetRequest,
+    AgentStatusResponse, AgentUpRequest, BugreportResponse, DaemonState, NetcheckResponse,
+    PingRequest, PingResponse, PingVia,
 };
 
 use crate::output::{
@@ -32,13 +35,6 @@ use crate::output::{
 };
 
 const ENV_AUTHKEY_FILE: &str = "MESH_AUTHKEY_FILE";
-const IPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(850);
-#[cfg(windows)]
-const WIN_ERROR_FILE_NOT_FOUND: i32 = 2;
-#[cfg(windows)]
-const WIN_ERROR_ACCESS_DENIED: i32 = 5;
-#[cfg(windows)]
-const WIN_ERROR_PIPE_BUSY: i32 = 231;
 
 /// Global routing/formatting options passed to client command handlers.
 #[derive(Debug, Clone)]
@@ -69,8 +65,16 @@ pub(crate) enum ClientCommand {
     Set(SetArgs),
     /// Rotate local node WireGuard identity keypair cleanly (`meshd-admin`).
     RotateKey(RotateKeyArgs),
+    /// Clear local node enrollment identity and keys while keeping `meshd` running (`meshd-admin`, `ADR-024`).
+    ResetIdentity {
+        /// Confirm identity reset without an interactive prompt (required in non-TTY mode).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Generate a redacted non-secret diagnostic archive (`meshd-admin`).
     Bugreport,
+    /// Launch the Mesh VPN desktop tray and dashboard interface (`US-100`, `ADR-022`).
+    Gui,
 }
 
 #[derive(Debug, Args)]
@@ -153,19 +157,37 @@ pub(crate) async fn handle_client_command(
 ) -> AppResult<()> {
     match cmd {
         ClientCommand::Status => {
-            let resp: AgentStatusResponse =
-                send_ro_request(cfg, hyper::Method::GET, "/v1/agent/status", None::<&()>).await?;
+            let resp: AgentStatusResponse = send_ro_request(
+                cfg,
+                hyper::Method::GET,
+                "/v1/agent/status",
+                None::<&()>,
+                IpcOperationTier::ReadOnlyQuery,
+            )
+            .await?;
             emit_formatted(&resp, cfg.json, format_status)
         }
         ClientCommand::Peers => {
-            let resp: AgentStatusResponse =
-                send_ro_request(cfg, hyper::Method::GET, "/v1/agent/peers", None::<&()>).await?;
+            let resp: AgentStatusResponse = send_ro_request(
+                cfg,
+                hyper::Method::GET,
+                "/v1/agent/peers",
+                None::<&()>,
+                IpcOperationTier::ReadOnlyQuery,
+            )
+            .await?;
             emit_formatted(&resp, cfg.json, format_peers)
         }
         ClientCommand::Ping(args) => handle_ping(args, cfg).await,
         ClientCommand::Netcheck => {
-            let resp: NetcheckResponse =
-                send_ro_request(cfg, hyper::Method::POST, "/v1/agent/netcheck", Some(&())).await?;
+            let resp: NetcheckResponse = send_ro_request(
+                cfg,
+                hyper::Method::POST,
+                "/v1/agent/netcheck",
+                Some(&()),
+                IpcOperationTier::NetcheckProbe,
+            )
+            .await?;
             emit_formatted(&resp, cfg.json, format_netcheck)
         }
         ClientCommand::Up(args) => handle_up(args, cfg).await,
@@ -180,12 +202,14 @@ pub(crate) async fn handle_client_command(
         }
         ClientCommand::Set(args) => handle_set(args, cfg).await,
         ClientCommand::RotateKey(args) => handle_rotate_key(args, cfg).await,
+        ClientCommand::ResetIdentity { yes } => handle_reset_identity(*yes, cfg).await,
         ClientCommand::Bugreport => {
             let resp: BugreportResponse =
                 send_admin_request(cfg, hyper::Method::POST, "/v1/agent/bugreport", Some(&()))
                     .await?;
             emit_formatted(&resp, cfg.json, format_bugreport)
         }
+        ClientCommand::Gui => handle_gui(),
     }
 }
 
@@ -263,8 +287,12 @@ async fn handle_ping(args: &PingArgs, cfg: &ClientDispatchConfig) -> AppResult<(
         force_direct: args.direct,
         timeout_ms: args.timeout_ms,
     };
+    let tier = IpcOperationTier::PingProbe {
+        count: args.count,
+        per_probe_timeout_ms: args.timeout_ms,
+    };
     let resp: PingResponse =
-        send_ro_request(cfg, hyper::Method::POST, "/v1/agent/ping", Some(&req)).await?;
+        send_ro_request(cfg, hyper::Method::POST, "/v1/agent/ping", Some(&req), tier).await?;
     emit_formatted(&resp, cfg.json, |dto| format_ping(dto, args.direct))?;
     if args.direct && !resp.samples.iter().any(|s| s.via == PingVia::Direct) {
         return Err(AppError::unavailable(
@@ -341,6 +369,174 @@ async fn handle_rotate_key(args: &RotateKeyArgs, cfg: &ClientDispatchConfig) -> 
     let resp: AgentActionResponse =
         send_admin_request(cfg, hyper::Method::POST, "/v1/agent/rotate-key", Some(&req)).await?;
     emit_formatted(&resp, cfg.json, format_agent_action)
+}
+
+async fn handle_reset_identity(yes: bool, cfg: &ClientDispatchConfig) -> AppResult<()> {
+    let is_tty = std::io::stdin().is_terminal();
+    require_reset_confirmation(yes, is_tty, prompt_reset_confirmation)?;
+    let resp: AgentActionResponse = send_admin_request(
+        cfg,
+        hyper::Method::POST,
+        "/v1/agent/reset-identity",
+        Some(&AgentResetIdentityRequest {}),
+    )
+    .await?;
+    emit_formatted(&resp, cfg.json, format_agent_action)
+}
+
+pub(crate) fn require_reset_confirmation<F>(yes: bool, is_tty: bool, prompt_fn: F) -> AppResult<()>
+where
+    F: FnOnce() -> AppResult<bool>,
+{
+    if yes {
+        return Ok(());
+    }
+    if !is_tty {
+        return Err(AppError::invalid_argument(
+            "reset-identity requires --yes in non-interactive mode",
+        ));
+    }
+    if prompt_fn()? {
+        Ok(())
+    } else {
+        Err(AppError::invalid_argument(
+            "identity reset aborted; node keys preserved",
+        ))
+    }
+}
+
+fn prompt_reset_confirmation() -> AppResult<bool> {
+    {
+        let mut err_out = std::io::stderr().lock();
+        err_out
+            .write_all(b"Reset local node identity and delete enrollment keys? [y/N]: ")
+            .map_err(|err| AppError::internal(format!("failed writing prompt: {err}")))?;
+        err_out
+            .flush()
+            .map_err(|err| AppError::internal(format!("failed flushing prompt: {err}")))?;
+    }
+    let mut answer = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .map_err(|err| AppError::internal(format!("failed reading confirmation: {err}")))?;
+    let trimmed = answer.trim();
+    Ok(trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_regular_non_symlink_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_regular_non_symlink_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn resolve_windows_gui_exe_from(
+    current_exe: Option<&Path>,
+    program_files: Option<&Path>,
+) -> Option<PathBuf> {
+    let sibling = current_exe
+        .and_then(Path::parent)
+        .map(|dir| dir.join("MeshVPN.exe"));
+    if let Some(candidate) = sibling.filter(|p| is_regular_non_symlink_file(p)) {
+        return Some(candidate);
+    }
+
+    let installed = program_files.map(|pf| pf.join("Mesh").join("MeshVPN.exe"));
+    installed.filter(|p| is_regular_non_symlink_file(p))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn find_windows_gui_executable() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    let program_files = std::env::var_os("ProgramFiles")
+        .or_else(|| std::env::var_os("PROGRAMFILES"))
+        .map(PathBuf::from);
+    resolve_windows_gui_exe_from(current_exe.as_deref(), program_files.as_deref())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resolve_macos_gui_app_from(
+    current_exe: Option<&Path>,
+    applications_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(exe) = current_exe {
+        for ancestor in exe.ancestors() {
+            if ancestor.file_name().and_then(|n| n.to_str()) == Some("Mesh VPN.app")
+                && is_regular_non_symlink_dir(ancestor)
+            {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+        if let Some(sibling) = exe.parent().map(|dir| dir.join("Mesh VPN.app"))
+            && is_regular_non_symlink_dir(&sibling)
+        {
+            return Some(sibling);
+        }
+    }
+
+    applications_dir
+        .map(|dir| dir.join("Mesh VPN.app"))
+        .filter(|p| is_regular_non_symlink_dir(p))
+}
+
+fn handle_gui() -> AppResult<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(gui_exe) = find_windows_gui_executable() else {
+            return Err(AppError::not_found(
+                "MeshVPN.exe was not found next to mesh.exe or under %ProgramFiles%\\Mesh\\MeshVPN.exe",
+            ));
+        };
+        mesh_sys::process_windows::spawn_detached_gui(&gui_exe).map_err(AppError::from)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let current_exe = std::env::current_exe().ok();
+        let Some(app_bundle) =
+            resolve_macos_gui_app_from(current_exe.as_deref(), Some(Path::new("/Applications")))
+        else {
+            return Err(AppError::not_found(
+                "Mesh VPN.app was not found in /Applications or alongside mesh",
+            ));
+        };
+        let app_str = app_bundle.to_str().ok_or_else(|| {
+            AppError::invalid_argument("Mesh VPN.app path contains invalid UTF-8")
+        })?;
+        if app_str.chars().any(char::is_control) {
+            return Err(AppError::invalid_argument(
+                "Mesh VPN.app path contains control characters",
+            ));
+        }
+        let status = std::process::Command::new("/usr/bin/open")
+            .arg("-a")
+            .arg(&app_bundle)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|err| {
+                AppError::unavailable(format!("failed launching /usr/bin/open: {err}"))
+            })?;
+        if !status.success() {
+            return Err(AppError::unavailable(
+                "failed launching Mesh VPN.app via /usr/bin/open (headless or desktop session unavailable)",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Err(AppError::unavailable(
+            "mesh gui is only supported on Windows and macOS desktop environments",
+        ))
+    }
 }
 
 fn emit_formatted<T, F>(value: &T, json_mode: bool, human_fmt: F) -> AppResult<()>
@@ -496,7 +692,33 @@ pub(crate) fn load_preauth_token(
     Ok(None)
 }
 
+/// Dispatches a JSON request over an already-connected duplex or IPC stream with an explicit
+/// 3-tier IPC timeout (`ADR-024`).
+pub(crate) async fn call_agent_stream_with_tier<S, Req, Resp>(
+    stream: S,
+    method: hyper::Method,
+    path: &str,
+    body: Option<&Req>,
+    tier: IpcOperationTier,
+) -> AppResult<Resp>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+    Req: Serialize,
+    Resp: DeserializeOwned,
+{
+    send_ipc_json_request_with_timeout(
+        stream,
+        method,
+        path,
+        body,
+        MAX_HTTP_BODY_BYTES,
+        tier.response_timeout(),
+    )
+    .await
+}
+
 /// Dispatches a JSON request over an already-connected duplex or IPC stream.
+#[cfg(test)]
 pub(crate) async fn call_agent_stream<S, Req, Resp>(
     stream: S,
     method: hyper::Method,
@@ -508,7 +730,7 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    send_ipc_json_request(stream, method, path, body, MAX_HTTP_BODY_BYTES).await
+    call_agent_stream_with_tier(stream, method, path, body, IpcOperationTier::AdminMutation).await
 }
 
 async fn send_ro_request<Req, Resp>(
@@ -516,6 +738,7 @@ async fn send_ro_request<Req, Resp>(
     method: hyper::Method,
     path: &str,
     body: Option<&Req>,
+    tier: IpcOperationTier,
 ) -> AppResult<Resp>
 where
     Req: Serialize,
@@ -525,7 +748,7 @@ where
         .ro_ipc_override
         .as_deref()
         .unwrap_or(default_ro_endpoint());
-    connect_and_send(endpoint, false, method, path, body).await
+    connect_and_send(endpoint, false, method, path, body, tier).await
 }
 
 async fn send_admin_request<Req, Resp>(
@@ -542,7 +765,15 @@ where
         .admin_ipc_override
         .as_deref()
         .unwrap_or(default_admin_endpoint());
-    connect_and_send(endpoint, true, method, path, body).await
+    connect_and_send(
+        endpoint,
+        true,
+        method,
+        path,
+        body,
+        IpcOperationTier::AdminMutation,
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -572,41 +803,14 @@ async fn connect_and_send<Req, Resp>(
     method: hyper::Method,
     path: &str,
     body: Option<&Req>,
+    tier: IpcOperationTier,
 ) -> AppResult<Resp>
 where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let stream = match tokio::time::timeout(
-        IPC_CONNECT_TIMEOUT,
-        tokio::net::UnixStream::connect(endpoint),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(err)) => return Err(map_unix_connect_error(endpoint, is_admin, &err)),
-        Err(_) => {
-            return Err(AppError::unavailable(format!(
-                "meshd daemon is not running (timed out connecting to {endpoint})"
-            )));
-        }
-    };
-    call_agent_stream(stream, method, path, body).await
-}
-
-#[cfg(unix)]
-fn map_unix_connect_error(endpoint: &str, is_admin: bool, err: &std::io::Error) -> AppError {
-    match err.kind() {
-        std::io::ErrorKind::PermissionDenied if is_admin => AppError::permission_denied(format!(
-            "permission denied accessing meshd admin socket {endpoint}: run as administrator/mesh-admin"
-        )),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            AppError::unavailable(format!("meshd daemon is not running ({endpoint}: {err})"))
-        }
-        _ => AppError::unavailable(format!(
-            "meshd daemon is not running (failed opening {endpoint}: {err})"
-        )),
-    }
+    let stream = connect_agent_unix_socket(endpoint, is_admin).await?;
+    call_agent_stream_with_tier(stream, method, path, body, tier).await
 }
 
 #[cfg(windows)]
@@ -616,49 +820,14 @@ async fn connect_and_send<Req, Resp>(
     method: hyper::Method,
     path: &str,
     body: Option<&Req>,
+    tier: IpcOperationTier,
 ) -> AppResult<Resp>
 where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let stream = connect_windows_named_pipe(pipe_name, is_admin).await?;
-    call_agent_stream(stream, method, path, body).await
-}
-
-#[cfg(windows)]
-async fn connect_windows_named_pipe(
-    pipe_name: &str,
-    is_admin: bool,
-) -> AppResult<tokio::net::windows::named_pipe::NamedPipeClient> {
-    let deadline = tokio::time::Instant::now() + IPC_CONNECT_TIMEOUT;
-    loop {
-        match tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name) {
-            Ok(client) => return Ok(client),
-            Err(err) if err.raw_os_error() == Some(WIN_ERROR_PIPE_BUSY) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(AppError::unavailable(format!(
-                        "meshd daemon is not running (busy pipe timeout on {pipe_name})"
-                    )));
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(err) if err.raw_os_error() == Some(WIN_ERROR_ACCESS_DENIED) && is_admin => {
-                return Err(AppError::permission_denied(format!(
-                    "permission denied accessing {pipe_name}: run from an elevated Administrator prompt"
-                )));
-            }
-            Err(err) if err.raw_os_error() == Some(WIN_ERROR_FILE_NOT_FOUND) => {
-                return Err(AppError::unavailable(format!(
-                    "meshd daemon is not running (pipe {pipe_name} unavailable)"
-                )));
-            }
-            Err(err) => {
-                return Err(AppError::unavailable(format!(
-                    "meshd daemon is not running (failed opening {pipe_name}: {err})"
-                )));
-            }
-        }
-    }
+    let stream = connect_agent_named_pipe(pipe_name, is_admin).await?;
+    call_agent_stream_with_tier(stream, method, path, body, tier).await
 }
 
 #[cfg(test)]
@@ -751,6 +920,7 @@ mod tests {
             hyper::Method::GET,
             "/v1/agent/status",
             None,
+            mesh_net::ipc::IpcOperationTier::ReadOnlyQuery,
         )
         .await
         .expect_err("offline pipe/sock must fail");
@@ -1047,5 +1217,147 @@ mod tests {
         assert!(!set_err.to_string().contains("[https://"));
         assert_eq!(http_err.kind(), ErrorKind::InvalidArgument);
         assert!(http_err.to_string().contains("without URL scheme"));
+    }
+
+    #[test]
+    fn test_gui_executable_resolvers_prefer_sibling_and_reject_directories() {
+        // Arrange
+        let Ok(dir) = tempfile::tempdir() else {
+            return;
+        };
+        let cli_dir = dir.path().join("bin");
+        let pf_dir = dir.path().join("ProgramFiles");
+        let pf_mesh_dir = pf_dir.join("Mesh");
+        assert!(std::fs::create_dir_all(&cli_dir).is_ok());
+        assert!(std::fs::create_dir_all(&pf_mesh_dir).is_ok());
+
+        let fake_cli = cli_dir.join("mesh.exe");
+        let pf_gui = pf_mesh_dir.join("MeshVPN.exe");
+        assert!(std::fs::write(&pf_gui, b"stub").is_ok());
+
+        // Act 1: falls back to %ProgramFiles%\Mesh\MeshVPN.exe when sibling missing.
+        let found_pf = super::resolve_windows_gui_exe_from(Some(&fake_cli), Some(&pf_dir));
+        assert_eq!(found_pf.as_deref(), Some(pf_gui.as_path()));
+
+        // Act 2: sibling MeshVPN.exe takes precedence over ProgramFiles.
+        let sibling_gui = cli_dir.join("MeshVPN.exe");
+        assert!(std::fs::write(&sibling_gui, b"stub").is_ok());
+        let found_sibling = super::resolve_windows_gui_exe_from(Some(&fake_cli), Some(&pf_dir));
+        assert_eq!(found_sibling.as_deref(), Some(sibling_gui.as_path()));
+
+        // Act 3: missing everywhere returns None.
+        let missing = super::resolve_windows_gui_exe_from(
+            Some(&dir.path().join("absent").join("mesh.exe")),
+            Some(&dir.path().join("absent-pf")),
+        );
+        assert!(missing.is_none());
+
+        // Act 4: macOS bundle & sibling resolution.
+        let apps_dir = dir.path().join("Applications");
+        let bundle = apps_dir.join("Mesh VPN.app");
+        assert!(std::fs::create_dir_all(&bundle).is_ok());
+        let found_mac = super::resolve_macos_gui_app_from(None, Some(&apps_dir));
+        assert_eq!(found_mac.as_deref(), Some(bundle.as_path()));
+    }
+
+    #[test]
+    fn test_reset_identity_confirmation_policy_requires_yes_when_non_tty() {
+        // Arrange & Act
+        let non_tty_no_yes = super::require_reset_confirmation(false, false, || Ok(true));
+        let non_tty_with_yes = super::require_reset_confirmation(true, false, || Ok(false));
+        let tty_declined = super::require_reset_confirmation(false, true, || Ok(false));
+        let tty_accepted = super::require_reset_confirmation(false, true, || Ok(true));
+
+        // Assert
+        assert_eq!(
+            non_tty_no_yes.err().map(|e| e.kind()),
+            Some(ErrorKind::InvalidArgument)
+        );
+        assert!(non_tty_with_yes.is_ok());
+        assert_eq!(
+            tty_declined.err().map(|e| e.kind()),
+            Some(ErrorKind::InvalidArgument)
+        );
+        assert!(tty_accepted.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_reset_identity_wire_contract_and_3_tier_ipc_timeouts() {
+        use mesh_net::ipc::{
+            IPC_ADMIN_MUTATION_TIMEOUT, IPC_NETCHECK_TIMEOUT, IPC_RO_QUERY_TIMEOUT,
+            IpcOperationTier,
+        };
+        use mesh_proto::agent_ipc::{AgentActionResponse, AgentResetIdentityRequest, DaemonState};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+
+        // Arrange
+        assert_eq!(
+            IpcOperationTier::ReadOnlyQuery.response_timeout(),
+            IPC_RO_QUERY_TIMEOUT
+        );
+        assert_eq!(
+            IpcOperationTier::NetcheckProbe.response_timeout(),
+            IPC_NETCHECK_TIMEOUT
+        );
+        assert_eq!(
+            IpcOperationTier::AdminMutation.response_timeout(),
+            IPC_ADMIN_MUTATION_TIMEOUT
+        );
+        assert_eq!(
+            IpcOperationTier::PingProbe {
+                count: 4,
+                per_probe_timeout_ms: 2_500
+            }
+            .response_timeout(),
+            std::time::Duration::from_millis(12_000)
+        );
+
+        let (client_io, mut server_io) = duplex(16 * 1024);
+        let resp_dto = AgentActionResponse {
+            state: DaemonState::Stopped,
+            message: "node identity reset cleanly; ready for enrollment".to_owned(),
+        };
+        let Ok(resp_bytes) = serde_json::to_vec(&resp_dto) else {
+            return;
+        };
+
+        // Act
+        let client_fut = super::call_agent_stream_with_tier::<
+            _,
+            AgentResetIdentityRequest,
+            AgentActionResponse,
+        >(
+            client_io,
+            hyper::Method::POST,
+            "/v1/agent/reset-identity",
+            Some(&AgentResetIdentityRequest {}),
+            IpcOperationTier::AdminMutation,
+        );
+        let server_fut = async move {
+            let mut buf = [0_u8; 4096];
+            let Ok(n) = server_io.read(&mut buf).await else {
+                return String::new();
+            };
+            let req_text = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).into_owned();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                resp_bytes.len()
+            );
+            let _head = server_io.write_all(reply.as_bytes()).await;
+            let _body = server_io.write_all(&resp_bytes).await;
+            let _flush = server_io.flush().await;
+            req_text
+        };
+        let (client_res, wire_req) = tokio::join!(client_fut, server_fut);
+
+        // Assert
+        assert!(wire_req.starts_with("POST /v1/agent/reset-identity HTTP/1.1"));
+        assert!(matches!(
+            client_res,
+            Ok(AgentActionResponse {
+                state: DaemonState::Stopped,
+                ..
+            })
+        ));
     }
 }

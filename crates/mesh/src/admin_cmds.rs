@@ -1,8 +1,6 @@
 //! Server administration CLI subcommands routed exclusively over `/run/mesh-server/admin.sock`
 //! (`US-002`, `US-012`, `US-013`, `US-045`, `US-046`, `US-047`, `US-056`, `US-074`).
 
-#[cfg(unix)]
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
@@ -16,8 +14,10 @@ use mesh_core::defaults::LINUX_SERVER_ADMIN_SOCKET;
 use mesh_core::defaults::MAX_HTTP_BODY_BYTES;
 use mesh_core::{AppError, AppResult, MobileJoinTlsAuth, NodeName, Port, SpkiPin, format_join_uri};
 use mesh_crypto::Secret;
+#[cfg(unix)]
+use mesh_net::ipc::IPC_CONNECT_TIMEOUT;
 #[cfg(any(unix, test))]
-use mesh_net::ipc::send_ipc_json_request;
+use mesh_net::ipc::{IPC_ADMIN_MUTATION_TIMEOUT, send_ipc_json_request_with_timeout};
 use mesh_proto::admin_ipc::{
     AdminNodeSummary, BackupCreatedResponse, CreatePreAuthKeyRequest, ExpireNodeRequest,
     HardeningCheckResponse, ListAuditEventsResponse, MigrateEndpointRequest,
@@ -35,8 +35,6 @@ use crate::output::{
 };
 use crate::qr::QrCode;
 
-#[cfg(unix)]
-const SERVER_IPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const KEY_EXPIRY_WARNING_MS: u64 = 7 * 86_400 * 1_000;
 
 /// Global routing/formatting options passed to Server Admin handlers.
@@ -777,7 +775,15 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    send_ipc_json_request(stream, method, path, body, MAX_HTTP_BODY_BYTES).await
+    send_ipc_json_request_with_timeout(
+        stream,
+        method,
+        path,
+        body,
+        MAX_HTTP_BODY_BYTES,
+        IPC_ADMIN_MUTATION_TIMEOUT,
+    )
+    .await
 }
 
 async fn send_server_admin<Req, Resp>(
@@ -798,7 +804,7 @@ where
     #[cfg(unix)]
     {
         let stream = match tokio::time::timeout(
-            SERVER_IPC_CONNECT_TIMEOUT,
+            IPC_CONNECT_TIMEOUT,
             tokio::net::UnixStream::connect(socket_path),
         )
         .await

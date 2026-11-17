@@ -30,7 +30,7 @@ const DAEMON_MAX_BLOCKING_THREADS: usize = 2;
 const DAEMON_THREAD_STACK_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "meshd", about = "Mesh VPN background agent daemon")]
+#[command(name = "meshd", version, about = "Mesh VPN background agent daemon")]
 struct DaemonArgs {
     /// Validate bootstrap config and initialized subsystems without touching host interfaces.
     #[arg(long)]
@@ -290,6 +290,28 @@ mod tests {
         assert!(args.check_config);
         assert!(args.foreground);
         assert!(!args.service);
+    }
+
+    #[test]
+    fn test_meshd_version_flag_displays_bare_workspace_semver() {
+        // Arrange & Act
+        let res = DaemonArgs::try_parse_from(["meshd", "--version"]);
+
+        // Assert
+        match res {
+            Err(err) => {
+                assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+                let rendered = err.to_string();
+                assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+                assert_eq!(
+                    rendered.trim(),
+                    format!("meshd {}", env!("CARGO_PKG_VERSION"))
+                );
+            }
+            Ok(parsed) => {
+                assert!(!parsed.foreground, "expected --version to short-circuit");
+            }
+        }
     }
 
     #[test]
