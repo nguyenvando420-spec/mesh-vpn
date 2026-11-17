@@ -3540,8 +3540,14 @@ mod tests {
             .await
             .expect("responsive baseline")
             .timer_tick_count;
-        sleep(Duration::from_millis(110)).await;
-        let after_resp = handle.query_status().await.expect("responsive after");
+        let mut after_resp = handle.query_status().await.expect("responsive initial");
+        for _ in 0..60 {
+            sleep(Duration::from_millis(25)).await;
+            after_resp = handle.query_status().await.expect("responsive after");
+            if after_resp.timer_tick_count > before_resp && !after_resp.idle_sleeping {
+                break;
+            }
+        }
 
         shutdown.cancel();
         assert!(

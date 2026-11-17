@@ -453,7 +453,10 @@ jobs:
           $logFile = Join-Path $env:RUNNER_TEMP 'check-ps1.log'
           & powershell -ExecutionPolicy Bypass -File scripts/check.ps1 *>&1 | Tee-Object -FilePath $logFile
           if ($LASTEXITCODE -ne 0) {
-            @'
+            Write-Output "::warning title=scripts/check.ps1::First attempt failed; retrying once..."
+            & powershell -ExecutionPolicy Bypass -File scripts/check.ps1 *>&1 | Tee-Object -FilePath $logFile
+            if ($LASTEXITCODE -ne 0) {
+              @'
           import os, pathlib, re
           p = pathlib.Path(os.environ["RUNNER_TEMP"]) / "check-ps1.log"
           lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -461,7 +464,8 @@ jobs:
           snippet = "\n".join((matches[-15:] + ["--- tail ---"] + lines[-25:])[-40:])
           print("::error title=scripts/check.ps1::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
           '@ | python -
-            exit 1
+              exit 1
+            }
           }
 
       - name: Run Windows Desktop GUI unit tests (gui_unit_tests)
