@@ -202,8 +202,8 @@ jobs:
           if-no-files-found: ignore
 
   check-macos:
-    name: Check macOS arm64 & Desktop macOS (scripts/check.sh, Swift 6 XCTest & Darwin Release)
-    runs-on: macos-latest
+    name: Check macOS & Desktop macOS (scripts/check.sh, Swift 6 XCTest & Darwin Release)
+    runs-on: macos-15-intel
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

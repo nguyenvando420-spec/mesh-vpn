@@ -34,13 +34,13 @@ jobs:
             archive_ext: tar.gz
             bin_ext: ""
             platform: linux
-          - os: macos-latest
+          - os: macos-15-intel
             target: aarch64-apple-darwin
             pkg_name: mesh-darwin-arm64
             archive_ext: tar.gz
             bin_ext: ""
             platform: macos
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             pkg_name: mesh-darwin-x86_64
             archive_ext: tar.gz
@@ -391,7 +391,7 @@ jobs:
   package-macos-desktop:
     name: Package Universal macOS Mesh VPN.app & DMG
     needs: [verify-and-build]
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
