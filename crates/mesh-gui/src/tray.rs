@@ -1,0 +1,286 @@
+//! System Tray 9-item menu, `TaskbarCreated` recovery, one-time minimize balloon, and dual
+//! quit semantics (`US-103`, `ADR-020`).
+
+#[cfg(target_os = "windows")]
+use mesh_sys::error::SysResult;
+#[cfg(target_os = "windows")]
+use mesh_sys::gui_windows::{
+    OwnedIcon, TrayIconController, TrayMenuEntry, get_dpi_for_window, get_sm_icon_px_for_dpi,
+    show_tray_context_menu,
+};
+
+use crate::app::{DerivedUiSnapshot, DesktopUiState, TunnelSubState};
+#[cfg(target_os = "windows")]
+use crate::icons::{UiIconTone, create_status_icon_for_px, icon_tone_for_state};
+
+/// Win32 tray icon numeric ID registered via `Shell_NotifyIconW`.
+#[cfg(target_os = "windows")]
+pub(crate) const TRAY_ICON_ID: u32 = 1;
+
+/// Command ID for the disabled Status summary menu header (1/9).
+pub(crate) const IDM_STATUS_HEADER: u16 = 1001;
+/// Command ID for `Open Dashboard` (2/9).
+pub(crate) const IDM_OPEN_DASHBOARD: u16 = 1002;
+/// Command ID for `Connect` (3/9).
+pub(crate) const IDM_CONNECT_UP: u16 = 1003;
+/// Command ID for `Disconnect` (4/9).
+pub(crate) const IDM_DISCONNECT: u16 = 1004;
+/// Command ID for `Run Netcheck` (5/9).
+pub(crate) const IDM_NETCHECK: u16 = 1005;
+/// Command ID for `Export Bugreport...` (6/9).
+pub(crate) const IDM_EXPORT_BUGREPORT: u16 = 1006;
+/// Command ID for `Launch at Login` (7/9).
+pub(crate) const IDM_TOGGLE_AUTOSTART: u16 = 1007;
+/// Command ID for `Quit Mesh VPN (Keep Connected in Background)` (8/9).
+pub(crate) const IDM_QUIT_KEEP_BACKGROUND: u16 = 1008;
+/// Command ID for `Disconnect & Quit Mesh VPN` (9/9).
+pub(crate) const IDM_DISCONNECT_AND_QUIT: u16 = 1009;
+
+/// OS-neutral representation of a single entry in the 9-item System Tray context menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrayMenuItemModel {
+    Header(String),
+    Separator,
+    Action {
+        id: u16,
+        label: String,
+        enabled: bool,
+        checked: bool,
+        default: bool,
+    },
+}
+
+/// Builds the canonical 9-item System Tray context menu for the active `DerivedUiSnapshot`.
+#[must_use]
+pub(crate) fn build_tray_menu_model(
+    snapshot: &DerivedUiSnapshot,
+    overlay_ip: Option<&str>,
+    autostart_enabled: bool,
+) -> Vec<TrayMenuItemModel> {
+    let status_text = match overlay_ip.filter(|s| !s.is_empty()) {
+        Some(ip) => format!("Status: {} ({ip})", snapshot.ui_state.label()),
+        None => format!("Status: {}", snapshot.ui_state.label()),
+    };
+
+    let ipc_ready = !matches!(
+        snapshot.ui_state,
+        DesktopUiState::AgentUnavailable | DesktopUiState::ServiceStopped
+    );
+    let connect_enabled = matches!(
+        (snapshot.ui_state, snapshot.tunnel_sub_state),
+        (DesktopUiState::Connected, TunnelSubState::Disconnected)
+            | (DesktopUiState::ErrorRecoverable, _)
+    );
+    let disconnect_enabled = matches!(
+        (snapshot.ui_state, snapshot.tunnel_sub_state),
+        (
+            DesktopUiState::Connected,
+            TunnelSubState::Connected | TunnelSubState::Degraded
+        ) | (DesktopUiState::Connecting, _)
+    );
+
+    vec![
+        TrayMenuItemModel::Header(status_text),
+        TrayMenuItemModel::Separator,
+        TrayMenuItemModel::Action {
+            id: IDM_OPEN_DASHBOARD,
+            label: "Open Dashboard".to_owned(),
+            enabled: true,
+            checked: false,
+            default: true,
+        },
+        TrayMenuItemModel::Action {
+            id: IDM_CONNECT_UP,
+            label: "Connect".to_owned(),
+            enabled: connect_enabled,
+            checked: false,
+            default: false,
+        },
+        TrayMenuItemModel::Action {
+            id: IDM_DISCONNECT,
+            label: "Disconnect".to_owned(),
+            enabled: disconnect_enabled,
+            checked: false,
+            default: false,
+        },
+        TrayMenuItemModel::Separator,
+        TrayMenuItemModel::Action {
+            id: IDM_NETCHECK,
+            label: "Run Netcheck Diagnostics".to_owned(),
+            enabled: ipc_ready,
+            checked: false,
+            default: false,
+        },
+        TrayMenuItemModel::Action {
+            id: IDM_EXPORT_BUGREPORT,
+            label: "Export Bugreport (.tar)...".to_owned(),
+            enabled: ipc_ready,
+            checked: false,
+            default: false,
+        },
+        TrayMenuItemModel::Action {
+            id: IDM_TOGGLE_AUTOSTART,
+            label: "Launch at Login".to_owned(),
+            enabled: true,
+            checked: autostart_enabled,
+            default: false,
+        },
+        TrayMenuItemModel::Separator,
+        TrayMenuItemModel::Action {
+            id: IDM_QUIT_KEEP_BACKGROUND,
+            label: "Quit Mesh VPN (Keep Connected in Background)".to_owned(),
+            enabled: true,
+            checked: false,
+            default: false,
+        },
+        TrayMenuItemModel::Action {
+            id: IDM_DISCONNECT_AND_QUIT,
+            label: "Disconnect && Quit Mesh VPN".to_owned(),
+            enabled: true,
+            checked: false,
+            default: false,
+        },
+    ]
+}
+
+/// Counts non-separator entries (the 9 menu entries: 1 header + 8 clickable items).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn count_non_separator_entries(items: &[TrayMenuItemModel]) -> usize {
+    items
+        .iter()
+        .filter(|entry| !matches!(entry, TrayMenuItemModel::Separator))
+        .count()
+}
+
+/// Manages Win32 `TrayIconController` lifecycle, DPI-scaled icons, `TaskbarCreated` restoration,
+/// and the once-per-session minimize balloon hint.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) struct TrayStateManager {
+    controller: TrayIconController,
+    current_icon: Option<OwnedIcon>,
+    last_tone: Option<UiIconTone>,
+    last_icon_px: i32,
+    minimize_balloon_shown: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl TrayStateManager {
+    /// Initializes an unadded `TrayStateManager` bound to `hwnd`.
+    #[must_use]
+    pub(crate) fn new(hwnd: isize) -> Self {
+        Self {
+            controller: TrayIconController::new(hwnd, TRAY_ICON_ID),
+            current_icon: None,
+            last_tone: None,
+            last_icon_px: 0,
+            minimize_balloon_shown: false,
+        }
+    }
+
+    /// Registers or re-adds the tray icon on `WM_CREATE` or `TaskbarCreated`.
+    pub(crate) fn ensure_added_or_restore(
+        &mut self,
+        hwnd: isize,
+        snapshot: &DerivedUiSnapshot,
+    ) -> SysResult<()> {
+        let icon_px = get_sm_icon_px_for_dpi(get_dpi_for_window(hwnd));
+        let tone = icon_tone_for_state(snapshot.ui_state, snapshot.tunnel_sub_state);
+        if self.current_icon.is_none()
+            || self.last_tone != Some(tone)
+            || self.last_icon_px != icon_px
+        {
+            self.current_icon = Some(create_status_icon_for_px(tone, icon_px)?);
+            self.last_tone = Some(tone);
+            self.last_icon_px = icon_px;
+        }
+        let Some(icon) = &self.current_icon else {
+            return Ok(());
+        };
+        let tooltip = snapshot
+            .ui_state
+            .tray_tooltip_summary(snapshot.tunnel_sub_state);
+        self.controller.add_or_restore(icon, tooltip)
+    }
+
+    /// Updates tray icon image and tooltip cleanly when state or monitor DPI changes.
+    pub(crate) fn sync_state(&mut self, hwnd: isize, snapshot: &DerivedUiSnapshot) {
+        let icon_px = get_sm_icon_px_for_dpi(get_dpi_for_window(hwnd));
+        let tone = icon_tone_for_state(snapshot.ui_state, snapshot.tunnel_sub_state);
+        if (self.current_icon.is_none()
+            || self.last_tone != Some(tone)
+            || self.last_icon_px != icon_px)
+            && let Ok(new_icon) = create_status_icon_for_px(tone, icon_px)
+        {
+            self.current_icon = Some(new_icon);
+            self.last_tone = Some(tone);
+            self.last_icon_px = icon_px;
+        }
+        if let Some(icon) = &self.current_icon {
+            let tooltip = snapshot
+                .ui_state
+                .tray_tooltip_summary(snapshot.tunnel_sub_state);
+            let _updated = self.controller.update(icon, tooltip);
+        }
+    }
+
+    /// Shows the "Minimized to System Tray" balloon notification at most once per session.
+    pub(crate) fn show_minimize_balloon_once(&mut self) {
+        if self.minimize_balloon_shown {
+            return;
+        }
+        let Some(icon) = &self.current_icon else {
+            return;
+        };
+        if self
+            .controller
+            .show_info_balloon(
+                icon,
+                "Mesh VPN Minimized",
+                "Mesh VPN continues running in the System Tray.",
+            )
+            .is_ok()
+        {
+            self.minimize_balloon_shown = true;
+        }
+    }
+
+    /// Displays the native Win32 tray context menu at the cursor position and returns chosen ID.
+    pub(crate) fn show_menu(
+        &self,
+        hwnd: isize,
+        snapshot: &DerivedUiSnapshot,
+        overlay_ip: Option<&str>,
+        autostart_enabled: bool,
+    ) -> SysResult<Option<u16>> {
+        let _header_id = IDM_STATUS_HEADER;
+        let model = build_tray_menu_model(snapshot, overlay_ip, autostart_enabled);
+        let entries: Vec<TrayMenuEntry> = model
+            .into_iter()
+            .map(|item| match item {
+                TrayMenuItemModel::Header(text) => TrayMenuEntry::Header(text),
+                TrayMenuItemModel::Separator => TrayMenuEntry::Separator,
+                TrayMenuItemModel::Action {
+                    id,
+                    label,
+                    enabled,
+                    checked,
+                    default,
+                } => TrayMenuEntry::Action {
+                    id,
+                    label,
+                    enabled,
+                    checked,
+                    default,
+                },
+            })
+            .collect();
+        show_tray_context_menu(hwnd, &entries)
+    }
+
+    /// Removes the tray icon from the Windows notification area prior to process exit.
+    pub(crate) fn remove(&mut self) {
+        self.controller.remove();
+    }
+}

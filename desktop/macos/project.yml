@@ -1,0 +1,73 @@
+name: MeshVPNApp
+options:
+  bundleIdPrefix: dev.meshvpn.macos
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+packages:
+  MeshDesktopCore:
+    path: MeshDesktopCore
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CLANG_ENABLE_MODULES: "YES"
+    INFOPLIST_OUTPUT_FORMAT: xml
+    ENABLE_APP_SANDBOX: "NO"
+targets:
+  MeshVPNApp:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: MeshVPNApp/Sources
+      - path: MeshVPNApp/Resources
+        excludes:
+          - Info.plist
+          - MeshVPN.entitlements
+    settings:
+      base:
+        PRODUCT_NAME: "Mesh VPN"
+        PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.macos
+        INFOPLIST_FILE: MeshVPNApp/Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: MeshVPNApp/Resources/MeshVPN.entitlements
+        CODE_SIGN_STYLE: Manual
+        COMBINE_HIDPI_IMAGES: "YES"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+    dependencies:
+      - package: MeshDesktopCore
+        product: MeshDesktopCore
+      - sdk: ServiceManagement.framework
+  MeshVPNAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: MeshVPNAppTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.meshvpn.macos.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+    dependencies:
+      - package: MeshDesktopCore
+        product: MeshDesktopCore
+schemes:
+  MeshVPNApp:
+    build:
+      targets:
+        MeshVPNApp: all
+        MeshVPNAppTests:
+          - test
+    test:
+      gatherCoverageData: false
+      targets:
+        - name: MeshVPNAppTests

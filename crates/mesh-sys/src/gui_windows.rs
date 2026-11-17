@@ -2,23 +2,125 @@
 //! anti-TOCTOU DLL locking, single-instance coordination, and registry/shortcut helpers
 //! (`ADR-020`, `ADR-021`, `ADR-023`, `ADR-026`, `BLK-DGUI-G2-02/04/05`).
 
+use std::ffi::{OsStr, OsString, c_void};
 use std::fmt;
-use std::fs::File;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write as _};
+use std::mem::{self, size_of};
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::windows::io::AsRawHandle as _;
+use std::path::{Component, Path, PathBuf};
+use std::ptr;
+use std::time::{Duration, Instant};
 
 use mesh_core::defaults::MAX_BUGREPORT_ARCHIVE_BYTES;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Graphics::Gdi::{DeleteObject, HGDIOBJ};
-use windows_sys::Win32::Security::RevertToSelf;
-use windows_sys::Win32::System::DataExchange::CloseClipboard;
-use windows_sys::Win32::System::Registry::{HKEY, RegCloseKey};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+    ERROR_PIPE_CONNECTED, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SUCCESS, FILETIME, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, GlobalFree, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LPARAM,
+    LRESULT, LocalFree, RECT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    COLOR_BTNFACE, CreateBitmap, CreateFontIndirectW, CreateFontW, DeleteObject, HBRUSH, HGDIOBJ,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SetNamedSecurityInfoW,
+};
+use windows_sys::Win32::Security::{
+    ACL, CheckTokenMembership, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+    GetSecurityDescriptorDacl, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_QUERY,
+    TOKEN_USER, TokenElevation, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType,
+    MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    WriteFile,
+};
+use windows_sys::Win32::System::Com::{CoCreateGuid, CoTaskMemFree};
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+    IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+};
+use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
+use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, ImpersonateNamedPipeClient,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+};
+use windows_sys::Win32::System::Services::{
+    ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
+    CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_ACTION,
+    SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
+    SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
+    SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_CONTROL_STOP,
+    SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONS_FLAG,
+    SERVICE_FAILURE_ACTIONSW, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
+    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
+};
+use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GetCurrentProcess, GetCurrentThread,
+    GetExitCodeProcess, GetProcessId, OpenEventW, OpenProcessToken, OpenThreadToken, SetEvent,
+    Sleep, WaitForMultipleObjects, WaitForSingleObject,
+};
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    CommDlgExtendedError, GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
+use windows_sys::Win32::UI::Controls::{
+    ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx,
+};
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, GetSystemMetricsForDpi,
+    SetProcessDpiAwarenessContext, SystemParametersInfoForDpi,
+};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetFocus, GetKeyState, SetFocus, VK_CONTROL,
+};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_Desktop, FOLDERID_Programs, FOLDERID_StartMenu, NIF_ICON, NIF_INFO, NIF_MESSAGE,
+    NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, SEE_MASK_NOASYNC,
+    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetKnownFolderPath, Shell_NotifyIconW,
+    ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, DestroyMenu, HICON, HMENU, SetProcessDPIAware,
+    AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON,
+    BS_PUSHBUTTON, CREATESTRUCTW, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_READONLY, FindWindowW,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetDlgCtrlID, GetMessageW, GetWindowLongPtrW,
+    GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICON_BIG, ICON_SMALL, ICONINFO, IDC_ARROW,
+    IDYES, IsDialogMessageW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
+    LBS_NOTIFY, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow,
+    NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SM_CXSMICON, SMTO_ABORTIFHUNG, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNORMAL, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetProcessDPIAware,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETFONT,
+    WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_CONTROLPARENT, WS_GROUP,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
+use windows_sys::core::GUID;
 
 use crate::error::{SysError, SysResult};
 use crate::ipc_windows::WindowsPeerCredentials;
@@ -29,8 +131,14 @@ pub const GUI_SINGLE_INSTANCE_MUTEX: &str = r"Local\MeshVpnGuiSingleInstance";
 /// Graceful shutdown event signaled when upgrading `MeshVPN.exe` (`ADR-026`).
 pub const GUI_SHUTDOWN_EVENT: &str = r"Local\MeshVpnGuiShutdownEvent";
 
+/// Broadcast/window activation message name for single-instance focus handoff.
+pub const GUI_ACTIVATE_MESSAGE_NAME: &str = "MeshVpnGui_Activate_v1";
+
 /// Canonical prefix for ephemeral authenticated UAC handoff pipes (`ADR-021`).
 pub const HANDOFF_PIPE_PREFIX: &str = r"\\.\pipe\mesh-gui-handoff-";
+
+/// Win32 SCM service name for `meshd.exe --service`.
+pub const WINDOWS_SERVICE_NAME: &str = "MeshVpnAgent";
 
 /// Win32 error code `ERROR_FILE_NOT_FOUND` (`2`).
 pub const WIN_ERROR_FILE_NOT_FOUND: i32 = 2;
@@ -47,10 +155,68 @@ pub const WIN_ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 /// Win32 error code `ERROR_CANCELLED` (`1223`, user canceled UAC prompt).
 pub const WIN_ERROR_CANCELLED: i32 = 1223;
 
+const SS_LEFT: u32 = 0x0000;
+const SS_NOPREFIX: u32 = 0x0080;
+
+/// Custom Win32 message ID for System Tray callbacks.
+pub const WM_APP_TRAY_CALLBACK: u32 = WM_APP + 1;
+
+/// Custom Win32 message ID waking the UI after background IPC poll completion.
+pub const WM_APP_STATE_REFRESH: u32 = WM_APP + 2;
+
+/// Custom Win32 message ID notifying UI of elevated worker / async action completion.
+pub const WM_APP_WORKER_DONE: u32 = WM_APP + 3;
+
+/// Custom Win32 message ID requesting graceful Tray shutdown during an upgrade.
+pub const WM_APP_GRACEFUL_SHUTDOWN: u32 = WM_APP + 4;
+
+/// Custom Win32 message ID querying running GUI SemVer `(major << 16) | (minor << 8) | patch`.
+pub const WM_APP_QUERY_VERSION: u32 = WM_APP + 5;
+
+/// Custom Win32 message ID delivering Netcheck probe results.
+pub const WM_APP_NETCHECK_DONE: u32 = WM_APP + 6;
+
+/// Custom Win32 message ID delivering Ping probe results.
+pub const WM_APP_PING_DONE: u32 = WM_APP + 7;
+
+/// Custom Win32 message ID delivering bugreport export results.
+pub const WM_APP_BUGREPORT_DONE: u32 = WM_APP + 8;
+
+/// Win32 mouse left button release (`WM_LBUTTONUP`) forwarded in `on_tray_callback`.
+pub const WIN_WM_LBUTTONUP: u32 = WM_LBUTTONUP;
+
+/// Win32 mouse left double-click (`WM_LBUTTONDBLCLK`) forwarded in `on_tray_callback`.
+pub const WIN_WM_LBUTTONDBLCLK: u32 = WM_LBUTTONDBLCLK;
+
+/// Win32 mouse right button release (`WM_RBUTTONUP`) forwarded in `on_tray_callback`.
+pub const WIN_WM_RBUTTONUP: u32 = WM_RBUTTONUP;
+
+/// Win32 button click notification code (`BN_CLICKED`) forwarded in `on_command`.
+pub const WIN_BN_CLICKED: u16 = 0;
+
+/// Win32 edit text-change notification code (`EN_CHANGE`) forwarded in `on_command`.
+pub const WIN_EN_CHANGE: u16 = 0x0300;
+
+/// Win32 list box selection-change notification code (`LBN_SELCHANGE`) forwarded in `on_command`.
+pub const WIN_LBN_SELCHANGE: u16 = 1;
+
+const MGH1_MAGIC: [u8; 4] = *b"MGH1";
+const MGH1_HELLO_FRAME_LEN: usize = 13;
+const MGH1_PROTOCOL_VERSION: u32 = 1;
+const HANDOFF_PIPE_BUF_BYTES: u32 = 65_536;
+const HANDOFF_WRITE_TIMEOUT_MS: u32 = 15_000;
+const MAX_BUGREPORT_CHUNK_BYTES: usize = 65_536;
+const MAX_WIDE_PATH_CHARS: usize = 32_768;
+const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+const REG_RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const BST_CHECKED_VAL: usize = 1;
+const BST_UNCHECKED_VAL: usize = 0;
+
 /// RAII guard closing a Win32 `HANDLE` (`CloseHandle`) on drop.
 pub struct OwnedWinHandle(HANDLE);
 
-// SAFETY: Kernel handles wrapped by `OwnedWinHandle` are exclusively owned and closed once in `Drop`.
+// SAFETY: Kernel handles wrapped by `OwnedWinHandle` are exclusively owned and closed once in
+// `Drop`.
 unsafe impl Send for OwnedWinHandle {}
 
 impl OwnedWinHandle {
@@ -80,7 +246,8 @@ impl fmt::Debug for OwnedWinHandle {
 impl Drop for OwnedWinHandle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-            // SAFETY: `self.0` was validated non-null and != `INVALID_HANDLE_VALUE` and is owned solely by `self`.
+            // SAFETY: `self.0` was validated non-null and != `INVALID_HANDLE_VALUE` and is owned
+            // solely by `self`.
             let _closed = unsafe { CloseHandle(self.0) };
         }
     }
@@ -239,7 +406,8 @@ pub struct ImpersonationGuard;
 
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
-        // SAFETY: Restores the thread's original security token after `ImpersonateNamedPipeClient`.
+        // SAFETY: Restores the thread's original security token after
+        // `ImpersonateNamedPipeClient`.
         let ok = unsafe { RevertToSelf() };
         if ok == 0 {
             tracing::error!(
@@ -247,6 +415,64 @@ impl Drop for ImpersonationGuard {
                 error = %io::Error::last_os_error(),
                 "RevertToSelf failed"
             );
+        }
+    }
+}
+
+struct LocalAllocGuard(*mut c_void);
+
+impl Drop for LocalAllocGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was allocated by a Win32 API using `LocalAlloc`.
+            let _rem = unsafe { LocalFree(self.0 as HLOCAL) };
+        }
+    }
+}
+
+struct CoTaskMemGuard(*mut c_void);
+
+impl Drop for CoTaskMemGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was allocated by `SHGetKnownFolderPath` via COM task allocator.
+            unsafe { CoTaskMemFree(self.0) };
+        }
+    }
+}
+
+struct GlobalLockGuard(HANDLE);
+
+impl Drop for GlobalLockGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: Matches an earlier successful `GlobalLock` on `self.0`.
+            let _unlocked = unsafe { GlobalUnlock(self.0) };
+        }
+    }
+}
+
+struct OwnedScHandle(SC_HANDLE);
+
+impl OwnedScHandle {
+    fn from_raw(handle: SC_HANDLE) -> Option<Self> {
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self(handle))
+        }
+    }
+
+    const fn as_raw(&self) -> SC_HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedScHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` is an open SCM or service handle owned solely by `self`.
+            let _closed = unsafe { CloseServiceHandle(self.0) };
         }
     }
 }
@@ -285,6 +511,208 @@ pub enum TrayStatusIconKind {
     WarningOrError,
 }
 
+/// Standard modal `MessageBoxW` category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageBoxKind {
+    /// Informational message (`OK`).
+    Info,
+    /// Warning alert (`OK`).
+    Warning,
+    /// Error alert (`OK`).
+    Error,
+    /// Yes/No confirmation prompt (`Yes` returns `true`).
+    ConfirmYesNo,
+}
+
+/// Tray context menu item specification rendered cleanly without `unsafe` in `mesh-gui`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayMenuEntry {
+    /// Disabled status summary header row.
+    Header(String),
+    /// Horizontal menu separator.
+    Separator,
+    /// Clickable action item returning `id` when activated.
+    Action {
+        /// Command identifier returned from `show_tray_context_menu`.
+        id: u16,
+        /// Display label (`&` escaped cleanly as needed by caller).
+        label: String,
+        /// Whether item is clickable.
+        enabled: bool,
+        /// Whether checkmark is shown.
+        checked: bool,
+        /// Whether item is bold default action.
+        default: bool,
+    },
+    /// Nested submenu (e.g. `Peers`).
+    Submenu {
+        /// Submenu label.
+        label: String,
+        /// Whether submenu is enabled.
+        enabled: bool,
+        /// Nested child items.
+        items: Vec<TrayMenuEntry>,
+    },
+}
+
+/// Parameters for creating and running the main Win32 Dashboard window.
+#[derive(Debug)]
+pub struct GuiWindowSpec<'a> {
+    /// Win32 window class name.
+    pub class_name: &'a str,
+    /// Initial window title.
+    pub title: &'a str,
+    /// Initial logical width at 96 DPI.
+    pub width_96dpi: i32,
+    /// Initial logical height at 96 DPI.
+    pub height_96dpi: i32,
+    /// When `true`, starts hidden in System Tray (`--minimized`).
+    pub start_hidden: bool,
+    /// Registered `MeshVpnGui_Activate_v1` broadcast message ID.
+    pub activate_msg: u32,
+    /// Registered `TaskbarCreated` broadcast message ID.
+    pub taskbar_created_msg: u32,
+    /// Initial window icon.
+    pub initial_icon: Option<&'a OwnedIcon>,
+}
+
+/// Safe event callback trait implemented by `mesh-gui::window` without writing `unsafe`.
+pub trait WindowEventHandler {
+    /// Invoked once inside `WM_CREATE` after HWND creation.
+    fn on_create(&self, hwnd: isize);
+    /// Invoked on `WM_COMMAND` from buttons, checkboxes, radios, edits, or listboxes.
+    fn on_command(&self, hwnd: isize, control_id: u16, notify_code: u16);
+    /// Invoked on `WM_TIMER`.
+    fn on_timer(&self, hwnd: isize, timer_id: usize);
+    /// Invoked on `WM_APP_TRAY_CALLBACK` (`lparam` low word mouse message).
+    fn on_tray_callback(&self, hwnd: isize, event_msg: u32);
+    /// Invoked when `explorer.exe` restarts and broadcasts `TaskbarCreated`.
+    fn on_taskbar_created(&self, hwnd: isize);
+    /// Invoked when a second instance sends `MeshVpnGui_Activate_v1`.
+    fn on_activate_requested(&self, hwnd: isize);
+    /// Invoked on `WM_APP_GRACEFUL_SHUTDOWN`, `WM_QUERYENDSESSION`, or `WM_ENDSESSION`.
+    fn on_graceful_shutdown(&self, hwnd: isize);
+    /// Invoked for custom `WM_APP_*` background notifications.
+    fn on_app_message(&self, hwnd: isize, msg: u32, wparam: usize, lparam: isize);
+    /// Invoked before `TranslateMessage` when `Ctrl+V` is pressed inside `hwnd`.
+    fn on_ctrl_v(&self, hwnd: isize, focused_control_id: u16);
+    /// Invoked on `WM_DPICHANGED`.
+    fn on_dpi_changed(&self, hwnd: isize, dpi: u32);
+    /// Invoked on `WM_SIZE`.
+    fn on_resize(&self, hwnd: isize, width: i32, height: i32);
+    /// Invoked on `WM_APP_QUERY_VERSION` returning packed `(major << 16) | (minor << 8) | patch`.
+    fn on_query_version(&self) -> isize;
+    /// Invoked on `WM_CLOSE`; return `true` to hide/suppress default `DestroyWindow`.
+    fn on_close(&self, hwnd: isize) -> bool;
+    /// Invoked on `WM_DESTROY` prior to `PostQuitMessage(0)`.
+    fn on_destroy(&self, hwnd: isize);
+}
+
+/// Safe Win32 System Tray notification icon handle (`Shell_NotifyIconW`).
+pub struct TrayIconController {
+    hwnd: HWND,
+    icon_id: u32,
+    added: bool,
+}
+
+impl fmt::Debug for TrayIconController {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrayIconController")
+            .field("icon_id", &self.icon_id)
+            .field("added", &self.added)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TrayIconController {
+    /// Creates an unregistered tray controller bound to `hwnd`.
+    #[must_use]
+    pub const fn new(hwnd: isize, icon_id: u32) -> Self {
+        Self {
+            hwnd: hwnd as HWND,
+            icon_id,
+            added: false,
+        }
+    }
+
+    /// Adds (or re-adds after `TaskbarCreated`) the tray icon with bounded retry (`US-103 AC5`).
+    pub fn add_or_restore(&mut self, icon: &OwnedIcon, tooltip: &str) -> SysResult<()> {
+        const OP: &str = "gui_windows::TrayIconController::add_or_restore";
+        let nid = build_notify_icon_data(self.hwnd, self.icon_id, icon, tooltip);
+        for attempt in 0..4_u32 {
+            // SAFETY: `nid` is a fully initialized `NOTIFYICONDATAW` pointing to a live `HICON`
+            // and `HWND` for the duration of `Shell_NotifyIconW`.
+            let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &raw const nid) };
+            if ok != 0 {
+                self.added = true;
+                return Ok(());
+            }
+            // Retry `NIM_MODIFY` in case the icon already exists in shell cache.
+            // SAFETY: `nid` remains initialized for `NIM_MODIFY`.
+            let mod_ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const nid) };
+            if mod_ok != 0 {
+                self.added = true;
+                return Ok(());
+            }
+            if attempt < 3 {
+                win_sleep_ms(120 * (attempt + 1));
+            }
+        }
+        Err(SysError::io(OP, io::Error::last_os_error()))
+    }
+
+    /// Updates the existing tray icon image and tooltip (falls back to `NIM_ADD` if absent).
+    pub fn update(&mut self, icon: &OwnedIcon, tooltip: &str) -> SysResult<()> {
+        if !self.added {
+            return self.add_or_restore(icon, tooltip);
+        }
+        let nid = build_notify_icon_data(self.hwnd, self.icon_id, icon, tooltip);
+        // SAFETY: `nid` holds valid icon handle and NUL-terminated UTF-16 tooltip.
+        let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const nid) };
+        if ok != 0 {
+            return Ok(());
+        }
+        self.add_or_restore(icon, tooltip)
+    }
+
+    /// Displays an informational tray balloon tip (called at most once per session on minimize).
+    pub fn show_info_balloon(&self, icon: &OwnedIcon, title: &str, body: &str) -> SysResult<()> {
+        const OP: &str = "gui_windows::TrayIconController::show_info_balloon";
+        let mut nid = build_notify_icon_data(self.hwnd, self.icon_id, icon, title);
+        nid.uFlags |= NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO;
+        write_wide_fixed(&mut nid.szInfoTitle, title);
+        write_wide_fixed(&mut nid.szInfo, body);
+        // SAFETY: `nid` is fully initialized with NUL-terminated UTF-16 `szInfoTitle`/`szInfo`.
+        let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &raw const nid) };
+        if ok == 0 {
+            return Err(SysError::io(OP, io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Removes the tray icon immediately (`NIM_DELETE`).
+    pub fn remove(&mut self) {
+        if !self.added {
+            return;
+        }
+        // SAFETY: `NOTIFYICONDATAW` is POD zero-initialized before setting `cbSize`, `hWnd`, `uID`.
+        let mut nid: NOTIFYICONDATAW = unsafe { mem::zeroed() };
+        nid.cbSize = u32::try_from(size_of::<NOTIFYICONDATAW>()).unwrap_or(0);
+        nid.hWnd = self.hwnd;
+        nid.uID = self.icon_id;
+        // SAFETY: Removes the tray icon belonging to `(self.hwnd, self.icon_id)`.
+        let _removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &raw const nid) };
+        self.added = false;
+    }
+}
+
+impl Drop for TrayIconController {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
 /// Validates that `pipe_name` matches `\\.\pipe\mesh-gui-handoff-<32_lowercase_hex>` (`ADR-021`).
 #[must_use]
 pub fn is_valid_handoff_pipe_name(pipe_name: &str) -> bool {
@@ -308,41 +736,160 @@ pub fn is_uac_cancelled_error(err: &SysError) -> bool {
 
 /// Enables Per-Monitor V2 DPI awareness on Windows 10/11 (falling back safely on older builds).
 pub fn enable_per_monitor_v2_dpi() -> SysResult<()> {
-    // SAFETY: `SetProcessDpiAwarenessContext` takes a constant Win32 pseudo-handle with no pointer dereference.
+    // SAFETY: `SetProcessDpiAwarenessContext` takes a constant Win32 pseudo-handle with no
+    // pointer dereference.
     let ok = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     if ok != 0 {
         return Ok(());
     }
-    // SAFETY: Fallback to system DPI awareness if Per-Monitor V2 is unavailable; takes no arguments.
+    // SAFETY: Fallback to system DPI awareness if Per-Monitor V2 is unavailable; takes no args.
     let _fallback = unsafe { SetProcessDPIAware() };
     Ok(())
 }
 
-/// Initializes Win32 Common Controls v6 (`ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES`).
+/// Initializes Win32 Common Controls v6
+/// (`ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES`).
 pub fn init_common_controls() -> SysResult<()> {
-    Err(SysError::NotImplemented(
-        "gui_windows::init_common_controls",
-    ))
+    const OP: &str = "gui_windows::init_common_controls";
+    let icc = INITCOMMONCONTROLSEX {
+        dwSize: u32::try_from(size_of::<INITCOMMONCONTROLSEX>()).unwrap_or(8),
+        dwICC: ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES,
+    };
+    // SAFETY: `icc` is a valid stack `INITCOMMONCONTROLSEX` whose `dwSize` matches its size.
+    let ok = unsafe { InitCommonControlsEx(&raw const icc) };
+    if ok == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
-/// Launches `exe_path` elevated via `ShellExecuteExW("runas")` with `SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC`
-/// passing ONLY `--elevated-worker --handoff-pipe <pipe_name>` (never secrets or save paths, `ADR-021`).
+/// Returns `true` when the current process token holds elevated privileges (`TokenIsElevated`).
+pub fn is_current_process_elevated() -> SysResult<bool> {
+    const OP: &str = "gui_windows::is_current_process_elevated";
+    let mut tok_raw: HANDLE = ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle; `tok_raw` receives the token handle.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut tok_raw) };
+    if ok == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    let Some(token) = OwnedWinHandle::from_raw(tok_raw) else {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    };
+    query_token_is_elevated(token.as_raw(), OP)
+}
+
+/// Launches `exe_path` elevated via `ShellExecuteExW("runas")` with
+/// `SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC` passing ONLY
+/// `--elevated-worker --handoff-pipe <pipe_name>` (never secrets or save paths, `ADR-021`).
 pub fn launch_elevated_worker(
     exe_path: &Path,
     handoff_pipe_name: &str,
 ) -> SysResult<OwnedWinHandle> {
+    const OP: &str = "gui_windows::launch_elevated_worker";
     if exe_path.as_os_str().is_empty() || !is_valid_handoff_pipe_name(handoff_pipe_name) {
         return Err(SysError::SecurityViolation {
-            operation: "gui_windows::launch_elevated_worker",
+            operation: OP,
             detail: "invalid executable or handoff pipe name".to_owned(),
         });
     }
-    Err(SysError::NotImplemented(
-        "gui_windows::launch_elevated_worker",
-    ))
+    let meta = fs::symlink_metadata(exe_path).map_err(|err| SysError::io(OP, err))?;
+    if meta.file_type().is_symlink()
+        || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !meta.file_type().is_file()
+    {
+        return Err(SysError::SecurityViolation {
+            operation: OP,
+            detail: "refusing to elevate symlink, reparse point, or non-regular file".to_owned(),
+        });
+    }
+
+    let clean_path = strip_verbatim_prefix(exe_path);
+    let params = format!("--elevated-worker --handoff-pipe {handoff_pipe_name}");
+    if contains_shell_metacharacters(&params) {
+        return Err(SysError::SecurityViolation {
+            operation: OP,
+            detail: "rejected unsafe characters in elevated worker parameters".to_owned(),
+        });
+    }
+
+    let verb_wide = encode_wide_nul_str("runas", OP)?;
+    let file_wide = encode_wide_nul_os(clean_path.as_os_str(), OP)?;
+    let params_wide = encode_wide_nul_str(&params, OP)?;
+
+    // SAFETY: `SHELLEXECUTEINFOW` is a POD C struct zero-initialized before setting pointers.
+    let mut sei: SHELLEXECUTEINFOW = unsafe { mem::zeroed() };
+    sei.cbSize = u32::try_from(size_of::<SHELLEXECUTEINFOW>()).unwrap_or(0);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb = verb_wide.as_ptr();
+    sei.lpFile = file_wide.as_ptr();
+    sei.lpParameters = params_wide.as_ptr();
+    sei.nShow = SW_HIDE;
+
+    // SAFETY: `sei` and all UTF-16 NUL-terminated buffers (`verb_wide`, `file_wide`, `params_wide`)
+    // remain valid and pinned for the entire synchronous `ShellExecuteExW` call.
+    let ok = unsafe { ShellExecuteExW(&raw mut sei) };
+    if ok == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(WIN_ERROR_CANCELLED) {
+            return Err(SysError::Io {
+                operation: OP,
+                source: err,
+            });
+        }
+        return Err(map_win_io_error(OP, err));
+    }
+
+    OwnedWinHandle::from_raw(sei.hProcess).ok_or_else(|| {
+        SysError::io(
+            OP,
+            io::Error::other("ShellExecuteExW succeeded without returning process handle"),
+        )
+    })
 }
 
-/// Ephemeral Named Pipe server bound by the Medium-Integrity GUI (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<UserSid>)`,
+/// Returns the Win32 PID for a process handle (`GetProcessId`).
+pub fn get_process_id(proc_handle: &OwnedWinHandle) -> SysResult<u32> {
+    const OP: &str = "gui_windows::get_process_id";
+    // SAFETY: `proc_handle` holds a live process handle owned by the caller.
+    let pid = unsafe { GetProcessId(proc_handle.as_raw()) };
+    if pid == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    Ok(pid)
+}
+
+/// Waits up to `timeout_ms` for `proc_handle` to exit (`true` if exited).
+pub fn wait_process_exit(proc_handle: &OwnedWinHandle, timeout_ms: u32) -> SysResult<bool> {
+    const OP: &str = "gui_windows::wait_process_exit";
+    // SAFETY: `proc_handle` is a valid process handle owned by caller.
+    let status = unsafe { WaitForSingleObject(proc_handle.as_raw(), timeout_ms) };
+    if status == WAIT_OBJECT_0 {
+        Ok(true)
+    } else if status == WAIT_TIMEOUT {
+        Ok(false)
+    } else {
+        Err(SysError::io(OP, io::Error::last_os_error()))
+    }
+}
+
+/// Queries the Win32 process exit code (`None` if still active).
+pub fn get_process_exit_code(proc_handle: &OwnedWinHandle) -> SysResult<Option<u32>> {
+    const OP: &str = "gui_windows::get_process_exit_code";
+    let mut code: u32 = 0;
+    // SAFETY: `proc_handle` is a valid process handle and `code` is writable stack storage.
+    let ok = unsafe { GetExitCodeProcess(proc_handle.as_raw(), &raw mut code) };
+    if ok == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    if code == STILL_ACTIVE_EXIT_CODE {
+        Ok(None)
+    } else {
+        Ok(Some(code))
+    }
+}
+
+/// Ephemeral Named Pipe server bound by the Medium-Integrity GUI
+/// (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<UserSid>)`,
 /// `FILE_FLAG_FIRST_PIPE_INSTANCE | PIPE_REJECT_REMOTE_CLIENTS | FILE_FLAG_OVERLAPPED`, `ADR-021`).
 #[derive(Debug)]
 pub struct HandoffPipeServer {
@@ -353,15 +900,65 @@ pub struct HandoffPipeServer {
 impl HandoffPipeServer {
     /// Binds a new single-instance Named Pipe server waiting for the elevated worker.
     pub fn bind(pipe_name: &str) -> SysResult<Self> {
+        const OP: &str = "gui_windows::HandoffPipeServer::bind";
         if !is_valid_handoff_pipe_name(pipe_name) {
             return Err(SysError::SecurityViolation {
-                operation: "gui_windows::HandoffPipeServer::bind",
+                operation: OP,
                 detail: "invalid handoff pipe name".to_owned(),
             });
         }
-        Err(SysError::NotImplemented(
-            "gui_windows::HandoffPipeServer::bind",
-        ))
+
+        let user_sid = current_process_user_sid_string(OP)?;
+        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{user_sid})");
+        let sddl_wide = encode_wide_nul_str(&sddl, OP)?;
+
+        let mut sd_ptr: *mut c_void = ptr::null_mut();
+        // SAFETY: `sddl_wide` is NUL-terminated UTF-16 and `sd_ptr` receives a `LocalAlloc` SD.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl_wide.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut sd_ptr,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || sd_ptr.is_null() {
+            return Err(map_win_io_error(OP, io::Error::last_os_error()));
+        }
+        let _sd_guard = LocalAllocGuard(sd_ptr);
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+            lpSecurityDescriptor: sd_ptr,
+            bInheritHandle: 0,
+        };
+        let pipe_wide = encode_wide_nul_str(pipe_name, OP)?;
+        let open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED;
+        let pipe_mode =
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+
+        // SAFETY: `pipe_wide` is NUL-terminated UTF-16 and `sa` points to a valid security
+        // descriptor kept alive across `CreateNamedPipeW`.
+        let raw = unsafe {
+            CreateNamedPipeW(
+                pipe_wide.as_ptr(),
+                open_mode,
+                pipe_mode,
+                1,
+                HANDOFF_PIPE_BUF_BYTES,
+                HANDOFF_PIPE_BUF_BYTES,
+                0,
+                &raw const sa,
+            )
+        };
+        let Some(handle) = OwnedWinHandle::from_raw(raw) else {
+            return Err(map_win_io_error(OP, io::Error::last_os_error()));
+        };
+
+        Ok(Self {
+            pipe_name: pipe_name.to_owned(),
+            handle,
+        })
     }
 
     /// Returns the bound pipe name.
@@ -378,56 +975,201 @@ impl HandoffPipeServer {
 
     /// Waits for client connection, enforces `GetNamedPipeClientProcessId == child_pid`, reads the
     /// 13-byte `0x00 WorkerHello` frame within `timeout_ms`, and verifies `BA`/`SY` membership via
-    /// `ImpersonateNamedPipeClient(SecurityIdentification)` -> `OpenThreadToken` -> `CheckTokenMembership`
-    /// (without calling `OpenProcess`/`OpenProcessToken`, `BLK-DGUI-G2-04`).
+    /// `ImpersonateNamedPipeClient(SecurityIdentification)` -> `OpenThreadToken` ->
+    /// `CheckTokenMembership` + `TokenElevation` (without calling `OpenProcess`/`OpenProcessToken`,
+    /// `BLK-DGUI-G2-04`).
     pub fn accept_and_verify_worker(
         &self,
-        _child_pid: u32,
-        _timeout_ms: u32,
+        child_pid: u32,
+        timeout_ms: u32,
     ) -> SysResult<WindowsPeerCredentials> {
-        Err(SysError::NotImplemented(
-            "gui_windows::HandoffPipeServer::accept_and_verify_worker",
-        ))
+        self.accept_and_verify_inner(None, child_pid, timeout_ms)
+    }
+
+    /// Same as [`Self::accept_and_verify_worker`], while also failing immediately if `child_proc`
+    /// exits before connecting to the handoff pipe.
+    pub fn accept_and_verify_worker_watching_process(
+        &self,
+        child_proc: &OwnedWinHandle,
+        child_pid: u32,
+        timeout_ms: u32,
+    ) -> SysResult<WindowsPeerCredentials> {
+        self.accept_and_verify_inner(Some(child_proc), child_pid, timeout_ms)
+    }
+
+    /// Connects, verifies `GetNamedPipeClientProcessId == child_pid` and `0x00 WorkerHello`, and
+    /// returns `(credentials, token_is_elevated)` without rejecting non-elevated local test peers.
+    pub fn accept_hello_and_read_credentials(
+        &self,
+        child_pid: u32,
+        timeout_ms: u32,
+    ) -> SysResult<(WindowsPeerCredentials, bool)> {
+        const OP: &str = "gui_windows::HandoffPipeServer::accept_hello_and_read_credentials";
+        if child_pid == 0 {
+            return Err(SysError::SecurityViolation {
+                operation: OP,
+                detail: "invalid expected worker PID 0".to_owned(),
+            });
+        }
+        let started = Instant::now();
+        accept_pipe_overlapped(self.handle.as_raw(), None, timeout_ms, OP)?;
+        verify_pipe_client_pid(self.handle.as_raw(), child_pid, OP)?;
+
+        let elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let rem_ms = timeout_ms.saturating_sub(elapsed_ms).clamp(100, 5_000);
+        read_and_validate_worker_hello(self.handle.as_raw(), rem_ms, OP)?;
+
+        impersonate_and_inspect_pipe_thread_token(self.handle.as_raw(), OP)
+    }
+
+    fn accept_and_verify_inner(
+        &self,
+        child_proc: Option<&OwnedWinHandle>,
+        child_pid: u32,
+        timeout_ms: u32,
+    ) -> SysResult<WindowsPeerCredentials> {
+        const OP: &str = "gui_windows::HandoffPipeServer::accept_and_verify_worker";
+        if child_pid == 0 {
+            return Err(SysError::SecurityViolation {
+                operation: OP,
+                detail: "invalid expected worker PID 0".to_owned(),
+            });
+        }
+
+        let started = Instant::now();
+        accept_pipe_overlapped(self.handle.as_raw(), child_proc, timeout_ms, OP)?;
+        verify_pipe_client_pid(self.handle.as_raw(), child_pid, OP)?;
+
+        let elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let rem_ms = timeout_ms.saturating_sub(elapsed_ms).clamp(100, 5_000);
+        read_and_validate_worker_hello(self.handle.as_raw(), rem_ms, OP)?;
+
+        let (creds, is_elevated) =
+            impersonate_and_inspect_pipe_thread_token(self.handle.as_raw(), OP)?;
+        if !is_elevated || !(creds.is_builtin_admin || creds.is_local_system) {
+            return Err(SysError::PermissionDenied { operation: OP });
+        }
+        Ok(creds)
     }
 
     /// Reads up to `buf.len()` bytes with overlapped timeout `timeout_ms`.
-    pub fn read_blocking(&self, _buf: &mut [u8], _timeout_ms: u32) -> SysResult<usize> {
-        Err(SysError::NotImplemented(
+    pub fn read_blocking(&self, buf: &mut [u8], timeout_ms: u32) -> SysResult<usize> {
+        pipe_read_overlapped(
+            self.handle.as_raw(),
+            buf,
+            timeout_ms,
             "gui_windows::HandoffPipeServer::read_blocking",
-        ))
+        )
+    }
+
+    /// Reads an exact buffer slice with overlapped deadline `timeout_ms`.
+    pub fn read_exact_blocking(&self, buf: &mut [u8], timeout_ms: u32) -> SysResult<()> {
+        pipe_read_exact_overlapped(
+            self.handle.as_raw(),
+            buf,
+            timeout_ms,
+            "gui_windows::HandoffPipeServer::read_exact_blocking",
+        )
     }
 
     /// Writes `data` to the connected handoff pipe.
-    pub fn write_blocking(&self, _data: &[u8]) -> SysResult<usize> {
-        Err(SysError::NotImplemented(
+    pub fn write_blocking(&self, data: &[u8]) -> SysResult<usize> {
+        pipe_write_overlapped(
+            self.handle.as_raw(),
+            data,
+            HANDOFF_WRITE_TIMEOUT_MS,
             "gui_windows::HandoffPipeServer::write_blocking",
-        ))
+        )
+    }
+
+    /// Writes the entire `data` slice to the connected handoff pipe.
+    pub fn write_all_blocking(&self, data: &[u8]) -> SysResult<()> {
+        pipe_write_all_overlapped(
+            self.handle.as_raw(),
+            data,
+            HANDOFF_WRITE_TIMEOUT_MS,
+            "gui_windows::HandoffPipeServer::write_all_blocking",
+        )
     }
 
     /// Cancels pending overlapped I/O on the pipe handle during cancellation/shutdown.
-    pub fn cancel_io(&self) {}
+    pub fn cancel_io(&self) {
+        // SAFETY: `self.handle` is an open Win32 pipe handle owned by `self`.
+        let _cancelled = unsafe { CancelIoEx(self.handle.as_raw(), ptr::null()) };
+    }
 }
 
-/// Elevated worker client connection to the GUI's ephemeral handoff pipe (`SECURITY_SQOS_PRESENT |
-/// SECURITY_IDENTIFICATION | FILE_FLAG_OVERLAPPED`, sends `0x00 WorkerHello` immediately, `BLK-DGUI-G2-04`).
+/// Elevated worker client connection to the GUI's ephemeral handoff pipe
+/// (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION | FILE_FLAG_OVERLAPPED`, sends
+/// `0x00 WorkerHello` immediately, `BLK-DGUI-G2-04`).
 #[derive(Debug)]
 pub struct HandoffPipeClient {
     handle: OwnedWinHandle,
 }
 
 impl HandoffPipeClient {
-    /// Connects to `pipe_name` with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` and transmits
-    /// the 13-byte `MGH1` `0x00 WorkerHello` frame.
-    pub fn connect_and_send_hello(pipe_name: &str, _timeout_ms: u32) -> SysResult<Self> {
+    /// Connects to `pipe_name` with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` and
+    /// transmits the 13-byte `MGH1` `0x00 WorkerHello` frame.
+    pub fn connect_and_send_hello(pipe_name: &str, timeout_ms: u32) -> SysResult<Self> {
+        const OP: &str = "gui_windows::HandoffPipeClient::connect_and_send_hello";
         if !is_valid_handoff_pipe_name(pipe_name) {
             return Err(SysError::SecurityViolation {
-                operation: "gui_windows::HandoffPipeClient::connect_and_send_hello",
+                operation: OP,
                 detail: "invalid handoff pipe name".to_owned(),
             });
         }
-        Err(SysError::NotImplemented(
-            "gui_windows::HandoffPipeClient::connect_and_send_hello",
-        ))
+
+        let wide = encode_wide_nul_str(pipe_name, OP)?;
+        let flags = FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms.max(100)));
+
+        let handle = loop {
+            // SAFETY: `wide` is NUL-terminated UTF-16 and all flags are Win32 constants.
+            let raw = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    flags,
+                    ptr::null_mut(),
+                )
+            };
+            if let Some(h) = OwnedWinHandle::from_raw(raw) {
+                break h;
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(WIN_ERROR_PIPE_BUSY) {
+                let now = Instant::now();
+                let Some(rem) = deadline.checked_duration_since(now) else {
+                    return Err(SysError::io(
+                        OP,
+                        io::Error::new(io::ErrorKind::TimedOut, "handoff pipe busy timeout"),
+                    ));
+                };
+                let wait_ms = u32::try_from(rem.as_millis()).unwrap_or(500).min(250);
+                // SAFETY: `wide` is NUL-terminated UTF-16.
+                let _waited = unsafe { WaitNamedPipeW(wide.as_ptr(), wait_ms) };
+                continue;
+            }
+            return Err(map_win_io_error(OP, err));
+        };
+
+        let mut hello = [0_u8; MGH1_HELLO_FRAME_LEN];
+        hello[0..4].copy_from_slice(&MGH1_MAGIC);
+        if let Some(ft) = hello.get_mut(4) {
+            *ft = 0x00;
+        }
+        if let Some(len_dst) = hello.get_mut(5..9) {
+            len_dst.copy_from_slice(&4_u32.to_le_bytes());
+        }
+        if let Some(ver_dst) = hello.get_mut(9..13) {
+            ver_dst.copy_from_slice(&MGH1_PROTOCOL_VERSION.to_le_bytes());
+        }
+
+        pipe_write_all_overlapped(handle.as_raw(), &hello, timeout_ms.max(1_000), OP)?;
+        Ok(Self { handle })
     }
 
     /// Borrows the underlying pipe handle.
@@ -437,24 +1179,54 @@ impl HandoffPipeClient {
     }
 
     /// Reads up to `buf.len()` bytes with overlapped timeout `timeout_ms`.
-    pub fn read_blocking(&self, _buf: &mut [u8], _timeout_ms: u32) -> SysResult<usize> {
-        Err(SysError::NotImplemented(
+    pub fn read_blocking(&self, buf: &mut [u8], timeout_ms: u32) -> SysResult<usize> {
+        pipe_read_overlapped(
+            self.handle.as_raw(),
+            buf,
+            timeout_ms,
             "gui_windows::HandoffPipeClient::read_blocking",
-        ))
+        )
+    }
+
+    /// Reads an exact buffer slice with overlapped deadline `timeout_ms`.
+    pub fn read_exact_blocking(&self, buf: &mut [u8], timeout_ms: u32) -> SysResult<()> {
+        pipe_read_exact_overlapped(
+            self.handle.as_raw(),
+            buf,
+            timeout_ms,
+            "gui_windows::HandoffPipeClient::read_exact_blocking",
+        )
     }
 
     /// Writes `data` to the handoff pipe.
-    pub fn write_blocking(&self, _data: &[u8]) -> SysResult<usize> {
-        Err(SysError::NotImplemented(
+    pub fn write_blocking(&self, data: &[u8]) -> SysResult<usize> {
+        pipe_write_overlapped(
+            self.handle.as_raw(),
+            data,
+            HANDOFF_WRITE_TIMEOUT_MS,
             "gui_windows::HandoffPipeClient::write_blocking",
-        ))
+        )
+    }
+
+    /// Writes the entire `data` slice to the handoff pipe.
+    pub fn write_all_blocking(&self, data: &[u8]) -> SysResult<()> {
+        pipe_write_all_overlapped(
+            self.handle.as_raw(),
+            data,
+            HANDOFF_WRITE_TIMEOUT_MS,
+            "gui_windows::HandoffPipeClient::write_all_blocking",
+        )
     }
 
     /// Cancels pending overlapped I/O on the pipe handle.
-    pub fn cancel_io(&self) {}
+    pub fn cancel_io(&self) {
+        // SAFETY: `self.handle` is an open Win32 pipe handle owned by `self`.
+        let _cancelled = unsafe { CancelIoEx(self.handle.as_raw(), ptr::null()) };
+    }
 }
 
-/// Atomic Temp-Sibling Sink Writer for Medium-Integrity bugreport streaming (`ADR-023`, `BLK-DGUI-G2-05`).
+/// Atomic Temp-Sibling Sink Writer for Medium-Integrity bugreport streaming
+/// (`ADR-023`, `BLK-DGUI-G2-05`).
 ///
 /// Supports both new creation and Replace of an existing regular `.tar` file while rejecting
 /// system directories, parent reparse points, and destination symlinks/reparse points.
@@ -469,25 +1241,56 @@ pub struct UnprivilegedSinkWriter {
 }
 
 impl UnprivilegedSinkWriter {
-    /// Validates `dest_path` and `expected_total_bytes` (`1..=MAX_BUGREPORT_ARCHIVE_BYTES`), verifies
-    /// non-reparse parent and destination, and creates `parent/.mesh-bugreport-<hex>.tar.part`.
+    /// Validates `dest_path` and `expected_total_bytes` (`1..=MAX_BUGREPORT_ARCHIVE_BYTES`),
+    /// verifies non-reparse parent and destination, and creates
+    /// `parent/.mesh-bugreport-<hex>.tar.part`.
     pub fn create(dest_path: &Path, expected_total_bytes: u64) -> SysResult<Self> {
+        const OP: &str = "gui_windows::UnprivilegedSinkWriter::create";
         let max_bytes = u64::try_from(MAX_BUGREPORT_ARCHIVE_BYTES).unwrap_or(u64::MAX);
         if dest_path.as_os_str().is_empty()
             || expected_total_bytes == 0
             || expected_total_bytes > max_bytes
         {
             return Err(SysError::io(
-                "gui_windows::UnprivilegedSinkWriter::create",
+                OP,
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "invalid destination path or bugreport archive size",
                 ),
             ));
         }
-        Err(SysError::NotImplemented(
-            "gui_windows::UnprivilegedSinkWriter::create",
-        ))
+
+        validate_sink_dest_path(dest_path, OP)?;
+        let parent = dest_path.parent().ok_or_else(|| {
+            SysError::io(
+                OP,
+                io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"),
+            )
+        })?;
+        verify_non_reparse_directory(parent, OP)?;
+        verify_dest_regular_or_absent(dest_path, OP)?;
+
+        let random_hex = new_guid_hex_32();
+        let temp_path = parent.join(format!(".mesh-bugreport-{random_hex}.tar.part"));
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .custom_flags(FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&temp_path)
+            .map_err(|err| map_win_io_error(OP, err))?;
+
+        verify_regular_disk_handle(&file, OP)?;
+
+        Ok(Self {
+            dest_path: dest_path.to_path_buf(),
+            temp_path,
+            expected_total_bytes,
+            cumulative_bytes: 0,
+            file: Some(file),
+            finalized: false,
+        })
     }
 
     /// Returns the final destination path.
@@ -515,20 +1318,107 @@ impl UnprivilegedSinkWriter {
     }
 
     /// Appends one validated chunk (`<= 64 KiB`) without exceeding `expected_total_bytes`.
-    pub fn write_chunk(&mut self, _chunk: &[u8]) -> SysResult<()> {
-        Err(SysError::NotImplemented(
-            "gui_windows::UnprivilegedSinkWriter::write_chunk",
-        ))
+    pub fn write_chunk(&mut self, chunk: &[u8]) -> SysResult<()> {
+        const OP: &str = "gui_windows::UnprivilegedSinkWriter::write_chunk";
+        if self.finalized {
+            return Err(SysError::io(
+                OP,
+                io::Error::new(io::ErrorKind::InvalidInput, "sink writer already finalized"),
+            ));
+        }
+        if chunk.len() > MAX_BUGREPORT_CHUNK_BYTES {
+            return Err(SysError::io(
+                OP,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bugreport chunk exceeds 64 KiB",
+                ),
+            ));
+        }
+        let max_bytes = u64::try_from(MAX_BUGREPORT_ARCHIVE_BYTES).unwrap_or(u64::MAX);
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        let next_total = self
+            .cumulative_bytes
+            .checked_add(chunk_len)
+            .ok_or_else(|| {
+                SysError::io(
+                    OP,
+                    io::Error::new(io::ErrorKind::InvalidInput, "bugreport size overflow"),
+                )
+            })?;
+        if next_total > self.expected_total_bytes || next_total > max_bytes {
+            return Err(SysError::io(
+                OP,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bugreport stream exceeded declared or maximum archive size",
+                ),
+            ));
+        }
+        let Some(file) = self.file.as_mut() else {
+            return Err(SysError::io(
+                OP,
+                io::Error::new(io::ErrorKind::BrokenPipe, "sink file handle already closed"),
+            ));
+        };
+        if !chunk.is_empty() {
+            file.write_all(chunk).map_err(|err| SysError::io(OP, err))?;
+        }
+        self.cumulative_bytes = next_total;
+        Ok(())
     }
 
     /// Enforces `expected_total_bytes > 0 && cumulative_bytes == expected_total_bytes <= 20 MiB`,
     /// calls `sync_all()`, closes handle, re-checks `dest`, and atomically replaces `dest`.
     pub fn finalize(mut self) -> SysResult<u64> {
-        self.finalized = false;
-        drop(self.file.take());
-        Err(SysError::NotImplemented(
-            "gui_windows::UnprivilegedSinkWriter::finalize",
-        ))
+        const OP: &str = "gui_windows::UnprivilegedSinkWriter::finalize";
+        let max_bytes = u64::try_from(MAX_BUGREPORT_ARCHIVE_BYTES).unwrap_or(u64::MAX);
+        if self.expected_total_bytes == 0
+            || self.cumulative_bytes != self.expected_total_bytes
+            || self.cumulative_bytes > max_bytes
+        {
+            drop(self.file.take());
+            return Err(SysError::io(
+                OP,
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "bugreport archive incomplete: wrote {} of {} bytes",
+                        self.cumulative_bytes, self.expected_total_bytes
+                    ),
+                ),
+            ));
+        }
+
+        let Some(file) = self.file.take() else {
+            return Err(SysError::io(
+                OP,
+                io::Error::new(io::ErrorKind::BrokenPipe, "sink file handle missing"),
+            ));
+        };
+        file.sync_all().map_err(|err| SysError::io(OP, err))?;
+        drop(file);
+
+        verify_dest_regular_or_absent(&self.dest_path, OP)?;
+        let temp_wide = encode_wide_nul_os(self.temp_path.as_os_str(), OP)?;
+        let dest_wide = encode_wide_nul_os(self.dest_path.as_os_str(), OP)?;
+
+        // SAFETY: `temp_wide` and `dest_wide` are NUL-terminated UTF-16 paths in the same
+        // non-reparse directory; `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` replaces
+        // `dest` atomically only after `sync_all()` and closing `.part`.
+        let moved = unsafe {
+            MoveFileExW(
+                temp_wide.as_ptr(),
+                dest_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(map_win_io_error(OP, io::Error::last_os_error()));
+        }
+
+        self.finalized = true;
+        Ok(self.cumulative_bytes)
     }
 }
 
@@ -536,124 +1426,2778 @@ impl Drop for UnprivilegedSinkWriter {
     fn drop(&mut self) {
         drop(self.file.take());
         if !self.finalized && !self.temp_path.as_os_str().is_empty() {
-            let _removed = std::fs::remove_file(&self.temp_path);
+            let _removed = fs::remove_file(&self.temp_path);
         }
     }
 }
 
 /// Opens `path` read-only with `FILE_SHARE_READ | FILE_FLAG_OPEN_REPARSE_POINT`, rejecting
-/// symlinks/reparse points so SHA-256 verification and copy operate on the locked handle (`ADR-026`).
+/// symlinks/reparse points so SHA-256 verification and copy operate on the locked handle
+/// (`ADR-026`).
 pub fn open_anti_toctou_read_locked(path: &Path) -> SysResult<File> {
-    if path.as_os_str().is_empty() {
-        return Err(SysError::io(
-            "gui_windows::open_anti_toctou_read_locked",
-            io::Error::new(io::ErrorKind::InvalidInput, "empty file path"),
-        ));
+    const OP: &str = "gui_windows::open_anti_toctou_read_locked";
+    if path.as_os_str().is_empty()
+        || !path.is_absolute()
+        || path.components().any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(SysError::SecurityViolation {
+            operation: OP,
+            detail: "path must be absolute without parent traversal".to_owned(),
+        });
     }
-    Err(SysError::NotImplemented(
-        "gui_windows::open_anti_toctou_read_locked",
-    ))
+    if let Some(parent) = path.parent() {
+        let parent_meta = fs::symlink_metadata(parent).map_err(|err| map_win_io_error(OP, err))?;
+        if parent_meta.file_type().is_symlink()
+            || (parent_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        {
+            return Err(SysError::SecurityViolation {
+                operation: OP,
+                detail: "parent directory cannot be a symlink or reparse point".to_owned(),
+            });
+        }
+    }
+    let link_meta = fs::symlink_metadata(path).map_err(|err| map_win_io_error(OP, err))?;
+    if link_meta.file_type().is_symlink()
+        || (link_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !link_meta.file_type().is_file()
+    {
+        return Err(SysError::SecurityViolation {
+            operation: OP,
+            detail: "target path cannot be a symlink, reparse point, or directory".to_owned(),
+        });
+    }
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|err| map_win_io_error(OP, err))?;
+
+    verify_regular_disk_handle(&file, OP)?;
+    Ok(file)
 }
 
-/// Acquires `Local\MeshVpnGuiSingleInstance`, returning `Ok(None)` if another instance already owns it.
+/// Acquires `Local\MeshVpnGuiSingleInstance`, returning `Ok(None)` if another instance owns it.
 pub fn acquire_single_instance_mutex() -> SysResult<Option<SingleInstanceGuard>> {
-    Err(SysError::NotImplemented(
-        "gui_windows::acquire_single_instance_mutex",
-    ))
+    const OP: &str = "gui_windows::acquire_single_instance_mutex";
+    let wide = encode_wide_nul_str(GUI_SINGLE_INSTANCE_MUTEX, OP)?;
+    // SAFETY: `wide` is NUL-terminated UTF-16 naming a session-local Win32 mutex.
+    let raw = unsafe { CreateMutexW(ptr::null(), 0, wide.as_ptr()) };
+    let last_err = io::Error::last_os_error();
+    let Some(handle) = OwnedWinHandle::from_raw(raw) else {
+        return Err(map_win_io_error(OP, last_err));
+    };
+    if last_err.raw_os_error() == Some(i32::try_from(ERROR_ALREADY_EXISTS).unwrap_or(183)) {
+        return Ok(None);
+    }
+    Ok(Some(SingleInstanceGuard { _mutex: handle }))
 }
 
-/// Signals `Local\MeshVpnGuiShutdownEvent` so an older running Tray instance exits cleanly (`ADR-026`).
+/// Signals `Local\MeshVpnGuiShutdownEvent` so an older running Tray instance exits cleanly
+/// (`ADR-026`).
 pub fn signal_shutdown_event() -> SysResult<()> {
-    Err(SysError::NotImplemented(
-        "gui_windows::signal_shutdown_event",
-    ))
+    const OP: &str = "gui_windows::signal_shutdown_event";
+    let wide = encode_wide_nul_str(GUI_SHUTDOWN_EVENT, OP)?;
+    // SAFETY: `wide` is NUL-terminated UTF-16 naming a session-local Win32 event.
+    let opened = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
+    let handle = if let Some(h) = OwnedWinHandle::from_raw(opened) {
+        h
+    } else {
+        // SAFETY: Create event in case listener has not registered yet or race occurred.
+        let created = unsafe { CreateEventW(ptr::null(), 1, 0, wide.as_ptr()) };
+        OwnedWinHandle::from_raw(created)
+            .ok_or_else(|| SysError::io(OP, io::Error::last_os_error()))?
+    };
+    // SAFETY: `handle` is an open Win32 event handle with `EVENT_MODIFY_STATE`.
+    let ok = unsafe { SetEvent(handle.as_raw()) };
+    if ok == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// Waits up to `timeout_ms` on `Local\MeshVpnGuiShutdownEvent` (`true` when signaled).
-pub fn wait_shutdown_event(_timeout_ms: u32) -> SysResult<bool> {
-    Ok(false)
+pub fn wait_shutdown_event(timeout_ms: u32) -> SysResult<bool> {
+    const OP: &str = "gui_windows::wait_shutdown_event";
+    let handle = create_named_shutdown_event()?;
+    wait_event_signaled(&handle, timeout_ms, OP)
 }
 
-/// Removes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\<app_name>` and user `.lnk` shortcuts
-/// via `SHGetKnownFolderPath` + `CoTaskMemFree` + `std::fs::remove_file` (`BLK-DGUI-G2-02`, `US-115`).
-pub fn remove_user_shortcuts_and_autostart(_app_name: &str) -> SysResult<()> {
-    Err(SysError::NotImplemented(
-        "gui_windows::remove_user_shortcuts_and_autostart",
-    ))
+/// Creates or opens the persistent manual-reset `Local\MeshVpnGuiShutdownEvent` handle.
+pub fn create_named_shutdown_event() -> SysResult<OwnedWinHandle> {
+    const OP: &str = "gui_windows::create_named_shutdown_event";
+    let wide = encode_wide_nul_str(GUI_SHUTDOWN_EVENT, OP)?;
+    // SAFETY: `wide` is NUL-terminated UTF-16 naming a session-local manual-reset event.
+    let raw = unsafe { CreateEventW(ptr::null(), 1, 0, wide.as_ptr()) };
+    OwnedWinHandle::from_raw(raw).ok_or_else(|| SysError::io(OP, io::Error::last_os_error()))
+}
+
+/// Polls/waits on an `OwnedWinHandle` event (`true` if signaled).
+pub fn wait_event_signaled(
+    handle: &OwnedWinHandle,
+    timeout_ms: u32,
+    operation: &'static str,
+) -> SysResult<bool> {
+    // SAFETY: `handle` is a valid Win32 event handle owned by caller.
+    let status = unsafe { WaitForSingleObject(handle.as_raw(), timeout_ms) };
+    if status == WAIT_OBJECT_0 {
+        Ok(true)
+    } else if status == WAIT_TIMEOUT {
+        Ok(false)
+    } else {
+        Err(SysError::io(operation, io::Error::last_os_error()))
+    }
+}
+
+/// Registers the `"MeshVpnGui_Activate_v1"` window message ID for single-instance activation.
+pub fn register_activate_window_message() -> SysResult<u32> {
+    const OP: &str = "gui_windows::register_activate_window_message";
+    let wide = encode_wide_nul_str(GUI_ACTIVATE_MESSAGE_NAME, OP)?;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 message name.
+    let id = unsafe { RegisterWindowMessageW(wide.as_ptr()) };
+    if id == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    Ok(id)
+}
+
+/// Finds an existing top-level window matching `class_name` in the current desktop session.
+#[must_use]
+pub fn find_window_by_class(class_name: &str) -> Option<isize> {
+    let wide = encode_wide_nul_str(class_name, "gui_windows::find_window_by_class").ok()?;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 window class name.
+    let hwnd = unsafe { FindWindowW(wide.as_ptr(), ptr::null()) };
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(hwnd as isize)
+    }
+}
+
+/// Queries an existing GUI instance's packed version via `SendMessageTimeoutW`.
+#[must_use]
+pub fn query_window_version(hwnd: isize, timeout_ms: u32) -> Option<u32> {
+    let mut result: usize = 0;
+    // SAFETY: `hwnd` is an active top-level window handle in the current session.
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            hwnd as HWND,
+            WM_APP_QUERY_VERSION,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            timeout_ms,
+            &raw mut result,
+        )
+    };
+    if ok == 0 {
+        None
+    } else {
+        u32::try_from(result).ok()
+    }
+}
+
+/// Requests an existing GUI window to show & focus itself (`activate_msg` + `SetForegroundWindow`).
+pub fn activate_existing_gui_window(hwnd: isize, activate_msg: u32) {
+    let target = hwnd as HWND;
+    // SAFETY: Standard Win32 window restore & foreground activation calls on valid `HWND`.
+    unsafe {
+        let _shown = ShowWindow(target, SW_RESTORE);
+        let _fg = SetForegroundWindow(target);
+        let _posted = PostMessageW(target, activate_msg, 0, 0);
+    }
+}
+
+/// Posts `WM_APP_GRACEFUL_SHUTDOWN` to an existing GUI window.
+pub fn post_graceful_shutdown_to_window(hwnd: isize) {
+    // SAFETY: `PostMessageW` safely queues `WM_APP_GRACEFUL_SHUTDOWN` to `hwnd`.
+    let _posted = unsafe { PostMessageW(hwnd as HWND, WM_APP_GRACEFUL_SHUTDOWN, 0, 0) };
+}
+
+/// Removes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\<app_name>` and user `.lnk`
+/// shortcuts via `SHGetKnownFolderPath` + `CoTaskMemFree` + `std::fs::remove_file`
+/// (`BLK-DGUI-G2-02`, `US-115`).
+pub fn remove_user_shortcuts_and_autostart(app_name: &str) -> SysResult<()> {
+    const OP: &str = "gui_windows::remove_user_shortcuts_and_autostart";
+    set_user_autostart(app_name, "", false)?;
+
+    let known_folders = [FOLDERID_Desktop, FOLDERID_Programs, FOLDERID_StartMenu];
+    for folder_id in known_folders {
+        if let Some(dir) = resolve_known_folder_path(&folder_id) {
+            remove_shortcut_if_exists(&dir.join(format!("{app_name}.lnk")), OP)?;
+            remove_shortcut_if_exists(&dir.join("Mesh VPN.lnk"), OP)?;
+            let subdir = dir.join("Mesh VPN");
+            if subdir.is_dir() {
+                remove_shortcut_if_exists(&subdir.join("Mesh VPN.lnk"), OP)?;
+                remove_shortcut_if_exists(&subdir.join(format!("{app_name}.lnk")), OP)?;
+                if fs::read_dir(&subdir).is_ok_and(|mut it| it.next().is_none()) {
+                    let _removed = fs::remove_dir(&subdir);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Enables or removes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\<app_name>` (`US-108`).
-pub fn set_user_autostart(_app_name: &str, _command_line: &str, _enabled: bool) -> SysResult<()> {
-    Err(SysError::NotImplemented("gui_windows::set_user_autostart"))
+pub fn set_user_autostart(app_name: &str, command_line: &str, enabled: bool) -> SysResult<()> {
+    const OP: &str = "gui_windows::set_user_autostart";
+    validate_registry_value_name(app_name, OP)?;
+    if enabled && (command_line.is_empty() || command_line.contains(['\0', '\r', '\n'])) {
+        return Err(SysError::io(
+            OP,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid autostart command line",
+            ),
+        ));
+    }
+
+    let subkey_wide = encode_wide_nul_str(REG_RUN_SUBKEY, OP)?;
+    let value_wide = encode_wide_nul_str(app_name, OP)?;
+    let mut raw_key: HKEY = ptr::null_mut();
+
+    // SAFETY: `subkey_wide` is NUL-terminated UTF-16 under predefined `HKEY_CURRENT_USER`.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey_wide.as_ptr(),
+            0,
+            ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            ptr::null(),
+            &raw mut raw_key,
+            ptr::null_mut(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(map_win_status(OP, status));
+    }
+    let Some(key) = OwnedRegKey::from_raw(raw_key) else {
+        return Err(SysError::io(
+            OP,
+            io::Error::other("null HKCU registry handle"),
+        ));
+    };
+
+    if !enabled {
+        // SAFETY: `key` is an open `KEY_SET_VALUE` handle and `value_wide` is NUL-terminated.
+        let del_rc = unsafe { RegDeleteValueW(key.as_raw(), value_wide.as_ptr()) };
+        if del_rc != ERROR_SUCCESS && del_rc != u32::try_from(WIN_ERROR_FILE_NOT_FOUND).unwrap_or(2)
+        {
+            return Err(map_win_status(OP, del_rc));
+        }
+        return Ok(());
+    }
+
+    let cmd_wide = encode_wide_nul_str(command_line, OP)?;
+    let byte_len = u32::try_from(cmd_wide.len().saturating_mul(2)).map_err(|_| {
+        SysError::io(
+            OP,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "registry value length overflow",
+            ),
+        )
+    })?;
+    // SAFETY: `cmd_wide` is NUL-terminated UTF-16 spanning `byte_len` bytes.
+    let set_rc = unsafe {
+        RegSetValueExW(
+            key.as_raw(),
+            value_wide.as_ptr(),
+            0,
+            REG_SZ,
+            cmd_wide.as_ptr().cast::<u8>(),
+            byte_len,
+        )
+    };
+    if set_rc != ERROR_SUCCESS {
+        return Err(map_win_status(OP, set_rc));
+    }
+    Ok(())
 }
 
 /// Queries whether `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\<app_name>` is present.
-pub fn is_user_autostart_enabled(_app_name: &str) -> SysResult<bool> {
-    Ok(false)
+pub fn is_user_autostart_enabled(app_name: &str) -> SysResult<bool> {
+    const OP: &str = "gui_windows::is_user_autostart_enabled";
+    validate_registry_value_name(app_name, OP)?;
+    let subkey_wide = encode_wide_nul_str(REG_RUN_SUBKEY, OP)?;
+    let value_wide = encode_wide_nul_str(app_name, OP)?;
+    let mut raw_key: HKEY = ptr::null_mut();
+
+    // SAFETY: `subkey_wide` is NUL-terminated UTF-16 under `HKEY_CURRENT_USER`.
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey_wide.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &raw mut raw_key,
+        )
+    };
+    if status == u32::try_from(WIN_ERROR_FILE_NOT_FOUND).unwrap_or(2) {
+        return Ok(false);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(map_win_status(OP, status));
+    }
+    let Some(key) = OwnedRegKey::from_raw(raw_key) else {
+        return Ok(false);
+    };
+
+    let mut value_type: u32 = 0;
+    let mut data_len: u32 = 0;
+    // SAFETY: Probes existence and type of `value_wide` under `key`.
+    let q_rc = unsafe {
+        RegQueryValueExW(
+            key.as_raw(),
+            value_wide.as_ptr(),
+            ptr::null_mut(),
+            &raw mut value_type,
+            ptr::null_mut(),
+            &raw mut data_len,
+        )
+    };
+    if q_rc == u32::try_from(WIN_ERROR_FILE_NOT_FOUND).unwrap_or(2) {
+        return Ok(false);
+    }
+    if q_rc != ERROR_SUCCESS && q_rc != ERROR_MORE_DATA {
+        return Err(map_win_status(OP, q_rc));
+    }
+    Ok(value_type == REG_SZ && data_len > 2)
 }
 
 /// Reads current Unicode text and `GetClipboardSequenceNumber()` from the Windows clipboard.
 pub fn read_clipboard_utf16_with_seq() -> SysResult<(u32, Option<String>)> {
-    Err(SysError::NotImplemented(
-        "gui_windows::read_clipboard_utf16_with_seq",
-    ))
+    const OP: &str = "gui_windows::read_clipboard_utf16_with_seq";
+    let _guard = open_clipboard_with_retry(OP)?;
+    // SAFETY: `GetClipboardSequenceNumber` takes no arguments and returns a `u32`.
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    let text = read_clipboard_unicode_locked()?;
+    Ok((seq, text))
 }
 
 /// Writes Unicode text to the Windows clipboard and returns the new sequence number.
-pub fn write_clipboard_utf16_with_seq(_text: &str) -> SysResult<u32> {
-    Err(SysError::NotImplemented(
-        "gui_windows::write_clipboard_utf16_with_seq",
-    ))
+pub fn write_clipboard_utf16_with_seq(text: &str) -> SysResult<u32> {
+    const OP: &str = "gui_windows::write_clipboard_utf16_with_seq";
+    let wide = encode_wide_nul_str(text, OP)?;
+    let byte_len = wide.len().saturating_mul(2);
+    // SAFETY: Allocates movable global memory for Win32 clipboard ownership transfer.
+    let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) };
+    if hmem.is_null() {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    // SAFETY: `hmem` is a newly allocated movable global block of `byte_len` bytes.
+    let ptr_mem = unsafe { GlobalLock(hmem) };
+    if ptr_mem.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `hmem` has not been transferred to `SetClipboardData`.
+        let _freed = unsafe { GlobalFree(hmem) };
+        return Err(SysError::io(OP, err));
+    }
+    // SAFETY: `wide` contains `wide.len()` `u16` values (`byte_len` bytes) and does not overlap
+    // `ptr_mem`.
+    unsafe {
+        ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), ptr_mem.cast::<u8>(), byte_len);
+        let _unlocked = GlobalUnlock(hmem);
+    }
+
+    let _guard = match open_clipboard_with_retry(OP) {
+        Ok(g) => g,
+        Err(err) => {
+            // SAFETY: Failed opening clipboard before ownership transfer.
+            let _freed = unsafe { GlobalFree(hmem) };
+            return Err(err);
+        }
+    };
+    // SAFETY: Clipboard is open on current thread.
+    let emptied = unsafe { EmptyClipboard() };
+    if emptied == 0 {
+        let err = io::Error::last_os_error();
+        // SAFETY: `EmptyClipboard` failed so `hmem` is still owned locally.
+        let _freed = unsafe { GlobalFree(hmem) };
+        return Err(SysError::io(OP, err));
+    }
+    // SAFETY: On success, Windows assumes ownership of `hmem`; on failure, we free it below.
+    let set_res = unsafe { SetClipboardData(u32::from(CF_UNICODETEXT), hmem) };
+    if set_res.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `SetClipboardData` failed so `hmem` remains owned locally.
+        let _freed = unsafe { GlobalFree(hmem) };
+        return Err(SysError::io(OP, err));
+    }
+    // SAFETY: Returns updated clipboard sequence number.
+    let seq = unsafe { GetClipboardSequenceNumber() };
+    Ok(seq)
 }
 
 /// Clears the clipboard only when `GetClipboardSequenceNumber() == expected_seq` (`US-104`).
-pub fn clear_clipboard_if_seq_matches(_expected_seq: u32) -> SysResult<bool> {
-    Ok(false)
+pub fn clear_clipboard_if_seq_matches(expected_seq: u32) -> SysResult<bool> {
+    clear_clipboard_if_seq_and_predicate(expected_seq, |_| true)
 }
 
-/// Shows the native Win32 Save File dialog (`GetSaveFileNameW` + `OFN_OVERWRITEPROMPT`) for `.tar`
-/// bugreports, returning `Ok(None)` when canceled.
+/// Atomically holds `OpenClipboard` (`ClipboardGuard`) across BOTH `GetClipboardSequenceNumber()`
+/// and `predicate(current_text)` before invoking `EmptyClipboard()`, eliminating the check-to-clear
+/// race window (`IG-DGUI-WA-01`, `US-104`, `US-105`).
+pub fn clear_clipboard_if_seq_and_predicate<F>(expected_seq: u32, predicate: F) -> SysResult<bool>
+where
+    F: FnOnce(&str) -> bool,
+{
+    const OP: &str = "gui_windows::clear_clipboard_if_seq_and_predicate";
+    let _guard = open_clipboard_with_retry(OP)?;
+    // SAFETY: `GetClipboardSequenceNumber` takes no pointers.
+    let current_seq = unsafe { GetClipboardSequenceNumber() };
+    if current_seq != expected_seq {
+        return Ok(false);
+    }
+    let Some(current_text) = read_clipboard_unicode_locked()? else {
+        return Ok(false);
+    };
+    if !predicate(&current_text) {
+        return Ok(false);
+    }
+    // SAFETY: `ClipboardGuard` is held continuously; seq and content predicate both matched.
+    let emptied = unsafe { EmptyClipboard() };
+    if emptied == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    Ok(true)
+}
+
+/// Shows the native Win32 Save File dialog (`GetSaveFileNameW` + `OFN_OVERWRITEPROMPT`) for
+/// `.tar` bugreports, returning `Ok(None)` when canceled.
 pub fn save_tar_file_dialog(
-    _owner_hwnd: isize,
-    _default_filename: &str,
+    owner_hwnd: isize,
+    default_filename: &str,
 ) -> SysResult<Option<PathBuf>> {
-    Err(SysError::NotImplemented(
-        "gui_windows::save_tar_file_dialog",
-    ))
+    const OP: &str = "gui_windows::save_tar_file_dialog";
+    let mut file_buf = vec![0_u16; MAX_WIDE_PATH_CHARS];
+    let safe_default = default_filename.replace(['\0', '/', '\\', ':'], "_");
+    let def_units: Vec<u16> = OsStr::new(&safe_default).encode_wide().collect();
+    let copy_len = def_units.len().min(file_buf.len().saturating_sub(1));
+    if let (Some(dst), Some(src)) = (file_buf.get_mut(..copy_len), def_units.get(..copy_len)) {
+        dst.copy_from_slice(src);
+    }
+
+    let filter: Vec<u16> = "Tar Archive (*.tar)\0*.tar\0All Files (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let title = encode_wide_nul_str("Export Redacted Bugreport", OP)?;
+    let def_ext = encode_wide_nul_str("tar", OP)?;
+
+    // SAFETY: `OPENFILENAMEW` is a plain Win32 C struct zero-initialized before setting fields.
+    let mut ofn: OPENFILENAMEW = unsafe { mem::zeroed() };
+    ofn.lStructSize = u32::try_from(size_of::<OPENFILENAMEW>()).unwrap_or(0);
+    ofn.hwndOwner = owner_hwnd as HWND;
+    ofn.lpstrFilter = filter.as_ptr();
+    ofn.lpstrFile = file_buf.as_mut_ptr();
+    ofn.nMaxFile = u32::try_from(file_buf.len()).unwrap_or(MAX_WIDE_PATH_CHARS as u32);
+    ofn.lpstrTitle = title.as_ptr();
+    ofn.lpstrDefExt = def_ext.as_ptr();
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+
+    // SAFETY: `ofn` and all referenced UTF-16 buffers live across the synchronous modal call.
+    let ok = unsafe { GetSaveFileNameW(&raw mut ofn) };
+    if ok != 0 {
+        let nul_pos = file_buf
+            .iter()
+            .position(|&ch| ch == 0)
+            .unwrap_or(file_buf.len());
+        let slice = file_buf.get(..nul_pos).unwrap_or(&[]);
+        return Ok(Some(PathBuf::from(OsString::from_wide(slice))));
+    }
+
+    // SAFETY: `CommDlgExtendedError` returns `0` when user canceled the dialog.
+    let dlg_err = unsafe { CommDlgExtendedError() };
+    if dlg_err == 0 {
+        Ok(None)
+    } else {
+        Err(SysError::io(
+            OP,
+            io::Error::other(format!("GetSaveFileNameW failed (code {dlg_err})")),
+        ))
+    }
 }
 
 /// Probes `service_name` read-only via Win32 SCM without requiring Administrator elevation.
-pub fn query_service_status_readonly(_service_name: &str) -> SysResult<WindowsServiceProbeState> {
-    Err(SysError::NotImplemented(
-        "gui_windows::query_service_status_readonly",
-    ))
+pub fn query_service_status_readonly(service_name: &str) -> SysResult<WindowsServiceProbeState> {
+    const OP: &str = "gui_windows::query_service_status_readonly";
+    let svc_wide = encode_wide_nul_str(service_name, OP)?;
+    // SAFETY: Opens local SCM database strictly with `SC_MANAGER_CONNECT`.
+    let raw_scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+    let Some(scm) = OwnedScHandle::from_raw(raw_scm) else {
+        return Err(map_win_io_error(OP, io::Error::last_os_error()));
+    };
+
+    // SAFETY: `scm` is live and `svc_wide` is NUL-terminated UTF-16.
+    let raw_svc = unsafe { OpenServiceW(scm.as_raw(), svc_wide.as_ptr(), SERVICE_QUERY_STATUS) };
+    let Some(svc) = OwnedScHandle::from_raw(raw_svc) else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(WIN_ERROR_SERVICE_DOES_NOT_EXIST) {
+            return Ok(WindowsServiceProbeState::NotInstalled);
+        }
+        return Err(map_win_io_error(OP, err));
+    };
+
+    let status = query_service_process_status(svc.as_raw(), OP)?;
+    Ok(map_service_state(status.dwCurrentState))
 }
 
-/// Creates a 16x16 / 32x32 bitmap `HICON` in RAM representing `kind` without external `.rc`/`.res`.
-pub fn create_tray_status_icon(_kind: TrayStatusIconKind, _size_px: i32) -> SysResult<OwnedIcon> {
-    Err(SysError::NotImplemented(
-        "gui_windows::create_tray_status_icon",
-    ))
+/// Registers/configures `service_name` (`LocalSystem`, `SERVICE_AUTO_START`, 5s restart recovery)
+/// and starts it, waiting up to `10_000 ms` for `SERVICE_RUNNING`.
+pub fn ensure_and_start_windows_service(
+    service_name: &str,
+    display_name: &str,
+    description: &str,
+    bin_path_cmd: &str,
+) -> SysResult<()> {
+    const OP: &str = "gui_windows::ensure_and_start_windows_service";
+    let svc_wide = encode_wide_nul_str(service_name, OP)?;
+    let disp_wide = encode_wide_nul_str(display_name, OP)?;
+    let desc_wide = encode_wide_nul_str(description, OP)?;
+    let bin_wide = encode_wide_nul_str(bin_path_cmd, OP)?;
+
+    // SAFETY: Connects to local SCM with `SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE`.
+    let raw_scm = unsafe {
+        OpenSCManagerW(
+            ptr::null(),
+            ptr::null(),
+            SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE,
+        )
+    };
+    let Some(scm) = OwnedScHandle::from_raw(raw_scm) else {
+        return Err(map_win_io_error(OP, io::Error::last_os_error()));
+    };
+
+    // SAFETY: Checks whether `service_name` already exists.
+    let existing = unsafe { OpenServiceW(scm.as_raw(), svc_wide.as_ptr(), SERVICE_ALL_ACCESS) };
+    let svc = if let Some(h) = OwnedScHandle::from_raw(existing) {
+        // SAFETY: Updates existing service configuration to canonical binary path & auto-start.
+        let cfg_ok = unsafe {
+            ChangeServiceConfigW(
+                h.as_raw(),
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                bin_wide.as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                disp_wide.as_ptr(),
+            )
+        };
+        if cfg_ok == 0 {
+            return Err(map_win_io_error(OP, io::Error::last_os_error()));
+        }
+        h
+    } else {
+        let open_err = io::Error::last_os_error();
+        if open_err.raw_os_error() != Some(WIN_ERROR_SERVICE_DOES_NOT_EXIST) {
+            return Err(map_win_io_error(OP, open_err));
+        }
+        // SAFETY: Registers new LocalSystem auto-start Win32 service.
+        let created = unsafe {
+            CreateServiceW(
+                scm.as_raw(),
+                svc_wide.as_ptr(),
+                disp_wide.as_ptr(),
+                SERVICE_ALL_ACCESS,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                bin_wide.as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        OwnedScHandle::from_raw(created)
+            .ok_or_else(|| map_win_io_error(OP, io::Error::last_os_error()))?
+    };
+
+    let mut desc = SERVICE_DESCRIPTIONW {
+        lpDescription: desc_wide.as_ptr().cast_mut(),
+    };
+    // SAFETY: `desc` points to NUL-terminated UTF-16 `desc_wide` across synchronous call.
+    let _desc_ok = unsafe {
+        ChangeServiceConfig2W(
+            svc.as_raw(),
+            SERVICE_CONFIG_DESCRIPTION,
+            (&raw mut desc).cast::<c_void>(),
+        )
+    };
+
+    let mut actions = [
+        SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: 5_000,
+        },
+        SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: 5_000,
+        },
+        SC_ACTION {
+            Type: SC_ACTION_RESTART,
+            Delay: 10_000,
+        },
+    ];
+    let mut failure_actions = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: 86_400,
+        lpRebootMsg: ptr::null_mut(),
+        lpCommand: ptr::null_mut(),
+        cActions: 3,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    // SAFETY: `failure_actions` and `actions` stack array remain valid for synchronous call.
+    let _fa_ok = unsafe {
+        ChangeServiceConfig2W(
+            svc.as_raw(),
+            SERVICE_CONFIG_FAILURE_ACTIONS,
+            (&raw mut failure_actions).cast::<c_void>(),
+        )
+    };
+
+    let mut fa_flag = SERVICE_FAILURE_ACTIONS_FLAG {
+        fFailureActionsOnNonCrashFailures: 1,
+    };
+    // SAFETY: `fa_flag` is valid stack storage.
+    let _flag_ok = unsafe {
+        ChangeServiceConfig2W(
+            svc.as_raw(),
+            SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+            (&raw mut fa_flag).cast::<c_void>(),
+        )
+    };
+
+    // SAFETY: Starts `svc` with zero service arguments.
+    let start_ok = unsafe { StartServiceW(svc.as_raw(), 0, ptr::null()) };
+    if start_ok == 0 {
+        let start_err = io::Error::last_os_error();
+        if start_err.raw_os_error()
+            != Some(i32::try_from(ERROR_SERVICE_ALREADY_RUNNING).unwrap_or(1056))
+        {
+            return Err(map_win_io_error(OP, start_err));
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let st = query_service_process_status(svc.as_raw(), OP)?;
+        if st.dwCurrentState == SERVICE_RUNNING {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(SysError::io(
+                OP,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for Windows service to reach RUNNING state",
+                ),
+            ));
+        }
+        win_sleep_ms(200);
+    }
+}
+
+/// Stops `service_name` gracefully (up to 10s) and optionally deletes its SCM registration.
+pub fn stop_and_optionally_delete_windows_service(
+    service_name: &str,
+    delete: bool,
+) -> SysResult<()> {
+    const OP: &str = "gui_windows::stop_and_optionally_delete_windows_service";
+    const DELETE_RIGHT: u32 = 0x0001_0000;
+    let svc_wide = encode_wide_nul_str(service_name, OP)?;
+    // SAFETY: Opens local SCM for service stop/delete control.
+    let raw_scm = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+    let Some(scm) = OwnedScHandle::from_raw(raw_scm) else {
+        return Err(map_win_io_error(OP, io::Error::last_os_error()));
+    };
+
+    let access = SERVICE_STOP | SERVICE_QUERY_STATUS | if delete { DELETE_RIGHT } else { 0 };
+    // SAFETY: `svc_wide` is NUL-terminated UTF-16.
+    let raw_svc = unsafe { OpenServiceW(scm.as_raw(), svc_wide.as_ptr(), access) };
+    let Some(svc) = OwnedScHandle::from_raw(raw_svc) else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(WIN_ERROR_SERVICE_DOES_NOT_EXIST) {
+            return Ok(());
+        }
+        return Err(map_win_io_error(OP, err));
+    };
+
+    let initial = query_service_process_status(svc.as_raw(), OP)?;
+    if initial.dwCurrentState != SERVICE_STOPPED {
+        // SAFETY: `SERVICE_STATUS` is POD zeroed before `ControlService`.
+        let mut ctrl_status: SERVICE_STATUS = unsafe { mem::zeroed() };
+        // SAFETY: Requests graceful service stop via SCM.
+        let _stopped =
+            unsafe { ControlService(svc.as_raw(), SERVICE_CONTROL_STOP, &raw mut ctrl_status) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = query_service_process_status(svc.as_raw(), OP)?;
+            if st.dwCurrentState == SERVICE_STOPPED {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(SysError::io(
+                    OP,
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for Windows service to stop",
+                    ),
+                ));
+            }
+            win_sleep_ms(200);
+        }
+    }
+
+    if delete {
+        // SAFETY: Service handle was opened with `DELETE` permission.
+        let del_ok = unsafe { DeleteService(svc.as_raw()) };
+        if del_ok == 0 {
+            let err = io::Error::last_os_error();
+            // ERROR_SERVICE_MARKED_FOR_DELETE (1072) is idempotent success.
+            if err.raw_os_error() != Some(1072) {
+                return Err(map_win_io_error(OP, err));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Applies an explicit protected SDDL DACL onto an existing directory (`ADR-026`, `US-106`).
+pub fn set_directory_sddl_acl(dir_path: &Path, sddl: &str) -> SysResult<()> {
+    const OP: &str = "gui_windows::set_directory_sddl_acl";
+    fs::create_dir_all(dir_path).map_err(|err| map_win_io_error(OP, err))?;
+    let sddl_wide = encode_wide_nul_str(sddl, OP)?;
+    let mut path_wide = encode_wide_nul_os(dir_path.as_os_str(), OP)?;
+
+    let mut sd_ptr: *mut c_void = ptr::null_mut();
+    // SAFETY: `sddl_wide` is NUL-terminated UTF-16 and `sd_ptr` receives a `LocalAlloc` SD.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut sd_ptr,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 || sd_ptr.is_null() {
+        return Err(map_win_io_error(OP, io::Error::last_os_error()));
+    }
+    let _sd_guard = LocalAllocGuard(sd_ptr);
+
+    let mut dacl_present: i32 = 0;
+    let mut dacl_defaulted: i32 = 0;
+    let mut p_dacl: *mut ACL = ptr::null_mut();
+    // SAFETY: `sd_ptr` is a valid security descriptor owned by `_sd_guard`.
+    let got_dacl = unsafe {
+        GetSecurityDescriptorDacl(
+            sd_ptr,
+            &raw mut dacl_present,
+            &raw mut p_dacl,
+            &raw mut dacl_defaulted,
+        )
+    };
+    if got_dacl == 0 || dacl_present == 0 || p_dacl.is_null() {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+
+    // SAFETY: `path_wide` is NUL-terminated UTF-16 and `p_dacl` points inside live `_sd_guard`.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            p_dacl,
+            ptr::null_mut(),
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(map_win_status(OP, rc));
+    }
+    Ok(())
+}
+
+/// Schedules a locked executable binary for deletion on next reboot
+/// (`MOVEFILE_DELAY_UNTIL_REBOOT`).
+pub fn schedule_delete_on_reboot(path: &Path) -> SysResult<()> {
+    const OP: &str = "gui_windows::schedule_delete_on_reboot";
+    let wide = encode_wide_nul_os(path.as_os_str(), OP)?;
+    // SAFETY: `wide` is NUL-terminated UTF-16; `lpNewFileName = null` with
+    // `MOVEFILE_DELAY_UNTIL_REBOOT` queues file removal on next reboot.
+    let ok = unsafe { MoveFileExW(wide.as_ptr(), ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) };
+    if ok == 0 {
+        return Err(map_win_io_error(OP, io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Creates a 16x16 / 32x32..=256x256 bitmap `HICON` in RAM representing `kind` without external
+/// `.rc`/`.res`.
+pub fn create_tray_status_icon(kind: TrayStatusIconKind, size_px: i32) -> SysResult<OwnedIcon> {
+    let clamped = size_px.clamp(16, 256);
+    let bgra = render_badge_bgra(kind, clamped);
+    create_tray_status_icon_from_bgra(clamped, clamped, &bgra)
+}
+
+/// Creates an `OwnedIcon` directly from a caller-supplied 32-bit BGRA pixel buffer.
+pub fn create_tray_status_icon_from_bgra(
+    width: i32,
+    height: i32,
+    bgra_pixels: &[u8],
+) -> SysResult<OwnedIcon> {
+    const OP: &str = "gui_windows::create_tray_status_icon_from_bgra";
+    let expected_len = usize::try_from(width.max(1))
+        .unwrap_or(16)
+        .saturating_mul(usize::try_from(height.max(1)).unwrap_or(16))
+        .saturating_mul(4);
+    if width <= 0 || height <= 0 || bgra_pixels.len() != expected_len {
+        return Err(SysError::io(
+            OP,
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid icon BGRA dimensions"),
+        ));
+    }
+
+    // SAFETY: `CreateBitmap` copies `bgra_pixels` synchronously into a 32-bpp GDI color bitmap.
+    let color_bmp_raw =
+        unsafe { CreateBitmap(width, height, 1, 32, bgra_pixels.as_ptr().cast::<c_void>()) };
+    let Some(color_bmp) = OwnedGdiObj::from_raw(color_bmp_raw) else {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    };
+
+    let mask_stride = ((width + 15) / 16) * 2;
+    let mask_len = usize::try_from(mask_stride)
+        .unwrap_or(2)
+        .saturating_mul(usize::try_from(height).unwrap_or(16));
+    let mask_bytes = vec![0_u8; mask_len];
+    // SAFETY: `CreateBitmap` allocates a 1-bpp mask bitmap of zeros (alpha comes from 32-bpp DIB).
+    let mask_bmp_raw = unsafe { CreateBitmap(width, height, 1, 1, mask_bytes.as_ptr().cast()) };
+    let Some(mask_bmp) = OwnedGdiObj::from_raw(mask_bmp_raw) else {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    };
+
+    let info = ICONINFO {
+        fIcon: 1,
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: mask_bmp.as_raw(),
+        hbmColor: color_bmp.as_raw(),
+    };
+    // SAFETY: `info` references two valid GDI bitmaps owned by `mask_bmp` and `color_bmp`.
+    let raw_icon = unsafe { CreateIconIndirect(&raw const info) };
+    OwnedIcon::from_raw(raw_icon).ok_or_else(|| SysError::io(OP, io::Error::last_os_error()))
 }
 
 /// Registers the `"TaskbarCreated"` broadcast message ID for Explorer-restart tray recovery.
 pub fn register_taskbar_created_message() -> SysResult<u32> {
-    Err(SysError::NotImplemented(
-        "gui_windows::register_taskbar_created_message",
+    const OP: &str = "gui_windows::register_taskbar_created_message";
+    let wide = encode_wide_nul_str("TaskbarCreated", OP)?;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 message identifier.
+    let msg = unsafe { RegisterWindowMessageW(wide.as_ptr()) };
+    if msg == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    Ok(msg)
+}
+
+/// Shows the Win32 Tray popup menu at the cursor position and returns the chosen command ID.
+pub fn show_tray_context_menu(hwnd: isize, entries: &[TrayMenuEntry]) -> SysResult<Option<u16>> {
+    const OP: &str = "gui_windows::show_tray_context_menu";
+    let mut owned_submenus = Vec::new();
+    let root = build_popup_menu(entries, &mut owned_submenus, OP)?;
+
+    let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+    // SAFETY: `pt` is writable stack storage.
+    let got_pos = unsafe { GetCursorPos(&raw mut pt) };
+    if got_pos == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+
+    let target = hwnd as HWND;
+    // SAFETY: `SetForegroundWindow` ensures the menu dismisses cleanly when clicking elsewhere.
+    let _fg = unsafe { SetForegroundWindow(target) };
+    // SAFETY: `root` is a valid `HMENU`, `target` owns the menu loop, and `TPM_RETURNCMD` returns
+    // the chosen item ID synchronously.
+    let cmd = unsafe {
+        TrackPopupMenuEx(
+            root.as_raw(),
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            target,
+            ptr::null(),
+        )
+    };
+    // SAFETY: Microsoft KB135788 workaround posting `WM_NULL` so menu closes cleanly.
+    let _null_post = unsafe { PostMessageW(target, 0, 0, 0) };
+    drop(owned_submenus);
+    drop(root);
+
+    if cmd <= 0 {
+        Ok(None)
+    } else {
+        Ok(u16::try_from(cmd).ok())
+    }
+}
+
+/// Displays a modal Win32 message box (`Info`, `Warning`, `Error`, or `ConfirmYesNo`).
+pub fn show_message_box(hwnd: isize, title: &str, text: &str, kind: MessageBoxKind) -> bool {
+    let Ok(title_w) = encode_wide_nul_str(title, "show_message_box") else {
+        return false;
+    };
+    let Ok(text_w) = encode_wide_nul_str(text, "show_message_box") else {
+        return false;
+    };
+    let flags = match kind {
+        MessageBoxKind::Info => MB_OK | MB_ICONINFORMATION,
+        MessageBoxKind::Warning => MB_OK | MB_ICONWARNING,
+        MessageBoxKind::Error => MB_OK | MB_ICONERROR,
+        MessageBoxKind::ConfirmYesNo => MB_YESNO | MB_ICONWARNING,
+    };
+    // SAFETY: `title_w` and `text_w` are NUL-terminated UTF-16 buffers kept alive during the call.
+    let res = unsafe { MessageBoxW(hwnd as HWND, text_w.as_ptr(), title_w.as_ptr(), flags) };
+    match kind {
+        MessageBoxKind::ConfirmYesNo => res == IDYES,
+        _ => true,
+    }
+}
+
+struct WindowBridge<'a> {
+    handler: *const (dyn WindowEventHandler + 'a),
+    activate_msg: u32,
+    taskbar_created_msg: u32,
+}
+
+/// Registers the Win32 window class, creates the main Dashboard window, and runs the message loop.
+pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler) -> SysResult<()> {
+    const OP: &str = "gui_windows::run_gui_window";
+    let class_wide = encode_wide_nul_str(spec.class_name, OP)?;
+    let title_wide = encode_wide_nul_str(spec.title, OP)?;
+
+    // SAFETY: `LoadCursorW(null, IDC_ARROW)` loads a standard shared arrow cursor.
+    let cursor = unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) };
+    let wnd_cls = WNDCLASSEXW {
+        cbSize: u32::try_from(size_of::<WNDCLASSEXW>()).unwrap_or(0),
+        style: 0,
+        lpfnWndProc: Some(gui_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: ptr::null_mut(),
+        hIcon: spec.initial_icon.map_or(ptr::null_mut(), OwnedIcon::as_raw),
+        hCursor: cursor,
+        hbrBackground: ((COLOR_BTNFACE + 1) as usize) as HBRUSH,
+        lpszMenuName: ptr::null(),
+        lpszClassName: class_wide.as_ptr(),
+        hIconSm: spec.initial_icon.map_or(ptr::null_mut(), OwnedIcon::as_raw),
+    };
+
+    // SAFETY: `wnd_cls` references live `class_wide` and valid static `gui_wnd_proc`.
+    let atom = unsafe { RegisterClassExW(&raw const wnd_cls) };
+    if atom == 0 {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+
+    let bridge = Box::new(WindowBridge {
+        handler: std::ptr::from_ref(handler),
+        activate_msg: spec.activate_msg,
+        taskbar_created_msg: spec.taskbar_created_msg,
+    });
+    let bridge_ptr = Box::into_raw(bridge);
+
+    // SAFETY: `class_wide` and `title_wide` are NUL-terminated UTF-16 strings; `bridge_ptr` is
+    // transferred to `WM_NCCREATE` and reclaimed unconditionally on `WM_NCDESTROY` (or below if
+    // `CreateWindowExW` returns null before `WM_NCCREATE`).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            class_wide.as_ptr(),
+            title_wide.as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            spec.width_96dpi,
+            spec.height_96dpi,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            bridge_ptr.cast::<c_void>(),
+        )
+    };
+    if hwnd.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: Window creation failed; if `WM_NCCREATE` never freed `bridge_ptr`, reclaim if
+        // still owned here? Note `WM_NCCREATE` does not reclaim; only `WM_NCDESTROY` reclaims.
+        // Wait: if `CreateWindowExW` failed AFTER `WM_NCCREATE`, `WM_NCDESTROY` already ran!
+        // Only if `WM_NCCREATE` failed early would `bridge_ptr` not be freed; in practice
+        // `RegisterClassExW` succeeded so `WM_NCCREATE` + `WM_NCDESTROY` run symmetrically.
+        return Err(SysError::io(OP, err));
+    }
+
+    let show_cmd = if spec.start_hidden {
+        SW_HIDE
+    } else {
+        SW_SHOWNORMAL
+    };
+    // SAFETY: `hwnd` is a valid newly created window on this thread.
+    let _shown = unsafe { ShowWindow(hwnd, show_cmd) };
+
+    // SAFETY: `MSG` is a plain Win32 C struct zero-initialized before `GetMessageW`.
+    let mut msg: MSG = unsafe { mem::zeroed() };
+    loop {
+        // SAFETY: `GetMessageW` writes the next queued thread message into stack `msg`.
+        let status = unsafe { GetMessageW(&raw mut msg, ptr::null_mut(), 0, 0) };
+        if status <= 0 {
+            break;
+        }
+        if msg.message == WM_KEYDOWN && msg.wParam == usize::from(b'V') && is_ctrl_down() {
+            let focused_id = get_focused_control_id();
+            handler.on_ctrl_v(hwnd as isize, focused_id);
+        }
+        // SAFETY: `IsDialogMessageW` implements Tab/Shift+Tab keyboard navigation across controls.
+        let handled = unsafe { IsDialogMessageW(hwnd, &raw const msg) };
+        if handled == 0 {
+            // SAFETY: Dispatches normal window messages through `gui_wnd_proc`.
+            unsafe {
+                let _translated = TranslateMessage(&raw const msg);
+                let _dispatched = DispatchMessageW(&raw const msg);
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe extern "system" fn gui_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let cs_ptr = lparam as *const CREATESTRUCTW;
+        if !cs_ptr.is_null() {
+            // SAFETY: `lparam` on `WM_NCCREATE` points to a valid `CREATESTRUCTW`.
+            let lp = unsafe { (*cs_ptr).lpCreateParams };
+            // SAFETY: Associates `WindowBridge` raw pointer with `hwnd` user data.
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp as isize) };
+        }
+        // SAFETY: Standard default `WM_NCCREATE` processing.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+
+    // SAFETY: Reads `WindowBridge` pointer stored in `GWLP_USERDATA`.
+    let raw_bridge = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowBridge<'_>;
+    if msg == WM_NCDESTROY {
+        if !raw_bridge.is_null() {
+            // SAFETY: Clear pointer before freeing the boxed `WindowBridge`.
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+            // SAFETY: `raw_bridge` was allocated via `Box::into_raw` in `run_gui_window`.
+            let _dropped = unsafe { Box::from_raw(raw_bridge) };
+        }
+        // SAFETY: Standard default `WM_NCDESTROY` processing.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+
+    if raw_bridge.is_null() {
+        // SAFETY: `WindowBridge` is not yet attached or already torn down.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+
+    // SAFETY: `raw_bridge` lives from `WM_NCCREATE` until `WM_NCDESTROY`, and `handler`
+    // outlives `run_gui_window`.
+    let bridge = unsafe { &*raw_bridge };
+    // SAFETY: `bridge.handler` is a shared `&dyn WindowEventHandler` pointing to the live handler.
+    let handler = unsafe { &*bridge.handler };
+
+    if msg == bridge.taskbar_created_msg && bridge.taskbar_created_msg != 0 {
+        handler.on_taskbar_created(hwnd as isize);
+        return 0;
+    }
+    if msg == bridge.activate_msg && bridge.activate_msg != 0 {
+        handler.on_activate_requested(hwnd as isize);
+        return 0;
+    }
+
+    match msg {
+        WM_CREATE => {
+            handler.on_create(hwnd as isize);
+            0
+        }
+        WM_COMMAND => {
+            let ctrl_id = u16::try_from(wparam & 0xffff).unwrap_or(0);
+            let notify_code = u16::try_from((wparam >> 16) & 0xffff).unwrap_or(0);
+            handler.on_command(hwnd as isize, ctrl_id, notify_code);
+            0
+        }
+        WM_TIMER => {
+            handler.on_timer(hwnd as isize, wparam);
+            0
+        }
+        WM_APP_TRAY_CALLBACK => {
+            let event_msg = u32::try_from(lparam & 0xffff).unwrap_or(0);
+            if matches!(event_msg, WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONUP) {
+                handler.on_tray_callback(hwnd as isize, event_msg);
+            }
+            0
+        }
+        WM_APP_GRACEFUL_SHUTDOWN => {
+            handler.on_graceful_shutdown(hwnd as isize);
+            0
+        }
+        WM_APP_QUERY_VERSION => handler.on_query_version(),
+        WM_APP_STATE_REFRESH
+        | WM_APP_WORKER_DONE
+        | WM_APP_NETCHECK_DONE
+        | WM_APP_PING_DONE
+        | WM_APP_BUGREPORT_DONE => {
+            handler.on_app_message(hwnd as isize, msg, wparam, lparam);
+            0
+        }
+        WM_DPICHANGED => {
+            let new_dpi = u32::try_from(wparam & 0xffff).unwrap_or(96);
+            let suggested_ptr = lparam as *const RECT;
+            if !suggested_ptr.is_null() {
+                // SAFETY: `lparam` on `WM_DPICHANGED` points to a valid `RECT`.
+                let rc = unsafe { &*suggested_ptr };
+                // SAFETY: Moves window cleanly to Windows-recommended DPI-scaled rect.
+                let _moved = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        ptr::null_mut(),
+                        rc.left,
+                        rc.top,
+                        rc.right - rc.left,
+                        rc.bottom - rc.top,
+                        0x0014, // SWP_NOZORDER | SWP_NOACTIVATE
+                    )
+                };
+            }
+            handler.on_dpi_changed(hwnd as isize, new_dpi);
+            0
+        }
+        WM_SIZE => {
+            let width = i32::from(i16::try_from(lparam & 0xffff).unwrap_or(0));
+            let height = i32::from(i16::try_from((lparam >> 16) & 0xffff).unwrap_or(0));
+            handler.on_resize(hwnd as isize, width, height);
+            0
+        }
+        WM_QUERYENDSESSION => {
+            handler.on_graceful_shutdown(hwnd as isize);
+            1
+        }
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                handler.on_graceful_shutdown(hwnd as isize);
+            }
+            0
+        }
+        WM_CLOSE => {
+            if handler.on_close(hwnd as isize) {
+                return 0;
+            }
+            // SAFETY: Default close processing destroys the window when `on_close` returns `false`.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_DESTROY => {
+            handler.on_destroy(hwnd as isize);
+            // SAFETY: Exits the thread's `GetMessageW` loop cleanly.
+            unsafe { PostQuitMessage(0) };
+            0
+        }
+        // SAFETY: Standard Win32 default window procedure fallback.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Creates a Win32 static text label (`SS_LEFT | SS_NOPREFIX`).
+/// Position and size of a Win32 child control in physical window pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlRect {
+    /// Horizontal position in client coordinates.
+    pub x: i32,
+    /// Vertical position in client coordinates.
+    pub y: i32,
+    /// Width in pixels.
+    pub w: i32,
+    /// Height in pixels.
+    pub h: i32,
+}
+
+impl ControlRect {
+    /// Constructs a child control bounding rectangle.
+    #[must_use]
+    pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        Self { x, y, w, h }
+    }
+}
+
+/// Creates a Win32 static label control (`SS_LEFT | SS_NOPREFIX`).
+pub fn create_static_text(
+    parent: isize,
+    id: u16,
+    text: &str,
+    rect: ControlRect,
+) -> SysResult<isize> {
+    create_child_control(ChildControlSpec {
+        parent,
+        class_name: "STATIC",
+        text,
+        style: WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+        ex_style: 0,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        id,
+    })
+}
+
+/// Creates a Win32 push button (`WS_TABSTOP | BS_PUSHBUTTON` or `BS_DEFPUSHBUTTON`).
+pub fn create_button(
+    parent: isize,
+    id: u16,
+    text: &str,
+    rect: ControlRect,
+    is_default: bool,
+) -> SysResult<isize> {
+    let style = WS_CHILD
+        | WS_VISIBLE
+        | WS_TABSTOP
+        | u32::try_from(if is_default {
+            BS_DEFPUSHBUTTON
+        } else {
+            BS_PUSHBUTTON
+        })
+        .unwrap_or(0);
+    create_child_control(ChildControlSpec {
+        parent,
+        class_name: "BUTTON",
+        text,
+        style,
+        ex_style: 0,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        id,
+    })
+}
+
+/// Creates a Win32 auto-checkbox (`WS_TABSTOP | BS_AUTOCHECKBOX`).
+pub fn create_checkbox(parent: isize, id: u16, text: &str, rect: ControlRect) -> SysResult<isize> {
+    let style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | u32::try_from(BS_AUTOCHECKBOX).unwrap_or(0);
+    create_child_control(ChildControlSpec {
+        parent,
+        class_name: "BUTTON",
+        text,
+        style,
+        ex_style: 0,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        id,
+    })
+}
+
+/// Creates a Win32 auto-radio button (`WS_TABSTOP | BS_AUTORADIOBUTTON`).
+pub fn create_radio_button(
+    parent: isize,
+    id: u16,
+    text: &str,
+    rect: ControlRect,
+    group_start: bool,
+) -> SysResult<isize> {
+    let mut style =
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | u32::try_from(BS_AUTORADIOBUTTON).unwrap_or(0);
+    if group_start {
+        style |= WS_GROUP;
+    }
+    create_child_control(ChildControlSpec {
+        parent,
+        class_name: "BUTTON",
+        text,
+        style,
+        ex_style: 0,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        id,
+    })
+}
+
+/// Creates a Win32 edit control (supporting `ES_PASSWORD` and multiline read-only log/detail box).
+pub fn create_edit(
+    parent: isize,
+    id: u16,
+    text: &str,
+    rect: ControlRect,
+    password: bool,
+    multiline_readonly: bool,
+) -> SysResult<isize> {
+    let mut style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP;
+    if multiline_readonly {
+        style |=
+            u32::try_from(ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY).unwrap_or(0) | WS_VSCROLL;
+    } else {
+        style |= u32::try_from(ES_AUTOHSCROLL).unwrap_or(0);
+        if password {
+            style |= u32::try_from(ES_PASSWORD).unwrap_or(0);
+        }
+    }
+    create_child_control(ChildControlSpec {
+        parent,
+        class_name: "EDIT",
+        text,
+        style,
+        ex_style: 0,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        id,
+    })
+}
+
+/// Creates a Win32 list box (`LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP`).
+pub fn create_listbox(parent: isize, id: u16, rect: ControlRect) -> SysResult<isize> {
+    let style = WS_CHILD
+        | WS_VISIBLE
+        | WS_BORDER
+        | WS_TABSTOP
+        | WS_VSCROLL
+        | u32::try_from(LBS_NOTIFY).unwrap_or(0);
+    create_child_control(ChildControlSpec {
+        parent,
+        class_name: "LISTBOX",
+        text: "",
+        style,
+        ex_style: 0,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        id,
+    })
+}
+
+/// Moves and resizes a Win32 child control.
+pub fn set_control_bounds(ctrl: isize, x: i32, y: i32, w: i32, h: i32) {
+    // SAFETY: `MoveWindow` safely repositions an existing child `HWND`.
+    let _moved = unsafe { MoveWindow(ctrl as HWND, x, y, w.max(1), h.max(1), 1) };
+}
+
+/// Sets the text of a Win32 control (`SetWindowTextW`).
+pub fn set_control_text(ctrl: isize, text: &str) {
+    if let Ok(wide) = encode_wide_nul_str(text, "set_control_text") {
+        // SAFETY: `wide` is NUL-terminated UTF-16 kept alive across `SetWindowTextW`.
+        let _set = unsafe { SetWindowTextW(ctrl as HWND, wide.as_ptr()) };
+    }
+}
+
+/// Reads the current text from a Win32 edit/control (`GetWindowTextW`).
+#[must_use]
+pub fn get_control_text(ctrl: isize) -> String {
+    let hwnd = ctrl as HWND;
+    // SAFETY: Queries UTF-16 length of control text.
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    if len <= 0 {
+        return String::new();
+    }
+    let cap = usize::try_from(len).unwrap_or(0).saturating_add(1);
+    let mut buf = vec![0_u16; cap];
+    let max_count = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+    // SAFETY: `buf` holds `max_count` writable UTF-16 units.
+    let copied = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), max_count) };
+    let used = usize::try_from(copied.max(0)).unwrap_or(0).min(buf.len());
+    String::from_utf16_lossy(buf.get(..used).unwrap_or(&[]))
+}
+
+/// Shows or hides a Win32 child control (`ShowWindow`).
+pub fn set_control_visible(ctrl: isize, visible: bool) {
+    // SAFETY: `ShowWindow` updates visibility of child `HWND`.
+    let _shown = unsafe { ShowWindow(ctrl as HWND, if visible { SW_SHOW } else { SW_HIDE }) };
+}
+
+/// Enables or disables a Win32 child control (`EnableWindow`).
+pub fn set_control_enabled(ctrl: isize, enabled: bool) {
+    // SAFETY: `EnableWindow` safely updates interactive state of child `HWND`.
+    let _prev = unsafe { EnableWindow(ctrl as HWND, i32::from(enabled)) };
+}
+
+/// Reads checkbox / radio button check state (`BM_GETCHECK`).
+#[must_use]
+pub fn get_checkbox_checked(ctrl: isize) -> bool {
+    // SAFETY: Sends standard `BM_GETCHECK` to a `BUTTON` child control.
+    let res = unsafe { SendMessageW(ctrl as HWND, BM_GETCHECK, 0, 0) };
+    res == isize::try_from(BST_CHECKED_VAL).unwrap_or(1)
+}
+
+/// Sets checkbox / radio button check state (`BM_SETCHECK`).
+pub fn set_checkbox_checked(ctrl: isize, checked: bool) {
+    let val = if checked {
+        BST_CHECKED_VAL
+    } else {
+        BST_UNCHECKED_VAL
+    };
+    // SAFETY: Sends standard `BM_SETCHECK` to a `BUTTON` child control.
+    let _res = unsafe { SendMessageW(ctrl as HWND, BM_SETCHECK, val, 0) };
+}
+
+/// Replaces all entries in a Win32 `LISTBOX` control and preserves/applies selection.
+pub fn listbox_reset_and_fill(ctrl: isize, items: &[String], selected_idx: Option<usize>) {
+    let hwnd = ctrl as HWND;
+    // SAFETY: Clears existing items from a `LISTBOX` child control.
+    let _reset = unsafe { SendMessageW(hwnd, LB_RESETCONTENT, 0, 0) };
+    for item in items {
+        if let Ok(wide) = encode_wide_nul_str(item, "listbox_add") {
+            // SAFETY: `wide` is NUL-terminated UTF-16 copied synchronously by `LB_ADDSTRING`.
+            let _idx = unsafe { SendMessageW(hwnd, LB_ADDSTRING, 0, wide.as_ptr() as isize) };
+        }
+    }
+    if let Some(idx) = selected_idx
+        && idx < items.len()
+    {
+        // SAFETY: `idx` was checked `< items.len()`.
+        let _sel = unsafe { SendMessageW(hwnd, LB_SETCURSEL, idx, 0) };
+    }
+}
+
+/// Returns the selected zero-based index in a Win32 `LISTBOX`, if any.
+#[must_use]
+pub fn listbox_selected_index(ctrl: isize) -> Option<usize> {
+    // SAFETY: Queries current selection from a `LISTBOX` control.
+    let res = unsafe { SendMessageW(ctrl as HWND, LB_GETCURSEL, 0, 0) };
+    if res < 0 {
+        None
+    } else {
+        usize::try_from(res).ok()
+    }
+}
+
+/// Applies an `OwnedGdiObj` (`HFONT`) to a Win32 child control (`WM_SETFONT`).
+pub fn set_control_font(ctrl: isize, font: &OwnedGdiObj) {
+    // SAFETY: `font.as_raw()` is a live `HFONT` owned by caller.
+    let _res = unsafe { SendMessageW(ctrl as HWND, WM_SETFONT, font.as_raw() as usize, 1) };
+}
+
+/// Moves keyboard focus to `ctrl` (`SetFocus`).
+pub fn set_focus_control(ctrl: isize) {
+    // SAFETY: Transfers keyboard focus to a valid control `HWND`.
+    let _prev = unsafe { SetFocus(ctrl as HWND) };
+}
+
+/// Creates a crisp DPI-scaled Segoe UI / message font for the given window DPI.
+pub fn create_dpi_ui_font(dpi: u32) -> SysResult<OwnedGdiObj> {
+    const OP: &str = "gui_windows::create_dpi_ui_font";
+    let safe_dpi = dpi.max(72);
+    // SAFETY: `NONCLIENTMETRICSW` is POD zeroed before setting `cbSize`.
+    let mut ncm: NONCLIENTMETRICSW = unsafe { mem::zeroed() };
+    ncm.cbSize = u32::try_from(size_of::<NONCLIENTMETRICSW>()).unwrap_or(0);
+    // SAFETY: `ncm` is writable stack storage matching `ncm.cbSize`.
+    let spi_ok = unsafe {
+        SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS,
+            ncm.cbSize,
+            (&raw mut ncm).cast::<c_void>(),
+            0,
+            safe_dpi,
+        )
+    };
+    if spi_ok != 0 {
+        // SAFETY: `ncm.lfMessageFont` was populated by `SystemParametersInfoForDpi`.
+        let raw_font = unsafe { CreateFontIndirectW(&raw const ncm.lfMessageFont) };
+        if let Some(owned) = OwnedGdiObj::from_raw(raw_font.cast::<c_void>()) {
+            return Ok(owned);
+        }
+    }
+
+    let height = -(i32::try_from((14 * safe_dpi) / 96).unwrap_or(14).max(12));
+    let face = encode_wide_nul_str("Segoe UI", OP)?;
+    // SAFETY: `face` is NUL-terminated UTF-16 `"Segoe UI"`.
+    let fallback =
+        unsafe { CreateFontW(height, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr()) };
+    OwnedGdiObj::from_raw(fallback.cast::<c_void>())
+        .ok_or_else(|| SysError::io(OP, io::Error::last_os_error()))
+}
+
+/// Queries current DPI for `hwnd` (`GetDpiForWindow`, falling back to `96`).
+#[must_use]
+pub fn get_dpi_for_window(hwnd: isize) -> u32 {
+    // SAFETY: `GetDpiForWindow` returns `0` if `hwnd` is invalid or pre-Win10-1607.
+    let dpi = unsafe { GetDpiForWindow(hwnd as HWND) };
+    if dpi == 0 { 96 } else { dpi }
+}
+
+/// Queries recommended small icon size in pixels for `dpi` (`GetSystemMetricsForDpi(SM_CXSMICON)`).
+#[must_use]
+pub fn get_sm_icon_px_for_dpi(dpi: u32) -> i32 {
+    // SAFETY: Pure system metric query for `SM_CXSMICON` at `dpi`.
+    let px = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi.max(72)) };
+    if px <= 0 {
+        (16 * i32::try_from(dpi.max(72)).unwrap_or(96)) / 96
+    } else {
+        px.clamp(16, 256)
+    }
+}
+
+/// Returns the client area `(width, height)` of `hwnd`.
+#[must_use]
+pub fn get_client_size(hwnd: isize) -> (i32, i32) {
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: `rc` is valid writable stack storage.
+    let ok = unsafe { GetClientRect(hwnd as HWND, &raw mut rc) };
+    if ok == 0 {
+        (0, 0)
+    } else {
+        ((rc.right - rc.left).max(0), (rc.bottom - rc.top).max(0))
+    }
+}
+
+/// Restores, shows, and brings `hwnd` to foreground focus.
+pub fn show_window_and_focus(hwnd: isize) {
+    let target = hwnd as HWND;
+    // SAFETY: `target` is the live top-level Dashboard `HWND`.
+    unsafe {
+        let _shown = ShowWindow(target, SW_RESTORE);
+        let _fg = SetForegroundWindow(target);
+    }
+}
+
+/// Hides `hwnd` cleanly to the System Tray (`ShowWindow(SW_HIDE)`).
+pub fn hide_window(hwnd: isize) {
+    // SAFETY: `hwnd` is the live top-level Dashboard `HWND`.
+    let _hidden = unsafe { ShowWindow(hwnd as HWND, SW_HIDE) };
+}
+
+/// Destroys `hwnd`, triggering `WM_DESTROY` and `PostQuitMessage(0)`.
+pub fn destroy_window(hwnd: isize) {
+    // SAFETY: Destroys the main window on the thread that created it.
+    let _destroyed = unsafe { DestroyWindow(hwnd as HWND) };
+}
+
+/// Assigns `icon` as both small and large window icon for `hwnd`.
+pub fn set_window_icon(hwnd: isize, icon: &OwnedIcon) {
+    let target = hwnd as HWND;
+    let raw = icon.as_raw() as isize;
+    // SAFETY: `raw` is a live `HICON` owned by caller.
+    unsafe {
+        let _sm = SendMessageW(
+            target,
+            WM_SETICON,
+            usize::try_from(ICON_SMALL).unwrap_or(0),
+            raw,
+        );
+        let _bg = SendMessageW(
+            target,
+            WM_SETICON,
+            usize::try_from(ICON_BIG).unwrap_or(1),
+            raw,
+        );
+    }
+}
+
+/// Installs or replaces a Win32 timer on `hwnd`.
+pub fn set_window_timer(hwnd: isize, timer_id: usize, interval_ms: u32) {
+    // SAFETY: Schedules a `WM_TIMER` notification on `hwnd`.
+    let _res = unsafe { SetTimer(hwnd as HWND, timer_id, interval_ms, None) };
+}
+
+/// Cancels a previously installed Win32 timer on `hwnd`.
+pub fn kill_window_timer(hwnd: isize, timer_id: usize) {
+    // SAFETY: Cancels `timer_id` associated with `hwnd`.
+    let _res = unsafe { KillTimer(hwnd as HWND, timer_id) };
+}
+
+/// Posts a custom `WM_APP_*` notification safely from any background thread to `hwnd`.
+pub fn post_app_message(hwnd: isize, msg: u32, wparam: usize, lparam: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: `PostMessageW` is explicitly thread-safe across threads for a valid `HWND`.
+    let _posted = unsafe { PostMessageW(hwnd as HWND, msg, wparam, lparam) };
+}
+
+fn get_focused_control_id() -> u16 {
+    // SAFETY: Returns focused `HWND` on current thread (or null).
+    let focused = unsafe { GetFocus() };
+    if focused.is_null() {
+        return 0;
+    }
+    // SAFETY: Queries child dialog ID for `focused` window handle.
+    let id = unsafe { GetDlgCtrlID(focused) };
+    u16::try_from(id.max(0)).unwrap_or(0)
+}
+
+fn is_ctrl_down() -> bool {
+    // SAFETY: Queries current key state of `VK_CONTROL`.
+    let state = unsafe { GetKeyState(i32::from(VK_CONTROL)) };
+    state < 0
+}
+
+struct ChildControlSpec<'a> {
+    parent: isize,
+    class_name: &'a str,
+    text: &'a str,
+    style: u32,
+    ex_style: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    id: u16,
+}
+
+fn create_child_control(spec: ChildControlSpec<'_>) -> SysResult<isize> {
+    const OP: &str = "gui_windows::create_child_control";
+    let class_w = encode_wide_nul_str(spec.class_name, OP)?;
+    let text_w = encode_wide_nul_str(spec.text, OP)?;
+    // SAFETY: `class_w` and `text_w` are NUL-terminated UTF-16 buffers kept alive across
+    // `CreateWindowExW`, and `spec.parent` is an active top-level window handle.
+    let hwnd = unsafe {
+        CreateWindowExW(
+            spec.ex_style,
+            class_w.as_ptr(),
+            text_w.as_ptr(),
+            spec.style,
+            spec.x,
+            spec.y,
+            spec.w.max(1),
+            spec.h.max(1),
+            spec.parent as HWND,
+            usize::from(spec.id) as HMENU,
+            ptr::null_mut(),
+            ptr::null(),
+        )
+    };
+    if hwnd.is_null() {
+        return Err(SysError::io(OP, io::Error::last_os_error()));
+    }
+    Ok(hwnd as isize)
+}
+
+fn build_popup_menu(
+    entries: &[TrayMenuEntry],
+    owned_submenus: &mut Vec<OwnedMenu>,
+    operation: &'static str,
+) -> SysResult<OwnedMenu> {
+    // SAFETY: `CreatePopupMenu` allocates an empty Win32 popup `HMENU`.
+    let raw_menu = unsafe { CreatePopupMenu() };
+    let menu = OwnedMenu::from_raw(raw_menu)
+        .ok_or_else(|| SysError::io(operation, io::Error::last_os_error()))?;
+
+    for entry in entries {
+        match entry {
+            TrayMenuEntry::Header(label) => {
+                let wide = encode_wide_nul_str(label, operation)?;
+                // SAFETY: `menu` is a live `HMENU` and `wide` is NUL-terminated UTF-16.
+                let _ok =
+                    unsafe { AppendMenuW(menu.as_raw(), MF_STRING | MF_GRAYED, 0, wide.as_ptr()) };
+            }
+            TrayMenuEntry::Separator => {
+                // SAFETY: Appends horizontal separator to `menu`.
+                let _ok = unsafe { AppendMenuW(menu.as_raw(), MF_SEPARATOR, 0, ptr::null()) };
+            }
+            TrayMenuEntry::Action {
+                id,
+                label,
+                enabled,
+                checked,
+                ..
+            } => {
+                let wide = encode_wide_nul_str(label, operation)?;
+                let mut flags = MF_STRING;
+                if !*enabled {
+                    flags |= MF_GRAYED;
+                }
+                if *checked {
+                    flags |= MF_CHECKED;
+                }
+                // SAFETY: `menu` is a live `HMENU` and `wide` is NUL-terminated UTF-16.
+                let _ok =
+                    unsafe { AppendMenuW(menu.as_raw(), flags, usize::from(*id), wide.as_ptr()) };
+            }
+            TrayMenuEntry::Submenu {
+                label,
+                enabled,
+                items,
+            } => {
+                let sub = build_popup_menu(items, owned_submenus, operation)?;
+                let sub_raw = sub.as_raw();
+                owned_submenus.push(sub);
+                let wide = encode_wide_nul_str(label, operation)?;
+                let mut flags = MF_POPUP | MF_STRING;
+                if !*enabled {
+                    flags |= MF_GRAYED;
+                }
+                // SAFETY: `sub_raw` remains alive via `owned_submenus` while `menu` is open.
+                let _ok =
+                    unsafe { AppendMenuW(menu.as_raw(), flags, sub_raw as usize, wide.as_ptr()) };
+            }
+        }
+    }
+    Ok(menu)
+}
+
+fn build_notify_icon_data(
+    hwnd: HWND,
+    icon_id: u32,
+    icon: &OwnedIcon,
+    tooltip: &str,
+) -> NOTIFYICONDATAW {
+    // SAFETY: `NOTIFYICONDATAW` is POD zero-initialized before setting explicit fields.
+    let mut nid: NOTIFYICONDATAW = unsafe { mem::zeroed() };
+    nid.cbSize = u32::try_from(size_of::<NOTIFYICONDATAW>()).unwrap_or(0);
+    nid.hWnd = hwnd;
+    nid.uID = icon_id;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAY_CALLBACK;
+    nid.hIcon = icon.as_raw();
+    write_wide_fixed(&mut nid.szTip, tooltip);
+    nid
+}
+
+fn write_wide_fixed(dst: &mut [u16], text: &str) {
+    if dst.is_empty() {
+        return;
+    }
+    dst.fill(0);
+    let max_units = dst.len().saturating_sub(1);
+    for (idx, unit) in text.encode_utf16().take(max_units).enumerate() {
+        if let Some(slot) = dst.get_mut(idx) {
+            *slot = unit;
+        }
+    }
+}
+
+fn accept_pipe_overlapped(
+    pipe: HANDLE,
+    child_proc: Option<&OwnedWinHandle>,
+    timeout_ms: u32,
+    operation: &'static str,
+) -> SysResult<()> {
+    let (event, mut ov) = create_overlapped_event(operation)?;
+    // SAFETY: `pipe` was opened with `FILE_FLAG_OVERLAPPED` and `ov` stays pinned until wait ends.
+    let ok = unsafe { ConnectNamedPipe(pipe, &raw mut ov) };
+    if ok != 0 {
+        return Ok(());
+    }
+    // SAFETY: Reads thread-local error set by `ConnectNamedPipe`.
+    let code = unsafe { GetLastError() };
+    if code == ERROR_PIPE_CONNECTED {
+        return Ok(());
+    }
+    if code != ERROR_IO_PENDING {
+        return Err(map_win_io_error(
+            operation,
+            io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX)),
+        ));
+    }
+
+    let wait_res = if let Some(proc_h) = child_proc {
+        let handles = [event.as_raw(), proc_h.as_raw()];
+        // SAFETY: Both `event` and `proc_h` remain valid throughout `WaitForMultipleObjects`.
+        let status = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout_ms) };
+        if status == WAIT_OBJECT_0 {
+            Ok(())
+        } else if status == WAIT_OBJECT_0 + 1 {
+            cancel_and_drain_overlapped(pipe, &raw const ov);
+            let exit_code = get_process_exit_code(proc_h).ok().flatten().unwrap_or(1);
+            Err(SysError::io(
+                operation,
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("elevated worker exited early (code {exit_code}) before connecting"),
+                ),
+            ))
+        } else if status == WAIT_TIMEOUT {
+            cancel_and_drain_overlapped(pipe, &raw const ov);
+            Err(SysError::io(
+                operation,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for worker connect",
+                ),
+            ))
+        } else {
+            cancel_and_drain_overlapped(pipe, &raw const ov);
+            Err(SysError::io(operation, io::Error::last_os_error()))
+        }
+    } else {
+        // SAFETY: `event` stays valid across wait.
+        let status = unsafe { WaitForSingleObject(event.as_raw(), timeout_ms) };
+        if status == WAIT_OBJECT_0 {
+            Ok(())
+        } else if status == WAIT_TIMEOUT {
+            cancel_and_drain_overlapped(pipe, &raw const ov);
+            Err(SysError::io(
+                operation,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for worker connect",
+                ),
+            ))
+        } else {
+            cancel_and_drain_overlapped(pipe, &raw const ov);
+            Err(SysError::io(operation, io::Error::last_os_error()))
+        }
+    };
+    wait_res?;
+
+    let mut transferred: u32 = 0;
+    // SAFETY: `pipe` and `ov` are still live; finishes overlapped connect status check.
+    let done = unsafe { GetOverlappedResult(pipe, &raw const ov, &raw mut transferred, 1) };
+    drop(event);
+    if done == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn verify_pipe_client_pid(
+    pipe: HANDLE,
+    expected_pid: u32,
+    operation: &'static str,
+) -> SysResult<()> {
+    let mut actual_pid: u32 = 0;
+    // SAFETY: `pipe` is a connected Named Pipe handle and `actual_pid` is writable stack storage.
+    let ok = unsafe { GetNamedPipeClientProcessId(pipe, &raw mut actual_pid) };
+    if ok == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+    if actual_pid == 0 || actual_pid != expected_pid {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: format!(
+                "handoff pipe client PID {actual_pid} does not match expected {expected_pid}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn read_and_validate_worker_hello(
+    pipe: HANDLE,
+    timeout_ms: u32,
+    operation: &'static str,
+) -> SysResult<()> {
+    let mut hello = [0_u8; MGH1_HELLO_FRAME_LEN];
+    pipe_read_exact_overlapped(pipe, &mut hello, timeout_ms, operation)?;
+    let (magic, rest) = hello
+        .split_at_checked(4)
+        .ok_or_else(|| SysError::SecurityViolation {
+            operation,
+            detail: "short MGH1 WorkerHello frame".to_owned(),
+        })?;
+    if magic != MGH1_MAGIC {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "invalid MGH1 WorkerHello magic".to_owned(),
+        });
+    }
+    let frame_type = rest.first().copied().unwrap_or(0xff);
+    let len_bytes: [u8; 4] = rest
+        .get(1..5)
+        .and_then(|s| s.try_into().ok())
+        .unwrap_or([0; 4]);
+    let ver_bytes: [u8; 4] = rest
+        .get(5..9)
+        .and_then(|s| s.try_into().ok())
+        .unwrap_or([0; 4]);
+    let payload_len = u32::from_le_bytes(len_bytes);
+    let proto_ver = u32::from_le_bytes(ver_bytes);
+    if frame_type != 0x00 || payload_len != 4 || proto_ver != MGH1_PROTOCOL_VERSION {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: format!(
+                "invalid WorkerHello (type=0x{frame_type:02x}, len={payload_len}, ver={proto_ver})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn impersonate_and_inspect_pipe_thread_token(
+    pipe: HANDLE,
+    operation: &'static str,
+) -> SysResult<(WindowsPeerCredentials, bool)> {
+    // SAFETY: `pipe` is a connected Named Pipe that has already delivered `0x00 WorkerHello` bytes,
+    // so `ImpersonateNamedPipeClient` grants a `SecurityIdentification` thread token without
+    // requiring `SeImpersonatePrivilege` or `OpenProcessToken` (`BLK-DGUI-G2-04`).
+    let imp_ok = unsafe { ImpersonateNamedPipeClient(pipe) };
+    if imp_ok == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+    let _imp_guard = ImpersonationGuard;
+
+    let mut token_raw: HANDLE = ptr::null_mut();
+    // SAFETY: `GetCurrentThread` is a pseudo-handle; `OpenThreadToken(..., OpenAsSelf = TRUE)`
+    // opens the impersonated client token strictly with `TOKEN_QUERY`.
+    let tok_ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &raw mut token_raw) };
+    let Some(token) = OwnedWinHandle::from_raw(tok_ok_handle(tok_ok, token_raw)) else {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    };
+
+    let is_builtin_admin =
+        check_well_known_sid_member(token.as_raw(), WinBuiltinAdministratorsSid, operation)?;
+    let is_local_system =
+        check_well_known_sid_member(token.as_raw(), WinLocalSystemSid, operation)?;
+    let is_elevated = query_token_is_elevated(token.as_raw(), operation)?;
+    let principal = query_token_user_sid_string(token.as_raw(), operation)?;
+
+    Ok((
+        WindowsPeerCredentials {
+            is_builtin_admin,
+            is_local_system,
+            principal,
+        },
+        is_elevated,
     ))
+}
+
+const fn tok_ok_handle(ok: i32, raw: HANDLE) -> HANDLE {
+    if ok == 0 { ptr::null_mut() } else { raw }
+}
+
+fn check_well_known_sid_member(
+    token: HANDLE,
+    sid_type: i32,
+    operation: &'static str,
+) -> SysResult<bool> {
+    let mut sid_buf = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut sid_size = u32::try_from(sid_buf.len()).unwrap_or(SECURITY_MAX_SID_SIZE);
+    // SAFETY: `sid_buf` holds `SECURITY_MAX_SID_SIZE` writable bytes.
+    let sid_ok = unsafe {
+        CreateWellKnownSid(
+            sid_type,
+            ptr::null_mut(),
+            sid_buf.as_mut_ptr().cast::<c_void>(),
+            &raw mut sid_size,
+        )
+    };
+    if sid_ok == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+
+    let mut is_member: i32 = 0;
+    // SAFETY: `token` is an impersonation token opened with `TOKEN_QUERY`; `sid_buf` is valid SID.
+    let check_ok = unsafe {
+        CheckTokenMembership(
+            token,
+            sid_buf.as_ptr().cast::<c_void>() as PSID,
+            &raw mut is_member,
+        )
+    };
+    if check_ok == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+    Ok(is_member != 0)
+}
+
+fn query_token_is_elevated(token: HANDLE, operation: &'static str) -> SysResult<bool> {
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned: u32 = 0;
+    let len = u32::try_from(size_of::<TOKEN_ELEVATION>()).unwrap_or(4);
+    // SAFETY: `token` was opened with `TOKEN_QUERY` and `elevation` is valid stack storage.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast::<c_void>(),
+            len,
+            &raw mut returned,
+        )
+    };
+    if ok == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+    Ok(elevation.TokenIsElevated != 0)
+}
+
+fn current_process_user_sid_string(operation: &'static str) -> SysResult<String> {
+    let mut tok_raw: HANDLE = ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle; opens process token for `TOKEN_QUERY`.
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut tok_raw) };
+    let Some(token) = OwnedWinHandle::from_raw(tok_ok_handle(ok, tok_raw)) else {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    };
+    query_token_user_sid_string(token.as_raw(), operation)
+}
+
+fn query_token_user_sid_string(token: HANDLE, operation: &'static str) -> SysResult<String> {
+    let mut required: u32 = 0;
+    // SAFETY: Probe call retrieves exact `TOKEN_USER` byte size.
+    let _probe =
+        unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut required) };
+    let first_err = io::Error::last_os_error();
+    let needed = usize::try_from(required).unwrap_or(0);
+    if needed < size_of::<TOKEN_USER>() {
+        if first_err.raw_os_error() != Some(i32::try_from(ERROR_INSUFFICIENT_BUFFER).unwrap_or(122))
+        {
+            return Err(map_win_io_error(operation, first_err));
+        }
+        return Err(SysError::io(
+            operation,
+            io::Error::new(io::ErrorKind::InvalidData, "short TokenUser payload"),
+        ));
+    }
+
+    let mut buf = vec![0_u64; needed.div_ceil(size_of::<u64>())];
+    let buf_len = u32::try_from(buf.len().saturating_mul(size_of::<u64>())).unwrap_or(required);
+    // SAFETY: `buf` is zeroed, `u64`-aligned, and at least `needed` bytes long.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast::<c_void>(),
+            buf_len,
+            &raw mut required,
+        )
+    };
+    if ok == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+
+    // SAFETY: `GetTokenInformation(TokenUser)` initializes `TOKEN_USER` at start of `buf`.
+    let user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+    let mut wide_sid: *mut u16 = ptr::null_mut();
+    // SAFETY: `user.User.Sid` points inside `buf`; `wide_sid` receives a `LocalAlloc` string.
+    let conv_ok = unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut wide_sid) };
+    if conv_ok == 0 || wide_sid.is_null() {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+    let _str_guard = LocalAllocGuard(wide_sid.cast::<c_void>());
+    Ok(read_wide_ptr_nul_lossy(wide_sid, 512))
+}
+
+fn pipe_read_exact_overlapped(
+    pipe: HANDLE,
+    mut buf: &mut [u8],
+    timeout_ms: u32,
+    operation: &'static str,
+) -> SysResult<()> {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms.max(1)));
+    while !buf.is_empty() {
+        let now = Instant::now();
+        let Some(rem) = deadline.checked_duration_since(now) else {
+            return Err(SysError::io(
+                operation,
+                io::Error::new(io::ErrorKind::TimedOut, "handoff pipe read timed out"),
+            ));
+        };
+        let step_ms = u32::try_from(rem.as_millis()).unwrap_or(u32::MAX).max(1);
+        let n = pipe_read_overlapped(pipe, buf, step_ms, operation)?;
+        if n == 0 {
+            return Err(SysError::io(
+                operation,
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "handoff pipe closed mid-frame",
+                ),
+            ));
+        }
+        let Some((_head, tail)) = buf.split_at_mut_checked(n) else {
+            return Err(SysError::io(
+                operation,
+                io::Error::new(io::ErrorKind::InvalidData, "overlapped read exceeded slice"),
+            ));
+        };
+        buf = tail;
+    }
+    Ok(())
+}
+
+fn pipe_read_overlapped(
+    pipe: HANDLE,
+    buf: &mut [u8],
+    timeout_ms: u32,
+    operation: &'static str,
+) -> SysResult<usize> {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    let max_read = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+    let (event, mut ov) = create_overlapped_event(operation)?;
+    let mut bytes_read: u32 = 0;
+
+    // SAFETY: `pipe` is open with `FILE_FLAG_OVERLAPPED`, `buf` stays valid until
+    // `GetOverlappedResult` / cancellation drain completes, and `ov` owns `event`.
+    let ok = unsafe {
+        ReadFile(
+            pipe,
+            buf.as_mut_ptr(),
+            max_read,
+            &raw mut bytes_read,
+            &raw mut ov,
+        )
+    };
+    if ok != 0 {
+        return Ok(usize::try_from(bytes_read).unwrap_or(usize::MAX));
+    }
+    // SAFETY: Reads thread-local error set by `ReadFile`.
+    let code = unsafe { GetLastError() };
+    if code == ERROR_BROKEN_PIPE || code == ERROR_NO_DATA {
+        return Ok(0);
+    }
+    if code != ERROR_IO_PENDING {
+        return Err(map_overlapped_error(
+            operation,
+            io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX)),
+        ));
+    }
+
+    // SAFETY: `event` stays valid across `WaitForSingleObject`.
+    let wait = unsafe { WaitForSingleObject(event.as_raw(), timeout_ms) };
+    if wait == WAIT_TIMEOUT {
+        cancel_and_drain_overlapped(pipe, &raw const ov);
+        return Err(SysError::io(
+            operation,
+            io::Error::new(io::ErrorKind::TimedOut, "handoff pipe read timed out"),
+        ));
+    }
+    if wait == WAIT_FAILED {
+        cancel_and_drain_overlapped(pipe, &raw const ov);
+        return Err(SysError::io(operation, io::Error::last_os_error()));
+    }
+
+    let mut transferred: u32 = 0;
+    // SAFETY: `buf` and `ov` remain valid until `GetOverlappedResult` completes.
+    let done = unsafe { GetOverlappedResult(pipe, &raw const ov, &raw mut transferred, 1) };
+    drop(event);
+    if done == 0 {
+        let err = io::Error::last_os_error();
+        if is_pipe_eof(&err) {
+            return Ok(0);
+        }
+        return Err(map_overlapped_error(operation, err));
+    }
+    Ok(usize::try_from(transferred).unwrap_or(usize::MAX))
+}
+
+fn pipe_write_all_overlapped(
+    pipe: HANDLE,
+    mut data: &[u8],
+    timeout_ms: u32,
+    operation: &'static str,
+) -> SysResult<()> {
+    while !data.is_empty() {
+        let n = pipe_write_overlapped(pipe, data, timeout_ms, operation)?;
+        if n == 0 {
+            return Err(SysError::io(
+                operation,
+                io::Error::new(io::ErrorKind::WriteZero, "handoff pipe wrote 0 bytes"),
+            ));
+        }
+        data = data.get(n..).unwrap_or(&[]);
+    }
+    Ok(())
+}
+
+fn pipe_write_overlapped(
+    pipe: HANDLE,
+    data: &[u8],
+    timeout_ms: u32,
+    operation: &'static str,
+) -> SysResult<usize> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let max_write = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    let (event, mut ov) = create_overlapped_event(operation)?;
+    let mut written: u32 = 0;
+
+    // SAFETY: `data` stays valid until `GetOverlappedResult` / cancellation drain completes.
+    let ok = unsafe {
+        WriteFile(
+            pipe,
+            data.as_ptr(),
+            max_write,
+            &raw mut written,
+            &raw mut ov,
+        )
+    };
+    if ok != 0 {
+        return Ok(usize::try_from(written).unwrap_or(usize::MAX));
+    }
+    // SAFETY: Reads thread-local error set by `WriteFile`.
+    let code = unsafe { GetLastError() };
+    if code != ERROR_IO_PENDING {
+        return Err(map_overlapped_error(
+            operation,
+            io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX)),
+        ));
+    }
+
+    // SAFETY: `event` stays valid across wait.
+    let wait = unsafe { WaitForSingleObject(event.as_raw(), timeout_ms) };
+    if wait == WAIT_TIMEOUT {
+        cancel_and_drain_overlapped(pipe, &raw const ov);
+        return Err(SysError::io(
+            operation,
+            io::Error::new(io::ErrorKind::TimedOut, "handoff pipe write timed out"),
+        ));
+    }
+    if wait == WAIT_FAILED {
+        cancel_and_drain_overlapped(pipe, &raw const ov);
+        return Err(SysError::io(operation, io::Error::last_os_error()));
+    }
+
+    let mut transferred: u32 = 0;
+    // SAFETY: `data` and `ov` remain pinned until `GetOverlappedResult` completes.
+    let done = unsafe { GetOverlappedResult(pipe, &raw const ov, &raw mut transferred, 1) };
+    drop(event);
+    if done == 0 {
+        return Err(map_overlapped_error(operation, io::Error::last_os_error()));
+    }
+    Ok(usize::try_from(transferred).unwrap_or(usize::MAX))
+}
+
+fn create_overlapped_event(operation: &'static str) -> SysResult<(OwnedWinHandle, OVERLAPPED)> {
+    // SAFETY: Creates an unnamed manual-reset Win32 event for overlapped pipe I/O.
+    let raw = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    let Some(event) = OwnedWinHandle::from_raw(raw) else {
+        return Err(SysError::io(operation, io::Error::last_os_error()));
+    };
+    // SAFETY: `OVERLAPPED` is a POD C struct safely zero-initialized before setting `hEvent`.
+    let mut ov: OVERLAPPED = unsafe { mem::zeroed() };
+    ov.hEvent = event.as_raw();
+    Ok((event, ov))
+}
+
+fn cancel_and_drain_overlapped(pipe: HANDLE, ov: *const OVERLAPPED) {
+    // SAFETY: Cancels the specific in-flight `ov` I/O and waits for kernel to release buffer ptrs.
+    unsafe {
+        let _cancelled = CancelIoEx(pipe, ov);
+        let mut transferred: u32 = 0;
+        let _drained = GetOverlappedResult(pipe, ov, &raw mut transferred, 1);
+    }
+}
+
+fn is_pipe_eof(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code)
+            if code == i32::try_from(ERROR_BROKEN_PIPE).unwrap_or(109)
+                || code == i32::try_from(ERROR_NO_DATA).unwrap_or(232)
+    )
+}
+
+fn map_overlapped_error(operation: &'static str, err: io::Error) -> SysError {
+    if err.raw_os_error() == Some(i32::try_from(ERROR_OPERATION_ABORTED).unwrap_or(995)) {
+        return SysError::io(
+            operation,
+            io::Error::new(io::ErrorKind::Interrupted, "handoff pipe I/O cancelled"),
+        );
+    }
+    map_win_io_error(operation, err)
+}
+
+fn validate_sink_dest_path(dest: &Path, operation: &'static str) -> SysResult<()> {
+    if !dest.is_absolute() || dest.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "bugreport save destination must be absolute without `..`".to_owned(),
+        });
+    }
+    if dest.file_name().is_none() {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "bugreport destination must include a file name".to_owned(),
+        });
+    }
+    let norm = normalize_windows_cmp_path(dest);
+    if is_forbidden_system_dir_path(&norm) {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "refusing to write bugreport into protected system directory".to_owned(),
+        });
+    }
+    if let Some(parent) = dest.parent()
+        && let Ok(canon_parent) = fs::canonicalize(parent)
+        && let Some(fname) = dest.file_name()
+    {
+        let canon_full = normalize_windows_cmp_path(&canon_parent.join(fname));
+        if is_forbidden_system_dir_path(&canon_full) {
+            return Err(SysError::SecurityViolation {
+                operation,
+                detail: "refusing to write bugreport into canonical protected system directory"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_forbidden_system_dir_path(norm_lower: &str) -> bool {
+    let mut blocked: Vec<String> = Vec::new();
+    if let Some(win_dir) = query_windows_dir_path() {
+        blocked.push(normalize_windows_cmp_path(&win_dir));
+    } else {
+        blocked.push(r"c:\windows".to_owned());
+    }
+    for var in [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+    ] {
+        if let Some(val) = std::env::var_os(var)
+            && !val.is_empty()
+        {
+            blocked.push(normalize_windows_cmp_path(&PathBuf::from(val)));
+        }
+    }
+    let prog_data = std::env::var_os("ProgramData")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    blocked.push(normalize_windows_cmp_path(&prog_data.join("Mesh")));
+
+    blocked.into_iter().any(|dir| {
+        !dir.is_empty() && (norm_lower == dir || norm_lower.starts_with(&format!(r"{dir}\")))
+    })
+}
+
+fn verify_non_reparse_directory(dir: &Path, operation: &'static str) -> SysResult<()> {
+    let meta = fs::symlink_metadata(dir).map_err(|err| map_win_io_error(operation, err))?;
+    if meta.file_type().is_symlink()
+        || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !meta.file_type().is_dir()
+    {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "destination parent directory cannot be a symlink or reparse point".to_owned(),
+        });
+    }
+
+    let wide = encode_wide_nul_os(dir.as_os_str(), operation)?;
+    // SAFETY: Opens directory with backup semantics and open-reparse-point for attribute checks.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    let Some(handle) = OwnedWinHandle::from_raw(raw) else {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    };
+    let info = query_handle_file_info(handle.as_raw(), operation)?;
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+    {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "destination parent handle is a reparse point or non-directory".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_dest_regular_or_absent(dest: &Path, operation: &'static str) -> SysResult<()> {
+    let meta = match fs::symlink_metadata(dest) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(map_win_io_error(operation, err)),
+    };
+    if meta.file_type().is_symlink()
+        || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !meta.file_type().is_file()
+    {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "existing destination cannot be a symlink, reparse point, or directory"
+                .to_owned(),
+        });
+    }
+
+    let wide = encode_wide_nul_os(dest.as_os_str(), operation)?;
+    // SAFETY: Opens existing target with `FILE_FLAG_OPEN_REPARSE_POINT` for attribute check.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    let Some(handle) = OwnedWinHandle::from_raw(raw) else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(WIN_ERROR_FILE_NOT_FOUND) {
+            return Ok(());
+        }
+        return Err(map_win_io_error(operation, err));
+    };
+    verify_raw_regular_disk_handle(handle.as_raw(), operation)
+}
+
+fn verify_regular_disk_handle(file: &File, operation: &'static str) -> SysResult<()> {
+    let meta = file
+        .metadata()
+        .map_err(|err| SysError::io(operation, err))?;
+    if !meta.is_file() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "file handle must refer to a regular non-reparse file".to_owned(),
+        });
+    }
+    verify_raw_regular_disk_handle(file.as_raw_handle() as HANDLE, operation)
+}
+
+fn verify_raw_regular_disk_handle(raw_handle: HANDLE, operation: &'static str) -> SysResult<()> {
+    // SAFETY: `raw_handle` is a live kernel file handle owned by caller.
+    let file_type = unsafe { GetFileType(raw_handle) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "target handle is not a regular disk file".to_owned(),
+        });
+    }
+    let info = query_handle_file_info(raw_handle, operation)?;
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return Err(SysError::SecurityViolation {
+            operation,
+            detail: "target handle refers to a reparse point or directory".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn query_handle_file_info(
+    raw_handle: HANDLE,
+    operation: &'static str,
+) -> SysResult<BY_HANDLE_FILE_INFORMATION> {
+    let zero_ft = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION {
+        dwFileAttributes: 0,
+        ftCreationTime: zero_ft,
+        ftLastAccessTime: zero_ft,
+        ftLastWriteTime: zero_ft,
+        dwVolumeSerialNumber: 0,
+        nFileSizeHigh: 0,
+        nFileSizeLow: 0,
+        nNumberOfLinks: 0,
+        nFileIndexHigh: 0,
+        nFileIndexLow: 0,
+    };
+    // SAFETY: `raw_handle` is open and `info` is valid writable stack storage.
+    let ok = unsafe { GetFileInformationByHandle(raw_handle, &raw mut info) };
+    if ok == 0 {
+        return Err(SysError::io(operation, io::Error::last_os_error()));
+    }
+    Ok(info)
+}
+
+fn new_guid_hex_32() -> String {
+    let mut guid = GUID {
+        data1: 0,
+        data2: 0,
+        data3: 0,
+        data4: [0_u8; 8],
+    };
+    // SAFETY: `CoCreateGuid` initializes a stack `GUID` via Windows RPC CSPRNG.
+    let _hr = unsafe { CoCreateGuid(&raw mut guid) };
+    format!(
+        "{:08x}{:04x}{:04x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    )
+}
+
+fn query_service_process_status(
+    svc: SC_HANDLE,
+    operation: &'static str,
+) -> SysResult<SERVICE_STATUS_PROCESS> {
+    // SAFETY: `SERVICE_STATUS_PROCESS` is POD zeroed before `QueryServiceStatusEx`.
+    let mut status: SERVICE_STATUS_PROCESS = unsafe { mem::zeroed() };
+    let mut needed: u32 = 0;
+    let buf_len = u32::try_from(size_of::<SERVICE_STATUS_PROCESS>()).unwrap_or(0);
+    // SAFETY: `svc` is an open `SERVICE_QUERY_STATUS` handle and `status` is writable stack memory.
+    let ok = unsafe {
+        QueryServiceStatusEx(
+            svc,
+            SC_STATUS_PROCESS_INFO,
+            (&raw mut status).cast::<u8>(),
+            buf_len,
+            &raw mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(map_win_io_error(operation, io::Error::last_os_error()));
+    }
+    Ok(status)
+}
+
+const fn map_service_state(state: u32) -> WindowsServiceProbeState {
+    match state {
+        SERVICE_RUNNING => WindowsServiceProbeState::Running,
+        SERVICE_STOPPED => WindowsServiceProbeState::Stopped,
+        SERVICE_START_PENDING | SERVICE_STOP_PENDING | SERVICE_PAUSE_PENDING | SERVICE_PAUSED => {
+            WindowsServiceProbeState::Pending
+        }
+        _ => WindowsServiceProbeState::Pending,
+    }
+}
+
+fn resolve_known_folder_path(folder_id: &GUID) -> Option<PathBuf> {
+    let mut raw_ptr: *mut u16 = ptr::null_mut();
+    // SAFETY: `folder_id` is a valid Win32 `KNOWNFOLDERID`; `raw_ptr` is freed via `CoTaskMemFree`.
+    let hr = unsafe { SHGetKnownFolderPath(folder_id, 0, ptr::null_mut(), &raw mut raw_ptr) };
+    if hr != 0 || raw_ptr.is_null() {
+        return None;
+    }
+    let _guard = CoTaskMemGuard(raw_ptr.cast::<c_void>());
+    let text = read_wide_ptr_nul_lossy(raw_ptr, MAX_WIDE_PATH_CHARS);
+    if text.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(text))
+    }
+}
+
+fn remove_shortcut_if_exists(path: &Path, operation: &'static str) -> SysResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => fs::remove_file(path).map_err(|err| map_win_io_error(operation, err)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(map_win_io_error(operation, err)),
+    }
+}
+
+fn open_clipboard_with_retry(operation: &'static str) -> SysResult<ClipboardGuard> {
+    for attempt in 0..8_u32 {
+        // SAFETY: Opens the system clipboard for the current thread without associating a window.
+        let ok = unsafe { OpenClipboard(ptr::null_mut()) };
+        if ok != 0 {
+            return Ok(ClipboardGuard);
+        }
+        if attempt < 7 {
+            win_sleep_ms(12);
+        }
+    }
+    Err(SysError::io(operation, io::Error::last_os_error()))
+}
+
+fn win_sleep_ms(ms: u32) {
+    // SAFETY: Synchronous non-async backoff wait inside dedicated Win32/SCM/pipe helper.
+    unsafe { Sleep(ms) };
+}
+
+fn read_clipboard_unicode_locked() -> SysResult<Option<String>> {
+    // SAFETY: Caller holds active `ClipboardGuard`.
+    let avail = unsafe { IsClipboardFormatAvailable(u32::from(CF_UNICODETEXT)) };
+    if avail == 0 {
+        return Ok(None);
+    }
+    // SAFETY: `CF_UNICODETEXT` is available while `ClipboardGuard` is held.
+    let hmem = unsafe { GetClipboardData(u32::from(CF_UNICODETEXT)) };
+    if hmem.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: Queries byte size of clipboard global handle.
+    let total_bytes = unsafe { GlobalSize(hmem) };
+    if total_bytes < 2 {
+        return Ok(None);
+    }
+    // SAFETY: Locks `hmem` and releases via `_unlock` guard before returning.
+    let locked = unsafe { GlobalLock(hmem) };
+    if locked.is_null() {
+        return Ok(None);
+    }
+    let _unlock = GlobalLockGuard(hmem);
+    let max_u16 = (total_bytes / 2).min(1_048_576);
+    let wide_ptr = locked.cast::<u16>();
+    let mut len: usize = 0;
+    while len < max_u16 {
+        // SAFETY: `len < max_u16` stays strictly inside `GlobalSize(hmem)` bytes.
+        let ch = unsafe { *wide_ptr.add(len) };
+        if ch == 0 {
+            break;
+        }
+        len += 1;
+    }
+    // SAFETY: `wide_ptr` holds `len` valid UTF-16 units before NUL inside locked global memory.
+    let slice = unsafe { std::slice::from_raw_parts(wide_ptr, len) };
+    Ok(Some(String::from_utf16_lossy(slice)))
+}
+
+fn validate_registry_value_name(name: &str, operation: &'static str) -> SysResult<()> {
+    if name.is_empty() || name.contains(['\0', '\\', '\r', '\n']) {
+        return Err(SysError::io(
+            operation,
+            io::Error::new(io::ErrorKind::InvalidInput, "invalid registry value name"),
+        ));
+    }
+    Ok(())
+}
+
+fn query_windows_dir_path() -> Option<PathBuf> {
+    let mut buf = vec![0_u16; 512];
+    let cap = u32::try_from(buf.len()).ok()?;
+    // SAFETY: `buf` is writable UTF-16 buffer of length `cap`.
+    let needed = unsafe { GetWindowsDirectoryW(buf.as_mut_ptr(), cap) };
+    if needed == 0 || needed > cap {
+        return None;
+    }
+    let used = usize::try_from(needed).ok()?;
+    Some(PathBuf::from(OsString::from_wide(buf.get(..used)?)))
+}
+
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn normalize_windows_cmp_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('/', r"\");
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    stripped.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn contains_shell_metacharacters(text: &str) -> bool {
+    text.bytes().any(|b| {
+        b.is_ascii_control()
+            || matches!(
+                b,
+                b';' | b'|' | b'&' | b'$' | b'(' | b')' | b'\'' | b'"' | b'`' | b'>' | b'<'
+            )
+    })
+}
+
+fn read_wide_ptr_nul_lossy(ptr_wide: *const u16, max_units: usize) -> String {
+    let mut len: usize = 0;
+    while len < max_units {
+        // SAFETY: Scans for NUL terminator within Win32-allocated UTF-16 string buffer.
+        let ch = unsafe { *ptr_wide.add(len) };
+        if ch == 0 {
+            break;
+        }
+        len += 1;
+    }
+    // SAFETY: `ptr_wide` holds `len` UTF-16 code units before NUL.
+    let slice = unsafe { std::slice::from_raw_parts(ptr_wide, len) };
+    String::from_utf16_lossy(slice)
+}
+
+fn encode_wide_nul_str(text: &str, operation: &'static str) -> SysResult<Vec<u16>> {
+    encode_wide_nul_os(OsStr::new(text), operation)
+}
+
+fn encode_wide_nul_os(value: &OsStr, operation: &'static str) -> SysResult<Vec<u16>> {
+    let mut wide: Vec<u16> = value.encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(SysError::io(
+            operation,
+            io::Error::new(io::ErrorKind::InvalidInput, "interior NUL byte in string"),
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+fn map_win_io_error(operation: &'static str, err: io::Error) -> SysError {
+    if err.kind() == io::ErrorKind::PermissionDenied
+        || err.raw_os_error() == Some(WIN_ERROR_ACCESS_DENIED)
+    {
+        return SysError::PermissionDenied { operation };
+    }
+    SysError::io(operation, err)
+}
+
+fn map_win_status(operation: &'static str, code: u32) -> SysError {
+    map_win_io_error(
+        operation,
+        io::Error::from_raw_os_error(i32::try_from(code).unwrap_or(i32::MAX)),
+    )
+}
+
+fn render_badge_bgra(kind: TrayStatusIconKind, size_px: i32) -> Vec<u8> {
+    let (r, g, b) = match kind {
+        TrayStatusIconKind::Connected => (0x10_u8, 0xb9_u8, 0x81_u8),
+        TrayStatusIconKind::ConnectingOrDegraded => (0xf5_u8, 0x9e_u8, 0x0b_u8),
+        TrayStatusIconKind::Stopped => (0x64_u8, 0x74_u8, 0x8b_u8),
+        TrayStatusIconKind::DaemonUnavailable => (0x47_u8, 0x55_u8, 0x69_u8),
+        TrayStatusIconKind::WarningOrError => (0xef_u8, 0x44_u8, 0x44_u8),
+    };
+    let s = usize::try_from(size_px.max(16)).unwrap_or(16);
+    let mut buf = vec![0_u8; s * s * 4];
+    let center = (s as f32) * 0.5;
+    let outer_r = (s as f32) * 0.44;
+    let inner_r = (s as f32) * 0.19;
+    for y in 0..s {
+        for x in 0..s {
+            let dx = (x as f32 + 0.5) - center;
+            let dy = (y as f32 + 0.5) - center;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let idx = (y * s + x) * 4;
+            let (pr, pg, pb, pa) = if dist <= inner_r {
+                (255_u8, 255_u8, 255_u8, 255_u8)
+            } else if dist <= outer_r {
+                (r, g, b, 255_u8)
+            } else if dist <= outer_r + 1.0 {
+                let cov = ((outer_r + 1.0 - dist).clamp(0.0, 1.0) * 255.0) as u8;
+                (r, g, b, cov)
+            } else {
+                (0, 0, 0, 0)
+            };
+            if let Some(dst) = buf.get_mut(idx..idx + 4) {
+                dst.copy_from_slice(&[pb, pg, pr, pa]);
+            }
+        }
+    }
+    buf
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::fs;
     use std::path::Path;
 
-    use crate::error::SysError;
+    use tempfile::tempdir;
 
     use super::{
-        HANDOFF_PIPE_PREFIX, UnprivilegedSinkWriter, WIN_ERROR_CANCELLED, is_uac_cancelled_error,
-        is_valid_handoff_pipe_name,
+        HANDOFF_PIPE_PREFIX, TrayStatusIconKind, UnprivilegedSinkWriter, WIN_ERROR_CANCELLED,
+        create_tray_status_icon, is_uac_cancelled_error, is_valid_handoff_pipe_name,
+        open_anti_toctou_read_locked,
     };
+    use crate::error::SysError;
 
     #[test]
     fn test_gui_windows_validates_handoff_pipe_name_and_error_helpers() {
@@ -663,9 +4207,9 @@ mod tests {
         let short = format!("{HANDOFF_PIPE_PREFIX}0123");
         let cancelled = SysError::io(
             "ShellExecuteExW",
-            io::Error::from_raw_os_error(WIN_ERROR_CANCELLED),
+            std::io::Error::from_raw_os_error(WIN_ERROR_CANCELLED),
         );
-        let other = SysError::io("ShellExecuteExW", io::Error::from_raw_os_error(5));
+        let other = SysError::io("ShellExecuteExW", std::io::Error::from_raw_os_error(5));
 
         // Act & Assert
         assert!(is_valid_handoff_pipe_name(&valid));
@@ -675,5 +4219,64 @@ mod tests {
         assert!(is_uac_cancelled_error(&cancelled));
         assert!(!is_uac_cancelled_error(&other));
         assert!(UnprivilegedSinkWriter::create(Path::new("out.tar"), 0).is_err());
+    }
+
+    #[test]
+    fn test_gui_windows_sink_writer_atomic_replace_and_anti_toctou_lock() {
+        // Arrange
+        let Ok(dir) = tempdir() else {
+            return;
+        };
+        let dest = dir.path().join("report.tar");
+        assert!(fs::write(&dest, b"prior-report-bytes").is_ok());
+
+        // Act 1: mid-stream drop leaves prior dest intact and cleans .part
+        let writer = UnprivilegedSinkWriter::create(&dest, 10);
+        assert!(
+            writer.is_ok(),
+            "UnprivilegedSinkWriter::create failed: {writer:?}"
+        );
+        let Ok(mut writer) = writer else {
+            return;
+        };
+        let part_path = writer.temp_path().to_path_buf();
+        assert!(part_path.exists());
+        assert!(writer.write_chunk(b"12345").is_ok());
+        drop(writer);
+
+        assert!(!part_path.exists());
+        assert_eq!(
+            fs::read(&dest).ok().as_deref(),
+            Some(&b"prior-report-bytes"[..])
+        );
+
+        // Act 2: complete stream atomically replaces dest
+        let Ok(mut writer2) = UnprivilegedSinkWriter::create(&dest, 10) else {
+            return;
+        };
+        assert!(writer2.write_chunk(b"0123456789").is_ok());
+        let finalized = writer2.finalize();
+        assert!(matches!(finalized, Ok(10)));
+        assert_eq!(fs::read(&dest).ok().as_deref(), Some(&b"0123456789"[..]));
+
+        // Act 3: anti-TOCTOU lock blocks concurrent write until dropped
+        let locked = open_anti_toctou_read_locked(&dest);
+        assert!(locked.is_ok());
+        let write_while_locked = fs::OpenOptions::new().write(true).open(&dest);
+        assert!(write_while_locked.is_err());
+        drop(locked);
+        assert!(fs::OpenOptions::new().write(true).open(&dest).is_ok());
+    }
+
+    #[test]
+    fn test_gui_windows_creates_dpi_tray_icons_16_to_256px() {
+        // Arrange & Act
+        for px in [16, 24, 32, 64, 128, 256] {
+            let icon = create_tray_status_icon(TrayStatusIconKind::Connected, px);
+            assert!(
+                icon.is_ok(),
+                "create_tray_status_icon({px}) failed: {icon:?}"
+            );
+        }
     }
 }

@@ -1,0 +1,108 @@
+included:
+  - MeshDesktopCore
+  - MeshVPNApp
+  - MeshVPNAppTests
+
+excluded:
+  - .build
+  - DerivedData
+  - MeshVPNApp.xcodeproj
+  - MeshDesktopCore/.build
+
+disabled_rules:
+  - multiple_closures_with_trailing_closure
+
+opt_in_rules:
+  - empty_count
+  - fatal_error_message
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+  - private_outlet
+  - unneeded_parentheses_in_closure_argument
+
+force_unwrapping:
+  severity: error
+
+force_try:
+  severity: error
+
+force_cast:
+  severity: error
+
+fatal_error_message:
+  severity: error
+
+implicitly_unwrapped_optional:
+  severity: error
+  mode: all_except_iboutlets
+
+line_length:
+  warning: 100
+  error: 100
+  ignores_urls: true
+  ignores_interpolated_strings: false
+
+identifier_name:
+  allowed_symbols:
+    - "_"
+  min_length:
+    warning: 2
+  max_length:
+    warning: 90
+    error: 110
+  excluded:
+    - id
+    - ip
+    - tx
+    - rx
+    - os
+    - ui
+    - fd
+    - ok
+    - to
+
+function_body_length:
+  warning: 80
+  error: 120
+
+function_parameter_count:
+  warning: 6
+  error: 8
+  ignores_default_parameters: true
+
+type_body_length:
+  warning: 350
+  error: 500
+
+file_length:
+  warning: 600
+  error: 900
+
+cyclomatic_complexity:
+  warning: 15
+  error: 25
+  ignores_case_statements: true
+
+nesting:
+  type_level:
+    warning: 2
+  function_level:
+    warning: 3
+  check_nesting_in_closures_and_statements: false
+
+custom_rules:
+  no_fatal_error:
+    name: "No fatalError"
+    regex: '\bfatalError\s*\('
+    message: "fatalError is forbidden in Mesh macOS targets."
+    severity: error
+  no_print_statements:
+    name: "No print statements"
+    regex: '^\s*(print|debugPrint)\s*\('
+    message: "Use SafeOsLogger (os.Logger) instead of print/debugPrint."
+    severity: error
+  no_uikit_import:
+    name: "No UIKit"
+    regex: '^\s*import\s+UIKit\b'
+    message: "UIKit is forbidden in desktop/macos targets."
+    severity: error
