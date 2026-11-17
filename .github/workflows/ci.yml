@@ -208,47 +208,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.94.1 toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.94.1"
-          components: rustfmt, clippy
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
-
-      - name: Cache Cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Cache cargo-deny 0.20.2
-        id: cache-deny
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-deny
-          key: cargo-deny-0.20.2-macos-${{ runner.arch }}
-
-      - name: Install cargo-deny 0.20.2 if not cached
-        if: steps.cache-deny.outputs.cache-hit != 'true'
-        run: |
-          cargo install --locked cargo-deny --version 0.20.2
-
-      - name: Run scripts/check.sh
-        run: sh scripts/check.sh
-
-      - name: Validate macOS verification script syntax and dry-run checks
-        run: |
-          bash -n lab/macos/verify-macos-host.sh
-          bash lab/macos/verify-macos-host.sh --ci-dry-run
-
-      - name: Run SLO verification suite (US-058)
-        run: bash scripts/run-slo-suite.sh --skip-static-checks --output-dir target/slo-macos
-
-      - name: Upload macOS SLO verification report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: slo-report-macos
-          path: target/slo-macos/*
-          if-no-files-found: ignore
-
       - name: Ensure Xcode 16 (Swift 6.0) toolchain is active
         run: |
           set -euo pipefail
@@ -326,6 +285,47 @@ jobs:
           sh scripts/package-macos-app.sh --dry-run
           sh scripts/install-macos.sh --dry-run
           sh scripts/install-macos.sh --uninstall --dry-run
+
+      - name: Install Rust 1.94.1 toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          components: rustfmt, clippy
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache cargo-deny 0.20.2
+        id: cache-deny
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-0.20.2-macos-${{ runner.arch }}
+
+      - name: Install cargo-deny 0.20.2 if not cached
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Run scripts/check.sh
+        run: sh scripts/check.sh
+
+      - name: Validate macOS verification script syntax and dry-run checks
+        run: |
+          bash -n lab/macos/verify-macos-host.sh
+          bash lab/macos/verify-macos-host.sh --ci-dry-run
+
+      - name: Run SLO verification suite (US-058)
+        run: bash scripts/run-slo-suite.sh --skip-static-checks --output-dir target/slo-macos
+
+      - name: Upload macOS SLO verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slo-report-macos
+          path: target/slo-macos/*
+          if-no-files-found: ignore
 
       - name: Build, codesign & package Darwin release binaries (aarch64 + x86_64)
         run: |
@@ -421,7 +421,20 @@ jobs:
 
       - name: Run scripts/check.ps1
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File scripts/check.ps1
+        run: |
+          $logFile = Join-Path $env:RUNNER_TEMP 'check-ps1.log'
+          & powershell -ExecutionPolicy Bypass -File scripts/check.ps1 *>&1 | Tee-Object -FilePath $logFile
+          if ($LASTEXITCODE -ne 0) {
+            @'
+          import os, pathlib, re
+          p = pathlib.Path(os.environ["RUNNER_TEMP"]) / "check-ps1.log"
+          lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"(?:FAILED|error(?:\[|:)|panicked at|Write-Error)", ln)]
+          snippet = "\n".join((matches[-15:] + ["--- tail ---"] + lines[-25:])[-40:])
+          print("::error title=scripts/check.ps1::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          '@ | python -
+            exit 1
+          }
 
       - name: Run Windows Desktop GUI unit tests (gui_unit_tests)
         shell: pwsh

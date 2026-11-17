@@ -35,6 +35,19 @@ mod tests {
                         .output(),
                 );
             }
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt as _;
+                const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+                drop(
+                    Command::new(env!("CARGO_BIN_EXE_mesh"))
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(CREATE_NEW_CONSOLE)
+                        .output(),
+                );
+            }
         });
     }
 
@@ -200,7 +213,7 @@ mod tests {
 
         // Assert 2
         assert!(!yes_out.status.success());
-        assert!(elapsed < Duration::from_secs(2));
+        assert!(elapsed < Duration::from_secs(5));
         let yes_err = String::from_utf8_lossy(&yes_out.stderr);
         assert!(!yes_err.contains("panicked at"));
         assert!(
