@@ -22,7 +22,7 @@ mod onboarding;
 mod peers_view;
 
 use std::net::Ipv4Addr;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1278,9 +1278,14 @@ async fn test_e2e_desktop_ipc_lifecycle_50_peers_sink_replace_reset_and_legacy()
         );
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
-        let log_dir = crate::app::gui_log_directory(Some(Path::new(r"C:\LocalAppData")));
+        let base = if cfg!(windows) {
+            Path::new(r"C:\LocalAppData")
+        } else {
+            Path::new("/home/alice/.local/share")
+        };
+        let log_dir = crate::app::gui_log_directory(Some(base));
         assert!(log_dir.is_some_and(|p| {
             p.ends_with(
                 Path::new(crate::app::GUI_APP_DATA_DIR_NAME).join(crate::app::GUI_LOG_SUBDIR),

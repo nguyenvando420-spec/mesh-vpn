@@ -1056,10 +1056,14 @@ fn test_ui_state_machine_and_no_secrets_in_outputs_comprehensive() {
         AgentVersionIndicator::Unknown
     );
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
-        let log_dir =
-            crate::app::gui_log_directory(Some(Path::new(r"C:\Users\Test\AppData\Local")));
+        let base = if cfg!(windows) {
+            Path::new(r"C:\Users\Test\AppData\Local")
+        } else {
+            Path::new("/home/alice/.local/share")
+        };
+        let log_dir = crate::app::gui_log_directory(Some(base));
         assert!(log_dir.is_some_and(|d| {
             d.ends_with(
                 Path::new(crate::app::GUI_APP_DATA_DIR_NAME).join(crate::app::GUI_LOG_SUBDIR),
