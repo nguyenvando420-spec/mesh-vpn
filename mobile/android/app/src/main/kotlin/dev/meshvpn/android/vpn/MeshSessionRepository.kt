@@ -543,7 +543,19 @@ class MeshSessionRepository(
             var temporaryEngine: MobileEngineHandle? = null
             try {
                 val engine =
-                    activeEngine ?: createTemporaryOfflineEngine().also { temporaryEngine = it }
+                    activeEngine
+                        ?: ffiGateway
+                            .createEngine(
+                                MeshSessionStateHelper.buildInitConfig(
+                                    stateStore,
+                                    defaultNodeNameProvider,
+                                ),
+                                createBridge(
+                                    socketProtector = { true },
+                                    tunEstablisher = null,
+                                    routeScope = null,
+                                ),
+                            ).also { temporaryEngine = it }
                 Result.success(block(engine))
             } catch (err: Throwable) {
                 handleFfiFailure(err)
@@ -561,19 +573,6 @@ class MeshSessionRepository(
                 _uiState.update { it.copy(isBusy = false) }
             }
         }
-
-    private fun createTemporaryOfflineEngine(): MobileEngineHandle {
-        val bridge =
-            createBridge(
-                socketProtector = { true },
-                tunEstablisher = null,
-                routeScope = null,
-            )
-        return ffiGateway.createEngine(
-            MeshSessionStateHelper.buildInitConfig(stateStore, defaultNodeNameProvider),
-            bridge,
-        )
-    }
 
     private fun createBridge(
         socketProtector: (Int) -> Boolean,
