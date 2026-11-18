@@ -123,6 +123,11 @@ case "${ARCH}" in
     ;;
 esac
 
+if [ "${ARCH}" = "universal" ]; then
+  MAX_APP_BYTES=$((30 * 1024 * 1024))
+  MAX_DMG_BYTES=$((30 * 1024 * 1024))
+fi
+
 if [ -z "${DMG_NAME}" ]; then
   DMG_NAME="MeshVPN-macos-${ARCH}.dmg"
 fi
@@ -221,7 +226,7 @@ sign_macho() {
 check_otool_deps() {
   local bin_path="$1"
   local bad_deps
-  bad_deps="$(/usr/bin/otool -L "${bin_path}" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/|@rpath/|@executable_path/|@loader_path/)' || true)"
+  bad_deps="$(/usr/bin/otool -L "${bin_path}" | awk '!/:$/ && NF > 0 {print $1}' | grep -Ev '^(/usr/lib/|/System/Library/|@rpath/|@executable_path/|@loader_path/)' || true)"
   if [ -n "${bad_deps}" ]; then
     echo "error: non-system dynamic library dependency detected in ${bin_path}:" >&2
     echo "${bad_deps}" >&2
@@ -434,12 +439,25 @@ if [ "${SKIP_DMG}" -eq 0 ]; then
   /usr/bin/ditto "${STAGED_APP}" "${DMG_STAGE}/Mesh VPN.app"
   ln -s /Applications "${DMG_STAGE}/Applications"
   rm -f "${DMG_PATH}"
-  /usr/bin/hdiutil create \
-    -volname "Mesh VPN" \
-    -srcfolder "${DMG_STAGE}" \
-    -ov \
-    -format UDZO \
-    "${DMG_PATH}" >/dev/null
+  dmg_created=0
+  for attempt in 1 2 3; do
+    if /usr/bin/hdiutil create \
+      -volname "Mesh VPN" \
+      -srcfolder "${DMG_STAGE}" \
+      -ov \
+      -format UDZO \
+      "${DMG_PATH}" >/dev/null; then
+      dmg_created=1
+      break
+    fi
+    if [ "${attempt}" -lt 3 ]; then
+      sleep 2
+    fi
+  done
+  if [ "${dmg_created}" -ne 1 ]; then
+    echo "error: hdiutil create failed after 3 attempts for ${DMG_PATH}" >&2
+    exit 1
+  fi
   /usr/bin/xattr -cr "${DMG_PATH}" >/dev/null 2>&1 || true
   assert_no_quarantine "${DMG_PATH}"
 
