@@ -26,7 +26,7 @@ use mesh_core::{AppError, AppResult, ErrorKind, NodeName, SpkiPin};
 use mesh_crypto::{ct_eq_bytes, random_bytes};
 use mesh_net::gui_handoff::{
     HANDOFF_UAC_WAIT_TIMEOUT, HANDOFF_WORKER_HELLO_TIMEOUT, HandoffFrame, HandoffRequest,
-    HandoffResponse, MGH1_PROTOCOL_VERSION, encode_mgh1_frame, handoff_request_to_agent_rotate_key,
+    HandoffResponse, MGH1_PROTOCOL_VERSION, handoff_request_to_agent_rotate_key,
     handoff_request_to_agent_up, parse_handoff_request_payload, read_mgh1_frame,
     serialize_handoff_request_zeroizing, write_mgh1_frame,
 };
@@ -368,15 +368,13 @@ async fn run_linux_gui_server(start_minimized: bool) -> Result<(), String> {
     }
 
     let router = build_gui_router(Arc::clone(&state));
-    let signal_cancel = shutdown.clone();
-    drop(tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancel.cancel();
-        }
-    }));
-
     let server_res = axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        })
         .await
         .map_err(|err| format!("GUI HTTP server failed: {err}"));
 
@@ -494,7 +492,6 @@ fn require_auth(state: &LinuxGuiState, headers: &HeaderMap) -> Option<Response> 
 #[derive(Debug, Deserialize)]
 struct StateQuery {
     q: Option<String>,
-    selected: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -573,7 +570,6 @@ async fn handle_api_state(
     });
 
     let filter_q = query.q.as_deref().unwrap_or("");
-    let selected_id = query.selected.as_deref().unwrap_or("");
     let peers = status.as_ref().map_or_else(Vec::new, |st| {
         filter_peers(&st.peers, filter_q)
             .into_iter()
@@ -590,10 +586,6 @@ async fn handle_api_state(
             })
             .collect()
     });
-    let _selected_present = !selected_id.is_empty()
-        && peers
-            .iter()
-            .any(|p| p.node_id == selected_id || p.name == selected_id);
     let self_network_text = status.as_ref().map_or_else(
         || "meshd daemon is offline or unreachable.".to_owned(),
         format_self_network_panel,
@@ -1191,7 +1183,7 @@ async fn probe_systemd_service_status() -> ServiceProbeKind {
 async fn query_ro_agent_status() -> AppResult<(AgentStatusResponse, AgentVersionStatus)> {
     let ro_path = probe_ro_socket_path();
     let stream = connect_agent_unix_socket(ro_path, false).await?;
-    let status_resp = send_ipc_json_with_meta::<(), AgentStatusResponse>(
+    let status_resp = send_ipc_json_with_meta::<_, (), AgentStatusResponse>(
         stream,
         Method::GET,
         "/v1/agent/status",
@@ -1205,7 +1197,7 @@ async fn query_ro_agent_status() -> AppResult<(AgentStatusResponse, AgentVersion
         Err(AppError::not_found("unused"))
     } else {
         let s2 = connect_agent_unix_socket(ro_path, false).await?;
-        send_ipc_json_request_with_timeout::<(), _, AgentVersionResponse>(
+        send_ipc_json_request_with_timeout::<_, (), AgentVersionResponse>(
             s2,
             Method::GET,
             "/v1/agent/version",
@@ -1247,7 +1239,7 @@ async fn fetch_bugreport_tar_bytes() -> AppResult<Vec<u8>> {
     match connect_agent_unix_socket(admin_sock, true).await {
         Ok(stream) => {
             let mut archive = Vec::new();
-            let _meta = stream_ipc_bugreport(
+            let meta = stream_ipc_bugreport(
                 stream,
                 IPC_ADMIN_MUTATION_TIMEOUT,
                 IPC_STREAM_CHUNK_IDLE_TIMEOUT,
@@ -1262,6 +1254,8 @@ async fn fetch_bugreport_tar_bytes() -> AppResult<Vec<u8>> {
                 },
             )
             .await?;
+            validate_bugreport_archive_size(meta.total_bytes)
+                .map_err(AppError::invalid_argument)?;
             validate_bugreport_archive_size(u64::try_from(archive.len()).unwrap_or(u64::MAX))
                 .map_err(AppError::invalid_argument)?;
             Ok(archive)
@@ -1460,7 +1454,6 @@ async fn run_linux_elevated_worker(socket_path: &str) -> Result<(), String> {
     let hello = HandoffFrame::WorkerHello {
         protocol_version: MGH1_PROTOCOL_VERSION,
     };
-    let _encoded_check = encode_mgh1_frame(&hello).map_err(|e| e.to_string())?;
     write_mgh1_frame(&mut stream, &hello)
         .await
         .map_err(|e| e.to_string())?;

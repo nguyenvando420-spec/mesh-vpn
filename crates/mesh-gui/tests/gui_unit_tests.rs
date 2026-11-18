@@ -838,7 +838,7 @@ fn test_linux_log_dir_and_desktop_state_rendering() {
         dir.as_deref(),
         Some(Path::new("/home/alice/.local/share/MeshVPN/logs"))
     );
-    let st = sample_status(DaemonState::Connected, Some("198.51.100.10:8443"), None);
+    let st = sample_status(DaemonState::Connected, true, None);
     let derived = derive_desktop_ui_state(StateProbeInputs {
         gui_version: "0.3.0",
         service_probe: ServiceProbeKind::Running,
