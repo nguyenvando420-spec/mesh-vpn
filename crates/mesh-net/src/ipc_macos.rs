@@ -123,7 +123,7 @@ pub fn bind_macos_server_admin_socket(socket_path: &Path) -> AppResult<UnixListe
             ))
         })?;
     }
-    remove_owned_stale_non_symlink_socket(unpriv_path, euid)?;
+    remove_owned_stale_non_symlink_socket(unpriv_path, Some(euid))?;
     let listener = UnixListener::bind(unpriv_path).map_err(|err| {
         AppError::internal(format!(
             "failed binding macOS server admin socket {}: {err}",
@@ -202,7 +202,10 @@ pub fn verify_macos_socket_peer(
     res
 }
 
-fn remove_owned_stale_non_symlink_socket(socket_path: &Path, expected_uid: u32) -> AppResult<()> {
+fn remove_owned_stale_non_symlink_socket(
+    socket_path: &Path,
+    expected_uid: Option<u32>,
+) -> AppResult<()> {
     match fs::symlink_metadata(socket_path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -211,7 +214,9 @@ fn remove_owned_stale_non_symlink_socket(socket_path: &Path, expected_uid: u32) 
                     socket_path.display()
                 )));
             }
-            if meta.uid() != expected_uid {
+            if let Some(uid) = expected_uid
+                && meta.uid() != uid
+            {
                 return Err(AppError::permission_denied(format!(
                     "refusing to remove macOS IPC socket {} owned by uid {}",
                     socket_path.display(),
@@ -234,27 +239,7 @@ fn remove_owned_stale_non_symlink_socket(socket_path: &Path, expected_uid: u32) 
 }
 
 fn remove_stale_non_symlink_socket(socket_path: &Path) -> AppResult<()> {
-    match fs::symlink_metadata(socket_path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                return Err(AppError::permission_denied(format!(
-                    "refusing to replace symlink at macOS IPC path {}",
-                    socket_path.display()
-                )));
-            }
-            fs::remove_file(socket_path).map_err(|err| {
-                AppError::internal(format!(
-                    "failed removing stale socket {}: {err}",
-                    socket_path.display()
-                ))
-            })
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(AppError::internal(format!(
-            "failed inspecting socket {}: {err}",
-            socket_path.display()
-        ))),
-    }
+    remove_owned_stale_non_symlink_socket(socket_path, None)
 }
 
 #[cfg(test)]

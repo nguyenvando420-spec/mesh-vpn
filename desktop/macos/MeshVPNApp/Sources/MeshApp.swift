@@ -6,15 +6,16 @@ import SwiftUI
 @MainActor
 final class MeshAppDelegate: NSObject, NSApplicationDelegate {
     weak var store: DesktopStore?
-    var openDashboard: (@MainActor () -> Void)?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
         NSApp.setActivationPolicy(.regular)
-        var foundDashboard = false
         for window in NSApp.windows where !(window is NSPanel) {
             let windowId = window.identifier?.rawValue ?? ""
             let isDashboard = windowId == "dashboard"
@@ -22,11 +23,7 @@ final class MeshAppDelegate: NSObject, NSApplicationDelegate {
                 || window.title == "Mesh VPN"
             if isDashboard {
                 window.makeKeyAndOrderFront(nil)
-                foundDashboard = true
             }
-        }
-        if !foundDashboard {
-            openDashboard?()
         }
         NSApp.activate(ignoringOtherApps: true)
         store?.setDashboardOpen(true)
@@ -112,7 +109,16 @@ struct MeshApp: App {
 
     var body: some Scene {
         Window("Mesh VPN", id: "dashboard") {
-            DashboardSceneContent(store: store, appDelegate: appDelegate)
+            DashboardWindowView(store: store)
+                .frame(minWidth: 760, minHeight: 540)
+                .onAppear {
+                    appDelegate.store = store
+                    if !CommandLine.arguments.contains("--minimized") {
+                        NSApp.setActivationPolicy(.regular)
+                        NSApp.activate(ignoringOtherApps: true)
+                        store.setDashboardOpen(true)
+                    }
+                }
         }
         .defaultSize(width: 860, height: 620)
         .commands {
@@ -130,29 +136,6 @@ struct MeshApp: App {
                 appDelegate.store = store
             }
         }
-    }
-}
-
-/// Hosts the dashboard window and registers SwiftUI openWindow callback with `MeshAppDelegate`.
-private struct DashboardSceneContent: View {
-    @ObservedObject var store: DesktopStore
-    let appDelegate: MeshAppDelegate
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        DashboardWindowView(store: store)
-            .frame(minWidth: 760, minHeight: 540)
-            .onAppear {
-                appDelegate.store = store
-                appDelegate.openDashboard = { [openWindow] in
-                    openWindow(id: "dashboard")
-                }
-                if !CommandLine.arguments.contains("--minimized") {
-                    NSApp.setActivationPolicy(.regular)
-                    NSApp.activate(ignoringOtherApps: true)
-                    store.setDashboardOpen(true)
-                }
-            }
     }
 }
 
