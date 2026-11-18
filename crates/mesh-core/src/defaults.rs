@@ -100,6 +100,12 @@ pub const LINUX_RUN_SERVER_DIR: &str = "/run/mesh-server";
 /// Linux server Admin Unix domain socket path (`0660 mesh:mesh-admin`).
 pub const LINUX_SERVER_ADMIN_SOCKET: &str = "/run/mesh-server/admin.sock";
 
+/// macOS server Admin Unix domain socket path when started as root (`0660 root:admin`).
+pub const MACOS_SERVER_ADMIN_SOCKET: &str = "/var/run/mesh-server/admin.sock";
+
+/// macOS server Admin Unix domain socket fallback path when started unprivileged (`0600`).
+pub const MACOS_SERVER_ADMIN_FALLBACK_SOCKET: &str = "/tmp/mesh-server-admin.sock";
+
 /// Windows server Admin Named Pipe path (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<owner_sid>)`).
 pub const WINDOWS_SERVER_ADMIN_PIPE: &str = r"\\.\pipe\mesh-server-admin";
 

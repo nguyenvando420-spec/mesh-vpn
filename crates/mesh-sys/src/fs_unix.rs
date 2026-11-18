@@ -95,6 +95,13 @@ pub fn verify_secure_file(path: &Path, policy: SecureDirPolicy) -> SysResult<()>
     verify_leaf_metadata(path, &meta, policy, false, "verify_secure_file")
 }
 
+/// Returns the current process's effective user ID via `libc::geteuid`.
+#[must_use]
+pub fn current_euid() -> u32 {
+    // SAFETY: `libc::geteuid()` has no preconditions and always returns the process EUID.
+    unsafe { libc::geteuid() }
+}
+
 /// Updates group ownership of `path` (without following symlinks) via `lchown` when its
 /// current group differs from `gid`.
 ///

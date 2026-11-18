@@ -137,9 +137,57 @@ where
     serve_ipc_http_connection(stream, router).await
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_unix_admin_accept_loop<F>(
+    listener: tokio::net::UnixListener,
+    state: AdminAppState,
+    tracker: &TaskTracker,
+    shutdown: CancellationToken,
+    verify_peer: F,
+) where
+    F: Fn(&tokio::net::UnixStream, &AdminAppState) -> AppResult<mesh_net::CallerPrivilege>
+        + Send
+        + Sync
+        + 'static,
+{
+    let loop_tracker = tracker.clone();
+    tracker.spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                accept_res = listener.accept() => {
+                    if let Ok((stream, _)) = accept_res {
+                        let st = state.clone();
+                        if let Ok(mesh_net::CallerPrivilege::Admin { principal }) =
+                            verify_peer(&stream, &st)
+                        {
+                            let cancel = shutdown.clone();
+                            loop_tracker.spawn(async move {
+                                let res = tokio::select! {
+                                    () = cancel.cancelled() => Ok(()),
+                                    res = serve_admin_ipc_stream(stream, st, CallerPrincipal(principal)) => res,
+                                };
+                                if let Err(err) = res {
+                                    tracing::debug!(
+                                        component = "admin_service",
+                                        event = "admin_ipc_stream_ended",
+                                        error = %err,
+                                        "admin IPC stream ended with error"
+                                    );
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Binds and serves the local Admin API strictly over Unix Domain Socket on Linux (`SEC-14`).
 ///
-/// On non-Linux development hosts this starts cleanly without opening any network or TCP socket.
+/// On non-Linux/macOS/Windows hosts this starts cleanly without opening any network or TCP socket.
 #[cfg(target_os = "linux")]
 pub async fn start_admin_ipc_listener(
     state: AdminAppState,
@@ -166,44 +214,41 @@ pub async fn start_admin_ipc_listener(
         admin_gid,
     )?;
 
-    let loop_tracker = tracker.clone();
-    tracker.spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                accept_res = listener.accept() => {
-                    if let Ok((stream, _)) = accept_res {
-                        let st = state.clone();
-                        match verify_unix_socket_peer(
-                            &stream,
-                            IpcChannelKind::ServerAdmin,
-                            Some(&st.config.admin_group_name),
-                        ) {
-                            Ok(mesh_net::CallerPrivilege::Admin { principal }) => {
-                                let cancel = shutdown.clone();
-                                loop_tracker.spawn(async move {
-                                    let res = tokio::select! {
-                                        () = cancel.cancelled() => Ok(()),
-                                        res = serve_admin_ipc_stream(stream, st, CallerPrincipal(principal)) => res,
-                                    };
-                                    if let Err(err) = res {
-                                        tracing::debug!(
-                                            component = "admin_service",
-                                            event = "admin_ipc_stream_ended",
-                                            error = %err,
-                                            "admin IPC stream ended with error"
-                                        );
-                                    }
-                                });
-                            }
-                            Ok(mesh_net::CallerPrivilege::ReadOnly { .. }) | Err(_) => {}
-                        }
-                    }
-                }
-            }
-        }
+    spawn_unix_admin_accept_loop(listener, state, tracker, shutdown, |stream, st| {
+        verify_unix_socket_peer(
+            stream,
+            IpcChannelKind::ServerAdmin,
+            Some(&st.config.admin_group_name),
+        )
     });
+    Ok(())
+}
+
+/// Binds and serves the local Admin API strictly over Unix Domain Socket on macOS (`SEC-14`).
+#[cfg(target_os = "macos")]
+pub async fn start_admin_ipc_listener(
+    state: AdminAppState,
+    tracker: &TaskTracker,
+    shutdown: CancellationToken,
+) -> AppResult<()> {
+    use mesh_net::ipc::IpcChannelKind;
+    use mesh_net::ipc_macos::{bind_macos_server_admin_socket, verify_macos_socket_peer};
+
+    let listener = bind_macos_server_admin_socket(&state.config.admin_socket_path)?;
+    let bound_path = listener
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_pathname().map(|path| path.display().to_string()));
+
+    spawn_unix_admin_accept_loop(listener, state, tracker, shutdown, |stream, _st| {
+        verify_macos_socket_peer(stream, IpcChannelKind::ServerAdmin)
+    });
+    tracing::info!(
+        component = "admin_service",
+        event = "admin_macos_uds_started",
+        admin_socket = bound_path.as_deref().unwrap_or("unknown"),
+        "started local macOS UDS server Admin IPC listener"
+    );
     Ok(())
 }
 
@@ -265,8 +310,8 @@ pub async fn start_admin_ipc_listener(
     Ok(())
 }
 
-/// Non-Linux/non-Windows hosts never bind a TCP fallback for the Admin socket (`SEC-14`).
-#[cfg(not(any(target_os = "linux", windows)))]
+/// Other hosts never bind a TCP fallback for the Admin socket (`SEC-14`).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub async fn start_admin_ipc_listener(
     _state: AdminAppState,
     _tracker: &TaskTracker,
@@ -275,7 +320,7 @@ pub async fn start_admin_ipc_listener(
     tracing::info!(
         component = "admin_service",
         event = "admin_uds_skipped_non_linux",
-        "server Admin IPC is only bound on Linux and Windows hosts"
+        "server Admin IPC is only bound on Linux, macOS, and Windows hosts"
     );
     Ok(())
 }

@@ -95,21 +95,39 @@ verify_root_owned_ancestors() {
   fi
   check_path="${target_dir}"
   while [ -n "${check_path}" ]; do
-    if [ -e "${check_path}" ]; then
-      if [ -L "${check_path}" ]; then
-        echo "error: untrusted symlink in root install path '${check_path}'." >&2
+    if [ -L "${check_path}" ]; then
+      link_uid="$(/usr/bin/stat -f '%u' "${check_path}")"
+      if [ "${link_uid}" -ne 0 ]; then
+        echo "error: untrusted symlink in root install path '${check_path}' (uid=${link_uid})." >&2
         exit 1
       fi
+      check_path="$(/bin/realpath "${check_path}")"
+      continue
+    fi
+    if [ -e "${check_path}" ]; then
       owner_uid="$(/usr/bin/stat -f '%u' "${check_path}")"
+      owner_gid="$(/usr/bin/stat -f '%g' "${check_path}")"
       perm_mode="$(/usr/bin/stat -f '%OLp' "${check_path}")"
       if [ "${owner_uid}" -ne 0 ]; then
         echo "error: directory '${check_path}' is not owned by root (uid=${owner_uid})." >&2
         exit 1
       fi
-      group_world_write=$((8#${perm_mode} & 022))
-      if [ "${group_world_write}" -ne 0 ]; then
-        echo "error: directory '${check_path}' is group/world writable (mode=${perm_mode})." >&2
-        exit 1
+      is_macos_var_run=0
+      if { [ "${check_path}" = "/var/run" ] || [ "${check_path}" = "/private/var/run" ]; } && [ "${owner_gid}" -eq 1 ]; then
+        is_macos_var_run=1
+      fi
+      if [ "${is_macos_var_run}" -eq 1 ]; then
+        world_write=$((0${perm_mode} & 002))
+        if [ "${world_write}" -ne 0 ]; then
+          echo "error: directory '${check_path}' is world writable (mode=${perm_mode})." >&2
+          exit 1
+        fi
+      else
+        group_world_write=$((0${perm_mode} & 022))
+        if [ "${group_world_write}" -ne 0 ]; then
+          echo "error: directory '${check_path}' is group/world writable (mode=${perm_mode})." >&2
+          exit 1
+        fi
       fi
     fi
     if [ "${check_path}" = "/" ]; then
@@ -135,7 +153,7 @@ verify_installed_file_security() {
     echo "error: artifact '${target_path}' not owned by root (uid=${owner_uid})." >&2
     exit 1
   fi
-  group_world_write=$((8#${perm_mode} & 022))
+  group_world_write=$((0${perm_mode} & 022))
   if [ "${group_world_write}" -ne 0 ]; then
     echo "error: artifact '${target_path}' has group/world write bits (mode=${perm_mode})." >&2
     exit 1
@@ -296,6 +314,10 @@ do_install() {
   require_root
   check_macos_platform
 
+  if [ "${FROM_DIR}" = "." ] && [ ! -f "${FROM_DIR}/meshd" ] && [ -f "${REPO_ROOT}/meshd" ]; then
+    FROM_DIR="${REPO_ROOT}"
+  fi
+
   meshd_src="${FROM_DIR}/meshd"
   mesh_src="${FROM_DIR}/mesh"
   if [ -z "${PLIST_SRC}" ]; then
@@ -356,6 +378,16 @@ do_install() {
   run_cmd /usr/bin/install -d -o root -g wheel -m 0700 "${STATE_DIR}"
   run_cmd /usr/bin/install -d -o root -g wheel -m 0755 "${RUN_DIR}"
   run_cmd /usr/bin/install -d -o root -g wheel -m 0750 "${LOG_DIR}"
+
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    # Unload running daemon and unlink prior Mach-O binaries before install to avoid
+    # Apple Silicon vnode code-signing invalidation (SIGKILL CODESIGNING).
+    /bin/launchctl bootout "system/${LAUNCHD_LABEL}" >/dev/null 2>&1 || true
+    /bin/rm -f "${DAEMON_BIN}" "${CLI_BIN}"
+  else
+    echo "[dry-run] /bin/launchctl bootout system/${LAUNCHD_LABEL}"
+    echo "[dry-run] /bin/rm -f ${DAEMON_BIN} ${CLI_BIN}"
+  fi
 
   run_cmd /usr/bin/install -o root -g wheel -m 0755 "${meshd_src}" "${DAEMON_BIN}"
   run_cmd /usr/bin/install -o root -g wheel -m 0755 "${mesh_src}" "${CLI_BIN}"

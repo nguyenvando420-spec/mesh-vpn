@@ -14,6 +14,8 @@ use mesh_core::defaults::LINUX_SERVER_ADMIN_SOCKET;
 use mesh_core::defaults::MAX_HTTP_BODY_BYTES;
 #[cfg(windows)]
 use mesh_core::defaults::WINDOWS_SERVER_ADMIN_PIPE;
+#[cfg(target_os = "macos")]
+use mesh_core::defaults::{MACOS_SERVER_ADMIN_FALLBACK_SOCKET, MACOS_SERVER_ADMIN_SOCKET};
 use mesh_core::{AppError, AppResult, MobileJoinTlsAuth, NodeName, Port, SpkiPin, format_join_uri};
 use mesh_crypto::Secret;
 #[cfg(unix)]
@@ -791,6 +793,37 @@ where
     .await
 }
 
+#[cfg(unix)]
+async fn connect_unix_admin_socket(socket_path: &str) -> AppResult<tokio::net::UnixStream> {
+    let group_hint = if cfg!(target_os = "macos") {
+        "admin"
+    } else {
+        "mesh-admin"
+    };
+    match tokio::time::timeout(
+        IPC_CONNECT_TIMEOUT,
+        tokio::net::UnixStream::connect(socket_path),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(err)) => {
+            let mapped = match err.kind() {
+                std::io::ErrorKind::PermissionDenied => AppError::permission_denied(format!(
+                    "permission denied accessing {socket_path}: caller must belong to {group_hint} group"
+                )),
+                _ => AppError::unavailable(format!(
+                    "mesh-server admin socket {socket_path} is unreachable: {err}"
+                )),
+            };
+            Err(mapped)
+        }
+        Err(_) => Err(AppError::unavailable(format!(
+            "timed out connecting to mesh-server admin socket {socket_path}"
+        ))),
+    }
+}
+
 async fn send_server_admin<Req, Resp>(
     cfg: &AdminDispatchConfig,
     method: hyper::Method,
@@ -803,33 +836,33 @@ where
 {
     #[cfg(unix)]
     {
-        let socket_path = cfg
-            .server_admin_socket_override
-            .as_deref()
-            .unwrap_or(LINUX_SERVER_ADMIN_SOCKET);
-        let stream = match tokio::time::timeout(
-            IPC_CONNECT_TIMEOUT,
-            tokio::net::UnixStream::connect(socket_path),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(err)) => {
-                let mapped = match err.kind() {
-                    std::io::ErrorKind::PermissionDenied => AppError::permission_denied(format!(
-                        "permission denied accessing {socket_path}: caller must belong to mesh-admin group"
-                    )),
-                    _ => AppError::unavailable(format!(
-                        "mesh-server admin socket {socket_path} is unreachable: {err}"
-                    )),
-                };
-                return Err(mapped);
-            }
-            Err(_) => {
-                return Err(AppError::unavailable(format!(
-                    "timed out connecting to mesh-server admin socket {socket_path}"
-                )));
-            }
+        #[cfg(target_os = "macos")]
+        let stream = match cfg.server_admin_socket_override.as_deref() {
+            Some(custom) => connect_unix_admin_socket(custom).await?,
+            None => match connect_unix_admin_socket(MACOS_SERVER_ADMIN_SOCKET).await {
+                Ok(stream) => stream,
+                Err(primary_err) => {
+                    match connect_unix_admin_socket(MACOS_SERVER_ADMIN_FALLBACK_SOCKET).await {
+                        Ok(stream) => stream,
+                        Err(fallback_err) => {
+                            if primary_err.kind() == mesh_core::ErrorKind::PermissionDenied {
+                                return Err(primary_err);
+                            }
+                            return Err(AppError::unavailable(format!(
+                                "mesh-server admin socket is unreachable at {MACOS_SERVER_ADMIN_SOCKET} ({primary_err}) or {MACOS_SERVER_ADMIN_FALLBACK_SOCKET} ({fallback_err})"
+                            )));
+                        }
+                    }
+                }
+            },
+        };
+        #[cfg(not(target_os = "macos"))]
+        let stream = {
+            let socket_path = cfg
+                .server_admin_socket_override
+                .as_deref()
+                .unwrap_or(LINUX_SERVER_ADMIN_SOCKET);
+            connect_unix_admin_socket(socket_path).await?
         };
         call_server_admin_stream(stream, method, path, body).await
     }

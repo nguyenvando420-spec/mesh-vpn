@@ -220,8 +220,29 @@ fn write_stdout_line(line: &str) -> AppResult<()> {
         .map_err(|err| AppError::internal(format!("failed writing stdout: {err}")))
 }
 
-async fn run_server(cfg: ServerConfig) -> AppResult<()> {
+async fn run_server(mut cfg: ServerConfig) -> AppResult<()> {
     crate::acme::ensure_rustls_ring_provider();
+    if (cfg!(target_os = "macos") || cfg!(windows))
+        && cfg.state_dir == Path::new("/var/lib/mesh")
+        && let Err(err) = std::fs::create_dir_all(&cfg.state_dir)
+        && matches!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ReadOnlyFilesystem
+        )
+    {
+        let fallback_dir = PathBuf::from("./mesh-server-data");
+        tracing::warn!(
+            component = "mesh-server",
+            event = "state_dir_fallback",
+            configured = %cfg.state_dir.display(),
+            fallback = %fallback_dir.display(),
+            error = %err,
+            "default state_dir unavailable without root privileges; using local fallback directory"
+        );
+        cfg.state_dir = fallback_dir;
+    }
     let config = Arc::new(cfg);
     let store = Arc::new(ControlStore::open_with_clock(
         ControlStoreConfig {
