@@ -112,11 +112,13 @@ verify_root_owned_ancestors() {
         echo "error: directory '${check_path}' is not owned by root (uid=${owner_uid})." >&2
         exit 1
       fi
-      is_macos_var_run=0
+      is_macos_trusted_system_group=0
       if { [ "${check_path}" = "/var/run" ] || [ "${check_path}" = "/private/var/run" ]; } && [ "${owner_gid}" -eq 1 ]; then
-        is_macos_var_run=1
+        is_macos_trusted_system_group=1
+      elif [ "${owner_gid}" -eq 80 ]; then
+        is_macos_trusted_system_group=1
       fi
-      if [ "${is_macos_var_run}" -eq 1 ]; then
+      if [ "${is_macos_trusted_system_group}" -eq 1 ]; then
         world_write=$((0${perm_mode} & 002))
         if [ "${world_write}" -ne 0 ]; then
           echo "error: directory '${check_path}' is world writable (mode=${perm_mode})." >&2
@@ -373,11 +375,16 @@ do_install() {
   verify_root_owned_ancestors "/Library/LaunchDaemons"
   verify_root_owned_ancestors "/var/db"
 
+  run_cmd /usr/bin/install -d -o root -g wheel -m 0755 "/usr/local/libexec"
   run_cmd /usr/bin/install -d -o root -g wheel -m 0755 "${DAEMON_DIR}"
   run_cmd /usr/bin/install -d -o root -g wheel -m 0755 "/usr/local/bin"
   run_cmd /usr/bin/install -d -o root -g wheel -m 0700 "${STATE_DIR}"
   run_cmd /usr/bin/install -d -o root -g wheel -m 0755 "${RUN_DIR}"
   run_cmd /usr/bin/install -d -o root -g wheel -m 0750 "${LOG_DIR}"
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    /usr/sbin/chown root:wheel "/usr/local/libexec" "${DAEMON_DIR}"
+    /bin/chmod 0755 "/usr/local/libexec" "${DAEMON_DIR}"
+  fi
 
   if [ "${DRY_RUN}" -eq 0 ]; then
     # Unload running daemon and unlink prior Mach-O binaries before install to avoid

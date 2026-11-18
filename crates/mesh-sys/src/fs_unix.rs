@@ -414,9 +414,20 @@ fn inspect_root_or_ancestor_dir(dir: &Path, expected_leaf_uid: u32) -> SysResult
 fn is_macos_system_var_run(dir: &Path, uid: u32, gid: u32, mode: u32) -> bool {
     #[cfg(target_os = "macos")]
     {
-        // Standard macOS ships `/private/var/run` as `0775 root:daemon` (`gid 1`),
-        // which is non-world-writable and only writable by privileged system daemons.
-        dir == Path::new("/private/var/run") && uid == 0 && gid == 1 && (mode & 0o002) == 0
+        // Standard macOS ships `/private/var/run` (`/var/run`) as `0775 root:daemon` (`gid 1`) and
+        // system parent directories (`/Library`, `/usr/local`, `/usr/local/libexec`) may be
+        // `0775 root:admin` (`gid 80`) without world-write bits.
+        if uid != 0 || (mode & 0o002) != 0 {
+            return false;
+        }
+        let is_var_run = dir == Path::new("/var/run") || dir == Path::new("/private/var/run");
+        if is_var_run && gid == 1 {
+            return true;
+        }
+        let is_macos_admin_parent = dir == Path::new("/usr/local")
+            || dir == Path::new("/usr/local/libexec")
+            || dir == Path::new("/Library");
+        is_macos_admin_parent && gid == 80
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -634,5 +645,46 @@ mod tests {
         assert!(dir_pct <= 100);
         assert!(file_pct <= 100);
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn test_fs_unix_macos_system_dir_exemptions() {
+        // Arrange
+        let var_run = Path::new("/var/run");
+        let private_var_run = Path::new("/private/var/run");
+        let usr_local_libexec = Path::new("/usr/local/libexec");
+        let untrusted = Path::new("/tmp/foo");
+
+        // Act & Assert
+        #[cfg(target_os = "macos")]
+        {
+            assert!(super::is_macos_system_var_run(var_run, 0, 1, 0o775));
+            assert!(super::is_macos_system_var_run(private_var_run, 0, 1, 0o775));
+            assert!(super::is_macos_system_var_run(
+                usr_local_libexec,
+                0,
+                80,
+                0o775
+            ));
+            assert!(!super::is_macos_system_var_run(var_run, 0, 1, 0o777));
+            assert!(!super::is_macos_system_var_run(untrusted, 0, 1, 0o775));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!super::is_macos_system_var_run(var_run, 0, 1, 0o775));
+            assert!(!super::is_macos_system_var_run(
+                private_var_run,
+                0,
+                1,
+                0o775
+            ));
+            assert!(!super::is_macos_system_var_run(
+                usr_local_libexec,
+                0,
+                80,
+                0o775
+            ));
+            assert!(!super::is_macos_system_var_run(untrusted, 0, 1, 0o775));
+        }
     }
 }
