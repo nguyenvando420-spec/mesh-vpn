@@ -14,7 +14,6 @@ use mesh_client::{
 use mesh_core::defaults::GRACEFUL_SHUTDOWN_BUDGET_MS;
 use mesh_core::{Clock, SystemClock};
 use mesh_datapath::TimerMode;
-use mesh_net::FakeNetMonitor;
 use mesh_proto::agent_ipc::{
     AgentRotateKeyRequest, AgentSetRequest, AgentUpRequest, DaemonState, PingRequest,
 };
@@ -288,6 +287,7 @@ impl MobileEngine {
 
         let res = self
             .run_on_engine(async move {
+                let _underlay = hooks.refresh_underlay_from_bridge_async().await;
                 let (reply_tx, reply_rx) = oneshot::channel();
                 cmd_tx
                     .send(ClientCommand::Up {
@@ -705,7 +705,8 @@ impl MobileEngine {
         };
         let mut opts = ClientSessionOptions::new(runtime_cfg)
             .with_default_tun_ifname(tun_hint)
-            .with_dns_interceptor(dns_interceptor);
+            .with_dns_interceptor(dns_interceptor)
+            .with_auto_resume(false);
         if let Some(ref dir) = state_dir {
             opts = opts.with_bugreport(
                 dir.clone(),
@@ -1094,7 +1095,7 @@ fn execute_enroll_blocking(
             rt_cfg.agent_version = init.agent_version.trim().to_owned();
         }
         let opts = ClientSessionOptions::new(rt_cfg);
-        let supervisor = ClientSessionSupervisor::boot(
+        let mut supervisor = ClientSessionSupervisor::boot(
             opts,
             Arc::clone(&clock),
             platform_hooks.clone(),
@@ -1102,13 +1103,8 @@ fn execute_enroll_blocking(
         )
         .map_err(MobileError::from)?;
 
+        let _underlay = platform_hooks.refresh_underlay_from_bridge_async().await;
         let runtime_state = supervisor.runtime_state();
-        let cmd_tx = supervisor.command_sender();
-        let shutdown = CancellationToken::new();
-        let sup_shutdown = shutdown.clone();
-        let monitor = Arc::new(FakeNetMonitor::new());
-        let sup_join = tokio::spawn(async move { supervisor.run(monitor, sup_shutdown).await });
-
         let req = EnrollOrRotateRequest {
             server_endpoint,
             port_override,
@@ -1119,26 +1115,14 @@ fn execute_enroll_blocking(
         };
         drop(raw_preauth_key);
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        cmd_tx
-            .send(ClientCommand::EnrollOrRotate {
-                req,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| MobileError::unavailable("enrollment supervisor channel closed"))?;
-
-        let enroll_res =
-            tokio::time::timeout(Duration::from_millis(COMMAND_WAIT_TIMEOUT_MS), reply_rx).await;
-
-        shutdown.cancel();
-        let _joined =
-            tokio::time::timeout(Duration::from_millis(GRACEFUL_SHUTDOWN_BUDGET_MS), sup_join)
-                .await;
+        let enroll_res = tokio::time::timeout(
+            Duration::from_millis(COMMAND_WAIT_TIMEOUT_MS),
+            supervisor.enroll_or_rotate_only(req),
+        )
+        .await;
 
         let enrolled = enroll_res
             .map_err(|_| MobileError::unavailable("enrollment request timed out"))?
-            .map_err(|_| MobileError::unavailable("enrollment reply channel closed"))?
             .map_err(MobileError::from)?;
 
         let status = runtime_state.build_status_response().await;
@@ -1215,19 +1199,22 @@ mod tests {
         BYTES_PER_MIB, JETSAM_COOLDOWN_MS, JetsamPressureController, JetsamPressureStage,
         MobileEngine,
     };
-    use crate::bridge::RouteOpKind;
+    use crate::bridge::{FfiStateStore, RouteOpKind};
     use crate::bugreport::LogRingBuffer;
     use crate::types::{
-        MobileEngineInitConfig, MobileError, MobilePlatformKind, MobilePlatformWarning,
-        MobileStatusSnapshot, MobileTunnelNetworkConfig, MobileUnderlayState,
-        PlatformNetworkBridge, create_pending_join_session, parse_mobile_join_uri,
+        MobileDaemonState, MobileEngineInitConfig, MobileError, MobilePlatformKind,
+        MobilePlatformWarning, MobileStatusSnapshot, MobileTunnelNetworkConfig,
+        MobileUnderlayState, PlatformNetworkBridge, create_pending_join_session,
+        parse_mobile_join_uri,
     };
+    use mesh_client::ClientStateStore;
 
     #[derive(Debug, Default)]
     struct TestMobileBridge {
         dek: StdMutex<Option<Vec<u8>>>,
         files: StdMutex<HashMap<String, Vec<u8>>>,
         warnings: StdMutex<Vec<MobilePlatformWarning>>,
+        route_callbacks: AtomicUsize,
         status_callbacks: AtomicUsize,
         status_file_saves: AtomicUsize,
     }
@@ -1239,7 +1226,9 @@ mod tests {
 
         fn on_tun_packets(&self, _packets: Vec<Vec<u8>>) {}
 
-        fn on_route_changed(&self, _op_id: u64, _config: MobileTunnelNetworkConfig) {}
+        fn on_route_changed(&self, _op_id: u64, _config: MobileTunnelNetworkConfig) {
+            self.route_callbacks.fetch_add(1, Ordering::Relaxed);
+        }
 
         fn on_status_changed(&self, _status: MobileStatusSnapshot) {
             self.status_callbacks.fetch_add(1, Ordering::Relaxed);
@@ -1795,6 +1784,84 @@ mod tests {
         .map_err(|_| "unix swap thread panicked".to_owned())?;
 
         assert!(swap_res.is_ok());
+        engine.shutdown().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_enrolled_mobile_engine_runs_config_update_and_bugreport_without_auto_resume()
+    -> Result<(), String> {
+        // Arrange: pre-enroll state store (identity + node_id + bootstrap) before creating MobileEngine
+        let dir = TempDir::new().map_err(|e| e.to_string())?;
+        let bridge = Arc::new(TestMobileBridge::default());
+        let state_store =
+            FfiStateStore::new(Arc::clone(&bridge) as _, Some(dir.path().to_path_buf()));
+        let _id = state_store
+            .load_or_create_identity(1_700_000_000_000)
+            .map_err(|e| e.to_string())?;
+        let node_id = mesh_core::NodeId::new_v7(1_700_000_000_000);
+        state_store
+            .set_identity_node_id(node_id)
+            .map_err(|e| e.to_string())?;
+        let bootstrap = mesh_client::BootstrapConfig {
+            node_id: Some(node_id),
+            node_name: Some(
+                mesh_core::NodeName::parse("pixel-enrolled").map_err(|e| e.to_string())?,
+            ),
+            overlay_ip: Some(
+                mesh_core::OverlayIp::from_ipv4(std::net::Ipv4Addr::new(100, 64, 0, 12))
+                    .map_err(|e| e.to_string())?,
+            ),
+            server_endpoint: Some("203.0.113.10:443".to_owned()),
+            tls_auth_mode: mesh_proto::agent_ipc::TlsAuthMode::SpkiPin,
+            active_pin: Some(mesh_core::SpkiPin::from_sha256_bytes([0x11; 32])),
+            ..mesh_client::BootstrapConfig::default()
+        };
+        state_store
+            .save_bootstrap(&bootstrap)
+            .map_err(|e| e.to_string())?;
+
+        // Act: boot MobileEngine and immediately update server config + export bugreport while Stopped
+        let clock = Arc::new(FakeClock::new(1_700_000_001_000));
+        let engine = MobileEngine::new_with_clock(
+            MobileEngineInitConfig {
+                platform: MobilePlatformKind::Android,
+                agent_version: "0.2.0-mobile".to_owned(),
+                default_node_name: Some("pixel-enrolled".to_owned()),
+                log_dir_path: dir.path().to_string_lossy().into_owned(),
+            },
+            bridge.clone(),
+            clock,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let updated = engine
+            .update_server_config(crate::types::MobileSetConfig {
+                server_endpoint: "198.51.100.44:8443".to_owned(),
+                tls_auth_mode: crate::types::MobileTlsAuthMode::SpkiPin,
+                server_pin: Some(mesh_core::SpkiPin::from_sha256_bytes([0x22; 32]).to_string()),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let bug_path = dir.path().join("offline-diag.tar");
+        let export = engine
+            .export_bugreport_to_file(bug_path.to_string_lossy().into_owned())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Assert: zero auto-resume TUN route callbacks, stopped daemon state preserved
+        assert_eq!(bridge.route_callbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(updated.daemon_state, MobileDaemonState::Stopped);
+        assert_eq!(
+            updated
+                .server_connection
+                .as_ref()
+                .map(|c| c.control_endpoint.as_str()),
+            Some("198.51.100.44:8443")
+        );
+        assert!(export.size_bytes > 0);
+
         engine.shutdown().map_err(|e| e.to_string())?;
         Ok(())
     }

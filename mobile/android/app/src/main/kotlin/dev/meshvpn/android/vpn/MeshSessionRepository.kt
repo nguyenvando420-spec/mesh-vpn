@@ -187,7 +187,7 @@ class MeshSessionRepository(
             try {
                 val bridge =
                     createBridge(
-                        socketProtector = { false },
+                        socketProtector = { true },
                         tunEstablisher = null,
                         routeScope = null,
                     )
@@ -372,7 +372,7 @@ class MeshSessionRepository(
                             }
                         val bridge =
                             createBridge(
-                                socketProtector = { false },
+                                socketProtector = { true },
                                 tunEstablisher = null,
                                 routeScope = null,
                             )
@@ -412,31 +412,18 @@ class MeshSessionRepository(
         tlsAuthMode: MobileTlsAuthMode,
         pin: String?,
     ): Result<MobileStatusSnapshot> =
-        withContext(ioDispatcher) {
-            val engine =
-                activeEngine
-                    ?: return@withContext Result.failure(
-                        IllegalStateException("Start VPN tunnel before updating server config"),
-                    )
-            _uiState.update { it.copy(isBusy = true, lastError = null) }
-            try {
-                val snapshot =
-                    engine.updateServerConfig(
-                        MobileSetConfig(
-                            serverEndpoint = endpoint,
-                            tlsAuthMode = tlsAuthMode,
-                            serverPin = pin,
-                        ),
-                    )
-                applySnapshot(snapshot)
-                refreshFromDisk()
-                Result.success(snapshot)
-            } catch (err: Throwable) {
-                handleFfiFailure(err)
-                Result.failure(err)
-            } finally {
-                _uiState.update { it.copy(isBusy = false) }
-            }
+        withAvailableEngine { engine ->
+            val snapshot =
+                engine.updateServerConfig(
+                    MobileSetConfig(
+                        serverEndpoint = endpoint,
+                        tlsAuthMode = tlsAuthMode,
+                        serverPin = pin,
+                    ),
+                )
+            applySnapshot(snapshot)
+            refreshFromDisk()
+            snapshot
         }
 
     suspend fun pingPeer(
@@ -490,28 +477,13 @@ class MeshSessionRepository(
         }
 
     suspend fun exportScrubbedBugreport(): Result<BugreportShareManager.PreparedBugreport> =
-        withContext(ioDispatcher) {
-            val engine =
-                activeEngine
-                    ?: return@withContext Result.failure(
-                        IllegalStateException("Start VPN tunnel to export live bugreport"),
-                    )
-            _uiState.update { it.copy(isBusy = true) }
-            return@withContext try {
-                val destFile = bugreportManager.nextExportDestination()
-                val res = engine.exportBugreportToFile(destFile.absolutePath)
-                val prepared =
-                    bugreportManager.prepareShareUri(
-                        archiveFile = destFile,
-                        reportedSizeBytes = res.sizeBytes.toLong(),
-                    )
-                Result.success(prepared)
-            } catch (err: Throwable) {
-                handleFfiFailure(err)
-                Result.failure(err)
-            } finally {
-                _uiState.update { it.copy(isBusy = false) }
-            }
+        withAvailableEngine { engine ->
+            val destFile = bugreportManager.nextExportDestination()
+            val res = engine.exportBugreportToFile(destFile.absolutePath)
+            bugreportManager.prepareShareUri(
+                archiveFile = destFile,
+                reportedSizeBytes = res.sizeBytes.toLong(),
+            )
         }
 
     suspend fun resetLocalIdentity(): Result<Unit> =
@@ -552,6 +524,55 @@ class MeshSessionRepository(
             )
         activeEngine = created
         return created
+    }
+
+    private suspend fun <T> withAvailableEngine(
+        block: suspend (MobileEngineHandle) -> T,
+    ): Result<T> =
+        withContext(ioDispatcher) {
+            if (!stateStore.isDeviceUnlocked()) {
+                markDeviceLockedWaiting()
+                return@withContext Result.failure(IllegalStateException("Device is locked"))
+            }
+            if (activeEngine == null && !nativeInitializer()) {
+                val err = IllegalStateException("Native Mesh FFI library failed to initialize")
+                handleFfiFailure(err)
+                return@withContext Result.failure(err)
+            }
+            _uiState.update { it.copy(isBusy = true, lastError = null) }
+            var temporaryEngine: MobileEngineHandle? = null
+            try {
+                val engine =
+                    activeEngine ?: createTemporaryOfflineEngine().also { temporaryEngine = it }
+                Result.success(block(engine))
+            } catch (err: Throwable) {
+                handleFfiFailure(err)
+                Result.failure(err)
+            } finally {
+                val temp = temporaryEngine
+                if (temp != null) {
+                    try {
+                        temp.shutdown()
+                        temp.destroy()
+                    } catch (_: Throwable) {
+                        // Best-effort cleanup for transient offline engine.
+                    }
+                }
+                _uiState.update { it.copy(isBusy = false) }
+            }
+        }
+
+    private fun createTemporaryOfflineEngine(): MobileEngineHandle {
+        val bridge =
+            createBridge(
+                socketProtector = { true },
+                tunEstablisher = null,
+                routeScope = null,
+            )
+        return ffiGateway.createEngine(
+            MeshSessionStateHelper.buildInitConfig(stateStore, defaultNodeNameProvider),
+            bridge,
+        )
     }
 
     private fun createBridge(

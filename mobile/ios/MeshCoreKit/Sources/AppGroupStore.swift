@@ -110,16 +110,18 @@ public final class CoordinatedAppGroupStore: AppGroupFileManaging, Sendable {
         ) {
             resolvedRoot = containerURL
         } else {
-            #if targetEnvironment(simulator)
-            let fallback = FileManager.default.temporaryDirectory
-                .appendingPathComponent("MeshAppGroupSimulator", isDirectory: true)
-            resolvedRoot = fallback
-            #else
-            throw MobileError.PermissionDenied(
-                errorCode: "E_PERM_DENIED",
-                message: "App Group container unavailable"
+            let fallbackBase = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first ?? FileManager.default.temporaryDirectory
+            resolvedRoot = fallbackBase.appendingPathComponent(
+                "MeshAppGroupFallback",
+                isDirectory: true
             )
-            #endif
+            logger.warning(
+                "app_group_fallback_container",
+                detail: "App Group container unavailable; using app sandbox fallback"
+            )
         }
 
         self.rootURL = resolvedRoot

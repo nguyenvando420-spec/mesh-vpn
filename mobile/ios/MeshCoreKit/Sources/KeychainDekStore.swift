@@ -53,6 +53,35 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
 
     /// Discovers the prefixed Keychain Access Group from an entitlement probe when available.
     public static func resolveAccessGroupIfPresent() -> String? {
+        if let existing = queryProbeAccessGroup() {
+            return existing
+        }
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: MeshConstants.keychainProbeService,
+            kSecAttrAccount as String: MeshConstants.keychainProbeAccount,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String: Data([0x01]),
+            kSecReturnAttributes as String: kCFBooleanTrue ?? true
+        ]
+        var addedResult: CFTypeRef?
+        let addStatus = SecItemAdd(addQuery as CFDictionary, &addedResult)
+        if addStatus == errSecSuccess {
+            cleanupProbeItem()
+            if let attrs = addedResult as? [String: Any],
+               let group = attrs[kSecAttrAccessGroup as String] as? String,
+               group.hasSuffix(MeshConstants.keychainAccessGroupSuffix) {
+                return group
+            }
+            return nil
+        }
+        if addStatus == errSecDuplicateItem {
+            return queryProbeAccessGroup()
+        }
+        return nil
+    }
+
+    private static func queryProbeAccessGroup() -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: MeshConstants.keychainProbeService,
@@ -71,6 +100,15 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
         return nil
     }
 
+    private static func cleanupProbeItem() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: MeshConstants.keychainProbeService,
+            kSecAttrAccount as String: MeshConstants.keychainProbeAccount
+        ]
+        _ = SecItemDelete(query as CFDictionary)
+    }
+
     public func readItem(
         service: String,
         account: String,
@@ -84,15 +122,11 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
         if status == MeshConstants.errSecMissingEntitlementCode && accessGroup != nil {
-            #if targetEnvironment(simulator)
             logger.warning(
-                "keychain_simulator_no_entitlement",
+                "keychain_no_entitlement",
                 detail: "Retrying read without access group"
             )
             return readItem(service: service, account: account, accessGroup: nil)
-            #else
-            return .missingEntitlement
-            #endif
         }
 
         switch status {
@@ -128,9 +162,8 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
 
         let status = SecItemAdd(attrs as CFDictionary, nil)
         if status == MeshConstants.errSecMissingEntitlementCode && request.accessGroup != nil {
-            #if targetEnvironment(simulator)
             logger.warning(
-                "keychain_simulator_no_entitlement",
+                "keychain_no_entitlement",
                 detail: "Retrying write without access group"
             )
             let fallback = KeychainWriteRequest(
@@ -142,9 +175,6 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
                 data: request.data
             )
             return writeItem(fallback)
-            #else
-            return status
-            #endif
         }
         return status
     }
@@ -152,6 +182,13 @@ public final class SecurityKeychainClient: KeychainClient, Sendable {
     public func deleteItem(service: String, account: String, accessGroup: String?) -> OSStatus {
         let query = baseQuery(service: service, account: account, accessGroup: accessGroup)
         let status = SecItemDelete(query as CFDictionary)
+        if status == MeshConstants.errSecMissingEntitlementCode && accessGroup != nil {
+            logger.warning(
+                "keychain_no_entitlement",
+                detail: "Retrying delete without access group"
+            )
+            return deleteItem(service: service, account: account, accessGroup: nil)
+        }
         return status == errSecItemNotFound ? errSecSuccess : status
     }
 

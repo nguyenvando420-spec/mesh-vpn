@@ -194,7 +194,7 @@ private extension PacketTunnelProvider {
         IosPlatformBridge(
             dekStore: KeychainDekStore(),
             appGroupStore: appGroupStore,
-            initialUnderlay: .disconnected,
+            initialUnderlay: UnderlayPathConverter.probeCurrentSnapshot(),
             packetWriter: packetWriter,
             onRouteChanged: { event in
                 routeContinuation?.yield(event)

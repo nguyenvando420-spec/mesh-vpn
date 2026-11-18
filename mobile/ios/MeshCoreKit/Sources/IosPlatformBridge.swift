@@ -149,7 +149,7 @@ public final class IosPlatformBridge: PlatformNetworkBridge, Sendable {
     public init(
         dekStore: KeychainDekStore = KeychainDekStore(),
         appGroupStore: AppGroupFileManaging,
-        initialUnderlay: UnderlayPathSnapshot = .disconnected,
+        initialUnderlay: UnderlayPathSnapshot = UnderlayPathConverter.probeCurrentSnapshot(),
         packetWriter: BoundedPacketWriter = BoundedPacketWriter(),
         onRouteChanged: @escaping @Sendable (RouteChangeEvent) -> Void = { _ in },
         onStatusChanged: @escaping @Sendable (MobileStatusSnapshot) -> Void = { _ in },

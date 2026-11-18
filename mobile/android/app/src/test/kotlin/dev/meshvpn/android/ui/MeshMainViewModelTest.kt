@@ -133,4 +133,35 @@ class MeshMainViewModelTest {
             assertEquals(MobileDaemonState.REVOKED, ui.daemonState)
             assertEquals(UiErrorKind.NODE_REVOKED, ui.lastError?.kind)
         }
+
+    @Test
+    fun offlineSettingsActionsWorkWithoutActiveTunnel() =
+        runTest {
+            // Arrange
+            val harness = MeshTestHarness(tempFolder.newFolder("vm_offline_ops"), this)
+            harness.viewModel.submitJoinUriInput("mesh://join?v=1")
+            harness.viewModel.setConnectOnConfirm(false)
+            harness.viewModel.confirmPendingJoin {}
+            harness.authResult = BiometricGateResult.Authenticated
+
+            // Act
+            harness.viewModel.updateServerConfigWithAuth(
+                rawEndpoint = "198.51.100.20:8443",
+                tlsAuthMode = MobileTlsAuthMode.SPKI_PIN,
+                rawPin = harness.pin,
+            )
+            harness.viewModel.exportBugreportWithAuth()
+
+            // Assert
+            val state = harness.viewModel.screenState.value
+            assertEquals("Server configuration updated.", state.infoBanner)
+            assertEquals(
+                "198.51.100.20:8443",
+                state.session.snapshot
+                    ?.serverConnection
+                    ?.controlEndpoint,
+            )
+            assertNotNull(state.pendingShareBugreport)
+            assertTrue(harness.lastCapturedBridge?.protectSocket(0) == true)
+        }
 }

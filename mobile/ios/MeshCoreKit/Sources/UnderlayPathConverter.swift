@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 
@@ -99,6 +100,77 @@ public struct UnderlayPathSnapshot: Sendable, Equatable {
 
 /// Converts Apple `NWPath` transitions into `MobileUnderlayState` and `MobileNetEventKind`.
 public enum UnderlayPathConverter: Sendable {
+    private struct InterfaceAccum {
+        let kind: UnderlayInterfaceDescriptor.Kind
+        var hasIpv4: Bool
+        var hasIpv6: Bool
+    }
+
+    /// Synchronously probes active physical underlay interfaces via Darwin `getifaddrs`.
+    public static func probeCurrentSnapshot() -> UnderlayPathSnapshot {
+        var ifaddrsPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrsPtr) == 0, let firstAddr = ifaddrsPtr else {
+            return .disconnected
+        }
+        defer { freeifaddrs(firstAddr) }
+
+        var byName: [String: InterfaceAccum] = [:]
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let entry = cursor?.pointee {
+            cursor = entry.ifa_next
+            accumulateInterfaceEntry(entry, into: &byName)
+        }
+
+        let descriptors = byName.compactMap { name, info -> UnderlayInterfaceDescriptor? in
+            let idx = if_nametoindex(name)
+            guard idx > 0 else { return nil }
+            return UnderlayInterfaceDescriptor(name: name, index: idx, kind: info.kind)
+        }
+        guard !descriptors.isEmpty else {
+            return .disconnected
+        }
+        return snapshot(
+            isSatisfied: true,
+            interfaces: descriptors,
+            supportsIpv4: byName.values.contains { $0.hasIpv4 },
+            supportsIpv6: byName.values.contains { $0.hasIpv6 }
+        )
+    }
+
+    private static func accumulateInterfaceEntry(
+        _ entry: ifaddrs,
+        into byName: inout [String: InterfaceAccum]
+    ) {
+        let flags = entry.ifa_flags
+        let isUp = (flags & UInt32(bitPattern: IFF_UP)) != 0
+        let isRunning = (flags & UInt32(bitPattern: IFF_RUNNING)) != 0
+        let isLoopback = (flags & UInt32(bitPattern: IFF_LOOPBACK)) != 0
+        guard isUp, isRunning, !isLoopback,
+              let namePtr = entry.ifa_name,
+              let addr = entry.ifa_addr else {
+            return
+        }
+        let name = String(cString: namePtr)
+        if name.hasPrefix("utun") || name.hasPrefix("ipsec") || name.hasPrefix("lo") {
+            return
+        }
+        let family = Int32(addr.pointee.sa_family)
+        guard family == AF_INET || family == AF_INET6 else {
+            return
+        }
+        if family == AF_INET6 && isLinkLocalIpv6(addr) {
+            return
+        }
+        var record = byName[name] ?? InterfaceAccum(
+            kind: inferInterfaceKind(name: name),
+            hasIpv4: false,
+            hasIpv6: false
+        )
+        if family == AF_INET { record.hasIpv4 = true }
+        if family == AF_INET6 { record.hasIpv6 = true }
+        byName[name] = record
+    }
+
     /// Builds a snapshot from a live `Network.NWPath`.
     public static func snapshot(from path: NWPath) -> UnderlayPathSnapshot {
         let descriptors = path.availableInterfaces.map(UnderlayInterfaceDescriptor.init)
@@ -170,6 +242,29 @@ public enum UnderlayPathConverter: Sendable {
             return .dnsServersChanged
         }
         return nil
+    }
+
+    private static func inferInterfaceKind(name: String) -> UnderlayInterfaceDescriptor.Kind {
+        if name.hasPrefix("en") {
+            return .wifi
+        }
+        if name.hasPrefix("pdp_ip") {
+            return .cellular
+        }
+        return .other
+    }
+
+    private static func isLinkLocalIpv6(_ addr: UnsafePointer<sockaddr>) -> Bool {
+        guard Int(addr.pointee.sa_len) >= MemoryLayout<sockaddr_in6>.size else {
+            return true
+        }
+        var sin6 = sockaddr_in6()
+        memcpy(&sin6, addr, MemoryLayout<sockaddr_in6>.size)
+        var addr6 = sin6.sin6_addr
+        return withUnsafeBytes(of: &addr6) { raw in
+            guard let first = raw.first, raw.count >= 2 else { return true }
+            return first == 0xfe && (raw[1] & 0xc0) == 0x80
+        }
     }
 
     private static func selectPreferredInterface(

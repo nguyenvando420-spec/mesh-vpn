@@ -185,6 +185,7 @@ jobs:
             -project mobile/ios/MeshApp.xcodeproj \
             -scheme MeshApp \
             -destination "platform=iOS Simulator,id=${SIM_UDID}" \
+            -derivedDataPath mobile/ios/build/DerivedDataSim \
             CODE_SIGNING_ALLOWED=NO \
             build test 2>&1 | tee /tmp/ios-xcodebuild.log; then
             python3 - <<'PY'
@@ -196,3 +197,72 @@ jobs:
           PY
             exit 1
           fi
+
+      - name: Build iOS device Release app & package IPA/App artifacts ($0)
+        run: |
+          set -euo pipefail
+          if ! xcodebuild \
+            -project mobile/ios/MeshApp.xcodeproj \
+            -scheme MeshApp \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath mobile/ios/build/DerivedDataDevice \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            build 2>&1 | tee /tmp/ios-xcodebuild-device.log; then
+            python3 - <<'PY'
+          import pathlib, re
+          lines = pathlib.Path("/tmp/ios-xcodebuild-device.log").read_text(encoding="utf-8", errors="replace").splitlines()
+          matches = [ln for ln in lines if re.search(r"(?:error:|fatal error:|BUILD FAILED)", ln)]
+          snippet = "\n".join((matches[-10:] + ["--- tail ---"] + lines[-25:])[-36:])
+          print("::error title=xcodebuild device release::" + snippet.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
+            exit 1
+          fi
+
+          ARTIFACTS_DIR="${PWD}/mobile/ios/build/artifacts"
+          STAGE_DIR="${RUNNER_TEMP}/ios-package"
+          rm -rf "${ARTIFACTS_DIR}" "${STAGE_DIR}"
+          mkdir -p "${ARTIFACTS_DIR}" "${STAGE_DIR}/Payload" "${STAGE_DIR}/sim"
+
+          DEVICE_APP_SRC="${PWD}/mobile/ios/build/DerivedDataDevice/Build/Products/Release-iphoneos/MeshApp.app"
+          SIM_APP_SRC="${PWD}/mobile/ios/build/DerivedDataSim/Build/Products/Debug-iphonesimulator/MeshApp.app"
+          if [ ! -d "${DEVICE_APP_SRC}" ]; then
+            echo "ERROR: Expected device MeshApp.app missing at ${DEVICE_APP_SRC}" >&2
+            exit 1
+          fi
+          if [ ! -d "${SIM_APP_SRC}" ]; then
+            echo "ERROR: Expected simulator MeshApp.app missing at ${SIM_APP_SRC}" >&2
+            exit 1
+          fi
+
+          DEVICE_APP_STAGE="${STAGE_DIR}/Payload/MeshApp.app"
+          cp -R "${DEVICE_APP_SRC}" "${DEVICE_APP_STAGE}"
+          for fw in "${DEVICE_APP_STAGE}/Frameworks/"*.framework; do
+            if [ -e "${fw}" ]; then
+              codesign --force --sign - --timestamp=none "${fw}"
+            fi
+          done
+          for ext in "${DEVICE_APP_STAGE}/PlugIns/"*.appex; do
+            if [ -e "${ext}" ]; then
+              codesign --force --sign - --timestamp=none "${ext}"
+            fi
+          done
+          codesign --force --sign - --timestamp=none "${DEVICE_APP_STAGE}"
+
+          (cd "${STAGE_DIR}" && zip -qry "${ARTIFACTS_DIR}/MeshVPN-ios-unsigned.ipa" Payload)
+          (cd "${STAGE_DIR}/Payload" && zip -qry "${ARTIFACTS_DIR}/MeshVPN-ios-device.app.zip" MeshApp.app)
+
+          cp -R "${SIM_APP_SRC}" "${STAGE_DIR}/sim/MeshApp.app"
+          (cd "${STAGE_DIR}/sim" && zip -qry "${ARTIFACTS_DIR}/MeshVPN-ios-simulator.app.zip" MeshApp.app)
+
+          ls -lh "${ARTIFACTS_DIR}"
+
+      - name: Upload iOS App artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-ios-app-artifacts
+          path: mobile/ios/build/artifacts/*
+          retention-days: 14

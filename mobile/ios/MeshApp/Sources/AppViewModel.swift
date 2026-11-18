@@ -176,7 +176,7 @@ public final class AppViewModel: ObservableObject {
         IosPlatformBridge(
             dekStore: dekStore,
             appGroupStore: appGroupStore,
-            initialUnderlay: .disconnected
+            initialUnderlay: UnderlayPathConverter.probeCurrentSnapshot()
         )
     }
 

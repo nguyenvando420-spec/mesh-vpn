@@ -120,6 +120,9 @@ internal class MeshTestHarness(
             ): MobileStatusSnapshot {
                 enrollCallCount += 1
                 lastCapturedBridge = bridge
+                check(bridge.protectSocket(0)) {
+                    "protectSocket must allow zero-TUN Control sockets during enrollment"
+                }
                 val dek = bridge.loadOrCreatePlatformDek()
                 dek.fill(0)
                 bridge.saveStateFile("identity.sealed.bin", byteArrayOf(7, 8, 9))

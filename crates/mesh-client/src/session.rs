@@ -195,6 +195,8 @@ pub struct ClientSessionOptions {
     pub in_memory_logs: Option<String>,
     /// Optional pre-`CryptokeyValidator` L3 MagicDNS interceptor (`Mobile`).
     pub dns_interceptor: Option<Arc<dyn DnsPacketInterceptor>>,
+    /// Whether `run()` auto-resumes a previously enrolled session on startup.
+    pub auto_resume_on_boot: bool,
 }
 
 impl std::fmt::Debug for ClientSessionOptions {
@@ -207,6 +209,7 @@ impl std::fmt::Debug for ClientSessionOptions {
             .field("bugreport_dir", &self.bugreport_dir)
             .field("bugreport_binary_name", &self.bugreport_binary_name)
             .field("has_dns_interceptor", &self.dns_interceptor.is_some())
+            .field("auto_resume_on_boot", &self.auto_resume_on_boot)
             .finish()
     }
 }
@@ -225,6 +228,7 @@ impl ClientSessionOptions {
             log_dirs: Vec::new(),
             in_memory_logs: None,
             dns_interceptor: None,
+            auto_resume_on_boot: true,
         }
     }
 
@@ -263,6 +267,13 @@ impl ClientSessionOptions {
     #[must_use]
     pub fn with_dns_interceptor(mut self, interceptor: Arc<dyn DnsPacketInterceptor>) -> Self {
         self.dns_interceptor = Some(interceptor);
+        self
+    }
+
+    /// Controls whether `run()` automatically resumes an enrolled session on startup.
+    #[must_use]
+    pub const fn with_auto_resume(mut self, enabled: bool) -> Self {
+        self.auto_resume_on_boot = enabled;
         self
     }
 }
@@ -442,8 +453,10 @@ impl ClientSessionSupervisor {
         .with_rebind_feedback(rebind_feedback_rx);
         daemon_tracker.spawn(roaming.run(root_shutdown.clone()));
 
-        self.auto_resume_enrolled_session_best_effort(&root_shutdown)
-            .await;
+        if self.options.auto_resume_on_boot {
+            self.auto_resume_enrolled_session_best_effort(&root_shutdown)
+                .await;
+        }
 
         loop {
             tokio::select! {
@@ -1211,14 +1224,9 @@ impl ClientSessionSupervisor {
         signing_kp: &NodeKeypair,
         req: RegisterNodeRequest,
     ) -> AppResult<RegisterNodeResponse> {
-        let (underlay, nat64_prefix) = {
-            let g = self.runtime.inner.read().await;
-            (
-                (g.underlay_if_index, g.linux_fwmark),
-                g.nat64_prefix
-                    .or_else(|| self.platform_hooks.nat64_prefix()),
-            )
-        };
+        let (underlay_if_index, linux_fwmark, nat64_prefix, _timer_mode) =
+            self.refresh_underlay_before_bind().await;
+        let underlay = (underlay_if_index, linux_fwmark);
         let protector = self
             .platform_hooks
             .socket_protector()
