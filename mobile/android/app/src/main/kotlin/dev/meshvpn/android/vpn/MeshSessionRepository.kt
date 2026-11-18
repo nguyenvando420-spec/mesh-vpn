@@ -588,7 +588,11 @@ class MeshSessionRepository(
             dekManager = dekManager,
             stateStore = stateStore,
             statusSink = ::applySnapshot,
-            warningSink = ::applyWarning,
+            warningSink = { warning ->
+                _uiState.update { current ->
+                    MeshSessionStateHelper.applyWarningUpdate(current, warning)
+                }
+            },
         )
 
     private fun applySnapshot(snapshot: MobileStatusSnapshot) {
@@ -607,12 +611,6 @@ class MeshSessionRepository(
                 isEnrolled = stateStore.hasEnrolledIdentity(),
                 isDeviceUnlocked = stateStore.isDeviceUnlocked(),
             )
-        }
-    }
-
-    private fun applyWarning(warning: MobilePlatformWarning) {
-        _uiState.update { current ->
-            MeshSessionStateHelper.applyWarningUpdate(current, warning)
         }
     }
 
