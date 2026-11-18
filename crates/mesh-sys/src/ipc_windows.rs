@@ -32,8 +32,8 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+    OpenThreadToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::error::{SysError, SysResult};
@@ -53,6 +53,8 @@ pub enum PipeAclMode {
     ReadOnly,
     /// Privileged Admin pipe (`D:P(A;;GA;;;SY)(A;;GA;;;BA)`).
     Admin,
+    /// Server Admin pipe (`SY` + `BA` + current server process owner SID when resolved).
+    ServerAdmin,
 }
 
 /// Verified Windows Named Pipe client token flags (`S-1-5-32-544` BA and `S-1-5-18` SY).
@@ -277,8 +279,22 @@ impl Drop for ImpersonationGuard {
 pub const fn sddl_for_pipe_mode(mode: PipeAclMode) -> &'static str {
     match mode {
         PipeAclMode::ReadOnly => RO_PIPE_SDDL,
-        PipeAclMode::Admin => ADMIN_PIPE_SDDL,
+        PipeAclMode::Admin | PipeAclMode::ServerAdmin => ADMIN_PIPE_SDDL,
     }
+}
+
+/// Returns the SID string (e.g. `S-1-5-21-...`) of the current process's user account.
+pub fn current_process_user_sid() -> SysResult<String> {
+    const OP: &str = "ipc_windows::current_process_user_sid";
+    let mut token_raw: HANDLE = ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle; `token_raw` receives an owned token.
+    let tok_ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token_raw) };
+    if tok_ok == 0 || token_raw.is_null() || token_raw == INVALID_HANDLE_VALUE {
+        return Err(map_win_error(OP, io::Error::last_os_error()));
+    }
+    // SAFETY: `token_raw` is a fresh owned kernel token returned by `OpenProcessToken`.
+    let token = unsafe { OwnedHandle::from_raw_handle(token_raw) };
+    query_token_user_sid_string(token.as_raw_handle(), OP)
 }
 
 /// Creates the first instance of a Windows Named Pipe enforcing `FILE_FLAG_FIRST_PIPE_INSTANCE`
@@ -298,7 +314,16 @@ pub fn create_secured_named_pipe_instance(
     const OP: &str = "ipc_windows::create_secured_named_pipe";
     validate_pipe_name(pipe_name, OP)?;
 
-    let sddl_wide = to_wide_nul(sddl_for_pipe_mode(mode), OP)?;
+    let sddl_string = if mode == PipeAclMode::ServerAdmin
+        && let Ok(sid) = current_process_user_sid()
+        && sid.starts_with("S-1-")
+        && sid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})")
+    } else {
+        sddl_for_pipe_mode(mode).to_owned()
+    };
+    let sddl_wide = to_wide_nul(&sddl_string, OP)?;
     let mut sd_ptr: *mut c_void = ptr::null_mut();
     // SAFETY: `sddl_wide` is NUL-terminated UTF-16 and `sd_ptr` receives a `LocalAlloc` descriptor.
     let ok = unsafe {

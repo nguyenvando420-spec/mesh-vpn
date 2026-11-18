@@ -100,6 +100,9 @@ pub const LINUX_RUN_SERVER_DIR: &str = "/run/mesh-server";
 /// Linux server Admin Unix domain socket path (`0660 mesh:mesh-admin`).
 pub const LINUX_SERVER_ADMIN_SOCKET: &str = "/run/mesh-server/admin.sock";
 
+/// Windows server Admin Named Pipe path (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<owner_sid>)`).
+pub const WINDOWS_SERVER_ADMIN_PIPE: &str = r"\\.\pipe\mesh-server-admin";
+
 /// Unix daemon runtime directory (`0755 root:wheel` or `root:root`).
 pub const UNIX_RUN_DAEMON_DIR: &str = "/var/run/meshd";
 

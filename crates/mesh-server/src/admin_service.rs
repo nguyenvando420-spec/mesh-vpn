@@ -207,8 +207,66 @@ pub async fn start_admin_ipc_listener(
     Ok(())
 }
 
-/// Non-Linux hosts never bind a TCP fallback for the Linux server Admin socket (`SEC-14`).
-#[cfg(not(target_os = "linux"))]
+/// Binds and serves the local Admin API strictly over a Windows Named Pipe (`SEC-14`).
+#[cfg(windows)]
+pub async fn start_admin_ipc_listener(
+    state: AdminAppState,
+    tracker: &TaskTracker,
+    shutdown: CancellationToken,
+) -> AppResult<()> {
+    use mesh_core::defaults::{LINUX_SERVER_ADMIN_SOCKET, WINDOWS_SERVER_ADMIN_PIPE};
+    use mesh_net::ipc::IpcChannelKind;
+    use mesh_net::ipc_windows::{WindowsIpcServer, pipe_acl_mode_for_channel};
+    use mesh_sys::ipc_windows::SecuredPipeServer;
+
+    let configured = state.config.admin_socket_path.to_string_lossy();
+    let trimmed = configured.trim();
+    let pipe_name = if trimmed.is_empty()
+        || state.config.admin_socket_path == std::path::Path::new(LINUX_SERVER_ADMIN_SOCKET)
+    {
+        WINDOWS_SERVER_ADMIN_PIPE.to_owned()
+    } else if trimmed.starts_with(r"\\.\pipe\") {
+        trimmed.to_owned()
+    } else {
+        let digest = mesh_crypto::sha256_hex(trimmed.as_bytes());
+        let suffix = digest.get(..16).unwrap_or("custom");
+        format!(r"\\.\pipe\mesh-server-admin-{suffix}")
+    };
+
+    let router = build_admin_router(state).layer(axum::Extension(CallerPrincipal::default()));
+    let first_pipe = Arc::new(
+        SecuredPipeServer::bind(
+            &pipe_name,
+            pipe_acl_mode_for_channel(IpcChannelKind::ServerAdmin),
+            true,
+        )
+        .map_err(AppError::from)?,
+    );
+    let server = WindowsIpcServer::new(pipe_name.clone(), IpcChannelKind::ServerAdmin);
+    tracker.spawn(async move {
+        if let Err(err) = server
+            .serve_with_initial(first_pipe, router, shutdown)
+            .await
+        {
+            tracing::warn!(
+                component = "admin_service",
+                event = "admin_windows_pipe_stopped",
+                error = %err,
+                "Windows server Admin IPC pipe exited with error"
+            );
+        }
+    });
+    tracing::info!(
+        component = "admin_service",
+        event = "admin_windows_pipe_started",
+        admin_pipe = %pipe_name,
+        "started local Windows Named Pipe server Admin IPC listener"
+    );
+    Ok(())
+}
+
+/// Non-Linux/non-Windows hosts never bind a TCP fallback for the Admin socket (`SEC-14`).
+#[cfg(not(any(target_os = "linux", windows)))]
 pub async fn start_admin_ipc_listener(
     _state: AdminAppState,
     _tracker: &TaskTracker,
@@ -217,7 +275,7 @@ pub async fn start_admin_ipc_listener(
     tracing::info!(
         component = "admin_service",
         event = "admin_uds_skipped_non_linux",
-        "server Admin IPC Unix socket is only bound on Linux production hosts"
+        "server Admin IPC is only bound on Linux and Windows hosts"
     );
     Ok(())
 }
@@ -322,13 +380,12 @@ async fn handle_create_preauth_key(
     let pin_flag = active_pin
         .map(|p| format!(" --server-pin {p}"))
         .unwrap_or_default();
-    let cli_join_command = format!(
-        "mesh up --server {server_endpoint}{pin_flag} --authkey-file /run/mesh/preauth.key"
-    );
+    let cli_join_command =
+        format!("mesh up --server {host_port}{pin_flag} --authkey-file /run/mesh/preauth.key");
     let join_command_file =
-        format!("mesh up --server {server_endpoint}{pin_flag} --authkey-file /path/to/key.txt");
+        format!("mesh up --server {host_port}{pin_flag} --authkey-file /path/to/key.txt");
     let join_command_stdin =
-        format!("mesh up --server {server_endpoint}{pin_flag} --authkey-stdin < key.txt");
+        format!("mesh up --server {host_port}{pin_flag} --authkey-stdin < key.txt");
 
     json_response(
         StatusCode::CREATED,

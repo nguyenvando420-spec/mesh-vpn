@@ -6,17 +6,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use mesh_core::defaults::LINUX_SERVER_ADMIN_SOCKET;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use mesh_core::defaults::MAX_HTTP_BODY_BYTES;
+#[cfg(windows)]
+use mesh_core::defaults::WINDOWS_SERVER_ADMIN_PIPE;
 use mesh_core::{AppError, AppResult, MobileJoinTlsAuth, NodeName, Port, SpkiPin, format_join_uri};
 use mesh_crypto::Secret;
 #[cfg(unix)]
 use mesh_net::ipc::IPC_CONNECT_TIMEOUT;
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 use mesh_net::ipc::{IPC_ADMIN_MUTATION_TIMEOUT, send_ipc_json_request_with_timeout};
 use mesh_proto::admin_ipc::{
     AdminNodeSummary, BackupCreatedResponse, CreatePreAuthKeyRequest, ExpireNodeRequest,
@@ -699,10 +701,13 @@ fn build_mobile_join_uri_from_created(
     overrides: &ParsedMobileJoinOverrides,
     resp: &PreAuthKeyCreatedResponse,
 ) -> AppResult<Secret<String>> {
-    let endpoint = overrides
-        .server
-        .as_deref()
-        .unwrap_or_else(|| resp.server_endpoint.trim());
+    let raw_ep = resp.server_endpoint.trim();
+    let default_ep = raw_ep
+        .strip_prefix("https://")
+        .or_else(|| raw_ep.strip_prefix("HTTPS://"))
+        .unwrap_or(raw_ep)
+        .trim_end_matches('/');
+    let endpoint = overrides.server.as_deref().unwrap_or(default_ep);
     if endpoint.is_empty() {
         return Err(AppError::invalid_argument(
             "missing control server endpoint for --emit-uri/--qr; pass --server <host_or_ip>:<port>",
@@ -762,8 +767,8 @@ fn emit_preauth_created_output(
     write_stdout(&formatted)
 }
 
-/// Dispatches a JSON request over an already-connected Server Admin stream (UDS or test duplex).
-#[cfg(any(unix, test))]
+/// Dispatches a JSON request over an already-connected Server Admin stream (UDS, Named Pipe, or test duplex).
+#[cfg(any(unix, windows, test))]
 pub(crate) async fn call_server_admin_stream<S, Req, Resp>(
     stream: S,
     method: hyper::Method,
@@ -796,13 +801,12 @@ where
     Req: Serialize,
     Resp: DeserializeOwned,
 {
-    let socket_path = cfg
-        .server_admin_socket_override
-        .as_deref()
-        .unwrap_or(LINUX_SERVER_ADMIN_SOCKET);
-
     #[cfg(unix)]
     {
+        let socket_path = cfg
+            .server_admin_socket_override
+            .as_deref()
+            .unwrap_or(LINUX_SERVER_ADMIN_SOCKET);
         let stream = match tokio::time::timeout(
             IPC_CONNECT_TIMEOUT,
             tokio::net::UnixStream::connect(socket_path),
@@ -830,8 +834,39 @@ where
         call_server_admin_stream(stream, method, path, body).await
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        let pipe_name_owned: String;
+        let pipe_name = match cfg.server_admin_socket_override.as_deref().map(str::trim) {
+            None | Some("") | Some(LINUX_SERVER_ADMIN_SOCKET) => WINDOWS_SERVER_ADMIN_PIPE,
+            Some(raw) if raw.starts_with(r"\\.\pipe\") => raw,
+            Some(raw) => {
+                let digest = mesh_crypto::sha256_hex(raw.as_bytes());
+                let suffix = digest.get(..16).unwrap_or("custom");
+                pipe_name_owned = format!(r"\\.\pipe\mesh-server-admin-{suffix}");
+                &pipe_name_owned
+            }
+        };
+        let stream = mesh_net::ipc::connect_agent_named_pipe(pipe_name, true)
+            .await
+            .map_err(|err| {
+                if err.kind() == mesh_core::ErrorKind::PermissionDenied {
+                    err
+                } else {
+                    AppError::unavailable(format!(
+                        "mesh-server admin pipe {pipe_name} is unreachable ({err}); ensure mesh-server.exe is running under the same user or Administrator"
+                    ))
+                }
+            })?;
+        call_server_admin_stream(stream, method, path, body).await
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let socket_path = cfg
+            .server_admin_socket_override
+            .as_deref()
+            .unwrap_or(LINUX_SERVER_ADMIN_SOCKET);
         let _unused = (method, path, body);
         Err(AppError::invalid_argument(format!(
             "mesh server admin commands target Linux UDS {socket_path}; execute on the mesh-server host"
@@ -1006,6 +1041,15 @@ mod tests {
         assert_eq!(parsed.preauth_key(), raw_key);
         assert!(mobile_human.contains("Mobile Join URI : mesh://join?"));
         assert!(mobile_human.contains("Scan Mobile Join QR Code:"));
+
+        // Server responses include an `https://` URL scheme in `server_endpoint`; verify it strips cleanly.
+        let mut scheme_resp = resp.clone();
+        scheme_resp.server_endpoint = "https://198.51.100.10:8443/".to_owned();
+        let scheme_uri = build_mobile_join_uri_from_created(&overrides, &scheme_resp)
+            .map_err(|e| e.to_string())?;
+        let scheme_parsed =
+            parse_join_uri(scheme_uri.expose_secret()).map_err(|e| e.to_string())?;
+        assert_eq!(scheme_parsed.control_endpoint, "198.51.100.10:8443");
 
         // Error case: IP endpoint without pin fails closed and does not echo raw_key.
         let mut no_pin_resp = resp.clone();

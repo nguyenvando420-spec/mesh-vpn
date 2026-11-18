@@ -30,7 +30,8 @@ const GRACEFUL_SHUTDOWN_SECS: u64 = 5;
 pub const fn pipe_acl_mode_for_channel(channel: IpcChannelKind) -> PipeAclMode {
     match channel {
         IpcChannelKind::AgentReadOnly => PipeAclMode::ReadOnly,
-        IpcChannelKind::ServerAdmin | IpcChannelKind::AgentAdmin => PipeAclMode::Admin,
+        IpcChannelKind::AgentAdmin => PipeAclMode::Admin,
+        IpcChannelKind::ServerAdmin => PipeAclMode::ServerAdmin,
     }
 }
 
@@ -56,6 +57,14 @@ fn authorize_windows_creds(
     channel: IpcChannelKind,
     creds: mesh_sys::ipc_windows::WindowsPeerCredentials,
 ) -> AppResult<CallerPrivilege> {
+    if matches!(channel, IpcChannelKind::ServerAdmin)
+        && let Ok(owner_sid) = mesh_sys::ipc_windows::current_process_user_sid()
+        && creds.principal == owner_sid
+    {
+        return Ok(CallerPrivilege::Admin {
+            principal: creds.principal,
+        });
+    }
     let identity = PeerIdentity::Windows {
         is_builtin_admin: creds.is_builtin_admin,
         is_local_system: creds.is_local_system,

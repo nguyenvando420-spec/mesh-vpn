@@ -161,6 +161,8 @@ mod tests {
             .arg("gui")
             .env("ProgramFiles", dir.path())
             .env("PROGRAMFILES", dir.path())
+            .env("ProgramW6432", dir.path())
+            .env("PROGRAMW6432", dir.path())
             .stdin(Stdio::null())
             .output()
             .map_err(|err| format!("spawn isolated mesh gui failed: {err}"))?;

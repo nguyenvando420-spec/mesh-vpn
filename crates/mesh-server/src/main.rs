@@ -283,6 +283,9 @@ async fn run_server(cfg: ServerConfig) -> AppResult<()> {
     let _bound_obs =
         start_obs_listener(obs_addr, obs_state.clone(), &tracker, shutdown.clone()).await?;
 
+    let active_spki_pin = acme
+        .status()
+        .map_or_else(|| "none".to_owned(), |s| s.active_pin.to_string());
     let admin_state = AdminAppState {
         config: Arc::clone(&config),
         store: Arc::clone(&store),
@@ -321,6 +324,7 @@ async fn run_server(cfg: ServerConfig) -> AppResult<()> {
         control_port = config.control_tcp_port,
         stun_port = config.stun_udp_port,
         tls_mode = config.tls_mode.as_str(),
+        spki_pin = %active_spki_pin,
         "mesh-server started cleanly"
     );
 
