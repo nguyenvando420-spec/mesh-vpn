@@ -492,7 +492,8 @@ fn handle_gui() -> AppResult<()> {
                 "MeshVPN.exe was not found next to mesh.exe or under %ProgramFiles%\\Mesh\\MeshVPN.exe",
             ));
         };
-        mesh_sys::process_windows::spawn_detached_gui(&gui_exe).map_err(AppError::from)
+        mesh_sys::process_windows::spawn_detached_gui(&gui_exe).map_err(AppError::from)?;
+        write_stdout("Launched Mesh VPN desktop GUI.")
     }
 
     #[cfg(target_os = "macos")]
@@ -528,7 +529,7 @@ fn handle_gui() -> AppResult<()> {
                 "failed launching Mesh VPN.app via /usr/bin/open (headless or desktop session unavailable)",
             ));
         }
-        Ok(())
+        write_stdout("Launched Mesh VPN desktop GUI.")
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]

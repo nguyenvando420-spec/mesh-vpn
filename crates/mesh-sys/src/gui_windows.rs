@@ -25,6 +25,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, CreateBitmap, CreateFontIndirectW, CreateFontW, DeleteObject, HBRUSH, HGDIOBJ,
+    UpdateWindow,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -51,6 +52,7 @@ use windows_sys::Win32::System::DataExchange::{
     IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
@@ -748,20 +750,32 @@ pub fn enable_per_monitor_v2_dpi() -> SysResult<()> {
     Ok(())
 }
 
-/// Initializes Win32 Common Controls v6
-/// (`ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES`).
+/// Initializes Win32 Common Controls
+/// (`ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES`), falling back to
+/// `ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES` when ComCtl32 v5.82 is loaded without an SxS v6
+/// manifest.
 pub fn init_common_controls() -> SysResult<()> {
     const OP: &str = "gui_windows::init_common_controls";
-    let icc = INITCOMMONCONTROLSEX {
-        dwSize: u32::try_from(size_of::<INITCOMMONCONTROLSEX>()).unwrap_or(8),
+    let dw_size = u32::try_from(size_of::<INITCOMMONCONTROLSEX>()).unwrap_or(8);
+    let full = INITCOMMONCONTROLSEX {
+        dwSize: dw_size,
         dwICC: ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES,
     };
-    // SAFETY: `icc` is a valid stack `INITCOMMONCONTROLSEX` whose `dwSize` matches its size.
-    let ok = unsafe { InitCommonControlsEx(&raw const icc) };
-    if ok == 0 {
-        return Err(SysError::io(OP, io::Error::last_os_error()));
+    // SAFETY: `full` is a valid stack `INITCOMMONCONTROLSEX` whose `dwSize` matches its size.
+    if unsafe { InitCommonControlsEx(&raw const full) } != 0 {
+        return Ok(());
     }
-    Ok(())
+    // Standard USER32 controls (`BUTTON`, `EDIT`, `STATIC`, `LISTBOX`) are built in and do not
+    // require `ICC_STANDARD_CLASSES`, which ComCtl32 v5.82 rejects without an SxS v6 manifest.
+    let fallback = INITCOMMONCONTROLSEX {
+        dwSize: dw_size,
+        dwICC: ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES,
+    };
+    // SAFETY: `fallback` is a valid stack `INITCOMMONCONTROLSEX` whose `dwSize` matches its size.
+    if unsafe { InitCommonControlsEx(&raw const fallback) } != 0 {
+        return Ok(());
+    }
+    Err(SysError::io(OP, io::Error::last_os_error()))
 }
 
 /// Returns `true` when the current process token holds elevated privileges (`TokenIsElevated`).
@@ -2384,6 +2398,8 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
     let class_wide = encode_wide_nul_str(spec.class_name, OP)?;
     let title_wide = encode_wide_nul_str(spec.title, OP)?;
 
+    // SAFETY: `GetModuleHandleW(null)` returns the current executable's `HINSTANCE`.
+    let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
     // SAFETY: `LoadCursorW(null, IDC_ARROW)` loads a standard shared arrow cursor.
     let cursor = unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) };
     let wnd_cls = WNDCLASSEXW {
@@ -2392,7 +2408,7 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
         lpfnWndProc: Some(gui_wnd_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
-        hInstance: ptr::null_mut(),
+        hInstance: hinstance,
         hIcon: spec.initial_icon.map_or(ptr::null_mut(), OwnedIcon::as_raw),
         hCursor: cursor,
         hbrBackground: ((COLOR_BTNFACE + 1) as usize) as HBRUSH,
@@ -2431,7 +2447,7 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
             spec.height_96dpi,
             ptr::null_mut(),
             ptr::null_mut(),
-            ptr::null_mut(),
+            hinstance,
             bridge_ptr.cast::<c_void>(),
         )
     };
@@ -2452,6 +2468,12 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
     };
     // SAFETY: `hwnd` is a valid newly created window on this thread.
     let _shown = unsafe { ShowWindow(hwnd, show_cmd) };
+    // SAFETY: `hwnd` is a valid newly created window on this thread.
+    let _updated = unsafe { UpdateWindow(hwnd) };
+    if !spec.start_hidden {
+        // SAFETY: Brings the newly opened Dashboard window to foreground focus.
+        let _fg = unsafe { SetForegroundWindow(hwnd) };
+    }
 
     // SAFETY: `MSG` is a plain Win32 C struct zero-initialized before `GetMessageW`.
     let mut msg: MSG = unsafe { mem::zeroed() };
@@ -3079,6 +3101,8 @@ fn create_child_control(spec: ChildControlSpec<'_>) -> SysResult<isize> {
     const OP: &str = "gui_windows::create_child_control";
     let class_w = encode_wide_nul_str(spec.class_name, OP)?;
     let text_w = encode_wide_nul_str(spec.text, OP)?;
+    // SAFETY: `GetModuleHandleW(null)` returns the current executable's `HINSTANCE`.
+    let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
     // SAFETY: `class_w` and `text_w` are NUL-terminated UTF-16 buffers kept alive across
     // `CreateWindowExW`, and `spec.parent` is an active top-level window handle.
     let hwnd = unsafe {
@@ -3093,7 +3117,7 @@ fn create_child_control(spec: ChildControlSpec<'_>) -> SysResult<isize> {
             spec.h.max(1),
             spec.parent as HWND,
             usize::from(spec.id) as HMENU,
-            ptr::null_mut(),
+            hinstance,
             ptr::null(),
         )
     };
@@ -4208,8 +4232,8 @@ mod tests {
 
     use super::{
         HANDOFF_PIPE_PREFIX, TrayStatusIconKind, UnprivilegedSinkWriter, WIN_ERROR_CANCELLED,
-        create_tray_status_icon, is_uac_cancelled_error, is_valid_handoff_pipe_name,
-        open_anti_toctou_read_locked,
+        create_tray_status_icon, init_common_controls, is_uac_cancelled_error,
+        is_valid_handoff_pipe_name, open_anti_toctou_read_locked,
     };
     use crate::error::SysError;
 
@@ -4292,5 +4316,14 @@ mod tests {
                 "create_tray_status_icon({px}) failed: {icon:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_init_common_controls_succeeds_on_windows() {
+        // Arrange & Act
+        let res = init_common_controls();
+
+        // Assert
+        assert!(res.is_ok(), "init_common_controls failed: {res:?}");
     }
 }

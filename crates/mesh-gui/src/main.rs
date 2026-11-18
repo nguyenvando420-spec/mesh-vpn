@@ -122,13 +122,21 @@ fn main() -> ExitCode {
                 match run_gui_entrypoint(start_minimized) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(err) => {
-                        let safe = app::sanitize_gui_log_text(&err);
+                        let clean_err = app::sanitize_gui_log_text(&err);
                         tracing::error!(
                             component = "mesh-gui",
                             event = "gui_entrypoint_failed",
-                            error = %safe,
+                            error = %clean_err,
                             "MeshVPN GUI terminated with error"
                         );
+                        if !start_minimized {
+                            let _shown = mesh_sys::gui_windows::show_message_box(
+                                0,
+                                "Mesh VPN Startup Error",
+                                &clean_err,
+                                mesh_sys::gui_windows::MessageBoxKind::Error,
+                            );
+                        }
                         ExitCode::from(1)
                     }
                 }
