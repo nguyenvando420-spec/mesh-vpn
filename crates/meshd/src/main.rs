@@ -26,7 +26,7 @@ use roaming_loop::create_platform_net_monitor;
 use supervisor::{DaemonSupervisor, ProductionPlatformAdapters};
 
 const DAEMON_WORKER_THREADS: usize = 2;
-const DAEMON_MAX_BLOCKING_THREADS: usize = 2;
+pub(crate) const DAEMON_MAX_BLOCKING_THREADS: usize = 32;
 const DAEMON_THREAD_STACK_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Parser)]

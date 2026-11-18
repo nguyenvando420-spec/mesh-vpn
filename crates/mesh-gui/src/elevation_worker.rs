@@ -677,6 +677,8 @@ async fn execute_install_or_start_service(
         })?;
         set_directory_sddl_acl(&install_dir, INSTALL_DIR_SDDL)
             .map_err(|err| AppError::internal(err.to_string()))?;
+        stop_and_optionally_delete_windows_service(WINDOWS_SERVICE_NAME, false)
+            .map_err(|err| AppError::unavailable(err.to_string()))?;
         verify_and_optionally_copy_wintun(&src_path, &install_dir, false)?;
         install_or_stage_bundle_exes(&src_path, &install_dir)?;
     }

@@ -194,7 +194,7 @@ extern "system" fn ffi_service_main(_num_args: u32, _args: *mut *mut u16) {
 fn run_scm_service(paths: DaemonRuntimePaths) -> AppResult<()> {
     let runtime = Builder::new_multi_thread()
         .worker_threads(2)
-        .max_blocking_threads(2)
+        .max_blocking_threads(crate::DAEMON_MAX_BLOCKING_THREADS)
         .thread_stack_size(512 * 1024)
         .enable_all()
         .build()
