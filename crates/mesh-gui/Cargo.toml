@@ -15,6 +15,7 @@ name = "MeshVPN"
 path = "src/main.rs"
 
 [dependencies]
+axum.workspace = true
 mesh-core.workspace = true
 mesh-crypto = { path = "../mesh-crypto", version = "0.3.0", default-features = false }
 mesh-proto.workspace = true
@@ -32,6 +33,5 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 proptest.workspace = true
 tempfile.workspace = true

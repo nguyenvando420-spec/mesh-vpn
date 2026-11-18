@@ -829,3 +829,28 @@ proptest! {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_linux_log_dir_and_desktop_state_rendering() {
+    let dir = crate::app::gui_log_directory(Some(Path::new("/home/alice/.local/share")));
+    assert_eq!(
+        dir.as_deref(),
+        Some(Path::new("/home/alice/.local/share/MeshVPN/logs"))
+    );
+    let st = sample_status(DaemonState::Connected, Some("198.51.100.10:8443"), None);
+    let derived = derive_desktop_ui_state(StateProbeInputs {
+        gui_version: "0.3.0",
+        service_probe: ServiceProbeKind::Running,
+        ipc_connected: true,
+        status: Some(&st),
+        version_status: Some(&AgentVersionStatus::Version("0.3.0".to_owned())),
+        ipc_error: None,
+        active_action_error: None,
+    });
+    assert_eq!(derived.ui_state, DesktopUiState::Connected);
+    assert_eq!(
+        derived.ui_state.headline(derived.tunnel_sub_state),
+        "Connected to Mesh Network"
+    );
+}

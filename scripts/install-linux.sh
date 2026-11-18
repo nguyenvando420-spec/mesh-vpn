@@ -6,6 +6,10 @@ REPO_ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 DAEMON_BIN="/usr/bin/meshd"
 CLI_BIN="/usr/bin/mesh"
+GUI_BIN="/usr/bin/MeshVPN"
+DESKTOP_DEST="/usr/share/applications/mesh-vpn.desktop"
+ICON_DEST="/usr/share/icons/hicolor/scalable/apps/mesh-vpn.svg"
+POLKIT_DEST="/usr/share/polkit-1/actions/internal.mesh.pkexec.policy"
 SERVICE_NAME="meshd.service"
 SERVICE_DEST="/etc/systemd/system/${SERVICE_NAME}"
 STATE_DIR="/var/lib/meshd"
@@ -285,6 +289,37 @@ do_install() {
   install -m 0755 -o root -g root "${mesh_cli_src}" "${CLI_BIN}"
   install -m 0644 -o root -g root "${unit_src}" "${SERVICE_DEST}"
 
+  if gui_src="$(resolve_artifact "MeshVPN")"; then
+    install -m 0755 -o root -g root "${gui_src}" "${GUI_BIN}"
+  fi
+  for desktop_cand in \
+    "${FROM_DIR:+${FROM_DIR}/deploy/linux-desktop/mesh-vpn.desktop}" \
+    "${REPO_ROOT}/deploy/linux-desktop/mesh-vpn.desktop"; do
+    if [ -n "${desktop_cand}" ] && [ -f "${desktop_cand}" ]; then
+      install -d -m 0755 /usr/share/applications
+      install -m 0644 -o root -g root "${desktop_cand}" "${DESKTOP_DEST}"
+      break
+    fi
+  done
+  for icon_cand in \
+    "${FROM_DIR:+${FROM_DIR}/deploy/linux-desktop/mesh-vpn.svg}" \
+    "${REPO_ROOT}/deploy/linux-desktop/mesh-vpn.svg"; do
+    if [ -n "${icon_cand}" ] && [ -f "${icon_cand}" ]; then
+      install -d -m 0755 /usr/share/icons/hicolor/scalable/apps
+      install -m 0644 -o root -g root "${icon_cand}" "${ICON_DEST}"
+      break
+    fi
+  done
+  for policy_cand in \
+    "${FROM_DIR:+${FROM_DIR}/deploy/linux-desktop/internal.mesh.pkexec.policy}" \
+    "${REPO_ROOT}/deploy/linux-desktop/internal.mesh.pkexec.policy"; do
+    if [ -n "${policy_cand}" ] && [ -f "${policy_cand}" ]; then
+      install -d -m 0755 /usr/share/polkit-1/actions
+      install -m 0644 -o root -g root "${policy_cand}" "${POLKIT_DEST}"
+      break
+    fi
+  done
+
   configure_desktop_firewall
 
   systemctl daemon-reload
@@ -311,7 +346,7 @@ do_uninstall() {
 
   remove_desktop_firewall
 
-  rm -f "${DAEMON_BIN}" "${CLI_BIN}"
+  rm -f "${DAEMON_BIN}" "${CLI_BIN}" "${GUI_BIN}" "${DESKTOP_DEST}" "${ICON_DEST}" "${POLKIT_DEST}"
   rm -rf "${RUN_DIR}"
 
   if [ "${PURGE}" -eq 1 ]; then

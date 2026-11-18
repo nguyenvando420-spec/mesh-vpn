@@ -6,13 +6,13 @@
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod app;
 #[cfg(target_os = "windows")]
 mod autostart;
 #[cfg(target_os = "windows")]
 mod clipboard;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod diagnostics_view;
 #[cfg(target_os = "windows")]
 mod elevation_worker;
@@ -20,9 +20,11 @@ mod elevation_worker;
 mod icons;
 #[cfg(target_os = "windows")]
 mod ipc_poller;
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "linux")]
+mod linux_gui;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod onboarding;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 mod peers_view;
 #[cfg(target_os = "windows")]
 mod single_instance;
@@ -74,14 +76,19 @@ fn init_gui_logging(is_worker: bool) -> Option<LogGuard> {
 }
 
 fn main() -> ExitCode {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         tracing::info!(
             component = "mesh-gui",
-            event = "non_windows_stub_exit",
-            "MeshVPN.exe native Win32 GUI is supported only on Windows targets"
+            event = "unsupported_os_stub_exit",
+            "MeshVPN native GUI binary is built for Windows and Linux desktop targets"
         );
         ExitCode::SUCCESS
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux_gui::run_linux_main(std::env::args())
     }
 
     #[cfg(target_os = "windows")]

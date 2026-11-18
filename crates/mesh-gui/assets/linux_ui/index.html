@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mesh VPN</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" id="state-dot"></span>
+        <div>
+          <h1>Mesh VPN</h1>
+          <p class="sub" id="tray-summary">Linux Desktop Control</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="pill" id="state-badge">Loading...</span>
+        <label class="toggle">
+          <input type="checkbox" id="chk-autostart">
+          <span>Autostart</span>
+        </label>
+        <button class="btn ghost" id="btn-quit" type="button">Quit GUI</button>
+      </div>
+    </header>
+
+    <section class="banners" id="banners"></section>
+
+    <main class="grid">
+      <section class="card">
+        <h2 id="status-headline">Checking daemon status...</h2>
+        <div class="btn-row">
+          <button class="btn primary" id="btn-connect" type="button">Connect</button>
+          <button class="btn" id="btn-disconnect" type="button">Disconnect</button>
+          <button class="btn warn" id="btn-service-start" type="button">Start / Repair Service</button>
+          <button class="btn" id="btn-cleanup" type="button">Run Cleanup</button>
+          <button class="btn danger" id="btn-reset-id" type="button">Reset Identity</button>
+        </div>
+        <h3>Node &amp; Network</h3>
+        <pre class="panel" id="self-network-panel">Waiting for meshd...</pre>
+      </section>
+
+      <section class="card">
+        <h2>Onboarding, Server &amp; Keys</h2>
+        <div class="field">
+          <label for="inp-join-uri">Join URI (mesh://join?...)</label>
+          <div class="inline">
+            <input id="inp-join-uri" type="password" autocomplete="off" placeholder="mesh://join?v=1&amp;...">
+            <button class="btn" id="btn-preview-uri" type="button">Load URI</button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="inp-endpoint">Control Endpoint (host:port)</label>
+          <input id="inp-endpoint" type="text" autocomplete="off" placeholder="203.0.113.10:8443">
+        </div>
+
+        <div class="field radios">
+          <label><input type="radio" name="tls_mode" value="spki_pin" id="rad-spki" checked> Pinned SPKI SHA-256 (Zero-TOFU)</label>
+          <label><input type="radio" name="tls_mode" value="system_ca" id="rad-ca"> System CA Trust (Domain only)</label>
+          <span class="hint" id="ca-lock-hint"></span>
+        </div>
+
+        <div class="field">
+          <label for="inp-pin">SPKI Pin (sha256:&lt;64hex&gt;)</label>
+          <input id="inp-pin" type="text" autocomplete="off" placeholder="sha256:...">
+        </div>
+
+        <div class="field-pair">
+          <div class="field">
+            <label for="inp-preauth">Pre-Auth Key (mpk_...)</label>
+            <input id="inp-preauth" type="password" autocomplete="off" placeholder="mpk_...">
+          </div>
+          <div class="field">
+            <label for="inp-nodename">Node Name (optional)</label>
+            <input id="inp-nodename" type="text" autocomplete="off" placeholder="ubuntu-workstation">
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn primary" id="btn-preview-manual" type="button">Enroll &amp; Connect</button>
+          <button class="btn" id="btn-update-server" type="button">Update Server / Pin</button>
+          <button class="btn warn" id="btn-rotate-key" type="button">Rotate Expired Key</button>
+        </div>
+      </section>
+
+      <section class="card wide">
+        <div class="peers-head">
+          <h2>Peers &amp; Diagnostics</h2>
+          <div class="inline">
+            <input id="inp-peer-filter" type="text" placeholder="Filter by name, FQDN, IP...">
+            <button class="btn" id="btn-netcheck" type="button">Netcheck</button>
+            <button class="btn" id="btn-bugreport" type="button">Export Bugreport (.tar)</button>
+          </div>
+        </div>
+        <div class="peers-split">
+          <div class="peer-list" id="peer-list"></div>
+          <div class="peer-detail-col">
+            <div class="btn-row">
+              <button class="btn" id="btn-ping" type="button">Ping Peer</button>
+              <button class="btn" id="btn-ping-direct" type="button">Ping Direct</button>
+            </div>
+            <pre class="panel" id="detail-panel">Select a peer to inspect path telemetry.</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="confirm-modal">
+    <div class="modal">
+      <h3>Confirm Action</h3>
+      <pre class="panel" id="confirm-summary"></pre>
+      <div class="btn-row">
+        <button class="btn primary" id="btn-confirm-ok" type="button">Confirm &amp; Execute</button>
+        <button class="btn" id="btn-confirm-cancel" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -163,6 +163,7 @@ mod tests {
             .env("PROGRAMFILES", dir.path())
             .env("ProgramW6432", dir.path())
             .env("PROGRAMW6432", dir.path())
+            .env("MESH_LINUX_GUI_DIR", dir.path())
             .stdin(Stdio::null())
             .output()
             .map_err(|err| format!("spawn isolated mesh gui failed: {err}"))?;
@@ -177,6 +178,7 @@ mod tests {
         assert!(
             stderr.contains("MeshVPN.exe")
                 || stderr.contains("Mesh VPN.app")
+                || stderr.contains("MeshVPN")
                 || stderr.contains("only supported"),
             "unexpected stderr for missing GUI binary: {stderr}"
         );

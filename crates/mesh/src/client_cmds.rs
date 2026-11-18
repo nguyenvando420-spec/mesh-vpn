@@ -424,7 +424,7 @@ fn prompt_reset_confirmation() -> AppResult<bool> {
     Ok(trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn is_regular_non_symlink_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
 }
@@ -432,6 +432,30 @@ fn is_regular_non_symlink_file(path: &Path) -> bool {
 #[cfg(any(target_os = "macos", test))]
 fn is_regular_non_symlink_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn resolve_linux_gui_exe_from(
+    current_exe: Option<&Path>,
+    bin_dir_override: Option<&Path>,
+) -> Option<PathBuf> {
+    let sibling = current_exe
+        .and_then(Path::parent)
+        .map(|dir| dir.join("MeshVPN"));
+    if let Some(candidate) = sibling.filter(|p| is_regular_non_symlink_file(p)) {
+        return Some(candidate);
+    }
+    if let Some(override_dir) = bin_dir_override {
+        let candidate = override_dir.join("MeshVPN");
+        return is_regular_non_symlink_file(&candidate).then_some(candidate);
+    }
+    for dir in ["/usr/bin", "/usr/local/bin"] {
+        let candidate = Path::new(dir).join("MeshVPN");
+        if is_regular_non_symlink_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -532,10 +556,32 @@ fn handle_gui() -> AppResult<()> {
         write_stdout("Launched Mesh VPN desktop GUI.")
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        let current_exe = std::env::current_exe().ok();
+        let override_dir = std::env::var_os("MESH_LINUX_GUI_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let Some(gui_exe) =
+            resolve_linux_gui_exe_from(current_exe.as_deref(), override_dir.as_deref())
+        else {
+            return Err(AppError::not_found(
+                "MeshVPN was not found next to mesh or in /usr/bin/MeshVPN",
+            ));
+        };
+        std::process::Command::new(&gui_exe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|err| AppError::unavailable(format!("failed launching MeshVPN GUI: {err}")))?;
+        write_stdout("Launched Mesh VPN desktop GUI.")
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         Err(AppError::unavailable(
-            "mesh gui is only supported on Windows and macOS desktop environments",
+            "mesh gui is only supported on Windows, macOS, and Linux desktop environments",
         ))
     }
 }
@@ -1259,6 +1305,14 @@ mod tests {
         assert!(std::fs::create_dir_all(&bundle).is_ok());
         let found_mac = super::resolve_macos_gui_app_from(None, Some(&apps_dir));
         assert_eq!(found_mac.as_deref(), Some(bundle.as_path()));
+
+        // Act 5: Linux binary sibling & override resolution.
+        let linux_dir = dir.path().join("linux-bin");
+        assert!(std::fs::create_dir_all(&linux_dir).is_ok());
+        let linux_gui = linux_dir.join("MeshVPN");
+        assert!(std::fs::write(&linux_gui, b"elf-stub").is_ok());
+        let found_linux = super::resolve_linux_gui_exe_from(None, Some(&linux_dir));
+        assert_eq!(found_linux.as_deref(), Some(linux_gui.as_path()));
     }
 
     #[test]

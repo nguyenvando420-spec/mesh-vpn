@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Mesh VPN">
+  <defs>
+    <linearGradient id="meshBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="meshShield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#meshBg)" stroke="#334155" stroke-width="3"/>
+  <path d="M64 24L96 38v26c0 21.5-13.7 39.3-32 45-18.3-5.7-32-23.5-32-45V38L64 24z" fill="none" stroke="url(#meshShield)" stroke-width="7" stroke-linejoin="round"/>
+  <circle cx="64" cy="46" r="6" fill="#34d399"/>
+  <circle cx="48" cy="70" r="6" fill="#34d399"/>
+  <circle cx="80" cy="70" r="6" fill="#34d399"/>
+  <path d="M64 46L48 70M64 46L80 70M48 70H80" stroke="#e2e8f0" stroke-width="4" stroke-linecap="round"/>
+</svg>

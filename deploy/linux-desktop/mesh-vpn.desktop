@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Mesh VPN
+GenericName=Overlay Mesh VPN Client
+Comment=Connect, monitor, and manage Mesh VPN overlay networks
+Exec=/usr/bin/MeshVPN
+Icon=mesh-vpn
+Terminal=false
+Categories=Network;Security;VPN;
+StartupNotify=true
+StartupWMClass=mesh-vpn
+Keywords=VPN;WireGuard;Mesh;Network;

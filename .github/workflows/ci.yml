@@ -610,7 +610,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            bins: "mesh meshd mesh-server"
+            bins: "MeshVPN mesh meshd mesh-server"
             ext: ""
             codesign: "false"
             check_gnu: "false"
@@ -692,7 +692,7 @@ jobs:
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
             cargo build --release --locked --target ${{ matrix.target }} --bin MeshVPN --bin mesh --bin meshd --bin mesh-server
           else
-            cargo build --release --locked --target ${{ matrix.target }} --bin mesh --bin meshd --bin mesh-server
+            cargo build --release --locked --target ${{ matrix.target }} --bin MeshVPN --bin mesh --bin meshd --bin mesh-server
           fi
 
       - name: Verify x86_64-pc-windows-gnu target compilation
@@ -789,10 +789,24 @@ jobs:
           cp deploy/systemd/* "${dist_dir}/deploy/systemd/"
           cp deploy/linux-desktop/* "${dist_dir}/deploy/linux-desktop/"
           cp scripts/install-linux.sh scripts/install-server.sh "${dist_dir}/scripts/"
+          bash scripts/package-linux-deb.sh \
+            --bin-dir "${dist_dir}" \
+            --out-dir "dist/linux"
+          cp dist/linux/mesh-vpn-linux-amd64.deb dist/linux/mesh-vpn-linux-amd64.deb.sha256 "${dist_dir}/"
           (
             cd "${dist_dir}"
             sha256sum ${{ matrix.bins }} > SHA256SUMS
           )
+
+      - name: Upload built Linux Debian/Ubuntu package (.deb)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeshVPN-linux-amd64-deb
+          path: |
+            dist/linux/mesh-vpn-linux-amd64.deb
+            dist/linux/mesh-vpn-linux-amd64.deb.sha256
+          if-no-files-found: error
 
       - name: Package macOS launchd plist, installer & SHA256SUMS
         if: matrix.codesign == 'true'

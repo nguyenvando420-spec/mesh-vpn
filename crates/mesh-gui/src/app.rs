@@ -1,18 +1,18 @@
 //! Application state machine, daemon version comparison, and sanitized GUI logging
 //! (`ADR-020`, `ADR-022`, `OPS-01`, `SEC-01`, `SEC-05`).
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::path::{Path, PathBuf};
 
 use mesh_net::ipc::AgentVersionStatus;
 use mesh_proto::agent_ipc::{AgentStatusResponse, DaemonState};
 
-/// Subdirectory inside `%LOCALAPPDATA%` reserved for MeshVPN client logs.
-#[cfg(target_os = "windows")]
+/// Subdirectory inside local data dir reserved for MeshVPN client logs.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) const GUI_APP_DATA_DIR_NAME: &str = "MeshVPN";
 
-/// Folder inside `%LOCALAPPDATA%\MeshVPN` storing rotating JSON logs.
-#[cfg(target_os = "windows")]
+/// Folder inside app data dir storing rotating JSON logs.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) const GUI_LOG_SUBDIR: &str = "logs";
 
 /// Eight high-level Windows Desktop GUI lifecycle states (`US-103`, `US-104`, `US-107`).
@@ -376,8 +376,8 @@ pub(crate) fn format_user_facing_error(raw: &str) -> String {
     sanitize_gui_log_text(raw.trim())
 }
 
-/// Computes `%LOCALAPPDATA%\MeshVPN\logs` when a local app-data base directory is provided.
-#[cfg(target_os = "windows")]
+/// Computes `<local_data_dir>/MeshVPN/logs` when a local app-data base directory is provided.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 #[must_use]
 pub(crate) fn gui_log_directory(local_app_data: Option<&Path>) -> Option<PathBuf> {
     local_app_data

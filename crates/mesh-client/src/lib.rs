@@ -81,4 +81,12 @@ mod tests {
         let descriptor = ClientRuntimeDescriptor::default();
         assert_eq!(descriptor.mobile_ws_frame_limit_bytes, 262_144);
     }
+
+    #[test]
+    fn test_client_session_options_auto_resume_toggle() {
+        let opts = ClientSessionOptions::new(ClientRuntimeConfig::for_mobile());
+        assert!(opts.auto_resume_on_boot);
+        let disabled = opts.with_auto_resume(false);
+        assert!(!disabled.auto_resume_on_boot);
+    }
 }
