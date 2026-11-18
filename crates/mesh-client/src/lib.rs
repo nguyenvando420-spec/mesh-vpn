@@ -18,8 +18,9 @@ pub use config::{
     BOOTSTRAP_SCHEMA_VERSION, BootstrapConfig, BootstrapStore, ClientRuntimeConfig,
     SplitTunnelCidr, SplitTunnelRoutePlan, build_tls_client_config_for,
     compute_split_tunnel_routes, current_target_arch, current_target_os, derive_overlay_dns_ip,
-    detect_default_node_name, load_inbound_filter_spec, sanitize_hostname_to_node_name,
-    split_host_port, validate_tls_trust_policy, write_private_file_atomic,
+    detect_default_node_name, is_loopback_endpoint, load_inbound_filter_spec,
+    sanitize_hostname_to_node_name, split_host_port, validate_tls_trust_policy,
+    write_private_file_atomic,
 };
 pub use control_loop::{
     ControlDialOptions, ControlLoop, ControlLoopContext, ControlSessionExit, ControlWakeSignal,

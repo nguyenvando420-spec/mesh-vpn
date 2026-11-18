@@ -1425,7 +1425,7 @@ pub async fn connect_bound_tcp_with_protector(
     // the socket before a single TCP SYN leaves the host.
     protect_socket2(protector, &sock)?;
 
-    if if_index.is_some() || fwmark.is_some() {
+    if !is_loopback_socket_addr(addr) && (if_index.is_some() || fwmark.is_some()) {
         bind_underlay_socket2(&sock, is_ipv6, if_index, fwmark)?;
     }
 
@@ -1456,6 +1456,15 @@ pub async fn connect_bound_tcp_with_protector(
         debug!(component = "datapath.relay_client", error = %err, "TCP keepalive ignored");
     }
     Ok(stream)
+}
+
+fn is_loopback_socket_addr(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 fn classify_tls_io_error(io_err: &io::Error) -> AppError {
@@ -3777,5 +3786,48 @@ mod tests {
         );
         assert_eq!(rtt, Some(17));
         assert!(keepalives_rx.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_connect_bound_tcp_loopback_skips_non_loopback_interface_bind() {
+        // Arrange
+        assert!(is_loopback_socket_addr(
+            "127.0.0.1:443".parse::<SocketAddr>().expect("v4 loopback")
+        ));
+        assert!(is_loopback_socket_addr(
+            "[::1]:443".parse::<SocketAddr>().expect("v6 loopback")
+        ));
+        assert!(is_loopback_socket_addr(
+            "[::ffff:127.0.0.1]:443"
+                .parse::<SocketAddr>()
+                .expect("v4-mapped loopback")
+        ));
+        assert!(!is_loopback_socket_addr(
+            "203.0.113.10:443".parse::<SocketAddr>().expect("public v4")
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let accept_task = tokio::spawn(async move { listener.accept().await.is_ok() });
+
+        // Act: pass a non-loopback `if_index`; loopback target must skip interface binding and connect.
+        let conn = connect_bound_tcp_with_protector(
+            addr,
+            Some(999_999),
+            None,
+            Duration::from_secs(2),
+            &NoopSocketProtector,
+        )
+        .await;
+
+        // Assert
+        assert!(
+            conn.is_ok(),
+            "loopback connect must ignore non-loopback if_index: {conn:?}"
+        );
+        drop(conn);
+        assert!(accept_task.await.unwrap_or(false));
     }
 }

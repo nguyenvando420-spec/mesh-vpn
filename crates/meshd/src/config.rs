@@ -81,7 +81,7 @@ impl DaemonRuntimePaths {
             admin_ipc_endpoint: default_admin_ipc_endpoint().to_owned(),
             ro_ipc_endpoint: default_ro_ipc_endpoint().to_owned(),
             bugreport_dir: state_dir.join("bugreports"),
-            wintun_sha256: option_env!("MESH_WINTUN_SHA256").map(str::to_owned),
+            wintun_sha256: resolve_default_wintun_sha256(),
             tun_mtu: DEFAULT_TUN_MTU,
             underlay_if_index: None,
             linux_fwmark: default_linux_fwmark(),
@@ -139,6 +139,44 @@ fn test_ipc_endpoint(base_dir: &Path, id_tag: &str, admin: bool) -> String {
 const fn default_linux_fwmark() -> Option<u32> {
     if cfg!(target_os = "linux") {
         Some(LINUX_FWMARK)
+    } else {
+        None
+    }
+}
+
+fn resolve_default_wintun_sha256() -> Option<String> {
+    if let Some(pin) = option_env!("MESH_WINTUN_SHA256") {
+        let trimmed = pin.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    resolve_app_wintun_sidecar_sha256()
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_app_wintun_sidecar_sha256() -> Option<String> {
+    let spec = mesh_net::tun_windows::WindowsTunOpenSpec::app_local("").ok()?;
+    let sidecar_path = spec.dll_path.parent()?.join("wintun.dll.sha256");
+    read_wintun_sha256_sidecar(&sidecar_path)
+}
+
+#[cfg(not(target_os = "windows"))]
+const fn resolve_app_wintun_sidecar_sha256() -> Option<String> {
+    None
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn read_wintun_sha256_sidecar(sidecar_path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(sidecar_path).ok()?;
+    if !meta.is_file() || meta.len() > 4096 {
+        return None;
+    }
+    let raw = std::fs::read_to_string(sidecar_path).ok()?;
+    let token = raw.split_whitespace().next()?;
+    let hex = token.strip_prefix("sha256:").unwrap_or(token);
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
     } else {
         None
     }
@@ -419,5 +457,28 @@ mod tests {
         assert!(archive_lossy.contains("netcheck.json"));
         assert!(archive_lossy.contains("bootstrap-sanitized.toml"));
         assert!(archive_lossy.contains("routes.txt"));
+    }
+
+    #[test]
+    fn test_read_wintun_sha256_sidecar_parses_valid_and_rejects_malformed() {
+        // Arrange
+        let dir = tempdir().expect("tempdir");
+        let valid_path = dir.path().join("wintun.dll.sha256");
+        let hex = "E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE";
+        std::fs::write(&valid_path, format!("{hex}  wintun.dll\n")).expect("write valid sidecar");
+
+        let bad_path = dir.path().join("bad.sha256");
+        std::fs::write(&bad_path, "not-a-valid-sha256  wintun.dll\n").expect("write bad sidecar");
+
+        // Act & Assert
+        assert_eq!(
+            super::read_wintun_sha256_sidecar(&valid_path).as_deref(),
+            Some("e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce")
+        );
+        assert_eq!(super::read_wintun_sha256_sidecar(&bad_path), None);
+        assert_eq!(
+            super::read_wintun_sha256_sidecar(&dir.path().join("missing.sha256")),
+            None
+        );
     }
 }

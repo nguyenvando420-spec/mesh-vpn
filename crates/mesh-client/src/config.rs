@@ -563,6 +563,25 @@ pub fn split_host_port(endpoint: &str) -> AppResult<(String, Port)> {
     Ok((host.to_owned(), port))
 }
 
+/// Returns `true` when `endpoint` targets a loopback host (`localhost`, `127.0.0.0/8`, `::1`, or
+/// IPv4-mapped `::ffff:127.0.0.0/8`) that must not be pinned to a non-loopback physical NIC.
+#[must_use]
+pub fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let Ok((host, _port)) = split_host_port(endpoint) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
 /// Enforces fail-closed zero-TOFU rules against IP endpoints and missing SPKI pins.
 pub fn validate_tls_trust_policy(
     endpoint: &str,
@@ -804,7 +823,8 @@ mod tests {
     use super::{
         BOOTSTRAP_SCHEMA_VERSION, BootstrapConfig, BootstrapStore, ClientRuntimeConfig,
         SplitTunnelCidr, compute_split_tunnel_routes, current_target_os, derive_overlay_dns_ip,
-        sanitize_hostname_to_node_name, split_host_port, validate_tls_trust_policy,
+        is_loopback_endpoint, sanitize_hostname_to_node_name, split_host_port,
+        validate_tls_trust_policy,
     };
 
     #[test]
@@ -851,6 +871,12 @@ mod tests {
         assert_eq!(v6, "2001:db8::1");
         assert_eq!(p6.get(), 9443);
         assert_eq!(node.as_str(), "my-phone-local");
+        assert!(is_loopback_endpoint("127.0.0.1:443"));
+        assert!(is_loopback_endpoint("LOCALHOST:8443"));
+        assert!(is_loopback_endpoint("[::1]:443"));
+        assert!(is_loopback_endpoint("[::ffff:127.0.0.1]:3478"));
+        assert!(!is_loopback_endpoint("203.0.113.10:443"));
+        assert!(!is_loopback_endpoint("vpn.example.com:443"));
     }
 
     #[test]

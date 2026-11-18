@@ -20,7 +20,7 @@ use mesh_net::nat64::{Nat64Prefix, NoopSocketProtector, SocketProtector};
 use mesh_proto::agent_ipc::{NetcheckResponse, PingRequest, PingResponse, PingSample, PingVia};
 use mesh_proto::netmap::{NatMappingKind, RelayMap};
 
-use crate::config::split_host_port;
+use crate::config::{is_loopback_endpoint, split_host_port};
 use crate::state::ClientRuntimeState;
 
 const MIN_PING_COUNT: u16 = 1;
@@ -270,8 +270,13 @@ pub async fn run_ephemeral_stun_probe(
     nat64_prefix: Option<Nat64Prefix>,
     socket_protector: Arc<dyn SocketProtector>,
 ) -> Option<StunProbeReport> {
+    let effective_if_index = if stun_endpoints.iter().any(|ep| is_loopback_endpoint(ep)) {
+        None
+    } else {
+        underlay_if_index
+    };
     let sock_cfg = MagicSocketConfig {
-        underlay_if_index,
+        underlay_if_index: effective_if_index,
         linux_fwmark,
         nat64_prefix,
         socket_protector: Arc::clone(&socket_protector),

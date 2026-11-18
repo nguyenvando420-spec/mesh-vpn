@@ -39,7 +39,7 @@ use mesh_proto::netmap::NetmapSnapshot;
 
 use crate::config::{
     BootstrapConfig, ClientRuntimeConfig, derive_overlay_dns_ip, detect_default_node_name,
-    split_host_port, validate_tls_trust_policy,
+    is_loopback_endpoint, split_host_port, validate_tls_trust_policy,
 };
 use crate::control_loop::{
     ControlDialOptions, ControlLoop, ControlLoopContext, ControlWakeSignal,
@@ -1373,12 +1373,17 @@ impl ClientSessionSupervisor {
         let identity = input.identity;
         let tun_dev = input.tun_dev;
         let underlay = input.underlay;
+        let effective_if_index = if is_loopback_endpoint(&params.endpoint) {
+            None
+        } else {
+            underlay.0
+        };
         let nat64_prefix = input.nat64_prefix;
         let timer_mode = input.timer_mode;
         let protector = input.protector;
         let mut socket_cfg = MagicSocketConfig::default()
             .with_mtu(self.options.runtime_cfg.tun_mtu)?
-            .with_underlay(underlay.0, underlay.1)
+            .with_underlay(effective_if_index, underlay.1)
             .with_nat64_prefix(nat64_prefix)
             .with_socket_protector(Arc::clone(&protector));
         if let Some(port) = params.preferred_udp_port {
@@ -1394,7 +1399,7 @@ impl ClientSessionSupervisor {
             endpoint: relay_ep,
             server_name_override: Some(relay_host),
             pin_set: params.bootstrap.pin_set(),
-            underlay_if_index: underlay.0,
+            underlay_if_index: effective_if_index,
             linux_fwmark: underlay.1,
             require_challenge_auth: true,
             agent_version: self.options.runtime_cfg.agent_version.clone(),
@@ -1878,18 +1883,29 @@ pub async fn handle_rebind_command(ctx: &RebindForwardContext, cmd: RebindComman
         }
     }
 
+    let rebind_if_index = if snapshot
+        .bootstrap
+        .server_endpoint
+        .as_deref()
+        .is_some_and(is_loopback_endpoint)
+    {
+        None
+    } else {
+        effective_if_index
+    };
+
     let (reprobe_ready, feedback) = execute_datapath_rebind(
         ctx,
         &snapshot,
         &cmd,
         interface_name,
-        effective_if_index,
+        rebind_if_index,
         is_ipv6,
     )
     .await;
 
     if reprobe_ready {
-        post_rebind_refresh(ctx, &snapshot, effective_if_index).await;
+        post_rebind_refresh(ctx, &snapshot, rebind_if_index).await;
     }
 
     if let Some(ref tx) = ctx.rebind_feedback_tx
