@@ -837,24 +837,26 @@ where
     #[cfg(unix)]
     {
         #[cfg(target_os = "macos")]
-        let stream = match cfg.server_admin_socket_override.as_deref() {
-            Some(custom) => connect_unix_admin_socket(custom).await?,
-            None => match connect_unix_admin_socket(MACOS_SERVER_ADMIN_SOCKET).await {
-                Ok(stream) => stream,
-                Err(primary_err) => {
-                    match connect_unix_admin_socket(MACOS_SERVER_ADMIN_FALLBACK_SOCKET).await {
-                        Ok(stream) => stream,
-                        Err(fallback_err) => {
-                            if primary_err.kind() == mesh_core::ErrorKind::PermissionDenied {
-                                return Err(primary_err);
+        let stream = match cfg.server_admin_socket_override.as_deref().map(str::trim) {
+            None | Some("") | Some(LINUX_SERVER_ADMIN_SOCKET) => {
+                match connect_unix_admin_socket(MACOS_SERVER_ADMIN_SOCKET).await {
+                    Ok(stream) => stream,
+                    Err(primary_err) => {
+                        match connect_unix_admin_socket(MACOS_SERVER_ADMIN_FALLBACK_SOCKET).await {
+                            Ok(stream) => stream,
+                            Err(fallback_err) => {
+                                if primary_err.kind() == mesh_core::ErrorKind::PermissionDenied {
+                                    return Err(primary_err);
+                                }
+                                return Err(AppError::unavailable(format!(
+                                    "mesh-server admin socket is unreachable at {MACOS_SERVER_ADMIN_SOCKET} ({primary_err}) or {MACOS_SERVER_ADMIN_FALLBACK_SOCKET} ({fallback_err})"
+                                )));
                             }
-                            return Err(AppError::unavailable(format!(
-                                "mesh-server admin socket is unreachable at {MACOS_SERVER_ADMIN_SOCKET} ({primary_err}) or {MACOS_SERVER_ADMIN_FALLBACK_SOCKET} ({fallback_err})"
-                            )));
                         }
                     }
                 }
-            },
+            }
+            Some(custom) => connect_unix_admin_socket(custom).await?,
         };
         #[cfg(not(target_os = "macos"))]
         let stream = {
