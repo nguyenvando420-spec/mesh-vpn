@@ -172,7 +172,7 @@ final class DesktopCoreTests: XCTestCase {
         fakePasteboard.setStringContent(secretUri)
         cleaner.recordAndScheduleWipe(text: secretUri)
         XCTAssertTrue(cleaner.hasPendingWipe)
-        try await Task.sleep(nanoseconds: 150_000_000)
+        try await waitUntilWipeCompletes(cleaner)
 
         // Assert 1
         XCTAssertNil(fakePasteboard.stringContent())
@@ -182,7 +182,7 @@ final class DesktopCoreTests: XCTestCase {
         fakePasteboard.setStringContent(secretUri)
         cleaner.scheduleWipeIfClipboardMatchesFieldText(secretUri)
         fakePasteboard.setStringContent("unrelated user text")
-        try await Task.sleep(nanoseconds: 150_000_000)
+        try await waitUntilWipeCompletes(cleaner)
 
         // Assert 2
         XCTAssertEqual(fakePasteboard.stringContent(), "unrelated user text")
@@ -199,11 +199,24 @@ final class DesktopCoreTests: XCTestCase {
         // Act
         cleaner.scheduleWipeIfClipboardMatchesFieldText(rawToken)
         XCTAssertTrue(cleaner.hasPendingWipe)
-        try await Task.sleep(nanoseconds: 150_000_000)
+        try await waitUntilWipeCompletes(cleaner)
 
         // Assert
         XCTAssertNil(fakePasteboard.stringContent())
         XCTAssertFalse(cleaner.hasPendingWipe)
+    }
+
+    @MainActor
+    private func waitUntilWipeCompletes(
+        _ cleaner: ClipboardAutoClear,
+        maxAttempts: Int = 120
+    ) async throws {
+        for _ in 0..<maxAttempts {
+            if !cleaner.hasPendingWipe {
+                return
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
     }
 
     private func base64UrlNoPadEncode(_ data: Data) -> String {
