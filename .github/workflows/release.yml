@@ -1,4 +1,4 @@
-name: Release 4-Target Artifacts
+name: Release All 5 Client Platforms & Server
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag label (e.g. v0.3.0-rc1)"
+        description: "Release tag label (e.g. v0.3.0)"
         type: string
         required: true
       draft:
@@ -207,8 +207,12 @@ jobs:
           "MESH_WINTUN_STAGE_DIR=$stageDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Output "Verified Wintun 0.14.1 SHA-256 and exported MESH_WINTUN_SHA256=$dllSha256"
 
-      - name: Build release binaries for ${{ matrix.target }} (Unix)
-        if: matrix.platform != 'windows'
+      - name: Build release binaries for ${{ matrix.target }} (Linux)
+        if: matrix.platform == 'linux'
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin MeshVPN --bin mesh --bin meshd --bin mesh-server
+
+      - name: Build release binaries for ${{ matrix.target }} (macOS)
+        if: matrix.platform == 'macos'
         run: cargo build --release --locked --target ${{ matrix.target }} --bin mesh --bin meshd --bin mesh-server
 
       - name: Build release binaries for ${{ matrix.target }} (Windows)
@@ -316,7 +320,7 @@ jobs:
           OUT="artifacts"
           mkdir -p "$STAGE" "$OUT"
 
-          if [ "${{ matrix.platform }}" = "windows" ]; then
+          if [ "${{ matrix.platform }}" = "windows" ] || [ "${{ matrix.platform }}" = "linux" ]; then
             BINS="MeshVPN mesh meshd mesh-server"
           else
             BINS="mesh meshd mesh-server"
@@ -368,6 +372,8 @@ jobs:
             cd "$STAGE"
             if [ "${{ matrix.platform }}" = "windows" ]; then
               sha256sum MeshVPN.exe mesh.exe meshd.exe mesh-server.exe wintun.dll > SHA256SUMS
+            elif [ "${{ matrix.platform }}" = "linux" ]; then
+              sha256sum MeshVPN mesh meshd mesh-server > SHA256SUMS
             elif command -v sha256sum >/dev/null 2>&1; then
               sha256sum mesh meshd mesh-server > SHA256SUMS
             else
@@ -380,6 +386,29 @@ jobs:
           else
             powershell -NoProfile -Command "Compress-Archive -Path '${STAGE}/*' -DestinationPath '${OUT}/${{ matrix.pkg_name }}.zip' -Force"
           fi
+
+      - name: Package Ubuntu/Debian .deb installer
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw_tag="${{ inputs.tag || github.ref_name }}"
+          deb_ver="${raw_tag#v}"
+          if [[ ! "${deb_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            deb_ver="0.3.0"
+          fi
+          bash scripts/package-linux-deb.sh \
+            --bin-dir "target/${{ matrix.target }}/release" \
+            --out-dir "artifacts/linux-deb" \
+            --version "${deb_ver}"
+
+      - name: Upload Linux Debian/Ubuntu .deb package
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mesh-linux-deb
+          path: artifacts/linux-deb/mesh-vpn-linux-amd64.deb
+          if-no-files-found: error
 
       - name: Upload packaged archive
         uses: actions/upload-artifact@v4
@@ -480,6 +509,7 @@ jobs:
             --x86_64-bin-dir darwin-raw/darwin-raw-x86_64-apple-darwin \
             --out-dir artifacts/macos \
             --dmg-name MeshVPN-macos-universal.dmg
+          /usr/bin/ditto -c -k --keepParent "artifacts/macos/Mesh VPN.app" "artifacts/macos/MeshVPN-macos-universal.app.zip"
 
       - name: Cleanup temporary Apple signing credentials
         if: always()
@@ -493,7 +523,285 @@ jobs:
           name: release-mesh-macos-universal
           path: |
             artifacts/macos/MeshVPN-macos-universal.dmg
+            artifacts/macos/MeshVPN-macos-universal.app.zip
             artifacts/macos/*.pkg
+          if-no-files-found: error
+
+  package-android-mobile:
+    name: Package Android APK & AAB Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK 35 & NDK r27c
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          yes | "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "${GITHUB_ENV}"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/27.2.12479018" >> "${GITHUB_ENV}"
+
+      - name: Install Rust 1.94.1 & Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-release-unified-v1
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Build Android JNI .so, Maven repo & UniFFI Kotlin bindings
+        run: bash scripts/build-android-ffi.sh
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+          build-scan-publish: false
+
+      - name: Decode optional release signing keystore
+        env:
+          MESH_ANDROID_KEYSTORE_BASE64: ${{ secrets.MESH_ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [[ -n "${MESH_ANDROID_KEYSTORE_BASE64}" ]]; then
+            python3 - <<'PY'
+          import base64
+          import os
+          data = base64.b64decode(os.environ["MESH_ANDROID_KEYSTORE_BASE64"])
+          with open("/tmp/mesh-release.jks", "wb") as fh:
+              fh.write(data)
+          os.chmod("/tmp/mesh-release.jks", 0o600)
+          PY
+            echo "MESH_ANDROID_KEYSTORE_PATH=/tmp/mesh-release.jks" >> "${GITHUB_ENV}"
+          else
+            echo "No release keystore secret configured; building unsigned release / debug APK (\$0 Mode)."
+          fi
+
+      - name: Run ktlint, detekt, Android Lint, unit tests & APK/AAB build
+        working-directory: mobile/android
+        env:
+          RUSTLS_PLATFORM_VERIFIER_REPO: ${{ github.workspace }}/mobile/android/.m2
+          MESH_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.MESH_ANDROID_KEYSTORE_PASSWORD }}
+          MESH_ANDROID_KEY_ALIAS: ${{ secrets.MESH_ANDROID_KEY_ALIAS }}
+          MESH_ANDROID_KEY_PASSWORD: ${{ secrets.MESH_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          gradle --no-daemon \
+            ktlintCheck \
+            detekt \
+            lintDebug \
+            testDebugUnitTest \
+            assembleDebug \
+            bundleRelease \
+            assembleRelease \
+            -PrustlsPlatformVerifierRepo="${RUSTLS_PLATFORM_VERIFIER_REPO}"
+
+      - name: Wipe temporary signing keystore
+        if: always()
+        run: rm -f /tmp/mesh-release.jks
+
+      - name: Verify APK native ABIs, page alignment & stage Android installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import struct
+          import zipfile
+
+          apks = glob.glob("mobile/android/app/build/outputs/apk/**/*.apk", recursive=True)
+          if not apks:
+              raise SystemExit("error: no APK outputs produced")
+
+          max_so_bytes = 6 * 1024 * 1024
+          for apk in apks:
+              with zipfile.ZipFile(apk, "r") as zf:
+                  names = set(zf.namelist())
+                  for abi in ("arm64-v8a", "x86_64"):
+                      entry = f"lib/{abi}/libmesh_mobile_ffi.so"
+                      if entry not in names:
+                          raise SystemExit(f"error: {apk} missing {entry}")
+                      raw = zf.read(entry)
+                      if len(raw) > max_so_bytes:
+                          raise SystemExit(f"error: {apk} {entry} size {len(raw)} > {max_so_bytes}")
+                      e_phoff = struct.unpack_from("<Q", raw, 32)[0]
+                      e_phentsize = struct.unpack_from("<H", raw, 54)[0]
+                      e_phnum = struct.unpack_from("<H", raw, 56)[0]
+                      for idx in range(e_phnum):
+                          off = e_phoff + idx * e_phentsize
+                          p_type = struct.unpack_from("<I", raw, off)[0]
+                          p_align = struct.unpack_from("<Q", raw, off + 48)[0]
+                          if p_type == 1 and p_align < 16384:
+                              raise SystemExit(f"error: {apk} {entry} p_align={p_align} < 16384")
+              print(f"Verified APK {apk}: ABIs present, size <= 6 MiB, 16 KB aligned.")
+          PY
+
+          mkdir -p artifacts/android
+          debug_apk="$(ls -1 mobile/android/app/build/outputs/apk/debug/*.apk | head -n 1)"
+          cp "${debug_apk}" "artifacts/android/MeshVPN-android-debug.apk"
+          rel_apk="$(ls -1 mobile/android/app/build/outputs/apk/release/*.apk | head -n 1)"
+          if [[ "${rel_apk}" == *-unsigned.apk ]]; then
+            cp "${rel_apk}" "artifacts/android/MeshVPN-android-release-unsigned.apk"
+          else
+            cp "${rel_apk}" "artifacts/android/MeshVPN-android-release.apk"
+          fi
+          rel_aab="$(ls -1 mobile/android/app/build/outputs/bundle/release/*.aab | head -n 1)"
+          cp "${rel_aab}" "artifacts/android/MeshVPN-android-release.aab"
+          ls -lh artifacts/android
+
+      - name: Upload Android APK & AAB installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mesh-android
+          path: artifacts/android/*
+          if-no-files-found: error
+
+  package-ios-mobile:
+    name: Package iOS IPA & App Bundle ($0)
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.94.1 with iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94.1"
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
+
+      - name: Cache Cargo registry and iOS build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen and SwiftLint
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          if ! command -v swiftlint >/dev/null 2>&1; then
+            brew install swiftlint
+          fi
+
+      - name: Build MeshMobileFFI.xcframework and UniFFI Swift bindings
+        run: bash scripts/build-ios-xcframework.sh
+
+      - name: Generate Xcode project via XcodeGen
+        run: xcodegen generate --spec mobile/ios/project.yml
+
+      - name: Run SwiftLint (--strict)
+        working-directory: mobile/ios
+        run: swiftlint lint --strict --reporter github-actions-logging
+
+      - name: Select available iPhone Simulator and run xcodebuild build test ($0)
+        run: |
+          set -euo pipefail
+          SIM_UDID="$(python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          raw = subprocess.check_output(
+              ["xcrun", "simctl", "list", "devices", "available", "-j"],
+              text=True,
+          )
+          data = json.loads(raw)
+          preferred = []
+          fallback = []
+          for runtime, devices in data.get("devices", {}).items():
+              if "iOS" not in runtime:
+                  continue
+              for dev in devices:
+                  if not dev.get("isAvailable"):
+                      continue
+                  name = dev.get("name", "")
+                  if name == "iPhone 16":
+                      preferred.append((runtime, dev["udid"]))
+                  elif name.startswith("iPhone"):
+                      fallback.append((runtime, dev["udid"]))
+          chosen = sorted(preferred, reverse=True) or sorted(fallback, reverse=True)
+          if not chosen:
+              print("ERROR: No available iPhone Simulator found", file=sys.stderr)
+              sys.exit(1)
+          print(chosen[0][1])
+          PY
+          )"
+          echo "Using iOS Simulator UDID: ${SIM_UDID}"
+          xcodebuild \
+            -project mobile/ios/MeshApp.xcodeproj \
+            -scheme MeshApp \
+            -destination "platform=iOS Simulator,id=${SIM_UDID}" \
+            -derivedDataPath mobile/ios/build/DerivedDataSim \
+            CODE_SIGNING_ALLOWED=NO \
+            build test
+
+      - name: Build iOS device Release app & package IPA/App artifacts ($0)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project mobile/ios/MeshApp.xcodeproj \
+            -scheme MeshApp \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath mobile/ios/build/DerivedDataDevice \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            build
+
+          ARTIFACTS_DIR="${PWD}/artifacts/ios"
+          STAGE_DIR="${RUNNER_TEMP}/ios-package"
+          rm -rf "${ARTIFACTS_DIR}" "${STAGE_DIR}"
+          mkdir -p "${ARTIFACTS_DIR}" "${STAGE_DIR}/Payload" "${STAGE_DIR}/sim"
+
+          DEVICE_APP_SRC="${PWD}/mobile/ios/build/DerivedDataDevice/Build/Products/Release-iphoneos/MeshApp.app"
+          SIM_APP_SRC="${PWD}/mobile/ios/build/DerivedDataSim/Build/Products/Debug-iphonesimulator/MeshApp.app"
+          test -d "${DEVICE_APP_SRC}"
+          test -d "${SIM_APP_SRC}"
+
+          DEVICE_APP_STAGE="${STAGE_DIR}/Payload/MeshApp.app"
+          cp -R "${DEVICE_APP_SRC}" "${DEVICE_APP_STAGE}"
+          for fw in "${DEVICE_APP_STAGE}/Frameworks/"*.framework; do
+            if [ -e "${fw}" ]; then
+              codesign --force --sign - --timestamp=none "${fw}"
+            fi
+          done
+          for ext in "${DEVICE_APP_STAGE}/PlugIns/"*.appex; do
+            if [ -e "${ext}" ]; then
+              codesign --force --sign - --timestamp=none "${ext}"
+            fi
+          done
+          codesign --force --sign - --timestamp=none "${DEVICE_APP_STAGE}"
+
+          (cd "${STAGE_DIR}" && zip -qry "${ARTIFACTS_DIR}/MeshVPN-ios-unsigned.ipa" Payload)
+          (cd "${STAGE_DIR}/Payload" && zip -qry "${ARTIFACTS_DIR}/MeshVPN-ios-device.app.zip" MeshApp.app)
+
+          cp -R "${SIM_APP_SRC}" "${STAGE_DIR}/sim/MeshApp.app"
+          (cd "${STAGE_DIR}/sim" && zip -qry "${ARTIFACTS_DIR}/MeshVPN-ios-simulator.app.zip" MeshApp.app)
+          ls -lh "${ARTIFACTS_DIR}"
+
+      - name: Upload iOS IPA & App installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-mesh-ios
+          path: artifacts/ios/*
           if-no-files-found: error
 
   build-server-container:
@@ -526,7 +834,7 @@ jobs:
 
   publish-release:
     name: Publish Unified SHA256SUMS & GitHub Release
-    needs: [verify-and-build, package-macos-desktop, build-server-container]
+    needs: [verify-and-build, package-macos-desktop, package-android-mobile, package-ios-mobile, build-server-container]
     runs-on: ubuntu-latest
     steps:
       - name: Download all release artifacts
@@ -542,7 +850,7 @@ jobs:
           set -euo pipefail
           cd release-dist
           files=()
-          for ext in tar.gz zip dmg pkg; do
+          for ext in tar.gz zip dmg pkg deb apk aab ipa; do
             for f in *."${ext}"; do
               if [ -f "$f" ]; then
                 files+=("$f")
@@ -570,9 +878,13 @@ jobs:
           prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           generate_release_notes: true
           body: |
-            ## Mesh VPN Desktop & CLI Release
+            ## Mesh VPN All-Platform Release
 
             - **Windows**: Extract `mesh-windows-x86_64-msvc.zip` and launch `MeshVPN.exe` (or run `scripts/install-windows.ps1` as Administrator).
-            - **macOS (`$0` Ad-Hoc Signed)**: Open `MeshVPN-macos-universal.dmg`, drag `Mesh VPN.app` to `/Applications`, and on first launch **Right-click -> Open** (or allow in *System Settings -> Privacy & Security*) to acknowledge Gatekeeper for unsigned/ad-hoc builds.
+            - **macOS (`$0` Ad-Hoc Signed)**: Open `MeshVPN-macos-universal.dmg` (or unzip `MeshVPN-macos-universal.app.zip`), move `Mesh VPN.app` to `/Applications`, and run `sudo bash scripts/install-macos.sh` to install and start `/Library/LaunchDaemons/internal.mesh.meshd.plist`.
+            - **Ubuntu / Debian Linux (`.deb`)**: Install `sudo apt install ./mesh-vpn-linux-amd64.deb` and run `mesh gui` or launch **Mesh VPN** from your application menu (tarball `mesh-linux-x86_64-musl.tar.gz` also included).
+            - **Android**: Sideload `MeshVPN-android-debug.apk` (recommended `$0` sideload APK) or re-sign `MeshVPN-android-release-unsigned.apk` / `MeshVPN-android-release.aab` with your keystore.
+            - **iOS**: `MeshVPN-ios-unsigned.ipa` / `MeshVPN-ios-device.app.zip` (re-sign with your Apple Developer provisioning profile including `packet-tunnel-provider` and `group.dev.meshvpn.ios`) and `MeshVPN-ios-simulator.app.zip` for iOS Simulator.
+            - **Server Container**: `mesh-server-image-linux-amd64.tar.gz` (`docker load -i ...`).
             - Verify all downloads against `SHA256SUMS`.
           files: ${{ steps.dist_files.outputs.files }}

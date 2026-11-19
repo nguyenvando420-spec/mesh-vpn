@@ -9,35 +9,27 @@ on:
       - "fix/**"
       - "sprint/**"
     paths:
-      - "mobile/ios/**"
-      - "crates/mesh-mobile-ffi/**"
-      - "crates/mesh-client/**"
-      - "crates/mesh-core/**"
-      - "crates/mesh-crypto/**"
-      - "crates/mesh-datapath/**"
-      - "crates/mesh-net/**"
-      - "crates/mesh-proto/**"
-      - "crates/mesh-sys/**"
+      - "crates/**"
       - "tools/uniffi-bindgen/**"
+      - "mobile/ios/**"
       - "scripts/build-ios-xcframework.sh"
       - ".github/workflows/mobile-ios.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
   pull_request:
     branches:
       - main
       - master
     paths:
-      - "mobile/ios/**"
-      - "crates/mesh-mobile-ffi/**"
-      - "crates/mesh-client/**"
-      - "crates/mesh-core/**"
-      - "crates/mesh-crypto/**"
-      - "crates/mesh-datapath/**"
-      - "crates/mesh-net/**"
-      - "crates/mesh-proto/**"
-      - "crates/mesh-sys/**"
+      - "crates/**"
       - "tools/uniffi-bindgen/**"
+      - "mobile/ios/**"
       - "scripts/build-ios-xcframework.sh"
       - ".github/workflows/mobile-ios.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
   workflow_dispatch:
 
 permissions:
@@ -265,4 +257,12 @@ jobs:
         with:
           name: mesh-ios-app-artifacts
           path: mobile/ios/build/artifacts/*
+          retention-days: 14
+
+      - name: Upload iOS Unsigned IPA installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeshVPN-ios-unsigned-ipa
+          path: mobile/ios/build/artifacts/MeshVPN-ios-unsigned.ipa
+          if-no-files-found: error
           retention-days: 14
