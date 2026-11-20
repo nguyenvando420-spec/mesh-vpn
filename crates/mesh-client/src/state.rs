@@ -468,7 +468,12 @@ fn assemble_status_response(
     let server_connection = snap.bootstrap.server_endpoint.as_ref().map(|ctrl_ep| {
         let relay_ep = snap.latest_netmap.as_ref().map_or_else(
             || ctrl_ep.clone(),
-            |n| n.relay_map.relay_tcp_endpoint.clone(),
+            |n| {
+                crate::session::resolve_effective_remote_endpoint(
+                    ctrl_ep,
+                    &n.relay_map.relay_tcp_endpoint,
+                )
+            },
         );
         let stun_eps = snap
             .latest_netmap

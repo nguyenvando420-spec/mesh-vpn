@@ -27,6 +27,10 @@ mod tests {
     use rustls::ClientConnection;
     use rustls::pki_types::ServerName;
     use tempfile::TempDir;
+    use tokio_tungstenite::tungstenite;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::http::StatusCode;
 
     use mesh_core::{Clock as _, KeyId, NodeName, SpkiPin, SystemClock};
     use mesh_crypto::{
@@ -37,7 +41,7 @@ mod tests {
     use mesh_proto::control::{
         ChallengeRequest, ChallengeResponse, HEADER_AUTH_PROOF, HEADER_BOX_NONCE,
         HEADER_CHALLENGE_ID, HEADER_NODE_PUBKEY, RegisterNodeRequest, RegisterNodeResponse,
-        TargetArch, TargetOs,
+        ServerControlFrame, TargetArch, TargetOs,
     };
     use mesh_store::{ControlStore, ControlStoreConfig, CreatePreAuthKeyInput};
 
@@ -562,5 +566,118 @@ mod tests {
             .await
             .expect("GET /v1/admin/nodes on obs");
         assert_eq!(obs_admin.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_live_server_allows_multi_cycle_challenge_reconnect_after_one_time_preauth_enroll()
+    -> Result<(), String> {
+        // Arrange: spawn real mesh-server + enroll once with single-use preauth key
+        let srv = spawn_live_server().await;
+        let node_kp = NodeKeypair::generate();
+        let disco_kp = DiscoKeypair::generate();
+        let reg_req = RegisterNodeRequest {
+            node_pubkey: node_kp.public_key(),
+            disco_pubkey: disco_kp.public_key(),
+            preauth_key: srv.one_time_preauth.clone(),
+            node_name: NodeName::parse("reconn-live-node").map_err(|e| e.to_string())?,
+            previous_node_pubkey: None,
+        };
+        let (reg_status, _reg_body) =
+            send_signed_register_attempt(srv.ctrl_port, srv.pin, &node_kp, &disco_kp, &reg_req);
+        assert_eq!(reg_status, 200);
+
+        // Act & Assert: run 3 consecutive disconnect/reconnect challenge + WS upgrade cycles
+        let port = srv.ctrl_port;
+        let pin = srv.pin;
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            for cycle in 1..=3_u32 {
+                let (ch_status, ch_bytes) =
+                    post_challenge_with_version(port, pin, &node_kp, &disco_kp, 1);
+                if ch_status != 200 {
+                    return Err(format!(
+                        "cycle {cycle} challenge failed with status {ch_status}"
+                    ));
+                }
+                let ch: ChallengeResponse =
+                    serde_json::from_slice(&ch_bytes).map_err(|e| e.to_string())?;
+                let (tls, exporter_b64) = open_pinned_tls(port, pin);
+                let proof = ProofPayload {
+                    challenge_id: ch.challenge_id,
+                    challenge_nonce: ch.challenge_nonce,
+                    method: "GET".to_owned(),
+                    path: "/v1/netmap/stream".to_owned(),
+                    body_sha256: sha256_hex(b""),
+                    node_pubkey: node_kp.public_key(),
+                    disco_pubkey: disco_kp.public_key(),
+                    timestamp_at_ms: SystemClock::new().now_unix_ms(),
+                    tls_exporter_binding: exporter_b64,
+                };
+                let sealed = seal_proof(&proof, &ch.server_eph_pubkey, &node_kp)
+                    .map_err(|e| e.to_string())?;
+                let mut req = format!("wss://127.0.0.1:{port}/v1/netmap/stream")
+                    .into_client_request()
+                    .map_err(|e| e.to_string())?;
+                let hdrs = [
+                    (HEADER_CHALLENGE_ID, ch.challenge_id.to_string()),
+                    (
+                        HEADER_NODE_PUBKEY,
+                        BASE64_STANDARD.encode(node_kp.public_key().as_bytes()),
+                    ),
+                    (HEADER_BOX_NONCE, BASE64_STANDARD.encode(sealed.box_nonce)),
+                    (
+                        HEADER_AUTH_PROOF,
+                        BASE64_STANDARD.encode(&sealed.ciphertext),
+                    ),
+                ];
+                for (name, value) in hdrs {
+                    let hn = tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|e| e.to_string())?;
+                    let hv = tungstenite::http::HeaderValue::from_str(&value)
+                        .map_err(|e| e.to_string())?;
+                    req.headers_mut().insert(hn, hv);
+                }
+                let (mut ws, resp) = tungstenite::client(req, tls)
+                    .map_err(|e| format!("cycle {cycle} ws upgrade failed: {e}"))?;
+                if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+                    return Err(format!(
+                        "cycle {cycle} expected 101 Switching Protocols, got {}",
+                        resp.status()
+                    ));
+                }
+                let msg = ws
+                    .read()
+                    .map_err(|e| format!("cycle {cycle} ws read: {e}"))?;
+                let WsMessage::Text(txt) = msg else {
+                    return Err(format!(
+                        "cycle {cycle} expected text netmap frame, got {msg:?}"
+                    ));
+                };
+                let frame = serde_json::from_str::<ServerControlFrame>(&txt)
+                    .map_err(|e| format!("cycle {cycle} decode frame: {e}"))?;
+                match frame {
+                    ServerControlFrame::NetmapSnapshot { netmap, .. } => {
+                        if !netmap
+                            .peers
+                            .iter()
+                            .any(|p| p.fqdn == "reconn-live-node.mesh.internal")
+                            && netmap.netmap_version == 0
+                        {
+                            return Err(format!("cycle {cycle} invalid initial netmap"));
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "cycle {cycle} expected NetmapSnapshot frame, got {other:?}"
+                        ));
+                    }
+                }
+                drop(ws.close(None));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        Ok(())
     }
 }

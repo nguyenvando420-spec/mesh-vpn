@@ -98,12 +98,62 @@ fn check_windows_netsh_output(out: &CommandOutput, allow_absent: bool) -> AppRes
 }
 
 fn is_windows_route_absent(out: &CommandOutput) -> bool {
-    let combined = format!("{} {}", out.stderr, out.stdout).to_ascii_lowercase();
-    combined.contains("element not found")
-        || combined.contains("not found")
-        || combined.contains("does not exist")
-        || combined.contains("cannot find")
-        || combined.contains("no routes")
+    crate::route::is_windows_netsh_route_absent(&out.stdout, &out.stderr)
+}
+
+fn is_windows_route_absent_in_os(cidr: &str, iface: &str) -> bool {
+    if let Ok(adapters) = mesh_sys::netmon_windows::list_adapters()
+        && !adapters
+            .iter()
+            .any(|adapter| adapter.friendly_name == iface)
+    {
+        return true;
+    }
+    let Ok(show_spec) = CommandSpec::new(
+        AllowedBinary::WindowsNetsh,
+        vec![
+            "interface".to_owned(),
+            "ipv4".to_owned(),
+            "show".to_owned(),
+            "route".to_owned(),
+            "store=active".to_owned(),
+        ],
+    ) else {
+        return false;
+    };
+    let Ok(out) = execute_windows_command(None, &show_spec) else {
+        return false;
+    };
+    if !out.success() {
+        return false;
+    }
+    !out.stdout
+        .lines()
+        .any(|line| line.contains(cidr) && line.contains(iface))
+}
+
+fn delete_windows_route_idempotent(
+    executor: Option<&dyn CommandExecutor>,
+    cidr: &str,
+    iface: &str,
+) -> AppResult<()> {
+    let del_spec = build_delete_route_command(cidr, iface)?;
+    let out = execute_windows_command(executor, &del_spec)?;
+    match check_windows_netsh_output(&out, true) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if executor.is_none() && is_windows_route_absent_in_os(cidr, iface) {
+                tracing::debug!(
+                    target: "mesh::net::route_windows",
+                    cidr = %cidr,
+                    interface = %iface,
+                    "Treating netsh route delete failure as idempotent because route/interface is absent"
+                );
+                return Ok(());
+            }
+            Err(err)
+        }
+    }
 }
 
 fn validate_windows_route_spec(spec: &RouteSpec) -> AppResult<()> {
@@ -129,7 +179,15 @@ impl RouteManager for WindowsRouteManager {
 
         // Remove any identical stale route best-effort so repeated startup stays idempotent.
         let del_spec = build_delete_route_command(&cidr, &iface)?;
-        self.run_command(&del_spec, true)?;
+        if let Err(err) = self.run_command(&del_spec, true) {
+            tracing::debug!(
+                target: "mesh::net::route_windows",
+                cidr = %cidr,
+                interface = %iface,
+                error = %err,
+                "Best-effort stale Windows route delete returned non-absent error"
+            );
+        }
 
         let add_spec = CommandSpec::new(
             AllowedBinary::WindowsNetsh,
@@ -148,11 +206,11 @@ impl RouteManager for WindowsRouteManager {
 
     fn remove_overlay_route(&self, spec: &RouteSpec) -> AppResult<()> {
         validate_windows_route_spec(spec)?;
-        let del_spec = build_delete_route_command(
+        delete_windows_route_idempotent(
+            self.executor.as_deref(),
             &spec.destination_cidr.to_string(),
             spec.interface_name.trim(),
-        )?;
-        self.run_command(&del_spec, true)
+        )
     }
 
     fn apply_linux_policy(&self, _policy: &LinuxPolicyRoutingSpec) -> AppResult<()> {
@@ -236,10 +294,8 @@ impl<E: CommandExecutor + 'static> LedgerCleanupOps for WindowsCleanupOps<E> {
                     "invalid interface name in Windows ledger route entry",
                 ));
             }
-            let del_spec = build_delete_route_command(&cidr.to_string(), iface)?;
             let exec_ref = self.executor.as_deref().map(|e| e as &dyn CommandExecutor);
-            let out = execute_windows_command(exec_ref, &del_spec)?;
-            check_windows_netsh_output(&out, true)?;
+            delete_windows_route_idempotent(exec_ref, &cidr.to_string(), iface)?;
         }
         Ok(())
     }
@@ -525,5 +581,63 @@ mod tests {
                 Some(AllowedBinary::WindowsNetsh)
             ));
         }
+    }
+
+    #[test]
+    fn test_route_windows_cleanup_succeeds_when_adapter_closed_syntax_incorrect() {
+        // Arrange: simulate Windows removing MeshVPN adapter before ResourceLedger::cleanup_all runs.
+        let dir = tempdir();
+        assert!(dir.is_ok());
+        let Ok(dir) = dir else {
+            return;
+        };
+        let ledger_path = dir.path().join("ledger.json");
+        let mut ledger = ResourceLedger::load_or_init(ledger_path).expect("ledger");
+        ledger
+            .record_tun_before_create(
+                "MeshVPN".to_owned(),
+                Some("{4d455348-5650-4e31-8000-000000000001}".to_owned()),
+                4242,
+                1_700_000_000_000,
+            )
+            .expect("record tun");
+        ledger
+            .record_route_before_add(LedgerRouteEntry {
+                destination_cidr: "100.64.0.0/10".to_owned(),
+                interface_name: "MeshVPN".to_owned(),
+                table: None,
+            })
+            .expect("record route");
+        ledger
+            .record_firewall_before_apply(None, vec!["MeshVPN-Overlay-Inbound".to_owned()])
+            .expect("record fw");
+
+        let fake_exec = FakeCommandExecutor::new();
+        // 1) route delete -> Windows netsh exits 1 with "The filename, directory name, or volume label syntax is incorrect."
+        fake_exec
+            .push_result(Ok(CommandOutput {
+                status_code: 1,
+                stdout: "The filename, directory name, or volume label syntax is incorrect.\r\n"
+                    .to_owned(),
+                stderr: String::new(),
+            }))
+            .expect("queue route error");
+        // 2) firewall delete -> "No rules match".
+        fake_exec
+            .push_result(Ok(CommandOutput {
+                status_code: 1,
+                stdout: "No rules match the specified criteria.\r\n".to_owned(),
+                stderr: String::new(),
+            }))
+            .expect("queue fw absent");
+
+        let cleanup = WindowsCleanupOps::with_executor(fake_exec);
+
+        // Act
+        let res = ledger.cleanup_all(&cleanup);
+
+        // Assert
+        assert!(res.is_ok(), "cleanup_all failed: {res:?}");
+        assert!(!ledger.needs_stale_recovery());
     }
 }

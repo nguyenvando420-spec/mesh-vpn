@@ -744,10 +744,14 @@ where
         .map(DatapathHandle::subscribe_stun_reports);
     let mut last_rx = tokio::time::Instant::now();
     let idle_limit = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
+    let mut initial_stream_snapshot_pending = true;
     let mut scratch = [0_u8; 4096];
 
     loop {
-        if let Some(exit) = drain_control_ws_messages(ctx, ws, &mut last_rx).await {
+        if let Some(exit) =
+            drain_control_ws_messages(ctx, ws, &mut last_rx, &mut initial_stream_snapshot_pending)
+                .await
+        {
             return exit;
         }
         if *ws_close_rx.borrow() || ctx.shutdown.is_cancelled() {
@@ -889,6 +893,7 @@ async fn drain_control_ws_messages<S>(
     ctx: &ControlLoopContext,
     ws: &mut WebSocket<BridgeStream<S>>,
     last_rx: &mut tokio::time::Instant,
+    initial_stream_snapshot_pending: &mut bool,
 ) -> Option<ControlSessionExit>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -907,7 +912,14 @@ where
                     });
                 }
                 *last_rx = tokio::time::Instant::now();
-                if let Some(exit) = handle_server_control_text(ctx, ws, txt.as_str()).await {
+                if let Some(exit) = handle_server_control_text(
+                    ctx,
+                    ws,
+                    txt.as_str(),
+                    initial_stream_snapshot_pending,
+                )
+                .await
+                {
                     return Some(exit);
                 }
             }
@@ -966,6 +978,7 @@ async fn handle_server_control_text<S>(
     ctx: &ControlLoopContext,
     ws: &mut WebSocket<BridgeStream<S>>,
     raw_txt: &str,
+    initial_stream_snapshot_pending: &mut bool,
 ) -> Option<ControlSessionExit>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1000,7 +1013,8 @@ where
             None
         }
         ServerControlFrame::NetmapSnapshot { netmap, .. } => {
-            if apply_netmap_update(ctx, *netmap).await {
+            let allow_equal = std::mem::replace(initial_stream_snapshot_pending, false);
+            if apply_netmap_update(ctx, *netmap, allow_equal).await {
                 close_ws_gracefully(ws).await;
                 return Some(ControlSessionExit::ReconnectImmediately);
             }
@@ -1152,8 +1166,28 @@ pub fn validate_and_sanitize_netmap_snapshot(
     self_pubkey: PublicKey,
     self_overlay_ip: Option<OverlayIp>,
 ) -> Result<bool, String> {
+    validate_and_sanitize_netmap_snapshot_with_policy(
+        snapshot,
+        (prev_version, false),
+        prev_peer_ids,
+        self_node_id,
+        self_pubkey,
+        self_overlay_ip,
+    )
+}
+
+fn validate_and_sanitize_netmap_snapshot_with_policy(
+    snapshot: &mut NetmapSnapshot,
+    version_policy: (Option<u64>, bool),
+    prev_peer_ids: &HashSet<NodeId>,
+    self_node_id: Option<NodeId>,
+    self_pubkey: PublicKey,
+    self_overlay_ip: Option<OverlayIp>,
+) -> Result<bool, String> {
+    let (prev_version, allow_equal_version) = version_policy;
     if let Some(prev) = prev_version
-        && snapshot.netmap_version <= prev
+        && (snapshot.netmap_version < prev
+            || (!allow_equal_version && snapshot.netmap_version == prev))
     {
         return Ok(false);
     }
@@ -1260,7 +1294,11 @@ fn warn_if_high_peer_churn(
     }
 }
 
-async fn apply_netmap_update(ctx: &ControlLoopContext, mut snapshot: NetmapSnapshot) -> bool {
+async fn apply_netmap_update(
+    ctx: &ControlLoopContext,
+    mut snapshot: NetmapSnapshot,
+    allow_equal_version: bool,
+) -> bool {
     let (prev_version, prev_peer_ids, self_node_id, self_overlay_ip) = {
         let g = ctx.state.inner.read().await;
         let prev_ver = g.latest_netmap.as_ref().map(|n| n.netmap_version);
@@ -1272,9 +1310,9 @@ async fn apply_netmap_update(ctx: &ControlLoopContext, mut snapshot: NetmapSnaps
         (prev_ver, prev_ids, g.node_id, g.overlay_ip)
     };
 
-    match validate_and_sanitize_netmap_snapshot(
+    match validate_and_sanitize_netmap_snapshot_with_policy(
         &mut snapshot,
-        prev_version,
+        (prev_version, allow_equal_version),
         &prev_peer_ids,
         self_node_id,
         ctx.node_keypair.public_key(),
@@ -1415,8 +1453,12 @@ async fn record_netmap_in_runtime(
         .apply_netmap_pins(snapshot.pin_set.active_pin, snapshot.pin_set.next_pin);
 
     let ep_ver = snapshot.relay_map.endpoint_version;
-    let server_ep = snapshot.relay_map.control_tcp_endpoint.clone();
-    let same_control_ep = g.bootstrap.server_endpoint.as_ref() == Some(&server_ep);
+    let raw_control_ep = snapshot.relay_map.control_tcp_endpoint.clone();
+    let effective_control_ep = g.bootstrap.server_endpoint.as_deref().map_or_else(
+        || raw_control_ep.clone(),
+        |boot_ep| crate::session::resolve_effective_remote_endpoint(boot_ep, &raw_control_ep),
+    );
+    let same_control_ep = g.bootstrap.server_endpoint.as_ref() == Some(&effective_control_ep);
     let mut acked_changed = false;
     let mut migration_candidate = None;
     if same_control_ep {
@@ -1426,8 +1468,8 @@ async fn record_netmap_in_runtime(
         }
         g.migration_pending_endpoint = None;
     } else if g.bootstrap.server_endpoint.is_some() {
-        g.migration_pending_endpoint = Some(server_ep.clone());
-        migration_candidate = Some((server_ep, ep_ver));
+        g.migration_pending_endpoint = Some(effective_control_ep.clone());
+        migration_candidate = Some((effective_control_ep, ep_ver));
     }
 
     if g.overlay_cidr.is_none() {
@@ -1459,14 +1501,29 @@ async fn record_netmap_in_runtime(
 
     let bootstrap_save =
         (pins_changed || acked_changed || key_exp_changed).then(|| g.bootstrap.clone());
-    let relay_changed = prev_relay_ep.as_ref() != Some(&snapshot.relay_map.relay_tcp_endpoint)
+    let effective_relay_ep = g.bootstrap.server_endpoint.as_deref().map_or_else(
+        || snapshot.relay_map.relay_tcp_endpoint.clone(),
+        |boot_ep| {
+            crate::session::resolve_effective_remote_endpoint(
+                boot_ep,
+                &snapshot.relay_map.relay_tcp_endpoint,
+            )
+        },
+    );
+    let effective_prev_relay_ep = prev_relay_ep.as_deref().map(|prev| {
+        g.bootstrap.server_endpoint.as_deref().map_or_else(
+            || prev.to_owned(),
+            |boot_ep| crate::session::resolve_effective_remote_endpoint(boot_ep, prev),
+        )
+    });
+    let relay_changed = effective_prev_relay_ep.as_deref() != Some(effective_relay_ep.as_str())
         || pins_changed
         || g.bootstrap.pin_set() != prev_pin_set;
     let relay_update = if relay_changed
         && let Some(ref rh) = g.relay_handle
         && let Ok(cfg) = build_relay_client_config_for_runtime(
             &g.bootstrap,
-            snapshot.relay_map.relay_tcp_endpoint.clone(),
+            effective_relay_ep,
             (g.underlay_if_index, g.linux_fwmark),
             ctx.runtime_cfg.agent_version.clone(),
         ) {
@@ -1498,6 +1555,14 @@ pub async fn stage_and_apply_control_migration(
 ) -> bool {
     let (mut probe_bootstrap, underlay, nat64) = {
         let g = ctx.state.inner.read().await;
+        if crate::config::is_loopback_endpoint(candidate_ep)
+            && g.bootstrap
+                .server_endpoint
+                .as_deref()
+                .is_some_and(|ep| !crate::config::is_loopback_endpoint(ep))
+        {
+            return false;
+        }
         (
             g.bootstrap.clone(),
             (g.underlay_if_index, g.linux_fwmark),
@@ -1542,7 +1607,12 @@ pub async fn stage_and_apply_control_migration(
         g.last_error = None;
         let relay_ep = g.latest_netmap.as_ref().map_or_else(
             || candidate_ep.to_owned(),
-            |n| n.relay_map.relay_tcp_endpoint.clone(),
+            |n| {
+                crate::session::resolve_effective_remote_endpoint(
+                    candidate_ep,
+                    &n.relay_map.relay_tcp_endpoint,
+                )
+            },
         );
         let relay_update = g.relay_handle.as_ref().and_then(|rh| {
             build_relay_client_config_for_runtime(
@@ -2517,7 +2587,8 @@ mod tests {
         is_tls_or_pin_error, map_http_error_response, map_verified_tls_http_error,
         probe_udp_routing_candidates_protected, read_http_response_inner,
         set_degraded_or_connecting, stage_and_apply_control_migration,
-        validate_and_sanitize_netmap_snapshot, wait_backoff_or_wake,
+        validate_and_sanitize_netmap_snapshot, validate_and_sanitize_netmap_snapshot_with_policy,
+        wait_backoff_or_wake,
     };
 
     struct DenyProtector(AtomicUsize);
@@ -3177,5 +3248,130 @@ mod tests {
         assert!(matches!(client_res, Ok(Ok(_))));
         assert!(done_tx.send(()).is_ok());
         assert_eq!(server_task.await.ok(), Some(true));
+    }
+
+    #[test]
+    fn test_control_loop_validate_netmap_allows_equal_version_only_on_initial_stream_sync() {
+        // Arrange
+        let self_node_id = NodeId::new_v7(1_700_000_000_000);
+        let peer_id = NodeId::new_v7(1_700_000_000_001);
+        let self_pubkey = NodeKeypair::generate().public_key();
+        let peer_pubkey = NodeKeypair::generate().public_key();
+        let overlay_cidr = "100.115.0.0/16".parse::<OverlayCidr>().expect("cidr");
+        let self_ip = "100.115.0.2".parse::<OverlayIp>().expect("self ip");
+        let base = NetmapSnapshot {
+            netmap_version: 7,
+            generated_at_ms: 1_700_000_000_000,
+            overlay_cidr,
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: RelayMap {
+                endpoint_version: 1,
+                control_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                relay_tcp_endpoint: "203.0.113.10:8443".to_owned(),
+                stun_udp_endpoints: Vec::new(),
+            },
+            pin_set: PinSetDto {
+                active_pin: SpkiPin::from_sha256_bytes([2_u8; 32]),
+                next_pin: None,
+            },
+            peers: vec![PeerEntry {
+                node_id: peer_id,
+                name: NodeName::parse("peer-1").expect("name"),
+                fqdn: "peer-1.mesh.internal".to_owned(),
+                overlay_ip: "100.115.0.10".parse().expect("peer ip"),
+                node_pubkey: peer_pubkey,
+                disco_pubkey: DiscoKeypair::generate().public_key(),
+                endpoints: Vec::new(),
+                relay_home: "203.0.113.10:8443".to_owned(),
+                key_expires_at_ms: None,
+                online: true,
+            }],
+        };
+        let mut prev_ids = HashSet::new();
+        prev_ids.insert(peer_id);
+
+        // Act
+        let mut same_stream_push = base.clone();
+        let stale_res = validate_and_sanitize_netmap_snapshot(
+            &mut same_stream_push,
+            Some(7),
+            &prev_ids,
+            Some(self_node_id),
+            self_pubkey,
+            Some(self_ip),
+        );
+        let mut initial_reconnect_sync = base;
+        let sync_res = validate_and_sanitize_netmap_snapshot_with_policy(
+            &mut initial_reconnect_sync,
+            (Some(7), true),
+            &prev_ids,
+            Some(self_node_id),
+            self_pubkey,
+            Some(self_ip),
+        );
+
+        // Assert
+        assert_eq!(stale_res, Ok(false));
+        assert_eq!(sync_res, Ok(true));
+    }
+
+    #[tokio::test]
+    async fn test_control_loop_guards_against_loopback_relay_map_poisoning() {
+        // Arrange
+        let t0 = 1_700_000_000_000_u64;
+        let bootstrap = BootstrapConfig {
+            node_id: Some(NodeId::new_v7(t0)),
+            node_name: Some(NodeName::parse("client-win").expect("name")),
+            overlay_ip: Some("100.115.0.2".parse().expect("ip")),
+            fqdn: Some("client-win.mesh.internal".to_owned()),
+            server_endpoint: Some("203.0.113.10:8443".to_owned()),
+            tls_auth_mode: TlsAuthMode::SpkiPin,
+            active_pin: Some(SpkiPin::from_sha256_bytes([2_u8; 32])),
+            ..BootstrapConfig::default()
+        };
+        let (_store, state) = make_state(bootstrap, t0);
+        let clock = Arc::new(FakeClock::new(t0));
+        let (_roaming_tx, roaming_rx) = mpsc::channel(4);
+        let (_wake_tx, wake_rx) = mpsc::channel(4);
+        let shutdown = CancellationToken::new();
+        let ctx = make_ctx(
+            Arc::clone(&state),
+            Arc::clone(&clock) as Arc<dyn mesh_core::clock::Clock>,
+            Arc::new(Mutex::new(roaming_rx)),
+            wake_rx,
+            None,
+            shutdown,
+        );
+
+        let snapshot = NetmapSnapshot {
+            netmap_version: 2,
+            generated_at_ms: t0,
+            overlay_cidr: "100.115.0.0/16".parse().expect("cidr"),
+            domain_suffix: "mesh.internal".to_owned(),
+            relay_map: RelayMap {
+                endpoint_version: 4,
+                control_tcp_endpoint: "127.0.0.1:8443".to_owned(),
+                relay_tcp_endpoint: "127.0.0.1:8443".to_owned(),
+                stun_udp_endpoints: Vec::new(),
+            },
+            pin_set: PinSetDto {
+                active_pin: SpkiPin::from_sha256_bytes([2_u8; 32]),
+                next_pin: None,
+            },
+            peers: Vec::new(),
+        };
+
+        // Act
+        let applied_need_reconnect = super::apply_netmap_update(&ctx, snapshot, true).await;
+        let status = state.build_status_response().await;
+        let migrated = stage_and_apply_control_migration(&ctx, "127.0.0.1:8443", 5).await;
+
+        // Assert
+        assert!(!applied_need_reconnect);
+        assert!(!migrated);
+        let srv = status.server_connection.expect("server connection");
+        assert_eq!(srv.control_endpoint, "203.0.113.10:8443");
+        assert_eq!(srv.relay_endpoint, "203.0.113.10:8443");
+        assert_eq!(srv.migration_pending_endpoint, None);
     }
 }

@@ -155,9 +155,19 @@ fn main() -> ExitCode {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use std::fs;
+    use std::net::Ipv4Addr;
     use std::path::Path;
 
-    use mesh_net::gui_handoff::generate_handoff_pipe_name;
+    use mesh_core::{AppError, NodeName, OverlayCidr, OverlayIp, SpkiPin};
+    use mesh_net::gui_handoff::{
+        HandoffResponse, generate_handoff_pipe_name, handoff_request_to_agent_up,
+        parse_handoff_request_payload,
+    };
+    use mesh_proto::agent_ipc::{
+        AgentActionResponse, AgentStatusResponse, DaemonState, SelfNetworkStatus,
+        ServerConnectionStatus, TlsAuthMode,
+    };
+    use mesh_proto::netmap::NatMappingKind;
     use tempfile::tempdir;
 
     use crate::app::{
@@ -173,11 +183,12 @@ mod tests {
     };
     use crate::ipc_poller::{
         DASHBOARD_POLL_INTERVAL_MS, PollingControl, TRAY_IDLE_POLL_INTERVAL_MS,
-        next_poll_interval_ms,
+        next_poll_interval_ms, unwrap_handoff_action_message,
     };
     use crate::tray::{
         IDM_TOGGLE_AUTOSTART, TrayMenuItemModel, build_tray_menu_model, count_non_separator_entries,
     };
+    use crate::window::build_reconnect_payload_from_status;
 
     #[test]
     fn test_worker_cli_args_and_wintun_preflight_verification() {
@@ -323,5 +334,88 @@ mod tests {
         ));
         assert!(is_locked_binary_replace_error(None, "sharing violation"));
         assert!(!is_locked_binary_replace_error(Some(2), "file not found"));
+    }
+
+    #[test]
+    fn test_handoff_action_unwraps_worker_errors_and_system_ca_reconnect_payload() {
+        // Arrange: worker failures must propagate Err(...) instead of falling back to Ok(...)
+        let err_resp = HandoffResponse::from_error(&AppError::unavailable("route cleanup failed"));
+        let internal_err_resp = HandoffResponse::from_error(&AppError::internal("raw detail"));
+        let ok_resp = HandoffResponse::from_action(AgentActionResponse {
+            state: DaemonState::Stopped,
+            message: "VPN stopped".to_owned(),
+        });
+
+        // Act 1
+        let unwrapped_err = unwrap_handoff_action_message(err_resp);
+        let unwrapped_internal = unwrap_handoff_action_message(internal_err_resp);
+        let unwrapped_ok = unwrap_handoff_action_message(ok_resp);
+
+        // Assert 1
+        assert!(
+            matches!(unwrapped_err, Err(ref msg) if msg.contains("route cleanup failed")),
+            "expected Err containing failure reason, got {unwrapped_err:?}"
+        );
+        assert!(
+            matches!(unwrapped_internal, Err(ref msg) if msg.contains("internal server error")),
+            "expected scrubbed internal error message, got {unwrapped_internal:?}"
+        );
+        assert_eq!(unwrapped_ok, Ok("VPN stopped".to_owned()));
+
+        // Arrange 2: SystemCa reconnect must serialize server_pin: None, even if active_pin is stale
+        let stale_pin = SpkiPin::from_sha256_bytes([0x55_u8; 32]);
+        let mut status = AgentStatusResponse {
+            daemon_state: DaemonState::Stopped,
+            node_id: None,
+            node_name: NodeName::parse("win-client").ok(),
+            fqdn: Some("win-client.mesh.internal".to_owned()),
+            overlay_ip: OverlayIp::from_ipv4(Ipv4Addr::new(100, 64, 0, 12)).ok(),
+            overlay_cidr: OverlayCidr::parse("100.64.0.0/10").ok(),
+            tun_interface_name: None,
+            tun_mtu: 1420,
+            netmap_version: 2,
+            key_expires_at_ms: None,
+            server_connection: Some(ServerConnectionStatus {
+                control_endpoint: "vpn.example.com:8443".to_owned(),
+                relay_endpoint: "vpn.example.com:8443".to_owned(),
+                stun_endpoints: Vec::new(),
+                tls_auth_mode: TlsAuthMode::SystemCa,
+                active_pin: Some(stale_pin),
+                next_pin: None,
+                control_connected: false,
+                relay_connected: false,
+                relay_rtt_ms: None,
+                migration_pending_endpoint: None,
+                last_error: None,
+            }),
+            self_network: SelfNetworkStatus {
+                local_udp_port: 51820,
+                bound_physical_interface: None,
+                nat_type: NatMappingKind::Unknown,
+                nat_classification_note: None,
+                overlay_conflict_warning: None,
+                macos_firewall_warning: None,
+                candidates: Vec::new(),
+            },
+            peers: Vec::new(),
+        };
+
+        // Act 2
+        let payload =
+            build_reconnect_payload_from_status(&status).expect("system-ca reconnect payload");
+        let parsed = parse_handoff_request_payload(&payload).expect("parse handoff request");
+        let up_req = handoff_request_to_agent_up(&parsed).expect("convert to AgentUpRequest");
+
+        // Assert 2
+        assert_eq!(up_req.server_endpoint, "vpn.example.com:8443");
+        assert_eq!(up_req.server_pin, None);
+        assert!(up_req.preauth_key.is_none());
+
+        // Act & Assert 3: SpkiPin mode without active_pin must fail closed instead of downgrading
+        if let Some(ref mut srv) = status.server_connection {
+            srv.tls_auth_mode = TlsAuthMode::SpkiPin;
+            srv.active_pin = None;
+        }
+        assert!(build_reconnect_payload_from_status(&status).is_err());
     }
 }

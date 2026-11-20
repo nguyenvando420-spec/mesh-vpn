@@ -309,6 +309,133 @@ final class DesktopStoreTests: XCTestCase {
         XCTAssertEqual(store.uiState, .connected)
         XCTAssertFalse(store.isPollingSuspended)
     }
+
+    func testDesktopStore_MultiCycleUriEnrollDisconnectAndOneClickReconnect_PreservesIdentityAndEndpoint() async {
+        // Arrange
+        let transport = MockDesktopIpcTransport()
+        let pasteboard = InMemoryPasteboardProvider()
+        let cleaner = ClipboardAutoClear(pasteboard: pasteboard, delaySeconds: 30)
+        let store = DesktopStore(
+            transport: transport,
+            privilegeHelper: MockAdminPrivilegeExecutor(),
+            clipboardAutoClear: cleaner,
+            serviceChecker: MockServicePresenceChecker(installed: true),
+            launchAtLogin: MockLaunchAtLoginController()
+        )
+        let validKey = "mpk_" + Data((0..<32).map { UInt8($0) })
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let pin = "sha256:" + String(repeating: "ef", count: 32)
+        let joinUri = "mesh://join?v=1&ep=203.0.113.55:8443&pin=\(pin)&key=\(validKey)"
+
+        // Act 1: URI enrollment -> connected
+        let draft = store.handlePastedOnboardingInput(joinUri)
+        XCTAssertNotNil(draft)
+        let enrolled = await store.confirmEnrollmentDraft()
+        XCTAssertTrue(enrolled)
+        transport.setState(
+            AgentStatusResponse(
+                daemonState: .connected,
+                nodeId: "node-mac-1",
+                nodeName: "macbook",
+                serverConnection: ServerConnectionStatus(
+                    controlEndpoint: "203.0.113.55:8443",
+                    tlsAuthMode: .spkiPin,
+                    activePin: pin,
+                    controlConnected: true
+                )
+            )
+        )
+        await store.refreshNow()
+        XCTAssertEqual(store.uiState, .connected)
+        XCTAssertFalse(store.isManuallyDisconnected)
+
+        // Act 2: Disconnect -> manually stopped -> 1st 1-click Connect -> connected
+        let down1 = await store.disconnect()
+        XCTAssertTrue(down1)
+        transport.setState(
+            AgentStatusResponse(
+                daemonState: .stopped,
+                nodeId: "node-mac-1",
+                nodeName: "macbook",
+                serverConnection: ServerConnectionStatus(
+                    controlEndpoint: "203.0.113.55:8443",
+                    tlsAuthMode: .spkiPin,
+                    activePin: pin
+                )
+            )
+        )
+        await store.refreshNow()
+        XCTAssertTrue(store.isManuallyDisconnected)
+
+        let up1 = await store.connectOneClick()
+        XCTAssertTrue(up1)
+        transport.setState(
+            AgentStatusResponse(
+                daemonState: .connected,
+                nodeId: "node-mac-1",
+                nodeName: "macbook",
+                serverConnection: ServerConnectionStatus(
+                    controlEndpoint: "203.0.113.55:8443",
+                    tlsAuthMode: .spkiPin,
+                    activePin: pin,
+                    controlConnected: true
+                )
+            )
+        )
+        await store.refreshNow()
+        XCTAssertEqual(store.uiState, .connected)
+        XCTAssertFalse(store.isManuallyDisconnected)
+
+        // Act 3: 2nd Disconnect -> 2nd 1-click Connect -> connected
+        let down2 = await store.disconnect()
+        XCTAssertTrue(down2)
+        transport.setState(
+            AgentStatusResponse(
+                daemonState: .stopped,
+                nodeId: "node-mac-1",
+                nodeName: "macbook",
+                serverConnection: ServerConnectionStatus(
+                    controlEndpoint: "203.0.113.55:8443",
+                    tlsAuthMode: .spkiPin,
+                    activePin: pin
+                )
+            )
+        )
+        await store.refreshNow()
+        XCTAssertTrue(store.isManuallyDisconnected)
+
+        let up2 = await store.connectOneClick()
+        XCTAssertTrue(up2)
+        transport.setState(
+            AgentStatusResponse(
+                daemonState: .connected,
+                nodeId: "node-mac-1",
+                nodeName: "macbook",
+                serverConnection: ServerConnectionStatus(
+                    controlEndpoint: "203.0.113.55:8443",
+                    tlsAuthMode: .spkiPin,
+                    activePin: pin,
+                    controlConnected: true
+                )
+            )
+        )
+        await store.refreshNow()
+
+        // Assert
+        XCTAssertEqual(store.uiState, .connected)
+        XCTAssertEqual(transport.bringDownCount, 2)
+        XCTAssertEqual(transport.bringUpRequests.count, 3)
+        XCTAssertEqual(transport.bringUpRequests[0].preauthKey, validKey)
+        XCTAssertNil(transport.bringUpRequests[1].preauthKey)
+        XCTAssertEqual(transport.bringUpRequests[1].serverEndpoint, "203.0.113.55:8443")
+        XCTAssertEqual(transport.bringUpRequests[1].serverPin, pin)
+        XCTAssertNil(transport.bringUpRequests[2].preauthKey)
+        XCTAssertEqual(transport.bringUpRequests[2].serverEndpoint, "203.0.113.55:8443")
+        XCTAssertEqual(transport.bringUpRequests[2].serverPin, pin)
+    }
 }
 
 private struct MockServicePresenceChecker: ServicePresenceChecking {
@@ -339,8 +466,10 @@ private final class MockDesktopIpcTransport: DesktopIpcTransport {
         )
         var fetchCount: Int = 0
         var lastUp: AgentUpRequest?
+        var upRequests: [AgentUpRequest] = []
         var resetCalled = false
         var downCalled = false
+        var downCount: Int = 0
         var legacy404 = false
         var upError: Error?
         var streamDelayNs: UInt64 = 0
@@ -350,8 +479,10 @@ private final class MockDesktopIpcTransport: DesktopIpcTransport {
 
     var fetchStatusCount: Int { state.withLock { $0.fetchCount } }
     var lastUpRequest: AgentUpRequest? { state.withLock { $0.lastUp } }
+    var bringUpRequests: [AgentUpRequest] { state.withLock { $0.upRequests } }
     var didCallResetIdentity: Bool { state.withLock { $0.resetCalled } }
     var didCallBringDown: Bool { state.withLock { $0.downCalled } }
+    var bringDownCount: Int { state.withLock { $0.downCount } }
     var simulateLegacy404Version: Bool {
         get { state.withLock { $0.legacy404 } }
         set { state.withLock { $0.legacy404 = newValue } }
@@ -417,12 +548,16 @@ private final class MockDesktopIpcTransport: DesktopIpcTransport {
                 throw err
             }
             current.lastUp = request
+            current.upRequests.append(request)
             return AgentActionResponse(state: .connecting, message: "ok")
         }
     }
 
     func bringDown(socketPath: String) async throws -> AgentActionResponse {
-        state.withLock { $0.downCalled = true }
+        state.withLock {
+            $0.downCalled = true
+            $0.downCount += 1
+        }
         return AgentActionResponse(state: .stopped, message: "ok")
     }
 

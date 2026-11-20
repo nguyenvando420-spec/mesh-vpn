@@ -244,12 +244,30 @@ pub fn read_route_events(fd: impl AsFd) -> io::Result<Vec<RawNetEventKind>> {
     let len = (n as usize).min(buf.len());
     Ok(buf
         .get(..len)
-        .map(parse_bsd_route_messages)
+        .map(|slice| {
+            parse_bsd_route_messages_physical(slice, &|if_index, if_name_opt| {
+                if let Some(name) = if_name_opt {
+                    return is_virtual_macos_ifname(name);
+                }
+                if if_index == 0 {
+                    return false;
+                }
+                lookup_if_name(if_index).is_some_and(|name| is_virtual_macos_ifname(&name))
+            })
+        })
         .unwrap_or_default())
 }
 
 /// Parses concatenated Darwin `PF_ROUTE` messages into deduplicated [`RawNetEventKind`] values.
 pub fn parse_bsd_route_messages(buf: &[u8]) -> Vec<RawNetEventKind> {
+    parse_bsd_route_messages_physical(buf, &|_, _| false)
+}
+
+/// Parses concatenated Darwin `PF_ROUTE` messages while skipping virtual interfaces (e.g. `utun*`).
+pub fn parse_bsd_route_messages_physical(
+    buf: &[u8],
+    is_virtual_if: &dyn Fn(u32, Option<&str>) -> bool,
+) -> Vec<RawNetEventKind> {
     let mut events = Vec::new();
     let mut offset = 0usize;
 
@@ -261,20 +279,67 @@ pub fn parse_bsd_route_messages(buf: &[u8]) -> Vec<RawNetEventKind> {
             break;
         };
         let msg_len = u16::from_ne_bytes(len_bytes) as usize;
-        if msg_len < 4 || offset.saturating_add(msg_len) > buf.len() {
+        let Some(end) = offset.checked_add(msg_len) else {
+            break;
+        };
+        if msg_len < 4 || end > buf.len() {
             break;
         }
 
-        if let Some(kind) = classify_bsd_rtm_type(msg_type)
+        let Some(msg) = buf.get(offset..end) else {
+            break;
+        };
+        let (if_idx_opt, if_name_opt) = extract_bsd_msg_interface(msg, msg_type);
+        let is_virtual = match (if_idx_opt, if_name_opt) {
+            (Some(idx), name_opt) => is_virtual_if(idx, name_opt),
+            (None, Some(name)) => is_virtual_if(0, Some(name)),
+            (None, None) => false,
+        };
+        if !is_virtual
+            && let Some(kind) = classify_bsd_rtm_type(msg_type)
             && !events.contains(&kind)
         {
             events.push(kind);
         }
 
-        offset = offset.saturating_add(msg_len);
+        offset = end;
     }
 
     events
+}
+
+fn extract_bsd_msg_interface(msg: &[u8], msg_type: u8) -> (Option<u32>, Option<&str>) {
+    match msg_type {
+        DARWIN_RTM_ADD | DARWIN_RTM_DELETE | DARWIN_RTM_CHANGE => {
+            let if_index = msg
+                .get(4..6)
+                .and_then(|s| <[u8; 2]>::try_from(s).ok())
+                .map(|b| u32::from(u16::from_ne_bytes(b)));
+            (if_index, None)
+        }
+        DARWIN_RTM_NEWADDR | DARWIN_RTM_DELADDR | DARWIN_RTM_IFINFO => {
+            let if_index = msg
+                .get(12..14)
+                .and_then(|s| <[u8; 2]>::try_from(s).ok())
+                .map(|b| u32::from(u16::from_ne_bytes(b)));
+            (if_index, None)
+        }
+        DARWIN_RTM_IFANNOUNCE => {
+            let if_index = msg
+                .get(4..6)
+                .and_then(|s| <[u8; 2]>::try_from(s).ok())
+                .map(|b| u32::from(u16::from_ne_bytes(b)));
+            let if_name = msg.get(6..22).and_then(|raw| {
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let candidate = raw.get(..end).unwrap_or_default();
+                (!candidate.is_empty())
+                    .then(|| std::str::from_utf8(candidate).ok())
+                    .flatten()
+            });
+            (if_index, if_name)
+        }
+        _ => (None, None),
+    }
 }
 
 /// Parses a `sysctl(NET_RT_DUMP)` response buffer to extract the first non-virtual default-route
@@ -553,8 +618,9 @@ fn classify_bsd_rtm_type(msg_type: u8) -> Option<RawNetEventKind> {
 mod tests {
     use super::{
         DARWIN_RT_MSGHDR_MIN_LEN, DARWIN_RTA_DST, DARWIN_RTA_GATEWAY, DARWIN_RTA_NETMASK,
-        DARWIN_RTM_ADD, DARWIN_RTM_IFINFO, DARWIN_RTM_NEWADDR, RawNetEventKind,
-        is_virtual_macos_ifname, parse_bsd_route_messages, pick_default_route_if_index_from_dump,
+        DARWIN_RTM_ADD, DARWIN_RTM_IFANNOUNCE, DARWIN_RTM_IFINFO, DARWIN_RTM_NEWADDR,
+        RawNetEventKind, is_virtual_macos_ifname, parse_bsd_route_messages,
+        parse_bsd_route_messages_physical, pick_default_route_if_index_from_dump,
     };
 
     fn write_at(buf: &mut [u8], offset: usize, bytes: &[u8]) {
@@ -686,5 +752,49 @@ mod tests {
                 24
             ))
         );
+    }
+
+    #[test]
+    fn test_netmon_macos_filters_virtual_utun_pf_route_messages() {
+        // Arrange: virtual utun7 RTM_ADD (idx=9), RTM_IFINFO (idx=9), RTM_IFANNOUNCE ("utun7"),
+        // plus one physical en0 RTM_NEWADDR (idx=4).
+        let mut buf = Vec::new();
+
+        // 1) RTM_ADD with rtm_index=9 at offset 4..6
+        let mut rtm_add = vec![0u8; 92];
+        write_at(&mut rtm_add, 0, &92u16.to_ne_bytes());
+        write_at(&mut rtm_add, 2, &[5, DARWIN_RTM_ADD]);
+        write_at(&mut rtm_add, 4, &9u16.to_ne_bytes());
+        buf.extend(rtm_add);
+
+        // 2) RTM_IFINFO with ifm_index=9 at offset 12..14
+        let mut ifinfo = vec![0u8; 20];
+        write_at(&mut ifinfo, 0, &20u16.to_ne_bytes());
+        write_at(&mut ifinfo, 2, &[5, DARWIN_RTM_IFINFO]);
+        write_at(&mut ifinfo, 12, &9u16.to_ne_bytes());
+        buf.extend(ifinfo);
+
+        // 3) RTM_IFANNOUNCE with ifan_index=9, ifan_name="utun7"
+        let mut announce = vec![0u8; 24];
+        write_at(&mut announce, 0, &24u16.to_ne_bytes());
+        write_at(&mut announce, 2, &[5, DARWIN_RTM_IFANNOUNCE]);
+        write_at(&mut announce, 4, &9u16.to_ne_bytes());
+        write_at(&mut announce, 6, b"utun7");
+        buf.extend(announce);
+
+        // 4) Physical en0 RTM_NEWADDR with ifam_index=4 at offset 12..14
+        let mut newaddr = vec![0u8; 20];
+        write_at(&mut newaddr, 0, &20u16.to_ne_bytes());
+        write_at(&mut newaddr, 2, &[5, DARWIN_RTM_NEWADDR]);
+        write_at(&mut newaddr, 12, &4u16.to_ne_bytes());
+        buf.extend(newaddr);
+
+        // Act
+        let filtered = parse_bsd_route_messages_physical(&buf, &|idx, name_opt| {
+            name_opt.map_or(idx == 9, is_virtual_macos_ifname)
+        });
+
+        // Assert: only physical en0 AddressChanged remains.
+        assert_eq!(filtered, vec![RawNetEventKind::AddressChanged]);
     }
 }

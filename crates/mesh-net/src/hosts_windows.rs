@@ -341,7 +341,7 @@ fn is_transient_lock_error(err: &io::Error) -> bool {
     )
 }
 
-fn backoff_wait(duration: Duration) {
+pub(crate) fn backoff_wait(duration: Duration) {
     let lock = Mutex::new(false);
     let cv = Condvar::new();
     if let Ok(guard) = lock.lock()

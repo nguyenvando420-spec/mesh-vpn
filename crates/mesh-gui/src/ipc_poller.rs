@@ -15,6 +15,8 @@ use std::thread::JoinHandle;
 use hyper::Method;
 #[cfg(target_os = "windows")]
 use mesh_core::defaults::{MAX_RO_IPC_BODY_BYTES, WINDOWS_AGENT_RO_PIPE};
+#[cfg(target_os = "windows")]
+use mesh_net::gui_handoff::HandoffResponse;
 use mesh_net::ipc::AgentVersionStatus;
 #[cfg(target_os = "windows")]
 use mesh_net::ipc::{
@@ -308,10 +310,7 @@ impl BackgroundIpcController {
             .name("mesh-gui-uac".to_owned())
             .spawn(move || {
                 let _pause_guard = poll_control.suspend();
-                let res = run_privileged_handoff(payload).map(|resp| {
-                    resp.message
-                        .unwrap_or_else(|| "Operation completed".to_owned())
-                });
+                let res = run_privileged_handoff(payload).and_then(unwrap_handoff_action_message);
                 if let Ok(mut q) = queues.lock() {
                     q.push_event(UiAsyncEvent::WorkerAction {
                         action_label,
@@ -508,4 +507,17 @@ async fn run_ping_probe(
     )
     .await
     .map_err(|err| err.to_string())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn unwrap_handoff_action_message(resp: HandoffResponse) -> Result<String, String> {
+    resp.into_action_result()
+        .map(|action| {
+            if action.message.trim().is_empty() {
+                "Operation completed".to_owned()
+            } else {
+                action.message
+            }
+        })
+        .map_err(|err| err.to_string())
 }

@@ -174,16 +174,24 @@ impl RoamingLoop {
             return false;
         }
 
-        if let Some(ref rt) = self.runtime {
-            mark_runtime_rebinding(rt, &event).await;
-        }
-
         let ready_primary =
             wait_for_usable_ip_with_backoff(&*self.probe, self.dhcp_cfg, shutdown).await;
         if shutdown.is_cancelled() {
             return false;
         }
         let primary = ready_primary.or_else(|| self.probe.query_primary_interface().ok());
+
+        let should_rebind = if let Some(ref rt) = self.runtime {
+            let primary_if_index = primary.as_ref().map(|p| p.if_index);
+            mark_runtime_rebinding(rt, &event, primary_if_index).await
+        } else {
+            true
+        };
+        if !should_rebind {
+            self.dispatch_non_blocking_commands(vec![RebindCommand::RefreshCandidates])
+                .await;
+            return false;
+        }
 
         info!(
             component = "mesh_client.roaming_loop",
@@ -367,17 +375,41 @@ async fn send_rebind_command(
     true
 }
 
-async fn mark_runtime_rebinding(runtime: &ClientRuntimeState, event: &NetEvent) {
+async fn mark_runtime_rebinding(
+    runtime: &ClientRuntimeState,
+    event: &NetEvent,
+    primary_if_index: Option<u32>,
+) -> bool {
+    let urgent = matches!(
+        event,
+        NetEvent::WakeFromSleep
+            | NetEvent::ClockJumpDetected { .. }
+            | NetEvent::InterfaceDown { .. }
+            | NetEvent::InterfaceUp { .. }
+            | NetEvent::AddressChanged { .. }
+    );
     let mut g = runtime.inner.write().await;
-    if !g.protocol_incompatible
-        && !matches!(
+    if g.protocol_incompatible
+        || matches!(
             g.daemon_state,
             DaemonState::Stopped | DaemonState::Revoked | DaemonState::ReauthRequired
         )
     {
+        return false;
+    }
+    let interface_changed = match (g.underlay_if_index, primary_if_index) {
+        (Some(prev), Some(curr)) => prev != curr,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => !g.control_connected,
+    };
+    if urgent || interface_changed || !g.control_connected {
         g.daemon_state = DaemonState::Connecting;
         g.control_connected = false;
         g.last_error = Some(format!("rebinding: {event:?}"));
+        true
+    } else {
+        false
     }
 }
 
@@ -469,7 +501,7 @@ mod tests {
     use mesh_datapath::{RebindCommand, RebindHandle};
     use mesh_net::netmon::{Debouncer, FakeNetMonitor, NetEvent};
 
-    use super::{NETWORK_CHANGE_CHANNEL_CAPACITY, RoamingLoop};
+    use super::{NETWORK_CHANGE_CHANNEL_CAPACITY, RoamingLoop, mark_runtime_rebinding};
 
     #[test]
     fn test_roaming_debounces_burst_but_bypasses_on_wake_from_sleep() {
@@ -687,5 +719,65 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn test_mark_runtime_rebinding_ignores_same_interface_when_control_connected() {
+        // Arrange
+        let store = Arc::new(crate::hooks::InMemoryClientStateStore::new());
+        let state = Arc::new(crate::state::ClientRuntimeState::new_with_now(
+            crate::config::BootstrapConfig::default(),
+            store,
+            None,
+            1280,
+            mesh_datapath::TimerMode::Responsive,
+            1_700_000_000_000,
+        ));
+        {
+            let mut g = state.inner.write().await;
+            g.daemon_state = mesh_proto::agent_ipc::DaemonState::Connected;
+            g.control_connected = true;
+            g.underlay_if_index = Some(4);
+            g.last_error = None;
+        }
+
+        // Act 1: non-urgent RouteChanged on the same physical interface while control is connected
+        let rebind1 = mark_runtime_rebinding(&state, &NetEvent::RouteChanged, Some(4)).await;
+        assert!(!rebind1);
+        {
+            let g = state.inner.read().await;
+            assert_eq!(
+                g.daemon_state,
+                mesh_proto::agent_ipc::DaemonState::Connected
+            );
+            assert!(g.control_connected);
+            assert_eq!(g.last_error, None);
+        }
+
+        // Act 2: physical interface switch (4 -> 9) triggers Connecting rebind state
+        let rebind2 = mark_runtime_rebinding(&state, &NetEvent::RouteChanged, Some(9)).await;
+        assert!(rebind2);
+        {
+            let mut g = state.inner.write().await;
+            assert_eq!(
+                g.daemon_state,
+                mesh_proto::agent_ipc::DaemonState::Connecting
+            );
+            assert!(!g.control_connected);
+            g.daemon_state = mesh_proto::agent_ipc::DaemonState::Connected;
+            g.control_connected = true;
+            g.underlay_if_index = Some(9);
+            g.last_error = None;
+        }
+
+        // Act 3: urgent WakeFromSleep always triggers Connecting even on same interface
+        let rebind3 = mark_runtime_rebinding(&state, &NetEvent::WakeFromSleep, Some(9)).await;
+        assert!(rebind3);
+        let g = state.inner.read().await;
+        assert_eq!(
+            g.daemon_state,
+            mesh_proto::agent_ipc::DaemonState::Connecting
+        );
+        assert!(!g.control_connected);
     }
 }

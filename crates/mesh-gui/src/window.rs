@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use mesh_core::NodeName;
 use mesh_net::gui_handoff::{HandoffRequest, serialize_handoff_request_zeroizing};
-use mesh_proto::agent_ipc::{AgentPeerStatus, AgentStatusResponse};
+use mesh_proto::agent_ipc::{AgentPeerStatus, AgentStatusResponse, TlsAuthMode};
 use mesh_sys::error::{SysError, SysResult};
 use mesh_sys::gui_windows::{
     ControlRect, GuiWindowSpec, MessageBoxKind, OwnedGdiObj, OwnedIcon, SingleInstanceGuard,
@@ -680,7 +680,7 @@ fn refresh_ui_from_state(st: &mut DashboardState) {
         && !srv.control_endpoint.trim().is_empty()
     {
         set_control_text(c.edit_endpoint, &srv.control_endpoint);
-        let is_pin = srv.active_pin.is_some();
+        let is_pin = matches!(srv.tls_auth_mode, TlsAuthMode::SpkiPin);
         set_checkbox_checked(c.radio_spki, is_pin);
         set_checkbox_checked(c.radio_system_ca, !is_pin);
         if let Some(pin) = &srv.active_pin {
@@ -841,6 +841,12 @@ fn build_reconnect_payload(st: &DashboardState) -> Result<Zeroizing<Vec<u8>>, St
         .as_ref()
         .and_then(|p| p.status.as_ref())
         .ok_or_else(|| "Agent status unavailable for 1-click reconnect".to_owned())?;
+    build_reconnect_payload_from_status(status)
+}
+
+pub(crate) fn build_reconnect_payload_from_status(
+    status: &AgentStatusResponse,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let srv = status
         .server_connection
         .as_ref()
@@ -848,10 +854,21 @@ fn build_reconnect_payload(st: &DashboardState) -> Result<Zeroizing<Vec<u8>>, St
         .ok_or_else(|| {
             "Control endpoint not configured; complete Setup & Onboarding.".to_owned()
         })?;
+    let server_pin = match srv.tls_auth_mode {
+        TlsAuthMode::SystemCa => None,
+        TlsAuthMode::SpkiPin => Some(
+            srv.active_pin
+                .ok_or_else(|| {
+                    "Active SPKI pin is missing for pinned control server; complete Setup & Onboarding."
+                        .to_owned()
+                })?
+                .to_string(),
+        ),
+    };
     let req = HandoffRequest::UpWithSecret {
         server_endpoint: srv.control_endpoint.clone(),
         port_override: None,
-        server_pin: srv.active_pin.map(|p| p.to_string()),
+        server_pin,
         preauth_key: None,
         node_name: status.node_name.as_ref().map(|n| n.as_str().to_owned()),
     };

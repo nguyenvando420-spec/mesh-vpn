@@ -98,7 +98,8 @@ pub use netmon::{
 pub use route::{
     FakeRouteManager, LinuxPolicyRoutingSpec, RouteManager, RouteSpec, apply_overlay_route_checked,
     bind_underlay_socket2, bind_underlay_udp_socket, disable_udp_dont_fragment,
-    ensure_cidr_contained, ensure_no_overlay_subnet_conflict, reject_non_overlay_cidr,
+    ensure_cidr_contained, ensure_no_overlay_subnet_conflict, is_bsd_route_or_iface_absent,
+    is_windows_netsh_route_absent, reject_non_overlay_cidr,
 };
 #[cfg(feature = "desktop-os")]
 pub use sysexec::{

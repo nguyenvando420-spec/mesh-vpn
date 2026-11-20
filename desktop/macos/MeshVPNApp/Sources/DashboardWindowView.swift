@@ -86,7 +86,7 @@ struct DashboardWindowView: View {
                         .padding(.vertical, 2)
                         .background(Color.secondary.opacity(0.12), in: Capsule())
                 }
-                Text(store.uiState.displayTitle)
+                Text(headerStatusSubtitle)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -260,10 +260,20 @@ struct DashboardWindowView: View {
                     ?? "Unable to communicate with meshd admin socket."
             ) {
                 HStack(spacing: 12) {
-                    Button("Retry") {
-                        Task { @MainActor in await store.refreshNow() }
+                    if store.isManuallyDisconnected {
+                        Button("Connect") {
+                            Task { @MainActor in _ = await store.connectOneClick() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("Retry") {
+                            Task { @MainActor in await store.refreshNow() }
+                        }
+                    } else {
+                        Button("Retry") {
+                            Task { @MainActor in await store.refreshNow() }
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
-                    .buttonStyle(.borderedProminent)
                     Button("Start / Repair Service") {
                         Task { @MainActor in _ = await store.startOrRepairService() }
                     }
@@ -272,6 +282,13 @@ struct DashboardWindowView: View {
                 .disabled(store.isBusy)
             }
         }
+    }
+
+    private var headerStatusSubtitle: String {
+        if store.isManuallyDisconnected && store.uiState == .connecting {
+            return "Disconnected"
+        }
+        return store.uiState.displayTitle
     }
 
     private var statusTintColor: Color {

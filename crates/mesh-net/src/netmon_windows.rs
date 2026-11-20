@@ -141,17 +141,13 @@ impl WindowsNetMonitor {
                         while os_rx.try_recv().is_ok() {}
                         let new_if = sys_query_primary_physical_interface().ok();
                         let new_ips = capture_usable_ips(new_if.as_ref().map(|(idx, _)| *idx));
-                        let ev = if new_if != last_if {
-                            classify_interface_transition_named(last_if.as_ref(), new_if.as_ref())
-                        } else if new_ips != last_ips {
-                            match new_if.as_ref() {
-                                Some((_, iface_name)) => NetEvent::AddressChanged {
-                                    interface: iface_name.clone(),
-                                },
-                                None => NetEvent::RouteChanged,
-                            }
-                        } else {
-                            NetEvent::RouteChanged
+                        let Some(ev) = classify_live_poll_transition(
+                            last_if.as_ref(),
+                            &last_ips,
+                            new_if.as_ref(),
+                            &new_ips,
+                        ) else {
+                            continue;
                         };
                         last_if = new_if;
                         last_ips = new_ips;
@@ -220,6 +216,26 @@ fn capture_usable_ips(if_index: Option<u32>) -> Vec<IpAddr> {
     ips
 }
 
+fn classify_live_poll_transition(
+    last_if: Option<&(u32, String)>,
+    last_ips: &[IpAddr],
+    new_if: Option<&(u32, String)>,
+    new_ips: &[IpAddr],
+) -> Option<NetEvent> {
+    if new_if != last_if {
+        Some(classify_interface_transition_named(last_if, new_if))
+    } else if new_ips != last_ips {
+        match new_if {
+            Some((_, iface_name)) => Some(NetEvent::AddressChanged {
+                interface: iface_name.clone(),
+            }),
+            None => Some(NetEvent::RouteChanged),
+        }
+    } else {
+        None
+    }
+}
+
 fn classify_interface_transition_named(
     previous: Option<&(u32, String)>,
     current: Option<&(u32, String)>,
@@ -283,7 +299,10 @@ impl NetMonitor for WindowsNetMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowsNetMonitor, WindowsPowerEvent, classify_interface_transition};
+    use super::{
+        WindowsNetMonitor, WindowsPowerEvent, classify_interface_transition,
+        classify_live_poll_transition,
+    };
     use crate::netmon::{NetEvent, NetMonitor};
 
     #[test]
@@ -343,5 +362,30 @@ mod tests {
 
         // Assert
         assert!(matches!(ev, Ok(Ok(NetEvent::WakeFromSleep))));
+    }
+
+    #[test]
+    fn test_netmon_windows_live_poll_ignores_unchanged_physical_interface_and_ips() {
+        // Arrange: e.g. virtual MeshVPN TUN creation triggers NotifyIpInterfaceChange while physical
+        // Ethernet NIC index and its usable IPv4 address are completely unchanged.
+        let iface = Some((10_u32, "Ethernet".to_owned()));
+        let ips = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            192, 168, 1, 50,
+        ))];
+
+        // Act
+        let unchanged = classify_live_poll_transition(iface.as_ref(), &ips, iface.as_ref(), &ips);
+        let new_ips = vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            192, 168, 1, 51,
+        ))];
+        let ip_changed =
+            classify_live_poll_transition(iface.as_ref(), &ips, iface.as_ref(), &new_ips);
+
+        // Assert
+        assert!(unchanged.is_none());
+        assert!(matches!(
+            ip_changed,
+            Some(NetEvent::AddressChanged { interface }) if interface == "Ethernet"
+        ));
     }
 }

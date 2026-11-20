@@ -141,6 +141,31 @@ const fn ipv4_mask(prefix_len: u8) -> u32 {
     }
 }
 
+/// Returns whether BSD `route`/`ifconfig`/`pfctl` output indicates an absent route, interface, or anchor.
+#[must_use]
+pub fn is_bsd_route_or_iface_absent(stdout: &str, stderr: &str) -> bool {
+    let combined = format!("{stdout} {stderr}").to_ascii_lowercase();
+    combined.contains("not in table")
+        || combined.contains("does not exist")
+        || combined.contains("no such process")
+        || combined.contains("anchor does not exist")
+        || combined.contains("bad address")
+        || combined.contains("no such interface")
+        || combined.contains("not configured")
+}
+
+/// Returns whether Windows `netsh` output indicates an absent route or already-closed interface.
+#[must_use]
+pub fn is_windows_netsh_route_absent(stdout: &str, stderr: &str) -> bool {
+    let combined = format!("{stdout} {stderr}").to_ascii_lowercase();
+    combined.contains("element not found")
+        || combined.contains("not found")
+        || combined.contains("does not exist")
+        || combined.contains("cannot find")
+        || combined.contains("no routes")
+        || combined.contains("filename, directory name, or volume label syntax is incorrect")
+}
+
 /// Linux policy-routing rule configuration defeating underlay/overlay routing loops (`REL-09`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxPolicyRoutingSpec {
@@ -442,7 +467,8 @@ mod tests {
 
     use super::{
         FakeRouteManager, LinuxPolicyRoutingSpec, RouteManager, RouteSpec,
-        apply_overlay_route_checked, reject_non_overlay_cidr,
+        apply_overlay_route_checked, is_bsd_route_or_iface_absent, is_windows_netsh_route_absent,
+        reject_non_overlay_cidr,
     };
     use crate::endpoint_filter::InterfaceSubnetSnapshot;
 
@@ -522,5 +548,37 @@ mod tests {
         // Switching to clean network installs route normally
         assert!(apply_overlay_route_checked(&mgr, &spec, &clean).is_ok());
         assert_eq!(mgr.active_routes().unwrap_or_default().len(), 1);
+    }
+
+    #[test]
+    fn test_route_absent_output_classifiers_match_closed_interface_messages() {
+        // Arrange & Act & Assert: BSD/macOS outputs
+        assert!(is_bsd_route_or_iface_absent(
+            "",
+            "route: bad address: utun7\n"
+        ));
+        assert!(is_bsd_route_or_iface_absent(
+            "delete net 100.64.0.0: not in table\n",
+            ""
+        ));
+        assert!(is_bsd_route_or_iface_absent(
+            "",
+            "ifconfig: interface utun7 does not exist\n"
+        ));
+        assert!(!is_bsd_route_or_iface_absent(
+            "",
+            "route: must be root to alter routing table\n"
+        ));
+
+        // Arrange & Act & Assert: Windows netsh outputs
+        assert!(is_windows_netsh_route_absent(
+            "The filename, directory name, or volume label syntax is incorrect.\r\n",
+            ""
+        ));
+        assert!(is_windows_netsh_route_absent("Element not found.\r\n", ""));
+        assert!(!is_windows_netsh_route_absent(
+            "The requested operation requires elevation (Run as administrator).\r\n",
+            ""
+        ));
     }
 }

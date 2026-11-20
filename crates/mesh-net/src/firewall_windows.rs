@@ -89,7 +89,14 @@ impl WindowsFirewallManager {
 
         // Remove only our owned rule first so recovery after Public profile drift is idempotent (`US-053 AC2`).
         let del_spec = build_delete_rule_command(&spec.rule_name)?;
-        self.run_command(&del_spec, true)?;
+        if let Err(err) = self.run_command(&del_spec, true) {
+            tracing::debug!(
+                target: "mesh::net::firewall_windows",
+                rule = %spec.rule_name,
+                error = %err,
+                "Best-effort stale Windows firewall rule delete returned non-absent error"
+            );
+        }
 
         let add_spec = build_add_rule_command(spec)?;
         self.run_command(&add_spec, false)?;
@@ -108,7 +115,40 @@ impl WindowsFirewallManager {
     pub fn remove_overlay_rule(&self, rule_name: &str) -> AppResult<()> {
         validate_owned_rule_name(rule_name)?;
         let del_spec = build_delete_rule_command(rule_name)?;
-        self.run_command(&del_spec, true)
+        match self.run_command(&del_spec, true) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if self.executor.is_none() && self.is_rule_absent_in_os(rule_name) {
+                    return Ok(());
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn is_rule_absent_in_os(&self, rule_name: &str) -> bool {
+        let Ok(show_spec) = CommandSpec::new(
+            AllowedBinary::WindowsNetsh,
+            vec![
+                "advfirewall".to_owned(),
+                "firewall".to_owned(),
+                "show".to_owned(),
+                "rule".to_owned(),
+                format!("name={}", rule_name.trim()),
+            ],
+        ) else {
+            return false;
+        };
+        let Ok(sys_dir) = windows_system_directory() else {
+            return false;
+        };
+        let Ok(exec) = StdCommandExecutor::with_windows_system32_dir(sys_dir) else {
+            return false;
+        };
+        let Ok(out) = exec.execute(&show_spec) else {
+            return false;
+        };
+        (out.success() && !out.stdout.contains(rule_name.trim())) || is_firewall_rule_absent(&out)
     }
 
     fn run_command(&self, spec: &CommandSpec, allow_absent: bool) -> AppResult<()> {
@@ -403,5 +443,41 @@ mod tests {
         assert!(apply_err.is_err());
         assert!(remove_err.is_err());
         assert!(remove_absent_ok.is_ok());
+    }
+
+    #[test]
+    fn test_firewall_windows_apply_proceeds_when_stale_delete_returns_localized_absent() {
+        // Arrange
+        let fake_exec = Arc::new(FakeCommandExecutor::new());
+        let mgr = WindowsFirewallManager::with_executor(Arc::clone(&fake_exec) as _);
+        let cidr = "100.64.0.0/10".parse::<OverlayCidr>().expect("cidr");
+        let spec =
+            WindowsFirewallRuleSpec::new(DEFAULT_OVERLAY_FIREWALL_RULE_NAME, "MeshVPN", cidr)
+                .expect("spec");
+
+        // 1) Pre-delete returns localized error -> best-effort logs and continues, 2) add succeeds.
+        fake_exec
+            .push_result(Ok(CommandOutput {
+                status_code: 1,
+                stdout: "Aucune regle ne correspond aux criteres specifies.".to_owned(),
+                stderr: String::new(),
+            }))
+            .expect("queue localized delete");
+        fake_exec
+            .push_result(Ok(CommandOutput {
+                status_code: 0,
+                stdout: "Ok.\r\n".to_owned(),
+                stderr: String::new(),
+            }))
+            .expect("queue add ok");
+
+        // Act
+        let apply_res = mgr.apply_overlay_rule(&spec, None);
+
+        // Assert
+        assert!(
+            apply_res.is_ok(),
+            "apply_overlay_rule should succeed: {apply_res:?}"
+        );
     }
 }

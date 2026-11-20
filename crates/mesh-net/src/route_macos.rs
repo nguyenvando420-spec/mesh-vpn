@@ -246,13 +246,20 @@ impl LedgerCleanupOps for MacOsCleanupOps {
         )?;
         self.exec_with(|exec| {
             let out = exec.execute(&spec)?;
-            if out.success() || is_route_or_anchor_absent(&out) {
+            if out.success()
+                || is_route_or_anchor_absent(&out)
+                || (self.executor.is_none() && is_macos_utun_absent_in_kernel(ifname))
+            {
                 return Ok(());
             }
-            Err(AppError::internal(format!(
-                "/sbin/ifconfig {ifname} down failed (exit {}): {}",
-                out.status_code,
+            let detail = if out.stderr.trim().is_empty() {
+                out.stdout.trim()
+            } else {
                 out.stderr.trim()
+            };
+            Err(AppError::internal(format!(
+                "/sbin/ifconfig {ifname} down failed (exit {}): {detail}",
+                out.status_code,
             )))
         })
     }
@@ -291,22 +298,32 @@ fn delete_macos_route_args(
         Some(exec) => exec.execute(&spec)?,
         None => StdCommandExecutor::new().execute(&spec)?,
     };
-    if out.success() || is_route_or_anchor_absent(&out) {
+    if out.success()
+        || is_route_or_anchor_absent(&out)
+        || (executor.is_none() && is_macos_utun_absent_in_kernel(utun_name))
+    {
         return Ok(());
     }
-    Err(AppError::internal(format!(
-        "/sbin/route delete failed (exit {}): {}",
-        out.status_code,
+    let detail = if out.stderr.trim().is_empty() {
+        out.stdout.trim()
+    } else {
         out.stderr.trim()
+    };
+    Err(AppError::internal(format!(
+        "/sbin/route delete failed (exit {}): {detail}",
+        out.status_code,
     )))
 }
 
 fn is_route_or_anchor_absent(out: &CommandOutput) -> bool {
-    let lower = out.stderr.to_ascii_lowercase();
-    lower.contains("not in table")
-        || lower.contains("does not exist")
-        || lower.contains("no such process")
-        || lower.contains("anchor does not exist")
+    crate::route::is_bsd_route_or_iface_absent(&out.stdout, &out.stderr)
+}
+
+fn is_macos_utun_absent_in_kernel(ifname: &str) -> bool {
+    match mesh_sys::netmon_macos::list_interface_addresses() {
+        Ok(addrs) => !addrs.iter().any(|iface| iface.name == ifname),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -319,7 +336,7 @@ mod tests {
 
     use super::{MacOsCleanupOps, MacOsRouteManager};
     use crate::firewall_macos::MESH_PF_ANCHOR_NAME;
-    use crate::ledger::ResourceLedger;
+    use crate::ledger::{LedgerRouteEntry, ResourceLedger};
     use crate::route::{RouteManager, RouteSpec};
     use crate::sysexec::{AllowedBinary, CommandOutput, FakeCommandExecutor};
 
@@ -402,5 +419,74 @@ mod tests {
                 c.binary == AllowedBinary::MacOsIfconfig && c.args == ["utun7", "down"]
             })
         );
+    }
+
+    #[test]
+    fn test_route_macos_cleanup_succeeds_when_utun_already_closed_after_datapath_shutdown() {
+        // Arrange: simulate DatapathEngine closing utun7 before ResourceLedger::cleanup_all runs.
+        let dir = tempdir().expect("tempdir");
+        let ledger_path = dir.path().join("ledger.json");
+        let mut ledger = ResourceLedger::load_or_init(ledger_path).expect("ledger");
+        ledger
+            .record_tun_before_create("utun7".to_owned(), None, 42, 1_700_000_000_000)
+            .expect("record tun");
+        ledger
+            .record_route_before_add(LedgerRouteEntry {
+                destination_cidr: "100.64.0.0/10".to_owned(),
+                interface_name: "utun7".to_owned(),
+                table: None,
+            })
+            .expect("record route");
+        ledger
+            .record_firewall_before_apply(Some(MESH_PF_ANCHOR_NAME.to_owned()), Vec::new())
+            .expect("record anchor");
+
+        let exec = Arc::new(FakeCommandExecutor::new());
+        // 1) route delete -> exit 68 "route: bad address: utun7" on stderr.
+        exec.push_result(Ok(CommandOutput {
+            status_code: 68,
+            stdout: String::new(),
+            stderr: "route: bad address: utun7\n".to_owned(),
+        }))
+        .expect("queue route stderr");
+        // 2) pfctl anchor flush -> already flushed.
+        exec.push_result(Ok(CommandOutput {
+            status_code: 1,
+            stdout: String::new(),
+            stderr: "pfctl: anchor does not exist\n".to_owned(),
+        }))
+        .expect("queue pfctl");
+        // 3) ifconfig utun7 down -> already destroyed by kernel.
+        exec.push_result(Ok(CommandOutput {
+            status_code: 1,
+            stdout: String::new(),
+            stderr: "ifconfig: interface utun7 does not exist\n".to_owned(),
+        }))
+        .expect("queue ifconfig");
+
+        let ops = MacOsCleanupOps::with_executor(
+            Arc::clone(&exec) as Arc<dyn crate::sysexec::CommandExecutor>
+        );
+
+        // Act
+        ledger
+            .cleanup_all(&ops)
+            .expect("cleanup must succeed when utun7 is already gone");
+
+        // Assert
+        assert!(!ledger.needs_stale_recovery());
+
+        // Also ensure stdout "not in table" is treated as absent for route delete.
+        exec.push_result(Ok(CommandOutput {
+            status_code: 1,
+            stdout: "delete net 100.64.0.0: not in table\n".to_owned(),
+            stderr: String::new(),
+        }))
+        .expect("queue route stdout");
+        let mgr = MacOsRouteManager::with_executor(exec);
+        let overlay = OverlayCidr::from_str("100.64.0.0/10").expect("cidr");
+        let spec = RouteSpec::new(overlay, overlay, "utun7", None).expect("spec");
+        mgr.remove_overlay_route(&spec)
+            .expect("stdout not in table must succeed");
     }
 }

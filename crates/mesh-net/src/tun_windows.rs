@@ -154,16 +154,14 @@ impl WindowsTunDevice {
                 .map_err(AppError::from)?,
         );
 
-        let default_exec;
-        let cmd_exec: &dyn CommandExecutor = match executor {
-            Some(exec) => exec,
+        match executor {
+            Some(exec) => configure_adapter_ip_and_mtu(&config, &adapter_name, exec)?,
             None => {
                 let sys_dir = windows_system_directory().map_err(AppError::from)?;
-                default_exec = StdCommandExecutor::with_windows_system32_dir(sys_dir)?;
-                &default_exec
+                let default_exec = StdCommandExecutor::with_windows_system32_dir(sys_dir)?;
+                configure_adapter_ip_and_mtu_with_retry(&config, &adapter_name, &default_exec)?;
             }
-        };
-        configure_adapter_ip_and_mtu(&config, &adapter_name, cmd_exec)?;
+        }
 
         let closed = Arc::new(AtomicBool::new(false));
         let (rx_receiver, recycle_tx, reader_thread) =
@@ -330,6 +328,14 @@ fn configure_adapter_ip_and_mtu(
     let addr_out = executor.execute(&addr_spec)?;
     check_netsh_step(&addr_out, "set adapter IPv4 address")?;
 
+    set_adapter_mtu(config, adapter_name, executor)
+}
+
+fn set_adapter_mtu(
+    config: &TunConfig,
+    adapter_name: &str,
+    executor: &dyn CommandExecutor,
+) -> AppResult<()> {
     let mtu_spec = CommandSpec::new(
         AllowedBinary::WindowsNetsh,
         vec![
@@ -343,8 +349,71 @@ fn configure_adapter_ip_and_mtu(
         ],
     )?;
     let mtu_out = executor.execute(&mtu_spec)?;
-    check_netsh_step(&mtu_out, "set adapter MTU")?;
-    Ok(())
+    check_netsh_step(&mtu_out, "set adapter MTU")
+}
+
+fn adapter_has_overlay_ip_os(adapter_name: &str, expected_ip: std::net::Ipv4Addr) -> bool {
+    match mesh_sys::netmon_windows::list_interface_addresses() {
+        Ok(addrs) => addrs.iter().any(|iface| {
+            iface.friendly_name == adapter_name && iface.ip == std::net::IpAddr::V4(expected_ip)
+        }),
+        Err(_) => false,
+    }
+}
+
+fn configure_adapter_ip_and_mtu_with_retry(
+    config: &TunConfig,
+    adapter_name: &str,
+    executor: &dyn CommandExecutor,
+) -> AppResult<()> {
+    configure_adapter_ip_and_mtu_with_policy(
+        config,
+        adapter_name,
+        executor,
+        5,
+        std::time::Duration::from_millis(80),
+        adapter_has_overlay_ip_os,
+    )
+}
+
+fn configure_adapter_ip_and_mtu_with_policy(
+    config: &TunConfig,
+    adapter_name: &str,
+    executor: &dyn CommandExecutor,
+    max_attempts: usize,
+    retry_delay: std::time::Duration,
+    ip_already_present: fn(&str, std::net::Ipv4Addr) -> bool,
+) -> AppResult<()> {
+    let attempts = max_attempts.max(1);
+    for attempt in 0..attempts {
+        match configure_adapter_ip_and_mtu(config, adapter_name, executor) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if ip_already_present(adapter_name, config.overlay_ip.as_ipv4())
+                    && set_adapter_mtu(config, adapter_name, executor).is_ok()
+                {
+                    return Ok(());
+                }
+                if attempt + 1 >= attempts {
+                    return Err(err);
+                }
+                tracing::debug!(
+                    target: "mesh::net::tun_windows",
+                    adapter = %adapter_name,
+                    attempt = attempt + 1,
+                    max_attempts = attempts,
+                    error = %err,
+                    "Retrying Windows Wintun IP/MTU configuration after transient failure"
+                );
+                if !retry_delay.is_zero() {
+                    crate::hosts_windows::backoff_wait(retry_delay);
+                }
+            }
+        }
+    }
+    Err(AppError::internal(
+        "failed configuring Windows Wintun adapter IPv4 and MTU",
+    ))
 }
 
 fn check_netsh_step(out: &CommandOutput, action: &'static str) -> AppResult<()> {
@@ -527,7 +596,8 @@ mod tests {
 
     use super::{
         TunConfig, WindowsTunDevice, WindowsTunOpenSpec, configure_adapter_ip_and_mtu,
-        format_guid_hyphenated, verify_wintun_before_load,
+        configure_adapter_ip_and_mtu_with_policy, format_guid_hyphenated,
+        verify_wintun_before_load,
     };
     use crate::sysexec::{CommandOutput, FakeCommandExecutor};
 
@@ -646,5 +716,107 @@ mod tests {
 
         // Assert
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_tun_windows_configure_adapter_retries_transient_syntax_incorrect_after_reopen() {
+        // Arrange: simulate Windows NDIS registration lag on immediate disconnect->reconnect reopen.
+        let cfg = sample_tun_config();
+        assert!(cfg.is_some());
+        let Some(cfg) = cfg else {
+            return;
+        };
+        let fake_exec = FakeCommandExecutor::new();
+        // Attempt 1: set address fails transiently with ERROR_INVALID_NAME text.
+        assert!(
+            fake_exec
+                .push_result(Ok(CommandOutput {
+                    status_code: 1,
+                    stdout: "The filename, directory name, or volume label syntax is incorrect."
+                        .to_owned(),
+                    stderr: String::new(),
+                }))
+                .is_ok()
+        );
+        // Attempt 2: set address ok + set mtu ok.
+        for _ in 0..2 {
+            assert!(
+                fake_exec
+                    .push_result(Ok(CommandOutput {
+                        status_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    }))
+                    .is_ok()
+            );
+        }
+
+        fn no_ip_yet(_iface: &str, _ip: Ipv4Addr) -> bool {
+            false
+        }
+
+        // Act
+        let res = configure_adapter_ip_and_mtu_with_policy(
+            &cfg,
+            "MeshVPN",
+            &fake_exec,
+            3,
+            std::time::Duration::from_millis(1),
+            no_ip_yet,
+        );
+
+        // Assert
+        assert!(res.is_ok(), "retry policy should recover: {res:?}");
+    }
+
+    #[test]
+    fn test_tun_windows_configure_adapter_recovers_when_ip_already_assigned() {
+        // Arrange
+        let cfg = sample_tun_config();
+        assert!(cfg.is_some());
+        let Some(cfg) = cfg else {
+            return;
+        };
+        let fake_exec = FakeCommandExecutor::new();
+        // set address returns error ("object already exists") while IP is already configured.
+        assert!(
+            fake_exec
+                .push_result(Ok(CommandOutput {
+                    status_code: 1,
+                    stdout: "The object already exists.".to_owned(),
+                    stderr: String::new(),
+                }))
+                .is_ok()
+        );
+        // fallback set_adapter_mtu succeeds.
+        assert!(
+            fake_exec
+                .push_result(Ok(CommandOutput {
+                    status_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                }))
+                .is_ok()
+        );
+
+        fn ip_present(_iface: &str, _ip: Ipv4Addr) -> bool {
+            true
+        }
+
+        // Act
+        let res = configure_adapter_ip_and_mtu_with_policy(
+            &cfg,
+            "MeshVPN",
+            &fake_exec,
+            1,
+            std::time::Duration::ZERO,
+            ip_present,
+        );
+
+        // Assert
+        assert!(
+            res.is_ok(),
+            "already-present fallback should succeed: {res:?}"
+        );
     }
 }

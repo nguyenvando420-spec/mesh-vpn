@@ -804,7 +804,10 @@ impl ClientSessionSupervisor {
                     if Some(nm.relay_map.relay_tcp_endpoint.as_str())
                         != prev_server_ep.as_deref() =>
                 {
-                    nm.relay_map.relay_tcp_endpoint.clone()
+                    resolve_effective_remote_endpoint(
+                        &req.server_endpoint,
+                        &nm.relay_map.relay_tcp_endpoint,
+                    )
                 }
                 _ => req.server_endpoint.clone(),
             };
@@ -937,6 +940,13 @@ impl ClientSessionSupervisor {
             .initial_netmap
             .as_ref()
             .map(|n| n.domain_suffix.as_str());
+        let (underlay_if_index, linux_fwmark, nat64_prefix, timer_mode) =
+            self.refresh_underlay_before_bind().await;
+        let protector = self
+            .platform_hooks
+            .socket_protector()
+            .unwrap_or_else(|| Arc::new(NoopSocketProtector));
+
         let tun_outcome = self
             .platform_hooks
             .activate_tun_and_routes(
@@ -950,13 +960,6 @@ impl ClientSessionSupervisor {
         self.overlay_route_installed
             .store(tun_outcome.route_installed, Ordering::SeqCst);
         let actual_ifname = tun_outcome.tun.interface_name().to_owned();
-
-        let (underlay_if_index, linux_fwmark, nat64_prefix, timer_mode) =
-            self.refresh_underlay_before_bind().await;
-        let protector = self
-            .platform_hooks
-            .socket_protector()
-            .unwrap_or_else(|| Arc::new(NoopSocketProtector));
 
         let (relay_client, relay_handle, engine) = self
             .build_datapath_and_relay(TunnelBindInput {
@@ -1065,12 +1068,16 @@ impl ClientSessionSupervisor {
                 DaemonState::Revoked | DaemonState::ReauthRequired
             ) {
                 g.daemon_state = DaemonState::Stopped;
+                if !g.protocol_incompatible {
+                    g.last_error = None;
+                }
             }
             g.control_connected = false;
             g.datapath_handle = None;
             g.rebind_handle = None;
             g.relay_handle = None;
             g.tun_interface_name = None;
+            g.migration_pending_endpoint = None;
             g.overlay_conflict_warning = None;
             g.lockdown_warning = None;
         }
@@ -1343,13 +1350,11 @@ impl ClientSessionSupervisor {
         let hook_dns = self.platform_hooks.underlay_dns_servers();
 
         let mut g = self.runtime.inner.write().await;
-        if g.underlay_if_index.is_none()
-            && let Some(ref primary) = probed_primary
-        {
-            if primary.if_index != 0 {
+        if let Some(ref primary) = probed_primary {
+            if self.options.underlay_if_index.is_none() && primary.if_index != 0 {
                 g.underlay_if_index = Some(primary.if_index);
-            }
-            if g.bound_physical_interface.is_none() {
+                g.bound_physical_interface = Some(primary.name.clone());
+            } else if g.bound_physical_interface.is_none() {
                 g.bound_physical_interface = Some(primary.name.clone());
             }
         }
@@ -1400,7 +1405,9 @@ impl ClientSessionSupervisor {
 
         let relay_ep = params.initial_netmap.as_ref().map_or_else(
             || params.endpoint.clone(),
-            |n| n.relay_map.relay_tcp_endpoint.clone(),
+            |n| {
+                resolve_effective_remote_endpoint(&params.endpoint, &n.relay_map.relay_tcp_endpoint)
+            },
         );
         let (relay_host, _) = split_host_port(&params.endpoint)?;
         let relay_cfg = RelayClientConfig {
@@ -1560,15 +1567,32 @@ impl ClientSessionSupervisor {
 
         // Apply initial/cached netmap only AFTER `relay_client.run` and `engine.run` are spawned
         // so `ApplyNetmap`'s command reply is serviced without startup deadlock (`BLK-W21-01`).
-        if let Some(snap) = initial_netmap
-            && let Err(err) = apply_dp_handle.apply_netmap(snap).await
-        {
-            warn!(
-                component = "mesh_client.session",
-                event = "initial_netmap_apply_failed",
-                error = %err,
-                "failed applying initial netmap snapshot to datapath"
-            );
+        if let Some(snap) = initial_netmap {
+            let (self_overlay_ip, self_node_name) = {
+                let g = self.runtime.inner.read().await;
+                (g.overlay_ip, g.node_name.clone())
+            };
+            if let Err(err) = apply_dp_handle.apply_netmap(snap.clone()).await {
+                warn!(
+                    component = "mesh_client.session",
+                    event = "initial_netmap_apply_failed",
+                    error = %err,
+                    "failed applying initial netmap snapshot to datapath"
+                );
+            }
+            if let Err(err) = self
+                .platform_hooks
+                .dns_hook()
+                .sync_mesh_dns(&snap, self_overlay_ip, self_node_name.as_ref())
+                .await
+            {
+                warn!(
+                    component = "mesh_client.session",
+                    event = "initial_dns_hook_sync_failed",
+                    error = %err,
+                    "failed synchronizing initial mesh DNS entries via DnsUpstreamHook"
+                );
+            }
         }
         if let Some(filter_spec) = self.platform_hooks.inbound_filter_spec()
             && let Err(err) = apply_dp_handle
@@ -1943,6 +1967,17 @@ struct RebindRuntimeSnapshot {
     relay_endpoint: Option<String>,
 }
 
+/// Preserves `bootstrap_ep` when a server advertises a loopback endpoint while `bootstrap_ep`
+/// is non-loopback (e.g. VPS `public_host` unset).
+pub(crate) fn resolve_effective_remote_endpoint(bootstrap_ep: &str, advertised_ep: &str) -> String {
+    let trimmed = advertised_ep.trim();
+    if trimmed.is_empty() || (!is_loopback_endpoint(bootstrap_ep) && is_loopback_endpoint(trimmed))
+    {
+        return bootstrap_ep.to_owned();
+    }
+    trimmed.to_owned()
+}
+
 async fn forward_non_interface_rebind(ctx: &RebindForwardContext, cmd: RebindCommand) {
     let (rebind_handle, relay_handle) = {
         let g = ctx.runtime.inner.read().await;
@@ -2004,7 +2039,14 @@ async fn capture_rebind_snapshot(
     let relay_endpoint = g
         .latest_netmap
         .as_ref()
-        .map(|n| n.relay_map.relay_tcp_endpoint.clone())
+        .map(|n| {
+            g.bootstrap.server_endpoint.as_deref().map_or_else(
+                || n.relay_map.relay_tcp_endpoint.clone(),
+                |boot_ep| {
+                    resolve_effective_remote_endpoint(boot_ep, &n.relay_map.relay_tcp_endpoint)
+                },
+            )
+        })
         .or_else(|| g.bootstrap.server_endpoint.clone());
     let peer_ids = g
         .latest_netmap
