@@ -38,6 +38,8 @@ pub(crate) enum DesktopUiState {
 
 impl DesktopUiState {
     /// Returns a concise human-readable state tag for badges and accessibility labels.
+    ///
+    /// Preserved unchanged for `linux_gui.rs` and existing test compatibility (`ADR-030`).
     #[must_use]
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -49,6 +51,30 @@ impl DesktopUiState {
             Self::ReauthRequired => "Re-auth Required",
             Self::Revoked => "Revoked",
             Self::ErrorRecoverable => "Error (Recoverable)",
+        }
+    }
+
+    /// Returns a concise sub-state-aware canonical label for UI badges, tray tooltips,
+    /// and accessibility announcements (`ADR-030`).
+    #[must_use]
+    pub(crate) const fn display_label(self, sub_state: TunnelSubState) -> &'static str {
+        match self {
+            Self::AgentUnavailable => "Agent Unavailable",
+            Self::ServiceStopped => "Service Stopped",
+            Self::NotEnrolled => "Not Enrolled",
+            Self::Connecting => "Connecting",
+            Self::Connected => match sub_state {
+                TunnelSubState::Connected => "Connected",
+                TunnelSubState::Degraded => "Degraded",
+                TunnelSubState::Disconnected => "Disconnected",
+                TunnelSubState::Connecting => "Connecting",
+                TunnelSubState::NotEnrolled => "Not Enrolled",
+                TunnelSubState::ReauthRequired => "Re-auth Required",
+                TunnelSubState::Revoked => "Device Revoked",
+            },
+            Self::ReauthRequired => "Re-auth Required",
+            Self::Revoked => "Device Revoked",
+            Self::ErrorRecoverable => "Attention Required",
         }
     }
 
@@ -132,6 +158,28 @@ pub(crate) enum AgentVersionIndicator {
     Unknown,
 }
 
+/// Primary 3-Zone navigation tabs displayed whenever a node is enrolled (`ADR-028`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum DashboardTab {
+    /// Zone 1: Status hero, tunnel telemetry, and primary connection CTAs.
+    #[default]
+    Status,
+    /// Zone 2: Peer search, 4-state filter chips, RTT/ping, and Copy IP/FQDN.
+    Peers,
+    /// Zone 3: Theme/Language preferences, Netcheck, Bugreport, and Rotate/Update modals.
+    DiagnosticsSettings,
+}
+
+/// Evaluates whether the 3-Tab Navigation bar (`Status / Peers / Diagnostics & Settings`)
+/// must be displayed (`ADR-028`).
+///
+/// Always visible when `enrolled == true`, regardless of `DesktopUiState` (including
+/// `ReauthRequired`, `Revoked`, `ErrorRecoverable`, `Connecting`, and `Connected`).
+#[must_use]
+pub(crate) const fn show_tab_bar(enrolled: bool, _ui_state: DesktopUiState) -> bool {
+    enrolled
+}
+
 /// Derived snapshot rendered by both Dashboard window and System Tray menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DerivedUiSnapshot {
@@ -142,6 +190,26 @@ pub(crate) struct DerivedUiSnapshot {
     pub(crate) recoverable_error: Option<String>,
     pub(crate) legacy_banner: Option<String>,
     pub(crate) version_mismatch_banner: Option<String>,
+}
+
+impl DerivedUiSnapshot {
+    /// Returns `true` when the 3-Tab Navigation bar must remain visible (`ADR-028`).
+    #[must_use]
+    pub(crate) const fn should_show_tab_bar(&self) -> bool {
+        show_tab_bar(self.enrolled, self.ui_state)
+    }
+
+    /// Returns `true` when the standalone onboarding form should be shown (`ADR-028`).
+    ///
+    /// Hidden completely whenever `self.enrolled == true`.
+    #[must_use]
+    pub(crate) const fn should_show_onboarding_form(&self) -> bool {
+        !self.enrolled
+            && !matches!(
+                self.ui_state,
+                DesktopUiState::AgentUnavailable | DesktopUiState::ServiceStopped
+            )
+    }
 }
 
 /// Classifies `AgentVersionStatus` returned from `meshd-ro` against `gui_version` (`ADR-022`).
@@ -383,4 +451,74 @@ pub(crate) fn gui_log_directory(local_app_data: Option<&Path>) -> Option<PathBuf
     local_app_data
         .filter(|p| !p.as_os_str().is_empty())
         .map(|base| base.join(GUI_APP_DATA_DIR_NAME).join(GUI_LOG_SUBDIR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DashboardTab, DesktopUiState, ServiceProbeKind, StateProbeInputs, TunnelSubState,
+        derive_desktop_ui_state, show_tab_bar,
+    };
+
+    #[test]
+    fn test_app_display_label_and_tab_bar_invariants() {
+        // Arrange
+        let tabs = [
+            DashboardTab::Status,
+            DashboardTab::Peers,
+            DashboardTab::DiagnosticsSettings,
+        ];
+        let probes = [
+            ServiceProbeKind::Running,
+            ServiceProbeKind::Stopped,
+            ServiceProbeKind::NotInstalled,
+            ServiceProbeKind::Unknown,
+        ];
+
+        // Act & Assert
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(probes.len(), 4);
+        assert_eq!(
+            DesktopUiState::Connected.display_label(TunnelSubState::Disconnected),
+            "Disconnected"
+        );
+        assert_eq!(
+            DesktopUiState::Connected.display_label(TunnelSubState::Revoked),
+            "Device Revoked"
+        );
+        assert_eq!(
+            DesktopUiState::ErrorRecoverable.display_label(TunnelSubState::Disconnected),
+            "Attention Required"
+        );
+        assert!(show_tab_bar(true, DesktopUiState::ReauthRequired));
+        assert!(!show_tab_bar(false, DesktopUiState::NotEnrolled));
+        assert!(
+            DesktopUiState::Connected
+                .headline(TunnelSubState::Connected)
+                .contains("Connected")
+        );
+        assert!(
+            DesktopUiState::Connected
+                .tray_tooltip_summary(TunnelSubState::Connected)
+                .contains("Connected")
+        );
+
+        let snap = derive_desktop_ui_state(StateProbeInputs {
+            gui_version: "0.4.0",
+            service_probe: ServiceProbeKind::Stopped,
+            ipc_connected: false,
+            status: None,
+            version_status: None,
+            ipc_error: None,
+            active_action_error: None,
+        });
+        assert!(!snap.should_show_tab_bar());
+        assert!(!snap.should_show_onboarding_form());
+
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            let dir = super::gui_log_directory(Some(std::path::Path::new("local")));
+            assert!(dir.is_some());
+        }
+    }
 }

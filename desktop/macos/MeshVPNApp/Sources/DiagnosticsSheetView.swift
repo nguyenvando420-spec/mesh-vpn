@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 /// Network diagnostics (`netcheck`), atomic `.tar` bugreport export, server config, and cleanup.
 struct DiagnosticsSheetView: View {
     @ObservedObject var store: DesktopStore
+    @ObservedObject var themeManager: ThemeManager
     let showCloseButton: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -18,8 +19,13 @@ struct DiagnosticsSheetView: View {
     @State private var confirmUninstallSheet: Bool = false
     @State private var purgeKeysOnUninstall: Bool = false
 
-    init(store: DesktopStore, showCloseButton: Bool = false) {
+    init(
+        store: DesktopStore,
+        themeManager: ThemeManager,
+        showCloseButton: Bool = false
+    ) {
         self.store = store
+        self.themeManager = themeManager
         self.showCloseButton = showCloseButton
     }
 
@@ -35,6 +41,7 @@ struct DiagnosticsSheetView: View {
                             .keyboardShortcut(.cancelAction)
                     }
                 }
+                AppearanceSettingsSection(themeManager: themeManager)
                 netcheckSection
                 bugreportSection
                 updateServerSection
@@ -120,7 +127,7 @@ struct DiagnosticsSheetView: View {
                     if let hint = result.diagnosticHint, !hint.isEmpty {
                         Text(hint)
                             .font(.caption)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(MeshPalette.semanticWarning)
                     }
                 }
             }
@@ -192,7 +199,7 @@ struct DiagnosticsSheetView: View {
                 if isEndpointIpLiteral {
                     Text("System CA is disabled for IP literal endpoints (Zero-TOFU).")
                         .font(.caption)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(MeshPalette.semanticWarning)
                 }
 
                 if tlsAuthMode == .spkiPin || isEndpointIpLiteral {
@@ -334,6 +341,28 @@ struct DiagnosticsSheetView: View {
         }
         Task { @MainActor in
             _ = await store.exportBugreport(to: destinationURL)
+        }
+    }
+}
+
+private struct AppearanceSettingsSection: View {
+    @ObservedObject var themeManager: ThemeManager
+
+    var body: some View {
+        GroupBox("Appearance & Theme") {
+            HStack(spacing: 12) {
+                Text("Theme Mode")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Picker("Theme Mode", selection: $themeManager.mode) {
+                    ForEach(ThemeMode.allCases) { item in
+                        Text(item.displayLabel).tag(item)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 260)
+            }
+            .padding(8)
         }
     }
 }

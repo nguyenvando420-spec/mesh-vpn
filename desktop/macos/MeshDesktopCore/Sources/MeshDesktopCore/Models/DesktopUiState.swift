@@ -58,48 +58,82 @@ public enum DesktopUiState: String, Equatable, Sendable, CaseIterable {
 
     public var displayTitle: String {
         switch self {
-        case .serviceNotInstalled:
-            return "Service Not Installed"
-        case .serviceStopped:
-            return "Service Stopped"
-        case .unconfigured:
-            return "Not Enrolled"
-        case .connecting:
-            return "Connecting"
-        case .connected:
-            return "Connected"
-        case .reauthRequired:
-            return "Key Rotation Required"
-        case .revoked:
-            return "Device Revoked"
-        case .error:
-            return "Attention Required"
+        case .serviceNotInstalled: return "Service Not Installed"
+        case .serviceStopped: return "Service Stopped"
+        case .unconfigured: return "Not Enrolled"
+        case .connecting: return "Connecting"
+        case .connected: return "Connected"
+        case .reauthRequired: return "Key Rotation Required"
+        case .revoked: return "Device Revoked"
+        case .error: return "Attention Required"
+        }
+    }
+
+    /// True when the node has passed initial enrollment and should show the 3-tab navigation bar.
+    public var isEnrolledState: Bool {
+        switch self {
+        case .serviceNotInstalled, .serviceStopped, .unconfigured: return false
+        case .connecting, .connected, .reauthRequired, .revoked, .error: return true
+        }
+    }
+
+    /// Sub-state-aware display label distinguishing Connected, Degraded, and Disconnected.
+    public func resolvedTitle(isDegradedTunnel: Bool, isManuallyDisconnected: Bool) -> String {
+        guard self == .connected else { return displayTitle }
+        if isManuallyDisconnected { return "Disconnected" }
+        return isDegradedTunnel ? "Degraded" : "Connected"
+    }
+}
+
+/// Semantic color classification shared across Menu Bar icons, badges, and status cards.
+public enum SemanticColorTone: String, Equatable, Sendable, CaseIterable {
+    case success, warning, error, neutral
+
+    public var lightHex: String {
+        switch self {
+        case .success: return MeshDesignTokens.semanticSuccessLight
+        case .warning: return MeshDesignTokens.semanticWarningLight
+        case .error: return MeshDesignTokens.semanticErrorLight
+        case .neutral: return MeshDesignTokens.semanticNeutralLight
+        }
+    }
+
+    public var darkHex: String {
+        switch self {
+        case .success: return MeshDesignTokens.semanticSuccessDark
+        case .warning: return MeshDesignTokens.semanticWarningDark
+        case .error: return MeshDesignTokens.semanticErrorDark
+        case .neutral: return MeshDesignTokens.semanticNeutralDark
         }
     }
 }
 
-/// Visual icon grouping rendered in the macOS Menu Bar `NSStatusItem` (`US-109`).
-public enum MenuBarStatusGroup: Equatable, Sendable {
-    case connected
-    case connectingOrDegraded
-    case disconnected
-    case serviceOffline
-    case warning
+/// Visual icon grouping rendered in the macOS Menu Bar `NSStatusItem` (`US-109`, `ADR-030`).
+public enum MenuBarStatusGroup: Equatable, Sendable, CaseIterable {
+    case connected, connectingOrDegraded, disconnected, serviceOffline, reauthRequired, warning
 
     public var symbolName: String {
         switch self {
-        case .connected:
-            return "checkmark.shield.fill"
-        case .connectingOrDegraded:
-            return "bolt.shield.fill"
-        case .disconnected:
-            return "shield"
-        case .serviceOffline:
-            return "shield.slash"
-        case .warning:
-            return "exclamationmark.shield.fill"
+        case .connected: return "checkmark.shield.fill"
+        case .connectingOrDegraded: return "bolt.shield.fill"
+        case .disconnected: return "shield"
+        case .serviceOffline: return "shield.slash"
+        case .reauthRequired: return "key.slash"
+        case .warning: return "exclamationmark.shield.fill"
         }
     }
+
+    public var semanticTone: SemanticColorTone {
+        switch self {
+        case .connected: return .success
+        case .connectingOrDegraded, .reauthRequired: return .warning
+        case .disconnected, .serviceOffline: return .neutral
+        case .warning: return .error
+        }
+    }
+
+    public var lightHex: String { semanticTone.lightHex }
+    public var darkHex: String { semanticTone.darkHex }
 }
 
 /// Result of probing the running or installed `meshd` version (`ADR-024`, `MED-DGUI-G2-01`).
@@ -336,7 +370,7 @@ public enum DesktopStateMapper: Sendable {
         case .reauthRequired:
             return ComputedState(
                 uiState: .reauthRequired,
-                menuBarGroup: .warning,
+                menuBarGroup: .reauthRequired,
                 isDegradedTunnel: false,
                 isManuallyDisconnected: false
             )
@@ -421,5 +455,122 @@ public enum DesktopStateMapper: Sendable {
             isDegradedTunnel: false,
             isManuallyDisconnected: true
         )
+    }
+}
+
+/// Canonical hex color tokens (`ADR-030` v1.1).
+public enum MeshDesignTokens: Sendable {
+    public static let surfaceBackgroundLight = "#F8FAFC"
+    public static let surfaceBackgroundDark = "#0F172A"
+    public static let surfaceCardLight = "#FFFFFF"
+    public static let surfaceCardDark = "#1E293B"
+    public static let surfaceBorderLight = "#CBD5E1"
+    public static let surfaceBorderDark = "#334155"
+    public static let textPrimaryLight = "#0F172A"
+    public static let textPrimaryDark = "#F1F5F9"
+    public static let textSecondaryLight = "#475569"
+    public static let textSecondaryDark = "#94A3B8"
+    public static let brandCobalt = "#0B57D0"
+    public static let brandSky = "#60A5FA"
+    public static let brandTeal = "#0D9488"
+    public static let brandTealLight = "#2DD4BF"
+    public static let semanticSuccessLight = "#16A34A"
+    public static let semanticSuccessDark = "#4ADE80"
+    public static let semanticWarningLight = "#D97706"
+    public static let semanticWarningDark = "#FBBF24"
+    public static let semanticErrorLight = "#DC2626"
+    public static let semanticErrorDark = "#F87171"
+    public static let semanticNeutralLight = "#6B7280"
+    public static let semanticNeutralDark = "#9CA3AF"
+}
+
+/// Appearance preference persisted under `UserDefaults(suiteName: "MeshVPN")`.
+public enum ThemeMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case system, light, dark
+
+    public static let userDefaultsSuiteName = "MeshVPN"
+    public static let userDefaultsKey = "mesh_theme_mode"
+    public var id: String { rawValue }
+    public var displayLabel: String { rawValue.capitalized }
+
+    public static func load(
+        from defaults: UserDefaults? = UserDefaults(suiteName: userDefaultsSuiteName)
+    ) -> ThemeMode {
+        guard let raw = defaults?.string(forKey: userDefaultsKey),
+              let parsed = ThemeMode(rawValue: raw) else { return .system }
+        return parsed
+    }
+
+    public func save(
+        to defaults: UserDefaults? = UserDefaults(suiteName: userDefaultsSuiteName)
+    ) {
+        defaults?.set(rawValue, forKey: Self.userDefaultsKey)
+    }
+}
+
+/// Canonical 3-tab Dashboard navigation sections (`ADR-028`).
+public enum DesktopTabKind: String, CaseIterable, Identifiable, Sendable {
+    case status = "Status"
+    case peers = "Peers"
+    case diagnostics = "Diagnostics & Settings"
+
+    public var id: String { rawValue }
+    public static func visibleTabs(for uiState: DesktopUiState) -> [DesktopTabKind] {
+        uiState.isEnrolledState ? DesktopTabKind.allCases : []
+    }
+}
+
+/// Filter chips and count badges for Peers directory (`US-120`).
+public enum PeerFilterMode: String, CaseIterable, Identifiable, Sendable {
+    case all = "All", online = "Online", direct = "Direct", relay = "Relay"
+    public var id: String { rawValue }
+}
+
+public struct PeerFilterCounts: Equatable, Sendable {
+    public let all: Int
+    public let online: Int
+    public let direct: Int
+    public let relay: Int
+
+    public func count(for mode: PeerFilterMode) -> Int {
+        switch mode {
+        case .all: return all
+        case .online: return online
+        case .direct: return direct
+        case .relay: return relay
+        }
+    }
+}
+
+public enum PeerDirectoryFilter: Sendable {
+    public static func counts(for peers: [AgentPeerStatus]) -> PeerFilterCounts {
+        PeerFilterCounts(
+            all: peers.count,
+            online: peers.filter(\.online).count,
+            direct: peers.filter { $0.online && $0.activePath == .direct }.count,
+            relay: peers.filter { $0.online && $0.activePath == .relay }.count
+        )
+    }
+
+    public static func filter(
+        peers: [AgentPeerStatus],
+        mode: PeerFilterMode,
+        query: String
+    ) -> [AgentPeerStatus] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return peers.filter { peer in
+            let matchesMode: Bool = switch mode {
+            case .all: true
+            case .online: peer.online
+            case .direct: peer.online && peer.activePath == .direct
+            case .relay: peer.online && peer.activePath == .relay
+            }
+            guard matchesMode else { return false }
+            guard !trimmed.isEmpty else { return true }
+            return peer.name.lowercased().contains(trimmed)
+                || peer.fqdn.lowercased().contains(trimmed)
+                || peer.overlayIp.lowercased().contains(trimmed)
+                || peer.nodeId.lowercased().contains(trimmed)
+        }
     }
 }

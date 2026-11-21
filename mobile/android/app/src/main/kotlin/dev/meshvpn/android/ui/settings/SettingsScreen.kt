@@ -34,20 +34,25 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.meshvpn.android.ui.MainUiScreenState
+import dev.meshvpn.android.ui.theme.ThemeMode
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import uniffi.mesh_mobile_ffi.MobileDaemonState
+import uniffi.mesh_mobile_ffi.MobileNetcheckResponse
 import uniffi.mesh_mobile_ffi.MobileTlsAuthMode
 
 @Composable
 fun SettingsScreen(
     screenState: MainUiScreenState,
+    onSelectThemeMode: (ThemeMode) -> Unit,
     onToggleRevealPins: () -> Unit,
     onSensitiveModalChanged: (Boolean) -> Unit,
     onUpdateServerConfig: (String, MobileTlsAuthMode, String) -> Unit,
     onRotateKey: (CharArray) -> Unit,
     onToggleAlwaysOnHint: (Boolean) -> Unit,
     onOpenVpnSettings: () -> Unit,
+    onRunNetcheck: () -> Unit,
     onExportBugreport: () -> Unit,
     onCleanupDiagnostics: () -> Unit,
     onResetIdentity: () -> Unit,
@@ -61,9 +66,7 @@ fun SettingsScreen(
     val snapshot = session.snapshot
     val bootstrap = session.bootstrapSummary
     val currentEndpoint =
-        snapshot?.serverConnection?.controlEndpoint
-            ?: bootstrap?.serverEndpoint
-            ?: ""
+        snapshot?.serverConnection?.controlEndpoint ?: bootstrap?.serverEndpoint.orEmpty()
     val currentTlsMode =
         snapshot?.serverConnection?.tlsAuthMode
             ?: bootstrap?.tlsAuthMode
@@ -71,55 +74,30 @@ fun SettingsScreen(
     val activePin = snapshot?.serverConnection?.activePin ?: bootstrap?.activePin
     val nextPin = snapshot?.serverConnection?.nextPin ?: bootstrap?.nextPin
 
-    Column(
-        modifier =
-            modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Text("Settings & Security", style = MaterialTheme.typography.headlineSmall)
-
-        ServerSecurityCard(
-            endpoint = currentEndpoint,
-            tlsMode = currentTlsMode,
-            activePin = activePin,
-            nextPin = nextPin,
-            pinsRevealed = screenState.isAdminPinsRevealed,
-            isBusy = session.isBusy,
-            onToggleRevealPins = onToggleRevealPins,
-            onOpenUpdateServer = {
-                onSensitiveModalChanged(true)
-                showServerDialog = true
-            },
-        )
-
-        IdentityManagementCard(
-            nodeId = snapshot?.nodeId ?: bootstrap?.nodeId,
-            nodeName = snapshot?.nodeName ?: bootstrap?.nodeName,
-            keyExpiresAtMs = snapshot?.keyExpiresAtMs,
-            isBusy = session.isBusy,
-            onOpenRotateKey = {
-                onSensitiveModalChanged(true)
-                showRotateDialog = true
-            },
-            onOpenResetIdentity = { showResetDialog = true },
-        )
-
-        BootAndAlwaysOnCard(
-            alwaysOnHint = session.isAlwaysOnHintEnabled,
-            onToggleAlwaysOnHint = onToggleAlwaysOnHint,
-            onOpenVpnSettings = onOpenVpnSettings,
-        )
-
-        DiagnosticsCard(
-            isBusy = session.isBusy,
-            hasActiveTunnel = snapshot != null,
-            onExportBugreport = onExportBugreport,
-            onCleanupDiagnostics = onCleanupDiagnostics,
-        )
-    }
+    SettingsBody(
+        screenState = screenState,
+        currentEndpoint = currentEndpoint,
+        currentTlsMode = currentTlsMode,
+        activePin = activePin,
+        nextPin = nextPin,
+        onSelectThemeMode = onSelectThemeMode,
+        onToggleRevealPins = onToggleRevealPins,
+        onOpenUpdateServer = {
+            onSensitiveModalChanged(true)
+            showServerDialog = true
+        },
+        onOpenRotateKey = {
+            onSensitiveModalChanged(true)
+            showRotateDialog = true
+        },
+        onOpenResetIdentity = { showResetDialog = true },
+        onToggleAlwaysOnHint = onToggleAlwaysOnHint,
+        onOpenVpnSettings = onOpenVpnSettings,
+        onRunNetcheck = onRunNetcheck,
+        onExportBugreport = onExportBugreport,
+        onCleanupDiagnostics = onCleanupDiagnostics,
+        modifier = modifier,
+    )
 
     SettingsDialogs(
         showServerDialog = showServerDialog,
@@ -145,6 +123,113 @@ fun SettingsScreen(
             onResetIdentity()
         },
     )
+}
+
+@Composable
+private fun SettingsBody(
+    screenState: MainUiScreenState,
+    currentEndpoint: String,
+    currentTlsMode: MobileTlsAuthMode,
+    activePin: String?,
+    nextPin: String?,
+    onSelectThemeMode: (ThemeMode) -> Unit,
+    onToggleRevealPins: () -> Unit,
+    onOpenUpdateServer: () -> Unit,
+    onOpenRotateKey: () -> Unit,
+    onOpenResetIdentity: () -> Unit,
+    onToggleAlwaysOnHint: (Boolean) -> Unit,
+    onOpenVpnSettings: () -> Unit,
+    onRunNetcheck: () -> Unit,
+    onExportBugreport: () -> Unit,
+    onCleanupDiagnostics: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val session = screenState.session
+    val snapshot = session.snapshot
+    val bootstrap = session.bootstrapSummary
+    Column(
+        modifier =
+            modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("Settings & Security", style = MaterialTheme.typography.headlineSmall)
+        AppearanceCard(
+            themeMode = screenState.themeMode,
+            onSelectThemeMode = onSelectThemeMode,
+        )
+        ServerSecurityCard(
+            endpoint = currentEndpoint,
+            tlsMode = currentTlsMode,
+            activePin = activePin,
+            nextPin = nextPin,
+            pinsRevealed = screenState.isAdminPinsRevealed,
+            isBusy = session.isBusy,
+            onToggleRevealPins = onToggleRevealPins,
+            onOpenUpdateServer = onOpenUpdateServer,
+        )
+        IdentityManagementCard(
+            nodeId = snapshot?.nodeId ?: bootstrap?.nodeId,
+            nodeName = snapshot?.nodeName ?: bootstrap?.nodeName,
+            keyExpiresAtMs = snapshot?.keyExpiresAtMs,
+            isBusy = session.isBusy,
+            onOpenRotateKey = onOpenRotateKey,
+            onOpenResetIdentity = onOpenResetIdentity,
+        )
+        BootAndAlwaysOnCard(
+            alwaysOnHint = session.isAlwaysOnHintEnabled,
+            onToggleAlwaysOnHint = onToggleAlwaysOnHint,
+            onOpenVpnSettings = onOpenVpnSettings,
+        )
+        DiagnosticsCard(
+            isBusy = session.isBusy,
+            isConnected = session.daemonState == MobileDaemonState.CONNECTED,
+            hasActiveTunnel = snapshot != null,
+            netcheck = session.lastNetcheckResult,
+            onRunNetcheck = onRunNetcheck,
+            onExportBugreport = onExportBugreport,
+            onCleanupDiagnostics = onCleanupDiagnostics,
+        )
+    }
+}
+
+@Composable
+private fun AppearanceCard(
+    themeMode: ThemeMode,
+    onSelectThemeMode: (ThemeMode) -> Unit,
+) {
+    val options =
+        listOf(
+            Triple(ThemeMode.SYSTEM, "System", "theme_option_system"),
+            Triple(ThemeMode.LIGHT, "Light", "theme_option_light"),
+            Triple(ThemeMode.DARK, "Dark", "theme_option_dark"),
+        )
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("Appearance", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("theme_selector"),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for ((mode, label, tag) in options) {
+                    FilterChip(
+                        selected = themeMode == mode,
+                        onClick = { onSelectThemeMode(mode) },
+                        label = { Text(label) },
+                        modifier = Modifier.testTag(tag),
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -330,7 +415,10 @@ private fun BootAndAlwaysOnCard(
 @Composable
 private fun DiagnosticsCard(
     isBusy: Boolean,
+    isConnected: Boolean,
     hasActiveTunnel: Boolean,
+    netcheck: MobileNetcheckResponse?,
+    onRunNetcheck: () -> Unit,
     onExportBugreport: () -> Unit,
     onCleanupDiagnostics: () -> Unit,
 ) {
@@ -346,6 +434,21 @@ private fun DiagnosticsCard(
                         "tokens, and credentials removed before sharing.",
                 style = MaterialTheme.typography.bodyMedium,
             )
+            OutlinedButton(
+                onClick = onRunNetcheck,
+                enabled = !isBusy && isConnected,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Run Network Check")
+            }
+            if (netcheck != null) {
+                Text(
+                    text =
+                        "UDP: ${netcheck.udpReachable} | NAT: ${netcheck.natType.name} | " +
+                            "Relay: ${netcheck.relayRttMs ?: "-"} ms",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
             Button(
                 onClick = onExportBugreport,
                 enabled = !isBusy && hasActiveTunnel,

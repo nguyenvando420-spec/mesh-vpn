@@ -23,6 +23,27 @@ pub(crate) enum OnboardingTlsMode {
     SystemCa,
 }
 
+/// Desktop Onboarding 2-tab mode (`ADR-028`: Join URI vs Manual Setup).
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum DesktopOnboardingTab {
+    /// Paste `mesh://join?...` URI quick setup tab.
+    #[default]
+    JoinUri,
+    /// Manual endpoint + TLS mode + SPKI pin + Pre-Auth Key form.
+    Manual,
+}
+
+/// Privileged maintenance modals hosted inside Zone 3 (`Diagnostics & Settings`) (`ADR-028`).
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Zone3ModalKind {
+    /// Modal dialog for rotating an expired or compromised Pre-Auth Key (`Rotate Node Key`).
+    RotateNodeKey,
+    /// Modal dialog for changing Control Server endpoint / SPKI Pin (`Update Control Server/Pin`).
+    UpdateControlServer,
+}
+
 /// Raw operator inputs collected from Setup & Onboarding form fields.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct OnboardingFormInput {
@@ -296,4 +317,23 @@ pub(crate) fn validate_update_server_payload(
     };
     let payload = serialize_handoff_request_zeroizing(&req).map_err(|err| err.to_string())?;
     Ok((normalized.endpoint, payload))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::{DesktopOnboardingTab, Zone3ModalKind};
+
+    #[test]
+    fn test_onboarding_tabs_and_zone3_modal_kinds() {
+        // Arrange & Act & Assert
+        assert_eq!(
+            DesktopOnboardingTab::default(),
+            DesktopOnboardingTab::JoinUri
+        );
+        assert_ne!(DesktopOnboardingTab::JoinUri, DesktopOnboardingTab::Manual);
+        assert_ne!(
+            Zone3ModalKind::RotateNodeKey,
+            Zone3ModalKind::UpdateControlServer
+        );
+    }
 }

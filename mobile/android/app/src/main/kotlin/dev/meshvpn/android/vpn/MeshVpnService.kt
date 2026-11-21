@@ -440,6 +440,7 @@ class MeshVpnService : VpnService() {
             NotificationCompat
                 .Builder(this, channelId)
                 .setSmallIcon(R.drawable.ic_vpn_key)
+                .setColor(notificationColorForState(uiState.daemonState))
                 .setContentTitle(getString(R.string.notification_title))
                 .setContentText(warningLines.firstOrNull() ?: statusText)
                 .setContentIntent(contentIntent)
@@ -465,10 +466,30 @@ class MeshVpnService : VpnService() {
         private const val CHANNEL_VPN_ALERTS = "mesh_vpn_alerts"
         private const val TEARDOWN_BUDGET_MS = 4_500L
 
+        private const val COLOR_SEMANTIC_SUCCESS = 0xFF16A34A.toInt()
+        private const val COLOR_SEMANTIC_WARNING = 0xFFD97706.toInt()
+        private const val COLOR_SEMANTIC_ERROR = 0xFFDC2626.toInt()
+        private const val COLOR_SEMANTIC_NEUTRAL = 0xFF6B7280.toInt()
+
         const val ACTION_START_TUNNEL = "dev.meshvpn.android.action.START_TUNNEL"
         const val ACTION_STOP_TUNNEL = "dev.meshvpn.android.action.STOP_TUNNEL"
         private const val ACTION_DISCONNECT_NOTIFICATION =
             "dev.meshvpn.android.action.DISCONNECT_FROM_NOTIFICATION"
+
+        fun notificationColorForState(state: MobileDaemonState): Int =
+            when (state) {
+                MobileDaemonState.CONNECTED -> COLOR_SEMANTIC_SUCCESS
+                MobileDaemonState.CONNECTING,
+                MobileDaemonState.DEGRADED,
+                MobileDaemonState.REAUTH_REQUIRED,
+                -> COLOR_SEMANTIC_WARNING
+                MobileDaemonState.REVOKED,
+                MobileDaemonState.SERVER_UPGRADE_REQUIRED,
+                -> COLOR_SEMANTIC_ERROR
+                MobileDaemonState.STOPPED,
+                MobileDaemonState.DEVICE_LOCKED,
+                -> COLOR_SEMANTIC_NEUTRAL
+            }
 
         fun startTunnelService(context: Context) {
             val intent =

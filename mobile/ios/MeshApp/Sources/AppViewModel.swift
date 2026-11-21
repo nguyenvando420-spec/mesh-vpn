@@ -17,9 +17,17 @@ public struct EnrollmentConfirmationDraft: Identifiable, Sendable {
     public let isRotation: Bool
 }
 
+/// Top-level 3-tab navigation destinations when enrolled (`ADR-028`, `US-119`).
+public enum AppTab: String, CaseIterable, Hashable, Sendable {
+    case status
+    case peers
+    case settings
+}
+
 /// Main `@MainActor` state store driving `MeshApp` SwiftUI screens, tunnel control, and IPC.
 @MainActor
 public final class AppViewModel: ObservableObject {
+    @Published public var selectedTab: AppTab = .status
     @Published public var isEnrolled = false
     @Published public var bootstrapSummary: BootstrapSummary?
     @Published public var tunnelStatus: MeshTunnelConnectionStatus = .disconnected
@@ -170,6 +178,15 @@ public final class AppViewModel: ObservableObject {
         if let cached = try? loadCachedSnapshot() {
             self.statusSnapshot = cached
         }
+    }
+
+    /// Copies non-secret overlay IP or FQDN without scheduling a 30s SEC-01 wipe (`US-121`).
+    public func copyNonSecretAddress(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        #if canImport(UIKit)
+        UIPasteboard.general.string = trimmed
+        #endif
     }
 
     func makeContainerBridge() -> IosPlatformBridge {

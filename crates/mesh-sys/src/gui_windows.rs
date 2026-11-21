@@ -25,9 +25,12 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_BTNFACE, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateFontIndirectW, CreateFontW, DeleteDC, DeleteObject, EndPaint, HBRUSH, HDC, HGDIOBJ,
-    InvalidateRect, PAINTSTRUCT, UpdateWindow,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, COLOR_BTNFACE, CreateBitmap, CreateCompatibleBitmap,
+    CreateCompatibleDC, CreateFontIndirectW, CreateFontW, CreatePen, CreateSolidBrush,
+    DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
+    DeleteObject, DrawFocusRect, DrawTextW, EndPaint, FillRect, GetStockObject, HBRUSH, HDC,
+    HGDIOBJ, InvalidateRect, LOGFONTW, NULL_PEN, OPAQUE, PAINTSTRUCT, PS_SOLID, RoundRect, SRCCOPY,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -81,18 +84,19 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GetCurrentProcess, GetCurrentThread,
-    GetExitCodeProcess, GetProcessId, OpenEventW, OpenProcessToken, OpenThreadToken, SetEvent,
-    Sleep, WaitForMultipleObjects, WaitForSingleObject,
+    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, GR_GDIOBJECTS, GetCurrentProcess,
+    GetCurrentThread, GetExitCodeProcess, GetGuiResources, GetProcessId, OpenEventW,
+    OpenProcessToken, OpenThreadToken, SetEvent, Sleep, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
-use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW, NotifyWinEvent};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
-    ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx,
+    DRAWITEMSTRUCT, ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
+    INITCOMMONCONTROLSEX, InitCommonControlsEx,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, GetSystemMetricsForDpi,
@@ -109,24 +113,26 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON,
-    BS_PUSHBUTTON, CREATESTRUCTW, CW_USEDEFAULT, CreateIconIndirect, CreatePopupMenu,
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_READONLY, FindWindowW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetDlgCtrlID, GetMessageW, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICON_BIG, ICON_SMALL, ICONINFO, IDC_ARROW,
-    IDYES, IsDialogMessageW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
-    LBS_NOTIFY, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow,
-    NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SM_CXSMICON, SMTO_ABORTIFHUNG, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SW_HIDE,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SendMessageTimeoutW, SendMessageW, SetForegroundWindow,
-    SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    SystemParametersInfoW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
-    WM_ENDSESSION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY,
-    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_BORDER, WS_CHILD, WS_EX_CONTROLPARENT, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    BS_OWNERDRAW, BS_PUSHBUTTON, CHILDID_SELF, CREATESTRUCTW, CW_USEDEFAULT, CreateIconIndirect,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
+    DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_READONLY,
+    EVENT_OBJECT_NAMECHANGE, FindWindowW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetDlgCtrlID,
+    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICON_BIG,
+    ICON_SMALL, ICONINFO, IDC_ARROW, IDYES, IsDialogMessageW, KillTimer, LB_ADDSTRING,
+    LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBS_NOTIFY, LoadCursorW, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, NONCLIENTMETRICSW, OBJID_CLIENT,
+    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON,
+    SMTO_ABORTIFHUNG, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNORMAL, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetProcessDPIAware,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_CONTROLPARENT, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows_sys::core::GUID;
 
@@ -207,6 +213,53 @@ pub const WIN_EN_CHANGE: u16 = 0x0300;
 
 /// Win32 list box selection-change notification code (`LBN_SELCHANGE`) forwarded in `on_command`.
 pub const WIN_LBN_SELCHANGE: u16 = 1;
+
+/// Win32 `WS_OVERLAPPEDWINDOW` window style bitmask (`ADR-027`).
+pub const WIN_WS_OVERLAPPEDWINDOW: u32 = WS_OVERLAPPEDWINDOW;
+
+/// Win32 `WS_CLIPCHILDREN` window style bitmask preventing child repaint flicker (`ADR-027`).
+pub const WIN_WS_CLIPCHILDREN: u32 = WS_CLIPCHILDREN;
+
+/// Canonical `dwStyle` for the main Dashboard window (`WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN`).
+///
+/// Placed strictly in `dwStyle` (NOT `dwExStyle`, where `WS_EX_CLIPCHILDREN` does not exist).
+pub const MAIN_WINDOW_STYLE: u32 = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+
+/// Win32 `WM_CTLCOLORSTATIC` message identifier forwarded to [`WindowEventHandler::on_ctlcolor`].
+pub const WIN_WM_CTLCOLORSTATIC: u32 = WM_CTLCOLORSTATIC;
+
+/// Win32 `WM_CTLCOLOREDIT` message identifier forwarded to [`WindowEventHandler::on_ctlcolor`].
+pub const WIN_WM_CTLCOLOREDIT: u32 = WM_CTLCOLOREDIT;
+
+/// Win32 `WM_CTLCOLORLISTBOX` message identifier forwarded to [`WindowEventHandler::on_ctlcolor`].
+pub const WIN_WM_CTLCOLORLISTBOX: u32 = WM_CTLCOLORLISTBOX;
+
+/// Win32 `WM_CTLCOLORBTN` message identifier forwarded to [`WindowEventHandler::on_ctlcolor`].
+pub const WIN_WM_CTLCOLORBTN: u32 = WM_CTLCOLORBTN;
+
+/// Win32 `ODS_SELECTED` item state flag for `BS_OWNERDRAW` controls (`WM_DRAWITEM`).
+pub const WIN_ODS_SELECTED: u32 = 0x0001;
+
+/// Win32 `ODS_DISABLED` item state flag for `BS_OWNERDRAW` controls (`WM_DRAWITEM`).
+pub const WIN_ODS_DISABLED: u32 = 0x0004;
+
+/// Win32 `ODS_FOCUS` item state flag for `BS_OWNERDRAW` controls (`WM_DRAWITEM`).
+pub const WIN_ODS_FOCUS: u32 = 0x0010;
+
+/// Safe OS-neutral projection of Win32 `DRAWITEMSTRUCT` for `BS_OWNERDRAW` controls (`ADR-027`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerDrawItem {
+    /// Child control identifier (`CtlID`).
+    pub control_id: u16,
+    /// Target device context handle (`HDC`) as `isize`.
+    pub hdc: isize,
+    /// Bounding rectangle in control client coordinates.
+    pub rect: ControlRect,
+    /// Bitmask of `WIN_ODS_*` flags (`selected`, `disabled`, `focus`).
+    pub item_state: u32,
+    /// Child control window handle (`HWND`) as `isize`.
+    pub hwnd_item: isize,
+}
 
 const MGH1_MAGIC: [u8; 4] = *b"MGH1";
 const MGH1_HELLO_FRAME_LEN: usize = 13;
@@ -347,6 +400,13 @@ impl OwnedGdiObj {
     #[must_use]
     pub const fn as_raw(&self) -> HGDIOBJ {
         self.0
+    }
+
+    /// Borrows the underlying raw `HGDIOBJ` handle encoded as `isize` for safe FFI return values
+    /// (such as `HBRUSH` returned from `WM_CTLCOLOR*`).
+    #[must_use]
+    pub fn as_raw_isize(&self) -> isize {
+        self.0 as isize
     }
 }
 
@@ -728,6 +788,27 @@ pub trait WindowEventHandler {
     fn on_close(&self, hwnd: isize) -> bool;
     /// Invoked on `WM_DESTROY` prior to `PostQuitMessage(0)`.
     fn on_destroy(&self, hwnd: isize);
+    /// Invoked on `WM_SETTINGCHANGE` or `WM_THEMECHANGED` (`ADR-027`).
+    fn on_theme_changed(&self, _hwnd: isize) {}
+    /// Invoked on `WM_CTLCOLORSTATIC`, `WM_CTLCOLOREDIT`, `WM_CTLCOLORLISTBOX`, `WM_CTLCOLORBTN`.
+    ///
+    /// Return a non-zero `HBRUSH` encoded as `isize` to override background painting, or `0` to
+    /// delegate to `DefWindowProcW`.
+    fn on_ctlcolor(&self, _hwnd: isize, _hdc: isize, _control_hwnd: isize, _msg: u32) -> isize {
+        0
+    }
+    /// Invoked on `WM_PAINT`; return `true` when painted via [`PaintGuard`], or `false` for default.
+    fn on_paint(&self, _hwnd: isize) -> bool {
+        false
+    }
+    /// Invoked on `WM_ERASEBKGND`; return `true` to suppress default background erase flicker.
+    fn on_erase_bkgnd(&self, _hwnd: isize, _hdc: isize) -> bool {
+        false
+    }
+    /// Invoked on `WM_DRAWITEM` for `BS_OWNERDRAW` buttons/tabs/pills (`ADR-027`).
+    fn on_draw_item(&self, _hwnd: isize, _item: &OwnerDrawItem) -> bool {
+        false
+    }
 }
 
 /// Safe Win32 System Tray notification icon handle (`Shell_NotifyIconW`).
@@ -2559,7 +2640,7 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
             WS_EX_CONTROLPARENT,
             class_wide.as_ptr(),
             title_wide.as_ptr(),
-            WS_OVERLAPPEDWINDOW,
+            MAIN_WINDOW_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             spec.width_96dpi,
@@ -2743,6 +2824,59 @@ unsafe extern "system" fn gui_wnd_proc(
             handler.on_resize(hwnd as isize, width, height);
             0
         }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            handler.on_theme_changed(hwnd as isize);
+            0
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
+            let brush = handler.on_ctlcolor(hwnd as isize, wparam as isize, lparam, msg);
+            if brush != 0 {
+                brush
+            } else {
+                // SAFETY: Standard Win32 default control color fallback.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_ERASEBKGND => {
+            if handler.on_erase_bkgnd(hwnd as isize, wparam as isize) {
+                1
+            } else {
+                // SAFETY: Standard Win32 default background erase fallback.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_PAINT => {
+            if handler.on_paint(hwnd as isize) {
+                0
+            } else {
+                // SAFETY: Standard Win32 default paint fallback.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_DRAWITEM => {
+            let dis_ptr = lparam as *const DRAWITEMSTRUCT;
+            if !dis_ptr.is_null() {
+                // SAFETY: `lparam` on `WM_DRAWITEM` points to a valid `DRAWITEMSTRUCT`.
+                let dis = unsafe { &*dis_ptr };
+                let item = OwnerDrawItem {
+                    control_id: u16::try_from(dis.CtlID).unwrap_or(0),
+                    hdc: dis.hDC as isize,
+                    rect: ControlRect::new(
+                        dis.rcItem.left,
+                        dis.rcItem.top,
+                        dis.rcItem.right.saturating_sub(dis.rcItem.left),
+                        dis.rcItem.bottom.saturating_sub(dis.rcItem.top),
+                    ),
+                    item_state: dis.itemState,
+                    hwnd_item: dis.hwndItem as isize,
+                };
+                if handler.on_draw_item(hwnd as isize, &item) {
+                    return 1;
+                }
+            }
+            // SAFETY: Standard Win32 default owner-draw fallback.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_QUERYENDSESSION => {
             handler.on_graceful_shutdown(hwnd as isize);
             1
@@ -2831,6 +2965,29 @@ pub fn create_button(
             BS_PUSHBUTTON
         })
         .unwrap_or(0);
+    create_child_control(ChildControlSpec {
+        parent,
+        class_name: "BUTTON",
+        text,
+        style,
+        ex_style: 0,
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+        id,
+    })
+}
+
+/// Creates a Win32 owner-drawn push button (`WS_TABSTOP | BS_OWNERDRAW`) for Dark Mode CTAs,
+/// navigation tabs, and peer filter chips (`ADR-027`).
+pub fn create_owner_draw_button(
+    parent: isize,
+    id: u16,
+    text: &str,
+    rect: ControlRect,
+) -> SysResult<isize> {
+    let style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | u32::try_from(BS_OWNERDRAW).unwrap_or(0);
     create_child_control(ChildControlSpec {
         parent,
         class_name: "BUTTON",
@@ -3355,6 +3512,303 @@ pub fn invalidate_window(hwnd: isize) {
     unsafe {
         let _inv = InvalidateRect(hwnd as HWND, ptr::null(), 1);
         let _upd = UpdateWindow(hwnd as HWND);
+    }
+}
+
+/// Creates a solid Win32 GDI brush (`CreateSolidBrush`) owned by [`OwnedGdiObj`].
+#[must_use]
+pub fn create_solid_brush(color: u32) -> Option<OwnedGdiObj> {
+    // SAFETY: `CreateSolidBrush` allocates a standalone `HBRUSH` owned exclusively by the caller.
+    let raw = unsafe { CreateSolidBrush(color) };
+    OwnedGdiObj::from_raw(raw.cast::<c_void>())
+}
+
+/// Creates a solid Win32 GDI pen (`CreatePen(PS_SOLID, width, color)`) owned by [`OwnedGdiObj`].
+#[must_use]
+pub fn create_solid_pen(width: i32, color: u32) -> Option<OwnedGdiObj> {
+    // SAFETY: `CreatePen` allocates a standalone `HPEN` owned exclusively by the caller.
+    let raw = unsafe { CreatePen(PS_SOLID, width.max(1), color) };
+    OwnedGdiObj::from_raw(raw.cast::<c_void>())
+}
+
+/// Computes `LOGFONTW.lfHeight` from point size and DPI using pure integer math (no `MulDiv`,
+/// `ADR-027`): `lfHeight = -(((base_pt * dpi) + 36) / 72)`.
+#[must_use]
+pub const fn calc_font_height_for_dpi(base_pt: i32, dpi: u32) -> i32 {
+    let safe_pt = if base_pt <= 0 { 10 } else { base_pt };
+    let safe_dpi = if dpi < 72 { 72 } else { dpi };
+    let dpi_i32 = if safe_dpi > i32::MAX as u32 {
+        96
+    } else {
+        safe_dpi as i32
+    };
+    -(((safe_pt * dpi_i32) + 36) / 72)
+}
+
+/// Creates a DPI-scaled Win32 `HFONT` (`CreateFontIndirectW`) using pure integer height
+/// calculation (`lfHeight = -(((point_size * dpi) + 36) / 72)`, `ADR-027`).
+#[must_use]
+pub fn create_font_for_dpi(
+    face: &str,
+    point_size: i32,
+    weight: i32,
+    dpi: i32,
+) -> Option<OwnedGdiObj> {
+    let safe_dpi = u32::try_from(dpi.max(72)).unwrap_or(96);
+    let height = calc_font_height_for_dpi(point_size, safe_dpi);
+    // SAFETY: `LOGFONTW` is a plain POD C struct safely zero-initialized before populating fields.
+    let mut lf: LOGFONTW = unsafe { mem::zeroed() };
+    lf.lfHeight = height;
+    lf.lfWeight = weight;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    write_wide_fixed(&mut lf.lfFaceName, face);
+    // SAFETY: `lf` is fully initialized with NUL-terminated UTF-16 `lfFaceName`.
+    let raw = unsafe { CreateFontIndirectW(&raw const lf) };
+    OwnedGdiObj::from_raw(raw.cast::<c_void>())
+}
+
+/// Configures text color, background color, and background mode (`TRANSPARENT`/`OPAQUE`) on `hdc`.
+pub fn set_dc_text_and_bk_color(hdc: isize, text_color: u32, bk_color: u32, transparent: bool) {
+    if hdc == 0 {
+        return;
+    }
+    let dc = hdc as HDC;
+    // SAFETY: `dc` is a valid non-zero `HDC` supplied by `WM_CTLCOLOR*` or `WM_PAINT`.
+    unsafe {
+        let _tc = SetTextColor(dc, text_color);
+        let _bc = SetBkColor(dc, bk_color);
+        let _bm = SetBkMode(
+            dc,
+            if transparent {
+                i32::try_from(TRANSPARENT).unwrap_or(1)
+            } else {
+                i32::try_from(OPAQUE).unwrap_or(2)
+            },
+        );
+    }
+}
+
+/// Executes `paint(mem_dc)` on an off-screen double buffer `(width, height)`, `BitBlt`s onto
+/// `target_hdc`, and restores the original stock bitmap BEFORE dropping `OwnedGdiObj` and
+/// `OwnedMemDc` so zero GDI handles leak (`ADR-027`).
+pub fn with_double_buffer<F>(target_hdc: isize, width: i32, height: i32, paint: F) -> bool
+where
+    F: FnOnce(isize),
+{
+    let Some((mem_dc, bmp)) = create_double_buffer(target_hdc, width, height) else {
+        return false;
+    };
+    let mem_raw = mem_dc.as_raw() as HDC;
+    // SAFETY: `mem_raw` is a live memory DC and `bmp` is a compatible bitmap owned by this scope.
+    let old_bmp = unsafe { SelectObject(mem_raw, bmp.as_raw()) };
+    paint(mem_dc.as_raw());
+    // SAFETY: `target_hdc` and `mem_raw` are valid DCs with dimensions `(width, height)`.
+    let blt_ok = unsafe {
+        BitBlt(
+            target_hdc as HDC,
+            0,
+            0,
+            width,
+            height,
+            mem_raw,
+            0,
+            0,
+            SRCCOPY,
+        )
+    };
+    // SAFETY: Must restore original stock bitmap BEFORE `bmp` drops (`DeleteObject`).
+    let _restored = unsafe { SelectObject(mem_raw, old_bmp) };
+    drop(bmp);
+    drop(mem_dc);
+    blt_ok != 0
+}
+
+/// Fills `rect` on `hdc` using `brush` (`FillRect`).
+pub fn fill_rect_with_brush(hdc: isize, rect: &ControlRect, brush: &OwnedGdiObj) {
+    if hdc == 0 || rect.w <= 0 || rect.h <= 0 {
+        return;
+    }
+    let rc = RECT {
+        left: rect.x,
+        top: rect.y,
+        right: rect.x.saturating_add(rect.w),
+        bottom: rect.y.saturating_add(rect.h),
+    };
+    // SAFETY: `hdc` is a live DC, `rc` is valid stack storage, and `brush` is a live `HBRUSH`.
+    let _filled = unsafe { FillRect(hdc as HDC, &raw const rc, brush.as_raw() as HBRUSH) };
+}
+
+/// Draws a rounded card (`RoundRect`) filled with `fill_brush` and outlined with `border_pen`,
+/// restoring stock GDI objects before returning (`ADR-027`).
+pub fn draw_rounded_card(
+    hdc: isize,
+    rect: &ControlRect,
+    radius: i32,
+    fill_brush: &OwnedGdiObj,
+    border_pen: &OwnedGdiObj,
+) {
+    if hdc == 0 || rect.w <= 0 || rect.h <= 0 {
+        return;
+    }
+    let dc = hdc as HDC;
+    let dia = radius.max(0).saturating_mul(2);
+    // SAFETY: Selects live `fill_brush` and `border_pen`, draws `RoundRect`, and restores both
+    // previous stock objects before returning.
+    unsafe {
+        let old_brush = SelectObject(dc, fill_brush.as_raw());
+        let old_pen = SelectObject(dc, border_pen.as_raw());
+        let _ok = RoundRect(
+            dc,
+            rect.x,
+            rect.y,
+            rect.x.saturating_add(rect.w),
+            rect.y.saturating_add(rect.h),
+            dia,
+            dia,
+        );
+        let _r1 = SelectObject(dc, old_pen);
+        let _r2 = SelectObject(dc, old_brush);
+    }
+}
+
+/// Draws a rounded semantic status pill with centered text, restoring stock GDI objects (`ADR-027`).
+pub fn draw_status_pill(
+    hdc: isize,
+    rect: &ControlRect,
+    text: &str,
+    bg_brush: &OwnedGdiObj,
+    text_color: u32,
+    font: &OwnedGdiObj,
+) {
+    if hdc == 0 || rect.w <= 0 || rect.h <= 0 {
+        return;
+    }
+    let dc = hdc as HDC;
+    let dia = rect.h.max(8);
+    // SAFETY: Selects `bg_brush` and stock `NULL_PEN`, draws rounded pill, then restores both.
+    unsafe {
+        let null_pen = GetStockObject(NULL_PEN);
+        let old_brush = SelectObject(dc, bg_brush.as_raw());
+        let old_pen = SelectObject(dc, null_pen);
+        let _ok = RoundRect(
+            dc,
+            rect.x,
+            rect.y,
+            rect.x.saturating_add(rect.w),
+            rect.y.saturating_add(rect.h),
+            dia,
+            dia,
+        );
+        let _r1 = SelectObject(dc, old_pen);
+        let _r2 = SelectObject(dc, old_brush);
+    }
+    draw_text_in_rect(hdc, rect, text, text_color, font, true);
+}
+
+/// Draws single-line text clipped cleanly inside `rect` with transparent background (`DrawTextW`).
+pub fn draw_text_in_rect(
+    hdc: isize,
+    rect: &ControlRect,
+    text: &str,
+    text_color: u32,
+    font: &OwnedGdiObj,
+    center: bool,
+) {
+    if hdc == 0 || rect.w <= 0 || rect.h <= 0 || text.is_empty() {
+        return;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    if wide.is_empty() {
+        return;
+    }
+    let dc = hdc as HDC;
+    let mut rc = RECT {
+        left: rect.x,
+        top: rect.y,
+        right: rect.x.saturating_add(rect.w),
+        bottom: rect.y.saturating_add(rect.h),
+    };
+    let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | if center { DT_CENTER } else { DT_LEFT };
+    let count = i32::try_from(wide.len()).unwrap_or(i32::MAX);
+    // SAFETY: `wide` holds `count` UTF-16 units, `font` is a live `HFONT`, and `old_font` is
+    // restored before returning.
+    unsafe {
+        let old_font = SelectObject(dc, font.as_raw());
+        let _bm = SetBkMode(dc, i32::try_from(TRANSPARENT).unwrap_or(1));
+        let _tc = SetTextColor(dc, text_color);
+        let _drawn = DrawTextW(dc, wide.as_ptr(), count, &raw mut rc, flags);
+        let _r = SelectObject(dc, old_font);
+    }
+}
+
+/// Visual styling parameters for painting a `BS_OWNERDRAW` button/tab/filter chip (`ADR-027`).
+#[derive(Debug)]
+pub struct OwnerDrawButtonStyle<'a> {
+    /// Display text rendered centered inside the control.
+    pub text: &'a str,
+    /// Background fill brush (`HBRUSH`).
+    pub bg_brush: &'a OwnedGdiObj,
+    /// Outline border pen (`HPEN`).
+    pub border_pen: &'a OwnedGdiObj,
+    /// Foreground text `COLORREF` (`0x00BBGGRR`).
+    pub text_color: u32,
+    /// Font handle (`HFONT`).
+    pub font: &'a OwnedGdiObj,
+    /// Whether to draw a keyboard focus cue (`WIN_ODS_FOCUS`).
+    pub focused: bool,
+}
+
+/// Paints a `BS_OWNERDRAW` button/tab/filter chip inside `WM_DRAWITEM` (`ADR-027`).
+pub fn draw_owner_draw_button(hdc: isize, rect: &ControlRect, style: &OwnerDrawButtonStyle<'_>) {
+    if hdc == 0 || rect.w <= 0 || rect.h <= 0 {
+        return;
+    }
+    draw_rounded_card(hdc, rect, 6, style.bg_brush, style.border_pen);
+    draw_text_in_rect(hdc, rect, style.text, style.text_color, style.font, true);
+    if style.focused && rect.w > 6 && rect.h > 6 {
+        let focus_rc = RECT {
+            left: rect.x + 3,
+            top: rect.y + 3,
+            right: rect.x + rect.w - 3,
+            bottom: rect.y + rect.h - 3,
+        };
+        // SAFETY: `hdc` is a live `WM_DRAWITEM` DC and `focus_rc` is valid stack storage.
+        let _f = unsafe { DrawFocusRect(hdc as HDC, &raw const focus_rc) };
+    }
+}
+
+/// Returns the current process GDI object handle count (`GetGuiResources(GR_GDIOBJECTS)`).
+///
+/// Used by automated leak-gate tests (`contracts §5.3`, `US-123`).
+#[must_use]
+pub fn get_gui_resources_gdi_count() -> u32 {
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle valid for `GetGuiResources`.
+    unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) }
+}
+
+/// Returns `size_of::<HIGHCONTRASTW>() as u32` used for `SPI_GETHIGHCONTRAST` (`ADR-027`).
+#[must_use]
+pub const fn high_contrast_struct_cb_size() -> u32 {
+    let sz = size_of::<HIGHCONTRASTW>();
+    if sz > u32::MAX as usize { 0 } else { sz as u32 }
+}
+
+/// Updates an accessible text label proxy via `SetWindowTextW` and notifies screen readers via
+/// `NotifyWinEvent(EVENT_OBJECT_NAMECHANGE)` (`US-139`, zero `IAccessible`).
+pub fn announce_accessible_label(hwnd: isize, label: &str) {
+    if hwnd == 0 {
+        return;
+    }
+    set_control_text(hwnd, label);
+    // SAFETY: `hwnd` is a non-zero live window handle and constants match Win32 accessibility API.
+    unsafe {
+        NotifyWinEvent(
+            EVENT_OBJECT_NAMECHANGE,
+            hwnd as HWND,
+            OBJID_CLIENT,
+            i32::try_from(CHILDID_SELF).unwrap_or(0),
+        );
     }
 }
 
@@ -4518,8 +4972,11 @@ fn render_badge_bgra(kind: TrayStatusIconKind, size_px: i32) -> Vec<u8> {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
 
     use tempfile::tempdir;
+
+    static GDI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     use super::{
         HANDOFF_PIPE_PREFIX, OwnedMemDc, PaintGuard, TrayStatusIconKind, UnprivilegedSinkWriter,
@@ -4602,6 +5059,7 @@ mod tests {
 
     #[test]
     fn test_gui_windows_creates_dpi_tray_icons_16_to_256px() {
+        let _lock = GDI_TEST_LOCK.lock();
         // Arrange & Act
         for px in [16, 24, 32, 64, 128, 256] {
             let icon = create_tray_status_icon(TrayStatusIconKind::Connected, px);
@@ -4614,6 +5072,7 @@ mod tests {
 
     #[test]
     fn test_init_common_controls_succeeds_on_windows() {
+        let _lock = GDI_TEST_LOCK.lock();
         // Arrange & Act
         let res = init_common_controls();
 
@@ -4623,6 +5082,7 @@ mod tests {
 
     #[test]
     fn test_gdi_dwm_raii_and_safe_wrapper_stubs_on_windows() {
+        let _lock = GDI_TEST_LOCK.lock();
         // Arrange & Act
         let mem_dc = OwnedMemDc::from_compatible(0);
         let null_paint = PaintGuard::begin(0);
@@ -4640,5 +5100,121 @@ mod tests {
             assert_ne!(dc.as_raw(), 0);
             assert!(format!("{dc:?}").starts_with("OwnedMemDc(0x"));
         }
+    }
+
+    #[test]
+    fn test_gdi_obj_no_leak() {
+        let _lock = GDI_TEST_LOCK.lock();
+        let run_cycle = || {
+            let brush = super::create_solid_brush(0x00FC_FAF8);
+            let pen = super::create_solid_pen(1, 0x00E1_D5CB);
+            let font = super::create_font_for_dpi("Segoe UI", 10, 400, 96);
+            assert!(brush.is_some());
+            assert!(pen.is_some());
+            assert!(font.is_some());
+            if let Some(dc) = OwnedMemDc::from_compatible(0) {
+                let painted = super::with_double_buffer(dc.as_raw(), 160, 80, |mem_dc| {
+                    if let (Some(b), Some(p), Some(f)) = (&brush, &pen, &font) {
+                        let rect = super::ControlRect::new(4, 4, 152, 72);
+                        super::draw_rounded_card(mem_dc, &rect, 8, b, p);
+                        super::draw_status_pill(mem_dc, &rect, "Connected", b, 0x00FF_FFFF, f);
+                    }
+                });
+                assert!(painted);
+            }
+        };
+
+        // Arrange: warm up one-time process GDI32/ClearType/Uniscribe cache before baseline
+        run_cycle();
+        run_cycle();
+
+        // Act: allocate brushes, pens, fonts, and double buffers across 16 cycles, then drop all.
+        let mut zero_delta = false;
+        let mut last_pair = (0_u32, 0_u32);
+        for _attempt in 0..5 {
+            let before = super::get_gui_resources_gdi_count();
+            for _ in 0..16 {
+                run_cycle();
+            }
+            let after = super::get_gui_resources_gdi_count();
+            last_pair = (before, after);
+            if after == before {
+                zero_delta = true;
+                break;
+            }
+        }
+
+        // Assert: zero GDI handle delta after full RAII drop
+        assert!(
+            zero_delta,
+            "GDI handle leak detected: before={}, after={}",
+            last_pair.0, last_pair.1
+        );
+    }
+
+    #[test]
+    fn test_owned_mem_dc_lifecycle() {
+        let _lock = GDI_TEST_LOCK.lock();
+        // Arrange: warm up one-time process GDI initialization
+        drop(OwnedMemDc::from_compatible(0));
+        let before = super::get_gui_resources_gdi_count();
+
+        // Act
+        {
+            let mem_dc = OwnedMemDc::from_compatible(0);
+            assert!(mem_dc.is_some());
+            if let Some(dc) = mem_dc {
+                assert_ne!(dc.as_raw(), 0);
+                let buf = create_double_buffer(dc.as_raw(), 64, 32);
+                assert!(buf.is_some());
+                assert!(format!("{dc:?}").contains("OwnedMemDc("));
+            }
+        }
+
+        // Assert
+        let after = super::get_gui_resources_gdi_count();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn test_paint_guard_drop() {
+        let _lock = GDI_TEST_LOCK.lock();
+        // Arrange & Act
+        let guard_null = PaintGuard::begin(0);
+        super::announce_accessible_label(0, "Accessible label no-op");
+
+        // Assert
+        assert!(guard_null.is_none());
+    }
+
+    #[test]
+    fn test_detect_high_contrast_cbsize() {
+        let _lock = GDI_TEST_LOCK.lock();
+        // Arrange & Act
+        let cb_size = super::high_contrast_struct_cb_size();
+        let _hc = detect_high_contrast();
+
+        // Assert: HIGHCONTRASTW is { cbSize: u32, dwFlags: u32, lpszDefaultScheme: *mut u16 }
+        assert_eq!(
+            usize::try_from(cb_size).unwrap_or(0),
+            std::mem::size_of::<windows_sys::Win32::UI::Accessibility::HIGHCONTRASTW>()
+        );
+        assert!(cb_size >= 12);
+    }
+
+    #[test]
+    fn test_ws_clipchildren_in_dwstyle() {
+        // Arrange & Act
+        let style = super::MAIN_WINDOW_STYLE;
+
+        // Assert: WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN must live in dwStyle (ADR-027)
+        assert_ne!(style & super::WIN_WS_CLIPCHILDREN, 0);
+        assert_eq!(
+            style & super::WIN_WS_OVERLAPPEDWINDOW,
+            super::WIN_WS_OVERLAPPEDWINDOW
+        );
+        assert_eq!(super::calc_font_height_for_dpi(12, 96), -16);
+        assert_eq!(super::calc_font_height_for_dpi(12, 144), -24);
+        assert_eq!(super::calc_font_height_for_dpi(10, 192), -27);
     }
 }

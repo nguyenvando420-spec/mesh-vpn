@@ -206,6 +206,97 @@ final class DesktopCoreTests: XCTestCase {
         XCTAssertFalse(cleaner.hasPendingWipe)
     }
 
+    func testTabVisibility_AllEnrolledAndNonEnrolledStates_ReturnsExpectedTabs() {
+        // Arrange
+        let enrolledStates: [DesktopUiState] = [
+            .connecting, .connected, .reauthRequired, .revoked, .error
+        ]
+        let nonEnrolledStates: [DesktopUiState] = [
+            .serviceNotInstalled, .serviceStopped, .unconfigured
+        ]
+
+        // Act & Assert
+        for state in enrolledStates {
+            XCTAssertTrue(state.isEnrolledState, "\(state.rawValue) must be enrolled")
+            XCTAssertEqual(
+                DesktopTabKind.visibleTabs(for: state),
+                [.status, .peers, .diagnostics]
+            )
+        }
+        for state in nonEnrolledStates {
+            XCTAssertFalse(state.isEnrolledState, "\(state.rawValue) must not be enrolled")
+            XCTAssertTrue(DesktopTabKind.visibleTabs(for: state).isEmpty)
+        }
+    }
+
+    func testPeerDirectoryFilter_NodeIdSearchAndCountBadges_MatchesAndCountsAccurately() {
+        // Arrange
+        let peers = [
+            AgentPeerStatus(
+                nodeId: "node-alpha-9981",
+                name: "laptop",
+                fqdn: "laptop.mesh.internal",
+                overlayIp: "100.64.0.2",
+                online: true,
+                activePath: .direct
+            ),
+            AgentPeerStatus(
+                nodeId: "node-beta-4420",
+                name: "server",
+                fqdn: "server.mesh.internal",
+                overlayIp: "100.64.0.3",
+                online: true,
+                activePath: .relay
+            ),
+            AgentPeerStatus(
+                nodeId: "node-gamma-7711",
+                name: "nas",
+                fqdn: "nas.mesh.internal",
+                overlayIp: "100.64.0.4",
+                online: false,
+                activePath: .none
+            )
+        ]
+
+        // Act
+        let counts = PeerDirectoryFilter.counts(for: peers)
+        let byNodeId = PeerDirectoryFilter.filter(peers: peers, mode: .all, query: "BETA-4420")
+        let directOnly = PeerDirectoryFilter.filter(peers: peers, mode: .direct, query: "")
+        let relayNodeId = PeerDirectoryFilter.filter(peers: peers, mode: .relay, query: "4420")
+
+        // Assert
+        XCTAssertEqual(counts, PeerFilterCounts(all: 3, online: 2, direct: 1, relay: 1))
+        XCTAssertEqual(counts.count(for: .all), 3)
+        XCTAssertEqual(counts.count(for: .online), 2)
+        XCTAssertEqual(counts.count(for: .direct), 1)
+        XCTAssertEqual(counts.count(for: .relay), 1)
+        XCTAssertEqual(byNodeId.map(\.nodeId), ["node-beta-4420"])
+        XCTAssertEqual(directOnly.map(\.nodeId), ["node-alpha-9981"])
+        XCTAssertEqual(relayNodeId.map(\.nodeId), ["node-beta-4420"])
+    }
+
+    func testThemeMode_UserDefaultsPersistence_UsesSuiteMeshVPNAndKeyMeshThemeMode() {
+        // Arrange
+        let suiteName = "MeshVPN.test.\(UUID().uuidString.prefix(8))"
+        let defaults = UserDefaults(suiteName: suiteName)
+        defer { defaults?.removePersistentDomain(forName: suiteName) }
+
+        // Act & Assert
+        XCTAssertEqual(ThemeMode.userDefaultsSuiteName, "MeshVPN")
+        XCTAssertEqual(ThemeMode.userDefaultsKey, "mesh_theme_mode")
+        XCTAssertEqual(ThemeMode.load(from: defaults), .system)
+
+        ThemeMode.dark.save(to: defaults)
+        XCTAssertEqual(defaults?.string(forKey: "mesh_theme_mode"), "dark")
+        XCTAssertEqual(ThemeMode.load(from: defaults), .dark)
+
+        ThemeMode.light.save(to: defaults)
+        XCTAssertEqual(ThemeMode.load(from: defaults), .light)
+
+        defaults?.set("invalid_mode", forKey: "mesh_theme_mode")
+        XCTAssertEqual(ThemeMode.load(from: defaults), .system)
+    }
+
     @MainActor
     private func waitUntilWipeCompletes(
         _ cleaner: ClipboardAutoClear,

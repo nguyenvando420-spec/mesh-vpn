@@ -2,22 +2,16 @@ import AppKit
 import MeshDesktopCore
 import SwiftUI
 
-/// Single-instance Desktop Dashboard rendering all 8 UI states, warnings, peers, and settings.
+/// Single-instance Desktop Dashboard rendering 3-zone navigation for all enrolled states.
 struct DashboardWindowView: View {
     @ObservedObject var store: DesktopStore
+    @ObservedObject var themeManager: ThemeManager
 
-    @State private var activeTab: DashboardTab = .peers
+    @State private var activeTab: DesktopTabKind = .status
     @State private var onboardingSheetMode: OnboardingSheetModeWrapper?
     @State private var showDiagnosticsSheet: Bool = false
     @State private var firewallOptInOnInstall: Bool = true
     @State private var confirmRevokedReset: Bool = false
-
-    private enum DashboardTab: String, CaseIterable, Identifiable {
-        case peers = "Peers"
-        case diagnostics = "Diagnostics & Settings"
-
-        var id: String { rawValue }
-    }
 
     private struct OnboardingSheetModeWrapper: Identifiable {
         let mode: OnboardingMode
@@ -30,7 +24,7 @@ struct DashboardWindowView: View {
             DashboardBannersView(
                 store: store,
                 onOpenDiagnostics: {
-                    if store.uiState == .connected {
+                    if store.uiState.isEnrolledState {
                         activeTab = .diagnostics
                     } else {
                         showDiagnosticsSheet = true
@@ -48,12 +42,19 @@ struct DashboardWindowView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding(18)
+        .background(MeshPalette.surfaceBackground)
         .sheet(item: $onboardingSheetMode) { wrapper in
             OnboardingSheetView(store: store, mode: wrapper.mode)
+                .preferredColorScheme(themeManager.preferredColorScheme)
         }
         .sheet(isPresented: $showDiagnosticsSheet) {
-            DiagnosticsSheetView(store: store, showCloseButton: true)
-                .frame(minWidth: 620, minHeight: 520)
+            DiagnosticsSheetView(
+                store: store,
+                themeManager: themeManager,
+                showCloseButton: true
+            )
+            .frame(minWidth: 620, minHeight: 520)
+            .preferredColorScheme(themeManager.preferredColorScheme)
         }
         .alert("Reset Device Identity?", isPresented: $confirmRevokedReset) {
             Button("Cancel", role: .cancel) {}
@@ -118,7 +119,7 @@ struct DashboardWindowView: View {
             }
             .disabled(store.isBusy)
 
-            if store.uiState != .connected {
+            if !store.uiState.isEnrolledState {
                 Button("Diagnostics...") { showDiagnosticsSheet = true }
             }
         }
@@ -126,6 +127,65 @@ struct DashboardWindowView: View {
 
     @ViewBuilder
     private var stateMainContent: some View {
+        if store.uiState.isEnrolledState {
+            enrolledNavigationContent
+        } else {
+            nonEnrolledCardContent
+        }
+    }
+
+    private var enrolledNavigationContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ConnectedHeroSummaryView(
+                store: store,
+                onOpenKeyRotation: {
+                    onboardingSheetMode = OnboardingSheetModeWrapper(mode: .keyRotation)
+                },
+                onConfirmResetIdentity: {
+                    confirmRevokedReset = true
+                }
+            )
+            Picker("Section", selection: $activeTab) {
+                Text(DesktopTabKind.status.rawValue)
+                    .tag(DesktopTabKind.status)
+                Text("Peers (\(store.onlinePeerCount)/\(store.sortedPeers.count))")
+                    .tag(DesktopTabKind.peers)
+                Text(DesktopTabKind.diagnostics.rawValue)
+                    .tag(DesktopTabKind.diagnostics)
+            }
+            .pickerStyle(.segmented)
+
+            switch activeTab {
+            case .status:
+                StatusTabView(
+                    store: store,
+                    onOpenKeyRotation: {
+                        onboardingSheetMode = OnboardingSheetModeWrapper(mode: .keyRotation)
+                    },
+                    onConfirmResetIdentity: {
+                        confirmRevokedReset = true
+                    },
+                    onOpenDiagnostics: {
+                        activeTab = .diagnostics
+                    }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .peers:
+                PeersTableView(store: store)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .diagnostics:
+                DiagnosticsSheetView(
+                    store: store,
+                    themeManager: themeManager,
+                    showCloseButton: false
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var nonEnrolledCardContent: some View {
         switch store.uiState {
         case .serviceNotInstalled:
             DashboardCenteredCard(
@@ -186,118 +246,19 @@ struct DashboardWindowView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(store.isBusy)
             }
-        case .connecting:
-            DashboardCenteredCard(
-                icon: "bolt.shield.fill",
-                tintColor: statusTintColor,
-                title: "Connecting to Mesh Network...",
-                subtitle: "Establishing control session and utun interface for "
-                    + "\(store.status?.serverConnection?.controlEndpoint ?? "Control server")."
-            ) {
-                ProgressView().padding(.vertical, 4)
-                Button("Disconnect") {
-                    Task { @MainActor in _ = await store.disconnect() }
-                }
-                .disabled(store.isBusy)
-            }
-        case .connected:
-            VStack(alignment: .leading, spacing: 14) {
-                ConnectedHeroSummaryView(store: store)
-                Picker("Section", selection: $activeTab) {
-                    Text("Peers (\(store.onlinePeerCount)/\(store.sortedPeers.count))")
-                        .tag(DashboardTab.peers)
-                    Text("Diagnostics & Settings")
-                        .tag(DashboardTab.diagnostics)
-                }
-                .pickerStyle(.segmented)
-
-                switch activeTab {
-                case .peers:
-                    PeersTableView(store: store)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                case .diagnostics:
-                    DiagnosticsSheetView(store: store, showCloseButton: false)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
-        case .reauthRequired:
-            DashboardCenteredCard(
-                icon: "key.fill",
-                tintColor: statusTintColor,
-                title: "Node Pre-Auth Key Expired",
-                subtitle: "Control server requires a fresh mpk_ pre-auth key to reconnect."
-            ) {
-                HStack(spacing: 12) {
-                    Button("Rotate Pre-Auth Key...") {
-                        onboardingSheetMode = OnboardingSheetModeWrapper(mode: .keyRotation)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Button("Disconnect") {
-                        Task { @MainActor in _ = await store.disconnect() }
-                    }
-                }
-                .disabled(store.isBusy)
-            }
-        case .revoked:
-            DashboardCenteredCard(
-                icon: "hand.raised.fill",
-                tintColor: statusTintColor,
-                title: "Device Revoked by Control Server",
-                subtitle: "Reset local identity keys to re-enroll with a new pre-auth key."
-            ) {
-                Button("Reset Device Identity...", role: .destructive) {
-                    confirmRevokedReset = true
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(store.isBusy)
-            }
-        case .error:
-            DashboardCenteredCard(
-                icon: "exclamationmark.shield.fill",
-                tintColor: statusTintColor,
-                title: store.lastActionError?.title ?? "Daemon Communication Error",
-                subtitle: store.lastActionError?.message
-                    ?? "Unable to communicate with meshd admin socket."
-            ) {
-                HStack(spacing: 12) {
-                    if store.isManuallyDisconnected {
-                        Button("Connect") {
-                            Task { @MainActor in _ = await store.connectOneClick() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        Button("Retry") {
-                            Task { @MainActor in await store.refreshNow() }
-                        }
-                    } else {
-                        Button("Retry") {
-                            Task { @MainActor in await store.refreshNow() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    Button("Start / Repair Service") {
-                        Task { @MainActor in _ = await store.startOrRepairService() }
-                    }
-                    Button("Open Diagnostics...") { showDiagnosticsSheet = true }
-                }
-                .disabled(store.isBusy)
-            }
+        case .connecting, .connected, .reauthRequired, .revoked, .error:
+            EmptyView()
         }
     }
 
     private var headerStatusSubtitle: String {
-        if store.isManuallyDisconnected && store.uiState == .connecting {
-            return "Disconnected"
-        }
-        return store.uiState.displayTitle
+        store.uiState.resolvedTitle(
+            isDegradedTunnel: store.isDegradedTunnel,
+            isManuallyDisconnected: store.isManuallyDisconnected
+        )
     }
 
     private var statusTintColor: Color {
-        switch store.menuBarGroup {
-        case .connected: return .green
-        case .connectingOrDegraded: return .orange
-        case .disconnected: return .secondary
-        case .serviceOffline: return .secondary
-        case .warning: return .red
-        }
+        MeshPalette.color(for: store.menuBarGroup)
     }
 }

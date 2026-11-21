@@ -39,6 +39,18 @@ impl UiIconTone {
         }
     }
 
+    /// Returns the canonical `#RRGGBB` semantic hex token for this tone (`ADR-030`).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn hex(self) -> &'static str {
+        match self {
+            Self::Green => "#16A34A",
+            Self::Amber => "#D97706",
+            Self::Red => "#DC2626",
+            Self::Gray => "#6B7280",
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[must_use]
     pub(crate) const fn into_tray_kind(self) -> TrayStatusIconKind {
@@ -129,4 +141,24 @@ pub(crate) fn create_status_icon_for_px(tone: UiIconTone, size_px: i32) -> SysRe
     let bgra = render_status_badge_bgra(tone, clamped);
     let _kind = tone.into_tray_kind();
     create_tray_status_icon_from_bgra(clamped, clamped, &bgra)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ICON_MAX_PX, ICON_MIN_PX, UiIconTone, render_status_badge_bgra};
+
+    #[test]
+    fn test_icon_tones_and_bgra_bounds() {
+        // Arrange & Act & Assert
+        assert_eq!(ICON_MIN_PX, 16);
+        assert_eq!(ICON_MAX_PX, 256);
+        assert_eq!(UiIconTone::Green.rgb(), [22, 163, 74]);
+        assert_eq!(UiIconTone::Green.hex(), "#16A34A");
+        assert_eq!(render_status_badge_bgra(UiIconTone::Amber, 16).len(), 1024);
+        #[cfg(target_os = "windows")]
+        {
+            let _kind = UiIconTone::Red.into_tray_kind();
+            assert!(super::create_status_icon_for_px(UiIconTone::Gray, 16).is_ok());
+        }
+    }
 }

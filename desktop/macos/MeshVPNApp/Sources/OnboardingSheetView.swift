@@ -216,7 +216,7 @@ struct OnboardingSheetView: View {
             if isCurrentEndpointIpLiteral {
                 Text("IP literal endpoints require SPKI SHA-256 pinning (`System CA` disabled).")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(MeshPalette.semanticWarning)
             }
 
             if tlsAuthMode == .spkiPin || isCurrentEndpointIpLiteral {
@@ -309,7 +309,7 @@ struct OnboardingSheetView: View {
     private func inlineErrorBanner(_ error: DesktopUserFacingError) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
+                .foregroundStyle(MeshPalette.semanticError)
             VStack(alignment: .leading, spacing: 2) {
                 Text(error.title).font(.headline)
                 Text(error.message).font(.callout)
@@ -321,7 +321,10 @@ struct OnboardingSheetView: View {
             .buttonStyle(.borderless)
         }
         .padding(10)
-        .background(Color.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+        .background(
+            MeshPalette.semanticError.opacity(0.10),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
     }
 }
 

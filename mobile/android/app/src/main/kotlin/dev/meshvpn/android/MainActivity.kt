@@ -13,6 +13,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.Icon
@@ -24,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -38,14 +40,16 @@ import dev.meshvpn.android.ui.MainUiScreenState
 import dev.meshvpn.android.ui.MeshMainViewModel
 import dev.meshvpn.android.ui.MeshMainViewModelFactory
 import dev.meshvpn.android.ui.onboarding.OnboardingScreen
+import dev.meshvpn.android.ui.peers.PeersScreen
 import dev.meshvpn.android.ui.settings.SettingsScreen
 import dev.meshvpn.android.ui.status.StatusScreen
 import dev.meshvpn.android.ui.theme.MeshTheme
+import dev.meshvpn.android.ui.theme.SharedPrefsThemeStore
 import dev.meshvpn.android.vpn.MeshVpnService
 
 /**
- * Single-activity Compose host (`US-081..US-086`) managing Android VPN consent, `FLAG_SECURE`,
- * `BiometricPrompt` attachment, and transient bugreport sharing.
+ * Single-activity Compose host (`US-081..US-086`, `US-119`) managing Android VPN consent,
+ * `FLAG_SECURE`, `BiometricPrompt` attachment, 3-tab navigation, and transient bugreport sharing.
  */
 class MainActivity : FragmentActivity() {
     private val biometricBridge = ActivityBiometricBridge()
@@ -88,6 +92,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        viewModel.attachThemePrefs(SharedPrefsThemeStore(applicationContext))
         setContent {
             val screenState by viewModel.screenState.collectAsStateWithLifecycle()
 
@@ -101,7 +106,7 @@ class MainActivity : FragmentActivity() {
                 launchBugreportShareChooser(report)
             }
 
-            MeshTheme {
+            MeshTheme(themeMode = screenState.themeMode) {
                 MeshRootScaffold(
                     screenState = screenState,
                     viewModel = viewModel,
@@ -237,38 +242,56 @@ private fun MeshRootScaffold(
                 onCancelConfirmation = viewModel::cancelPendingConfirmation,
                 modifier = Modifier.padding(innerPadding),
             )
-        } else if (screenState.activeTab == MainTab.STATUS) {
-            StatusScreen(
-                screenState = screenState,
-                onToggleTunnel = {
-                    viewModel.onToggleTunnelRequested(
-                        onPrepareAndStart = onPrepareAndStartVpn,
-                        onStopService = onStopVpnService,
-                    )
-                },
-                onPingPeer = { target -> viewModel.pingPeer(target) },
-                onRunNetcheck = viewModel::runNetcheck,
-                onOpenVpnSettings = { onOpenSystemSettings(Settings.ACTION_VPN_SETTINGS) },
-                onOpenNetworkSettings = { onOpenSystemSettings(Settings.ACTION_WIRELESS_SETTINGS) },
-                onOpenDateTimeSettings = { onOpenSystemSettings(Settings.ACTION_DATE_SETTINGS) },
-                onOpenSettingsTab = { viewModel.selectTab(MainTab.SETTINGS) },
-                onResetAndReenroll = viewModel::resetIdentityWithAuth,
-                modifier = Modifier.padding(innerPadding),
-            )
-        } else {
-            SettingsScreen(
-                screenState = screenState,
-                onToggleRevealPins = viewModel::toggleRevealAdminPins,
-                onSensitiveModalChanged = viewModel::setSensitiveModalOpen,
-                onUpdateServerConfig = viewModel::updateServerConfigWithAuth,
-                onRotateKey = viewModel::rotateKeyWithAuth,
-                onToggleAlwaysOnHint = viewModel::setAlwaysOnHint,
-                onOpenVpnSettings = { onOpenSystemSettings(Settings.ACTION_VPN_SETTINGS) },
-                onExportBugreport = viewModel::exportBugreportWithAuth,
-                onCleanupDiagnostics = viewModel::purgeDiagnosticArtifacts,
-                onResetIdentity = viewModel::resetIdentityWithAuth,
-                modifier = Modifier.padding(innerPadding),
-            )
+            return@Scaffold
+        }
+
+        when (screenState.activeTab) {
+            MainTab.STATUS ->
+                StatusScreen(
+                    screenState = screenState,
+                    onToggleTunnel = {
+                        viewModel.onToggleTunnelRequested(
+                            onPrepareAndStart = onPrepareAndStartVpn,
+                            onStopService = onStopVpnService,
+                        )
+                    },
+                    onRunNetcheck = viewModel::runNetcheck,
+                    onOpenVpnSettings = { onOpenSystemSettings(Settings.ACTION_VPN_SETTINGS) },
+                    onOpenNetworkSettings = {
+                        onOpenSystemSettings(Settings.ACTION_WIRELESS_SETTINGS)
+                    },
+                    onOpenDateTimeSettings = {
+                        onOpenSystemSettings(Settings.ACTION_DATE_SETTINGS)
+                    },
+                    onOpenPeersTab = { viewModel.selectTab(MainTab.PEERS) },
+                    onOpenSettingsTab = { viewModel.selectTab(MainTab.SETTINGS) },
+                    onResetAndReenroll = viewModel::resetIdentityWithAuth,
+                    modifier = Modifier.padding(innerPadding),
+                )
+            MainTab.PEERS ->
+                PeersScreen(
+                    screenState = screenState,
+                    onSearchQueryChanged = viewModel::updatePeerSearchQuery,
+                    onSelectFilterMode = viewModel::selectPeerFilterMode,
+                    onPingPeer = { target -> viewModel.pingPeer(target) },
+                    modifier = Modifier.padding(innerPadding),
+                )
+            MainTab.SETTINGS ->
+                SettingsScreen(
+                    screenState = screenState,
+                    onSelectThemeMode = viewModel::selectThemeMode,
+                    onToggleRevealPins = viewModel::toggleRevealAdminPins,
+                    onSensitiveModalChanged = viewModel::setSensitiveModalOpen,
+                    onUpdateServerConfig = viewModel::updateServerConfigWithAuth,
+                    onRotateKey = viewModel::rotateKeyWithAuth,
+                    onToggleAlwaysOnHint = viewModel::setAlwaysOnHint,
+                    onOpenVpnSettings = { onOpenSystemSettings(Settings.ACTION_VPN_SETTINGS) },
+                    onRunNetcheck = viewModel::runNetcheck,
+                    onExportBugreport = viewModel::exportBugreportWithAuth,
+                    onCleanupDiagnostics = viewModel::purgeDiagnosticArtifacts,
+                    onResetIdentity = viewModel::resetIdentityWithAuth,
+                    modifier = Modifier.padding(innerPadding),
+                )
         }
     }
 }
@@ -284,12 +307,21 @@ private fun MeshBottomNavigation(
             onClick = { onSelectTab(MainTab.STATUS) },
             icon = { Icon(imageVector = Icons.Outlined.Shield, contentDescription = null) },
             label = { Text("Status") },
+            modifier = Modifier.testTag("nav_tab_status"),
+        )
+        NavigationBarItem(
+            selected = activeTab == MainTab.PEERS,
+            onClick = { onSelectTab(MainTab.PEERS) },
+            icon = { Icon(imageVector = Icons.Outlined.Group, contentDescription = null) },
+            label = { Text("Peers") },
+            modifier = Modifier.testTag("nav_tab_peers"),
         )
         NavigationBarItem(
             selected = activeTab == MainTab.SETTINGS,
             onClick = { onSelectTab(MainTab.SETTINGS) },
             icon = { Icon(imageVector = Icons.Outlined.Settings, contentDescription = null) },
             label = { Text("Settings") },
+            modifier = Modifier.testTag("nav_tab_settings"),
         )
     }
 }

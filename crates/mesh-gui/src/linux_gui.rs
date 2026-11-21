@@ -49,8 +49,9 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::app::{
-    DesktopUiState, ServiceProbeKind, StateProbeInputs, TunnelSubState, derive_desktop_ui_state,
-    format_user_facing_error, gui_log_directory, sanitize_gui_log_text,
+    DashboardTab, DesktopUiState, ServiceProbeKind, StateProbeInputs, TunnelSubState,
+    derive_desktop_ui_state, format_user_facing_error, gui_log_directory, sanitize_gui_log_text,
+    show_tab_bar,
 };
 use crate::diagnostics_view::{
     DEFAULT_BUGREPORT_FILENAME, format_netcheck_report, format_self_network_panel,
@@ -63,8 +64,8 @@ use crate::onboarding::{
     validate_update_server_payload,
 };
 use crate::peers_view::{
-    filter_peers, format_human_bytes, format_peer_detail_summary, format_peer_list_entry,
-    format_ping_response,
+    PeerFilterMode, count_peers_by_mode, filter_peers, filter_peers_by_mode, filter_peers_combined,
+    format_human_bytes, format_peer_detail_summary, format_peer_list_entry, format_ping_response,
 };
 
 const GUI_LOG_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -492,6 +493,15 @@ fn require_auth(state: &LinuxGuiState, headers: &HeaderMap) -> Option<Response> 
 #[derive(Debug, Deserialize)]
 struct StateQuery {
     q: Option<String>,
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PeerCountsDto {
+    all: usize,
+    online: usize,
+    direct: usize,
+    relay: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -507,10 +517,15 @@ struct PeerItemDto {
 struct GuiStateDto {
     ok: bool,
     state_label: &'static str,
+    display_label: &'static str,
     headline: &'static str,
     tray_summary: &'static str,
     tone: &'static str,
     enrolled: bool,
+    show_tab_bar: bool,
+    show_onboarding: bool,
+    default_tab: &'static str,
+    available_tabs: [&'static str; 3],
     autostart_enabled: bool,
     server_endpoint: Option<String>,
     active_pin: Option<String>,
@@ -519,6 +534,7 @@ struct GuiStateDto {
     legacy_banner: Option<String>,
     version_mismatch_banner: Option<String>,
     self_network_text: String,
+    peer_counts: PeerCountsDto,
     peers: Vec<PeerItemDto>,
 }
 
@@ -570,8 +586,38 @@ async fn handle_api_state(
     });
 
     let filter_q = query.q.as_deref().unwrap_or("");
+    let filter_mode = match query.mode.as_deref() {
+        Some("online") => PeerFilterMode::Online,
+        Some("direct") => PeerFilterMode::Direct,
+        Some("relay") => PeerFilterMode::Relay,
+        _ => PeerFilterMode::All,
+    };
+    let peer_counts = status.as_ref().map_or(
+        PeerCountsDto {
+            all: 0,
+            online: 0,
+            direct: 0,
+            relay: 0,
+        },
+        |st| {
+            let counts = count_peers_by_mode(&st.peers);
+            PeerCountsDto {
+                all: counts.all,
+                online: counts.online,
+                direct: counts.direct,
+                relay: counts.relay,
+            }
+        },
+    );
     let peers = status.as_ref().map_or_else(Vec::new, |st| {
-        filter_peers(&st.peers, filter_q)
+        let filtered = if filter_mode == PeerFilterMode::All {
+            filter_peers(&st.peers, filter_q)
+        } else if filter_q.trim().is_empty() {
+            filter_peers_by_mode(&st.peers, filter_mode)
+        } else {
+            filter_peers_combined(&st.peers, filter_q, filter_mode)
+        };
+        filtered
             .into_iter()
             .map(|p| PeerItemDto {
                 node_id: p.node_id.to_string(),
@@ -591,16 +637,33 @@ async fn handle_api_state(
         format_self_network_panel,
     );
     let srv = status.as_ref().and_then(|s| s.server_connection.as_ref());
+    let tab_name = |tab: DashboardTab| match tab {
+        DashboardTab::Status => "status",
+        DashboardTab::Peers => "peers",
+        DashboardTab::DiagnosticsSettings => "diagnostics_settings",
+    };
+    let default_tab = tab_name(DashboardTab::default());
+    let available_tabs = [
+        tab_name(DashboardTab::Status),
+        tab_name(DashboardTab::Peers),
+        tab_name(DashboardTab::DiagnosticsSettings),
+    ];
 
     json_ok(&GuiStateDto {
         ok: true,
         state_label: derived.ui_state.label(),
+        display_label: derived.ui_state.display_label(derived.tunnel_sub_state),
         headline: derived.ui_state.headline(derived.tunnel_sub_state),
         tray_summary: derived
             .ui_state
             .tray_tooltip_summary(derived.tunnel_sub_state),
         tone: state_tone(derived.ui_state, derived.tunnel_sub_state),
         enrolled: derived.enrolled,
+        show_tab_bar: show_tab_bar(derived.enrolled, derived.ui_state)
+            && derived.should_show_tab_bar(),
+        show_onboarding: derived.should_show_onboarding_form(),
+        default_tab,
+        available_tabs,
         autostart_enabled: is_linux_autostart_enabled(),
         server_endpoint: srv.map(|s| s.control_endpoint.clone()),
         active_pin: srv.and_then(|s| s.active_pin.map(|p| p.to_string())),
@@ -611,6 +674,7 @@ async fn handle_api_state(
         legacy_banner: derived.legacy_banner,
         version_mismatch_banner: derived.version_mismatch_banner,
         self_network_text,
+        peer_counts,
         peers,
     })
 }

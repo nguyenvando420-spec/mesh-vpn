@@ -44,4 +44,62 @@ final class MeshVPNAppTests: XCTestCase {
             XCTAssertNil(ats?["NSAllowsArbitraryLoads"])
         }
     }
+
+    func testDesignTokens_CanonicalHexValues_MatchAdr030Specification() {
+        // Arrange & Act & Assert
+        XCTAssertEqual(MeshDesignTokens.surfaceBackgroundLight, "#F8FAFC")
+        XCTAssertEqual(MeshDesignTokens.surfaceBackgroundDark, "#0F172A")
+        XCTAssertEqual(MeshDesignTokens.brandCobalt, "#0B57D0")
+        XCTAssertEqual(MeshDesignTokens.brandSky, "#60A5FA")
+        XCTAssertEqual(MeshDesignTokens.brandTeal, "#0D9488")
+        XCTAssertEqual(MeshDesignTokens.brandTealLight, "#2DD4BF")
+        XCTAssertEqual(MeshDesignTokens.semanticWarningLight, "#D97706")
+        XCTAssertEqual(MeshDesignTokens.semanticWarningDark, "#FBBF24")
+        XCTAssertEqual(MeshDesignTokens.semanticErrorLight, "#DC2626")
+        XCTAssertEqual(MeshDesignTokens.semanticErrorDark, "#F87171")
+    }
+
+    func testMenuBarAndTabVisibility_ReauthRequiredIsAmberAndShows3Tabs() {
+        // Arrange
+        let reauthState = DesktopStateMapper.compute(
+            serviceFilesPresent: true,
+            statusResponse: AgentStatusResponse(daemonState: .reauthRequired, nodeId: "n1"),
+            connectFailure: nil,
+            lastActionError: nil
+        )
+
+        // Act
+        let tabs = DesktopTabKind.visibleTabs(for: reauthState.uiState)
+
+        // Assert
+        XCTAssertEqual(reauthState.menuBarGroup, .reauthRequired)
+        XCTAssertEqual(reauthState.menuBarGroup.lightHex, "#D97706")
+        XCTAssertEqual(reauthState.menuBarGroup.darkHex, "#FBBF24")
+        XCTAssertEqual(tabs, [.status, .peers, .diagnostics])
+    }
+
+    func testPeerFilter_NodeIdAndBadges_WorkWithThemeModePersistence() {
+        // Arrange
+        let suiteName = "MeshVPN.app.test.\(UUID().uuidString.prefix(8))"
+        let defaults = UserDefaults(suiteName: suiteName)
+        defer { defaults?.removePersistentDomain(forName: suiteName) }
+        let peer = AgentPeerStatus(
+            nodeId: "node-xyz-007",
+            name: "workstation",
+            fqdn: "workstation.mesh.internal",
+            overlayIp: "100.64.0.15",
+            online: true,
+            activePath: .direct
+        )
+
+        // Act
+        ThemeMode.dark.save(to: defaults)
+        let matched = PeerDirectoryFilter.filter(peers: [peer], mode: .direct, query: "xyz-007")
+        let counts = PeerDirectoryFilter.counts(for: [peer])
+
+        // Assert
+        XCTAssertEqual(ThemeMode.load(from: defaults), .dark)
+        XCTAssertEqual(matched.count, 1)
+        XCTAssertEqual(counts.direct, 1)
+    }
 }

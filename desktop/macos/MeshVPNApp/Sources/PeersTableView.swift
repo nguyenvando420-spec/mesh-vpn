@@ -6,39 +6,22 @@ import SwiftUI
 struct PeersTableView: View {
     @ObservedObject var store: DesktopStore
     @State private var searchQuery: String = ""
-    @State private var filter: PeerFilter = .all
+    @State private var filter: PeerFilterMode = .all
     @State private var selectedPeerId: String?
     @State private var forceDirectPing: Bool = false
+    @State private var copyToastMessage: String?
+    @State private var toastDismissTask: Task<Void, Never>?
 
-    private enum PeerFilter: String, CaseIterable, Identifiable {
-        case all = "All"
-        case online = "Online"
-        case direct = "Direct"
-        case relay = "Relay"
-
-        var id: String { rawValue }
+    private var filterCounts: PeerFilterCounts {
+        PeerDirectoryFilter.counts(for: store.sortedPeers)
     }
 
     private var filteredPeers: [AgentPeerStatus] {
-        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return store.sortedPeers.filter { peer in
-            switch filter {
-            case .all:
-                break
-            case .online:
-                guard peer.online else { return false }
-            case .direct:
-                guard peer.online && peer.activePath == .direct else { return false }
-            case .relay:
-                guard peer.online && peer.activePath == .relay else { return false }
-            }
-            guard !query.isEmpty else {
-                return true
-            }
-            return peer.name.lowercased().contains(query)
-                || peer.fqdn.lowercased().contains(query)
-                || peer.overlayIp.lowercased().contains(query)
-        }
+        PeerDirectoryFilter.filter(
+            peers: store.sortedPeers,
+            mode: filter,
+            query: searchQuery
+        )
     }
 
     private var selectedPeer: AgentPeerStatus? {
@@ -50,34 +33,75 @@ struct PeersTableView: View {
     }
 
     var body: some View {
-        VStack(spacing: 12) {
-            filterToolbar
-            if filteredPeers.isEmpty {
-                emptyStateView
-            } else {
-                HSplitView {
-                    peerListPane
-                        .frame(minWidth: 280, idealWidth: 340)
-                    peerInspectorPane
-                        .frame(minWidth: 320)
+        ZStack(alignment: .bottom) {
+            VStack(spacing: 12) {
+                filterToolbar
+                if filteredPeers.isEmpty {
+                    emptyStateView
+                } else {
+                    HSplitView {
+                        peerListPane
+                            .frame(minWidth: 280, idealWidth: 340)
+                        peerInspectorPane
+                            .frame(minWidth: 320)
+                    }
                 }
+            }
+            if let toast = copyToastMessage {
+                copyToastOverlay(toast)
             }
         }
     }
 
     private var filterToolbar: some View {
-        HStack(spacing: 12) {
-            TextField("Search peers by name, FQDN, or IP...", text: $searchQuery)
-                .textFieldStyle(.roundedBorder)
+        let counts = filterCounts
+        return HStack(spacing: 12) {
+            TextField(
+                "Search peers by name, FQDN, IP, or node ID...",
+                text: $searchQuery
+            )
+            .textFieldStyle(.roundedBorder)
 
-            Picker("Filter", selection: $filter) {
-                ForEach(PeerFilter.allCases) { item in
-                    Text(item.rawValue).tag(item)
+            HStack(spacing: 6) {
+                ForEach(PeerFilterMode.allCases) { item in
+                    filterChipButton(item: item, count: counts.count(for: item))
                 }
             }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 260)
         }
+    }
+
+    private func filterChipButton(item: PeerFilterMode, count: Int) -> some View {
+        let isSelected = filter == item
+        let fgColor = isSelected ? Color.white : MeshPalette.textPrimary
+        let bgColor = isSelected ? MeshPalette.brandPrimary : MeshPalette.surfaceCard
+        let borderColor = isSelected ? MeshPalette.brandPrimary : MeshPalette.surfaceBorder
+        return Button {
+            filter = item
+        } label: {
+            HStack(spacing: 5) {
+                Text(item.rawValue)
+                    .font(.callout.weight(isSelected ? .semibold : .regular))
+                Text("\(count)")
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(
+                        isSelected
+                            ? Color.white.opacity(0.22)
+                            : MeshPalette.surfaceBorder.opacity(0.5),
+                        in: Capsule()
+                    )
+            }
+            .foregroundStyle(fgColor)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(bgColor, in: RoundedRectangle(cornerRadius: 7))
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(borderColor, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var peerListPane: some View {
@@ -159,10 +183,10 @@ struct PeersTableView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 Button("Copy Overlay IP") {
-                    copyToPasteboard(peer.overlayIp)
+                    copyToPasteboard(peer.overlayIp, label: "Overlay IP")
                 }
                 Button("Copy FQDN") {
-                    copyToPasteboard(peer.fqdn)
+                    copyToPasteboard(peer.fqdn, label: "FQDN")
                 }
                 Spacer()
                 Button("Ping Peer") {
@@ -217,10 +241,32 @@ struct PeersTableView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func copyToPasteboard(_ text: String) {
+    private func copyToastOverlay(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(MeshPalette.semanticSuccess)
+            Text(message)
+                .font(.callout.weight(.medium))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(MeshPalette.surfaceCard, in: Capsule())
+        .overlay(Capsule().stroke(MeshPalette.surfaceBorder, lineWidth: 1))
+        .shadow(radius: 4)
+        .padding(.bottom, 12)
+    }
+
+    private func copyToPasteboard(_ text: String, label: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+        copyToastMessage = "Copied \(label): \(text)"
+        toastDismissTask?.cancel()
+        toastDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled else { return }
+            copyToastMessage = nil
+        }
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {
@@ -246,7 +292,11 @@ private struct PeerRowView: View {
     var body: some View {
         HStack(spacing: 10) {
             Circle()
-                .fill(peer.online ? Color.green : Color.secondary.opacity(0.4))
+                .fill(
+                    peer.online
+                        ? MeshPalette.semanticSuccess
+                        : MeshPalette.semanticNeutral.opacity(0.45)
+                )
                 .frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 2) {
                 Text(peer.name)
@@ -290,11 +340,11 @@ private struct PeerPathBadge: View {
     }
 
     private var badgeColor: Color {
-        guard online else { return .secondary }
+        guard online else { return MeshPalette.semanticNeutral }
         switch activePath {
-        case .direct: return .green
-        case .relay: return .orange
-        case .none: return .secondary
+        case .direct: return MeshPalette.semanticSuccess
+        case .relay: return MeshPalette.semanticWarning
+        case .none: return MeshPalette.semanticNeutral
         }
     }
 }

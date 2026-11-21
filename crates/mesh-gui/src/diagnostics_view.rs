@@ -139,3 +139,39 @@ pub(crate) fn validate_bugreport_archive_size(expected_total_bytes: u64) -> Resu
     }
     Ok(expected_total_bytes)
 }
+
+/// Formats Zone 3 Settings & Identity summary (`Theme`, `Language`, `Server`, `Identity`, `ADR-028`).
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) fn format_settings_identity_summary(
+    status: Option<&AgentStatusResponse>,
+    theme_label: &str,
+    locale_label: &str,
+) -> String {
+    let mut lines = vec![format!(
+        "Appearance: Theme={theme_label} | Language={locale_label} | Version=v{}",
+        env!("CARGO_PKG_VERSION")
+    )];
+    if let Some(st) = status {
+        lines.push(format_self_network_panel(st));
+    } else {
+        lines.push("Daemon diagnostics unavailable until MeshVpnAgent is running.".to_owned());
+    }
+    lines.join("\r\n")
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::format_settings_identity_summary;
+
+    #[test]
+    fn test_diagnostics_view_settings_summary_without_status() {
+        // Arrange & Act
+        let text = format_settings_identity_summary(None, "Dark", "English");
+
+        // Assert
+        assert!(text.contains("Theme=Dark"));
+        assert!(text.contains("Language=English"));
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+    }
+}

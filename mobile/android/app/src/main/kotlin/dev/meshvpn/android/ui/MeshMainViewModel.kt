@@ -6,6 +6,10 @@ import dev.meshvpn.android.data.diagnostics.BugreportShareManager
 import dev.meshvpn.android.data.network.OnboardingInputValidator
 import dev.meshvpn.android.ffi.FfiErrorMapper
 import dev.meshvpn.android.ffi.MeshFfiGateway
+import dev.meshvpn.android.ui.peers.PeerFilterMode
+import dev.meshvpn.android.ui.theme.InMemoryThemePrefsStore
+import dev.meshvpn.android.ui.theme.ThemeMode
+import dev.meshvpn.android.ui.theme.ThemePrefsStore
 import dev.meshvpn.android.vpn.MeshSessionRepository
 import dev.meshvpn.android.vpn.MeshSessionUiState
 import dev.meshvpn.android.vpn.PendingEnrollmentRequest
@@ -32,6 +36,7 @@ enum class AdminAuthPurpose {
 
 enum class MainTab {
     STATUS,
+    PEERS,
     SETTINGS,
 }
 
@@ -52,6 +57,9 @@ data class JoinConfirmationUiModel(
 data class MainUiScreenState(
     val session: MeshSessionUiState = MeshSessionUiState(),
     val activeTab: MainTab = MainTab.STATUS,
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    val peerSearchQuery: String = "",
+    val peerFilterMode: PeerFilterMode = PeerFilterMode.ALL,
     val onboardingMethod: OnboardingMethod = OnboardingMethod.SCAN_QR,
     val pendingConfirmation: JoinConfirmationUiModel? = null,
     val connectOnConfirm: Boolean = true,
@@ -65,8 +73,10 @@ data class MainUiScreenState(
         get() =
             !session.isEnrolled ||
                 pendingConfirmation != null ||
-                isAdminPinsRevealed ||
-                isSensitiveModalOpen
+                (
+                    activeTab == MainTab.SETTINGS &&
+                        (isAdminPinsRevealed || isSensitiveModalOpen)
+                )
 }
 
 /**
@@ -81,16 +91,26 @@ class MeshMainViewModel(
     private val cleanupDiagnostics: () -> Unit,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     externalScope: CoroutineScope? = null,
+    initialThemePrefs: ThemePrefsStore = InMemoryThemePrefsStore(),
 ) : ViewModel() {
     private val scope: CoroutineScope = externalScope ?: viewModelScope
     private val confirmationLock = Any()
+
+    @Volatile
+    private var themePrefsStore: ThemePrefsStore = initialThemePrefs
+
+    @Volatile
+    private var themePrefsAttached = false
 
     @Volatile
     private var heldConfirmationRequest: PendingEnrollmentRequest? = null
 
     private val _screenState =
         MutableStateFlow(
-            MainUiScreenState(session = sessionRepository.uiState.value),
+            MainUiScreenState(
+                session = sessionRepository.uiState.value,
+                themeMode = initialThemePrefs.loadThemeMode(),
+            ),
         )
     val screenState: StateFlow<MainUiScreenState> = _screenState.asStateFlow()
 
@@ -105,10 +125,39 @@ class MeshMainViewModel(
         }
     }
 
+    fun attachThemePrefs(store: ThemePrefsStore) {
+        if (themePrefsAttached) {
+            return
+        }
+        themePrefsAttached = true
+        themePrefsStore = store
+        val savedMode = store.loadThemeMode()
+        _screenState.update { it.copy(themeMode = savedMode) }
+    }
+
+    fun selectThemeMode(mode: ThemeMode) {
+        themePrefsStore.saveThemeMode(mode)
+        _screenState.update { it.copy(themeMode = mode) }
+    }
+
+    fun updatePeerSearchQuery(query: String) {
+        _screenState.update { it.copy(peerSearchQuery = query) }
+    }
+
+    fun selectPeerFilterMode(mode: PeerFilterMode) {
+        _screenState.update { it.copy(peerFilterMode = mode) }
+    }
+
     fun selectTab(tab: MainTab) {
         _screenState.update { current ->
-            val keepReveal = tab == MainTab.SETTINGS && current.isAdminPinsRevealed
-            current.copy(activeTab = tab, isAdminPinsRevealed = keepReveal)
+            val onSettings = tab == MainTab.SETTINGS
+            val keepReveal = onSettings && current.isAdminPinsRevealed
+            val keepModal = onSettings && current.isSensitiveModalOpen
+            current.copy(
+                activeTab = tab,
+                isAdminPinsRevealed = keepReveal,
+                isSensitiveModalOpen = keepModal,
+            )
         }
     }
 
@@ -447,9 +496,11 @@ class MeshMainViewModel(
                 BiometricGateResult.Authenticated -> {
                     sessionRepository.resetLocalIdentity()
                     cleanupDiagnostics()
+                    val currentTheme = _screenState.value.themeMode
                     _screenState.update {
                         MainUiScreenState(
                             session = sessionRepository.uiState.value,
+                            themeMode = currentTheme,
                             infoBanner = "Local keys and Mesh state erased.",
                         )
                     }

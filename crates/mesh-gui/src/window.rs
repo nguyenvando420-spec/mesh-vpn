@@ -1,69 +1,80 @@
-//! Win32 Dashboard window layout, DPI scaling, onboarding/re-auth/recovery workflows,
-//! atomic clipboard 30s wipe hooks (`IG-DGUI-WA-01`), bugreport `GetSaveFileNameW` ->
-//! `PollingSuspensionGuard` ordering (`IG-DGUI-WA-03`), and clean `<= 3s` shutdown (`US-103..108`).
+//! Win32 Dashboard window layout, 3-Zone Navigation (`ADR-028`), GDI/DWM Dark/Light/High-Contrast
+//! rendering (`ADR-027`, `ADR-030`), Peers Zone filter chips & Copy IP/FQDN (`US-120`, `US-121`),
+//! Zone 3 maintenance modals, atomic clipboard 30s wipe hooks (`IG-DGUI-WA-01`), bugreport
+//! `GetSaveFileNameW` -> `PollingSuspensionGuard` ordering (`IG-DGUI-WA-03`), and clean `<= 3s`
+//! shutdown (`US-103..108`, `US-118..126`).
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mesh_core::NodeName;
 use mesh_net::gui_handoff::{HandoffRequest, serialize_handoff_request_zeroizing};
 use mesh_proto::agent_ipc::{AgentPeerStatus, AgentStatusResponse, TlsAuthMode};
 use mesh_sys::error::{SysError, SysResult};
 use mesh_sys::gui_windows::{
-    ControlRect, GuiWindowSpec, MessageBoxKind, OwnedGdiObj, OwnedIcon, SingleInstanceGuard,
-    WIN_BN_CLICKED, WIN_EN_CHANGE, WIN_LBN_SELCHANGE, WIN_WM_LBUTTONDBLCLK, WIN_WM_LBUTTONUP,
+    ControlRect, GuiWindowSpec, MessageBoxKind, OwnedGdiObj, OwnedIcon, OwnerDrawButtonStyle,
+    OwnerDrawItem, PaintGuard, SingleInstanceGuard, WIN_BN_CLICKED, WIN_EN_CHANGE,
+    WIN_LBN_SELCHANGE, WIN_ODS_DISABLED, WIN_ODS_FOCUS, WIN_ODS_SELECTED, WIN_WM_CTLCOLOREDIT,
+    WIN_WM_CTLCOLORLISTBOX, WIN_WM_CTLCOLORSTATIC, WIN_WM_LBUTTONDBLCLK, WIN_WM_LBUTTONUP,
     WIN_WM_RBUTTONUP, WM_APP_BUGREPORT_DONE, WM_APP_NETCHECK_DONE, WM_APP_PING_DONE,
     WM_APP_STATE_REFRESH, WM_APP_WORKER_DONE, WindowEventHandler, acquire_single_instance_mutex,
-    activate_existing_gui_window, create_button, create_checkbox, create_dpi_ui_font, create_edit,
-    create_listbox, create_named_shutdown_event, create_radio_button, create_static_text,
-    destroy_window, enable_per_monitor_v2_dpi, find_window_by_class, get_checkbox_checked,
+    activate_existing_gui_window, announce_accessible_label, apply_window_dark_titlebar,
+    create_button, create_checkbox, create_edit, create_listbox, create_named_shutdown_event,
+    create_owner_draw_button, create_radio_button, create_static_text, destroy_window,
+    draw_owner_draw_button, enable_per_monitor_v2_dpi, find_window_by_class, get_checkbox_checked,
     get_client_size, get_control_text, get_dpi_for_window, get_sm_icon_px_for_dpi, hide_window,
-    init_common_controls, is_user_autostart_enabled, kill_window_timer, listbox_reset_and_fill,
-    listbox_selected_index, post_graceful_shutdown_to_window, query_window_version,
-    read_clipboard_utf16_with_seq, register_activate_window_message,
+    init_common_controls, invalidate_window, is_user_autostart_enabled, kill_window_timer,
+    listbox_reset_and_fill, listbox_selected_index, post_graceful_shutdown_to_window,
+    query_window_version, read_clipboard_utf16_with_seq, register_activate_window_message,
     register_taskbar_created_message, remove_user_shortcuts_and_autostart, run_gui_window,
     save_tar_file_dialog, set_checkbox_checked, set_control_bounds, set_control_enabled,
-    set_control_font, set_control_text, set_focus_control, set_user_autostart, set_window_icon,
-    set_window_timer, show_message_box, show_window_and_focus, signal_shutdown_event,
-    wait_event_signaled,
+    set_control_font, set_control_text, set_control_visible, set_dc_text_and_bk_color,
+    set_focus_control, set_user_autostart, set_window_icon, set_window_timer, show_message_box,
+    show_window_and_focus, signal_shutdown_event, wait_event_signaled,
 };
 use zeroize::Zeroizing;
 
 use crate::app::{
-    DerivedUiSnapshot, DesktopUiState, ServiceProbeKind, StateProbeInputs, TunnelSubState,
-    derive_desktop_ui_state, format_user_facing_error, sanitize_gui_log_text,
+    DashboardTab, DerivedUiSnapshot, DesktopUiState, ServiceProbeKind, StateProbeInputs,
+    TunnelSubState, derive_desktop_ui_state, format_user_facing_error, sanitize_gui_log_text,
 };
 use crate::autostart::{AUTOSTART_REG_VALUE_NAME, format_autostart_command_line};
 use crate::clipboard::{
-    CLIPBOARD_WIPE_DELAY_MS, ClipboardSecretGuard, attempt_atomic_clipboard_clear,
-    looks_like_sensitive_paste,
+    CLIPBOARD_WIPE_DELAY_MS, ClipboardSecretGuard, CopyKind, attempt_atomic_clipboard_clear,
+    copy_non_secret_peer_value, looks_like_sensitive_paste,
 };
 use crate::diagnostics_view::{
     DEFAULT_BUGREPORT_FILENAME, format_netcheck_report, format_self_network_panel,
+    format_settings_identity_summary,
 };
 use crate::elevation_worker::resolve_program_files_mesh_dir;
+use crate::i18n::{LocaleMode, t};
 use crate::icons::{UiIconTone, create_status_icon_for_px, icon_tone_for_state};
 use crate::ipc_poller::{BackgroundIpcController, PolledStateUpdate, UiAsyncEvent};
 use crate::onboarding::{
-    OnboardingFormInput, OnboardingTlsMode, parse_mesh_join_uri_to_draft,
-    should_lock_system_ca_for_endpoint, validate_manual_onboarding_to_draft,
-    validate_rotate_key_to_draft, validate_update_server_payload,
+    DesktopOnboardingTab, OnboardingFormInput, OnboardingTlsMode, Zone3ModalKind,
+    parse_mesh_join_uri_to_draft, should_lock_system_ca_for_endpoint,
+    validate_manual_onboarding_to_draft, validate_rotate_key_to_draft,
+    validate_update_server_payload,
 };
 use crate::peers_view::{
-    filter_peers, format_peer_detail_summary, format_peer_list_entry, format_ping_response,
+    PeerFilterMode, count_peers_by_mode, filter_peers, filter_peers_by_mode, filter_peers_combined,
+    format_filter_chip_label, format_peer_detail_summary, format_peer_list_entry,
+    format_ping_response,
 };
+use crate::prefs::{UiPrefs, load_prefs, save_prefs};
 use crate::single_instance::{
     MAIN_WINDOW_CLASS_NAME, SemVerTriple, UPGRADE_SHUTDOWN_WAIT_MS, should_request_upgrade_shutdown,
 };
+use crate::status_view::{build_status_hero_model, paint_status_hero_surface};
+use crate::theme::{ThemeMode, UiThemePalette, resolve_palette_for_dpi};
 use crate::tray::{
     IDM_CONNECT_UP, IDM_DISCONNECT, IDM_DISCONNECT_AND_QUIT, IDM_EXPORT_BUGREPORT, IDM_NETCHECK,
     IDM_OPEN_DASHBOARD, IDM_QUIT_KEEP_BACKGROUND, IDM_TOGGLE_AUTOSTART, TrayStateManager,
 };
 
+// Accessible hidden/proxy status label + Zone 0 CTAs
 const IDC_STATUS_TITLE: u16 = 2001;
-const IDC_STATUS_META: u16 = 2002;
-const IDC_BANNER_TEXT: u16 = 2003;
 const IDC_BTN_CONNECT: u16 = 2004;
 const IDC_BTN_DISCONNECT: u16 = 2005;
 const IDC_BTN_START_REPAIR: u16 = 2006;
@@ -74,6 +85,21 @@ const IDC_BTN_BUGREPORT: u16 = 2010;
 const IDC_CHK_AUTOSTART: u16 = 2011;
 const IDC_BTN_UNINSTALL: u16 = 2012;
 
+// 3-Tab Navigation (`ADR-028`)
+const IDC_TAB_STATUS: u16 = 2013;
+const IDC_TAB_PEERS: u16 = 2014;
+const IDC_TAB_DIAG_SETTINGS: u16 = 2015;
+
+// Zone 3 Maintenance Modal triggers & Theme selectors (`ADR-028`, `ADR-030`)
+const IDC_BTN_OPEN_ROTATE_MODAL: u16 = 2016;
+const IDC_BTN_OPEN_UPDATE_SERVER_MODAL: u16 = 2017;
+const IDC_BTN_MODAL_CANCEL: u16 = 2018;
+const IDC_BTN_THEME_SYSTEM: u16 = 2050;
+const IDC_BTN_THEME_LIGHT: u16 = 2051;
+const IDC_BTN_THEME_DARK: u16 = 2052;
+const IDC_LBL_THEME: u16 = 2053;
+
+// Onboarding (2-tab Join URI / Manual) & Zone 3 modal inputs
 const IDC_LBL_SETUP: u16 = 2020;
 const IDC_BTN_PASTE_URI: u16 = 2021;
 const IDC_LBL_ENDPOINT: u16 = 2022;
@@ -88,18 +114,29 @@ const IDC_LBL_NODENAME: u16 = 2030;
 const IDC_EDIT_NODE_NAME: u16 = 2031;
 const IDC_BTN_ENROLL_SAVE: u16 = 2032;
 const IDC_BTN_UPDATE_SERVER: u16 = 2033;
+const IDC_TAB_ONBOARD_URI: u16 = 2034;
+const IDC_TAB_ONBOARD_MANUAL: u16 = 2035;
 
+// Zone 2 Peers controls (`US-120`, `US-121`)
 const IDC_LBL_PEERS: u16 = 2040;
 const IDC_EDIT_PEER_FILTER: u16 = 2041;
 const IDC_BTN_PING_PEER: u16 = 2042;
 const IDC_LIST_PEERS: u16 = 2043;
 const IDC_EDIT_DETAILS: u16 = 2044;
+const IDC_BTN_PEER_FILTER_ALL: u16 = 2045;
+const IDC_BTN_PEER_FILTER_ONLINE: u16 = 2046;
+const IDC_BTN_PEER_FILTER_DIRECT: u16 = 2047;
+const IDC_BTN_PEER_FILTER_RELAY: u16 = 2048;
+const IDC_BTN_COPY_PEER_IP: u16 = 2054;
+const IDC_BTN_COPY_PEER_FQDN: u16 = 2055;
 
 const TIMER_CLIPBOARD_WIPE: usize = 1;
 const TIMER_SHUTDOWN_POLL: usize = 2;
+const TIMER_TOAST_CLEAR: usize = 3;
 
-const BASE_WIN_W: i32 = 820;
-const BASE_WIN_H: i32 = 650;
+const TOAST_DISPLAY_MS: u32 = 4_000;
+const BASE_WIN_W: i32 = 860;
+const BASE_WIN_H: i32 = 660;
 
 enum SingleInstanceStartup {
     Primary {
@@ -107,6 +144,15 @@ enum SingleInstanceStartup {
         activate_msg: u32,
     },
     ActivatedExistingAndExit,
+}
+
+fn tr_or(key: &str, fallback: &str) -> String {
+    let localized = t(key);
+    if localized.is_empty() {
+        fallback.to_owned()
+    } else {
+        localized.to_owned()
+    }
 }
 
 fn negotiate_single_instance_startup() -> SysResult<SingleInstanceStartup> {
@@ -120,7 +166,7 @@ fn negotiate_single_instance_startup() -> SysResult<SingleInstanceStartup> {
 
     let current_ver = SemVerTriple::parse(env!("CARGO_PKG_VERSION")).unwrap_or(SemVerTriple {
         major: 0,
-        minor: 3,
+        minor: 4,
         patch: 0,
     });
 
@@ -210,18 +256,34 @@ pub(crate) fn run_gui_entrypoint(start_minimized: bool) -> Result<(), String> {
 #[derive(Debug, Default)]
 struct UiControls {
     status_title: isize,
-    status_meta: isize,
-    banner_text: isize,
+
+    // 3-Tab Navigation (`ADR-028`)
+    tab_status: isize,
+    tab_peers: isize,
+    tab_diag_settings: isize,
+
+    // Primary / Zone 1 CTAs
     btn_connect: isize,
     btn_disconnect: isize,
     btn_start_repair: isize,
-    btn_cleanup: isize,
-    btn_reset_id: isize,
+
+    // Zone 3 Diagnostics & Settings controls
     btn_netcheck: isize,
     btn_bugreport: isize,
+    btn_cleanup: isize,
+    btn_reset_id: isize,
     chk_autostart: isize,
     btn_uninstall: isize,
+    btn_open_rotate_modal: isize,
+    btn_open_update_server_modal: isize,
+    lbl_theme: isize,
+    btn_theme_system: isize,
+    btn_theme_light: isize,
+    btn_theme_dark: isize,
 
+    // Onboarding (2-tab) & Zone 3 modal shared inputs
+    tab_onboard_uri: isize,
+    tab_onboard_manual: isize,
     lbl_setup: isize,
     btn_paste_uri: isize,
     lbl_endpoint: isize,
@@ -236,29 +298,46 @@ struct UiControls {
     edit_node_name: isize,
     btn_enroll_save: isize,
     btn_update_server: isize,
+    btn_modal_cancel: isize,
 
+    // Zone 2 Peers controls
     lbl_peers: isize,
     edit_peer_filter: isize,
+    btn_peer_all: isize,
+    btn_peer_online: isize,
+    btn_peer_direct: isize,
+    btn_peer_relay: isize,
     btn_ping_peer: isize,
+    btn_copy_ip: isize,
+    btn_copy_fqdn: isize,
     list_peers: isize,
     edit_details: isize,
 }
 
 impl UiControls {
-    fn all_handles(&self) -> [isize; 27] {
+    fn all_handles(&self) -> [isize; 41] {
         [
             self.status_title,
-            self.status_meta,
-            self.banner_text,
+            self.tab_status,
+            self.tab_peers,
+            self.tab_diag_settings,
             self.btn_connect,
             self.btn_disconnect,
             self.btn_start_repair,
-            self.btn_cleanup,
-            self.btn_reset_id,
             self.btn_netcheck,
             self.btn_bugreport,
+            self.btn_cleanup,
+            self.btn_reset_id,
             self.chk_autostart,
             self.btn_uninstall,
+            self.btn_open_rotate_modal,
+            self.btn_open_update_server_modal,
+            self.lbl_theme,
+            self.btn_theme_system,
+            self.btn_theme_light,
+            self.btn_theme_dark,
+            self.tab_onboard_uri,
+            self.tab_onboard_manual,
             self.lbl_setup,
             self.btn_paste_uri,
             self.lbl_endpoint,
@@ -273,14 +352,21 @@ impl UiControls {
             self.edit_node_name,
             self.btn_enroll_save,
             self.btn_update_server,
+            self.btn_modal_cancel,
             self.lbl_peers,
+            self.edit_peer_filter,
+            self.btn_peer_all,
+            self.btn_peer_online,
+            self.btn_peer_direct,
         ]
     }
 
-    fn peer_handles(&self) -> [isize; 4] {
+    fn extra_peer_handles(&self) -> [isize; 6] {
         [
-            self.edit_peer_filter,
+            self.btn_peer_relay,
             self.btn_ping_peer,
+            self.btn_copy_ip,
+            self.btn_copy_fqdn,
             self.list_peers,
             self.edit_details,
         ]
@@ -290,8 +376,15 @@ impl UiControls {
 struct DashboardState {
     hwnd: isize,
     visible: bool,
+    current_dpi: u32,
+    theme_mode: ThemeMode,
+    locale_mode: LocaleMode,
+    palette: UiThemePalette,
+    active_tab: DashboardTab,
+    onboarding_tab: DesktopOnboardingTab,
+    active_modal: Option<Zone3ModalKind>,
+    peer_filter_mode: PeerFilterMode,
     controls: UiControls,
-    ui_font: Option<OwnedGdiObj>,
     window_icon: Option<OwnedIcon>,
     tray: Option<TrayStateManager>,
     poller: Option<BackgroundIpcController>,
@@ -302,6 +395,8 @@ struct DashboardState {
     displayed_peers: Vec<AgentPeerStatus>,
     active_action_error: Option<String>,
     detail_override: Option<String>,
+    toast_message: Option<String>,
+    last_announced_state: String,
     form_seeded_from_status: bool,
     busy_action: bool,
     pending_disconnect_and_quit: bool,
@@ -311,6 +406,7 @@ struct DashboardState {
 
 impl DashboardState {
     fn new(initially_visible: bool) -> Self {
+        let prefs = load_prefs();
         let initial_snapshot = derive_desktop_ui_state(StateProbeInputs {
             gui_version: env!("CARGO_PKG_VERSION"),
             service_probe: ServiceProbeKind::Unknown,
@@ -323,8 +419,15 @@ impl DashboardState {
         Self {
             hwnd: 0,
             visible: initially_visible,
+            current_dpi: 96,
+            theme_mode: prefs.theme,
+            locale_mode: prefs.locale,
+            palette: resolve_palette_for_dpi(prefs.theme, 96),
+            active_tab: DashboardTab::Status,
+            onboarding_tab: DesktopOnboardingTab::JoinUri,
+            active_modal: None,
+            peer_filter_mode: PeerFilterMode::All,
             controls: UiControls::default(),
-            ui_font: None,
             window_icon: None,
             tray: None,
             poller: None,
@@ -335,6 +438,8 @@ impl DashboardState {
             displayed_peers: Vec::new(),
             active_action_error: None,
             detail_override: None,
+            toast_message: None,
+            last_announced_state: String::new(),
             form_seeded_from_status: false,
             busy_action: false,
             pending_disconnect_and_quit: false,
@@ -367,42 +472,148 @@ enum PendingUiPrompt {
 }
 
 fn scale(px96: i32, dpi: u32) -> i32 {
-    ((px96 * i32::try_from(dpi).unwrap_or(96)) + 48) / 96
+    ((px96 * i32::try_from(dpi.max(72)).unwrap_or(96)) + 48) / 96
 }
 
 fn build_controls(hwnd: isize) -> Option<UiControls> {
     let z = ControlRect::new(0, 0, 100, 24);
     Some(UiControls {
+        // Accessible screen-reader label proxy (kept off-visual or 1x1 while GDI hero paints visually)
         status_title: create_static_text(hwnd, IDC_STATUS_TITLE, "Initializing Mesh VPN...", z)
             .ok()?,
-        status_meta: create_static_text(hwnd, IDC_STATUS_META, "", z).ok()?,
-        banner_text: create_static_text(hwnd, IDC_BANNER_TEXT, "", z).ok()?,
-        btn_connect: create_button(hwnd, IDC_BTN_CONNECT, "Connect", z, true).ok()?,
-        btn_disconnect: create_button(hwnd, IDC_BTN_DISCONNECT, "Disconnect", z, false).ok()?,
-        btn_start_repair: create_button(
+
+        // 3-Tab Navigation (`BS_OWNERDRAW` + `WS_TABSTOP`)
+        tab_status: create_owner_draw_button(
+            hwnd,
+            IDC_TAB_STATUS,
+            &tr_or("tab.status", "Status"),
+            z,
+        )
+        .ok()?,
+        tab_peers: create_owner_draw_button(hwnd, IDC_TAB_PEERS, &tr_or("tab.peers", "Peers"), z)
+            .ok()?,
+        tab_diag_settings: create_owner_draw_button(
+            hwnd,
+            IDC_TAB_DIAG_SETTINGS,
+            &tr_or("tab.diagnostics_settings", "Diagnostics & Settings"),
+            z,
+        )
+        .ok()?,
+
+        // Primary CTAs (`BS_OWNERDRAW` for crisp Dark Mode styling)
+        btn_connect: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_CONNECT,
+            &tr_or("action.connect", "Connect"),
+            z,
+        )
+        .ok()?,
+        btn_disconnect: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_DISCONNECT,
+            &tr_or("action.disconnect", "Disconnect"),
+            z,
+        )
+        .ok()?,
+        btn_start_repair: create_owner_draw_button(
             hwnd,
             IDC_BTN_START_REPAIR,
-            "Start / Update Service (UAC)",
+            &tr_or("win.start_update_service", "Start / Update Service (UAC)"),
             z,
-            false,
         )
         .ok()?,
-        btn_cleanup: create_button(hwnd, IDC_BTN_CLEANUP, "Cleanup", z, false).ok()?,
-        btn_reset_id: create_button(hwnd, IDC_BTN_RESET_ID, "Reset Identity", z, false).ok()?,
-        btn_netcheck: create_button(hwnd, IDC_BTN_NETCHECK, "Netcheck", z, false).ok()?,
-        btn_bugreport: create_button(hwnd, IDC_BTN_BUGREPORT, "Bugreport...", z, false).ok()?,
-        chk_autostart: create_checkbox(hwnd, IDC_CHK_AUTOSTART, "Launch at Login", z).ok()?,
-        btn_uninstall: create_button(hwnd, IDC_BTN_UNINSTALL, "Uninstall...", z, false).ok()?,
 
-        lbl_setup: create_static_text(
+        // Zone 3 Diagnostics & Settings controls
+        btn_netcheck: create_owner_draw_button(
             hwnd,
-            IDC_LBL_SETUP,
-            "Control Onboarding / Server Settings:",
+            IDC_BTN_NETCHECK,
+            &tr_or("action.run_netcheck", "Run Netcheck"),
             z,
         )
         .ok()?,
-        btn_paste_uri: create_button(hwnd, IDC_BTN_PASTE_URI, "Paste mesh:// URI", z, false)
-            .ok()?,
+        btn_bugreport: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_BUGREPORT,
+            &tr_or("action.export_bugreport", "Export Bugreport..."),
+            z,
+        )
+        .ok()?,
+        btn_cleanup: create_owner_draw_button(hwnd, IDC_BTN_CLEANUP, "Cleanup Routes", z).ok()?,
+        btn_reset_id: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_RESET_ID,
+            &tr_or("action.reset_identity", "Reset Identity"),
+            z,
+        )
+        .ok()?,
+        chk_autostart: create_checkbox(
+            hwnd,
+            IDC_CHK_AUTOSTART,
+            &tr_or("settings.launch_at_login", "Launch at Login"),
+            z,
+        )
+        .ok()?,
+        btn_uninstall: create_owner_draw_button(hwnd, IDC_BTN_UNINSTALL, "Uninstall...", z).ok()?,
+        btn_open_rotate_modal: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_OPEN_ROTATE_MODAL,
+            &tr_or("action.rotate_key", "Rotate Node Key..."),
+            z,
+        )
+        .ok()?,
+        btn_open_update_server_modal: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_OPEN_UPDATE_SERVER_MODAL,
+            &tr_or("settings.update_server", "Update Server / SPKI Pin..."),
+            z,
+        )
+        .ok()?,
+        lbl_theme: create_static_text(hwnd, IDC_LBL_THEME, "Theme:", z).ok()?,
+        btn_theme_system: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_THEME_SYSTEM,
+            &tr_or("theme.system", "System"),
+            z,
+        )
+        .ok()?,
+        btn_theme_light: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_THEME_LIGHT,
+            &tr_or("theme.light", "Light"),
+            z,
+        )
+        .ok()?,
+        btn_theme_dark: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_THEME_DARK,
+            &tr_or("theme.dark", "Dark"),
+            z,
+        )
+        .ok()?,
+
+        // Onboarding 2-tab switchers & inputs (reused cleanly by Zone 3 modals when open)
+        tab_onboard_uri: create_owner_draw_button(
+            hwnd,
+            IDC_TAB_ONBOARD_URI,
+            &tr_or("onboarding.desktop.tab.join_uri", "Join URI"),
+            z,
+        )
+        .ok()?,
+        tab_onboard_manual: create_owner_draw_button(
+            hwnd,
+            IDC_TAB_ONBOARD_MANUAL,
+            &tr_or("onboarding.desktop.tab.manual", "Manual Setup"),
+            z,
+        )
+        .ok()?,
+        lbl_setup: create_static_text(hwnd, IDC_LBL_SETUP, "Set Up Mesh VPN:", z).ok()?,
+        btn_paste_uri: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_PASTE_URI,
+            "Paste mesh:// Join URI",
+            z,
+        )
+        .ok()?,
         lbl_endpoint: create_static_text(hwnd, IDC_LBL_ENDPOINT, "Control Server:", z).ok()?,
         edit_endpoint: create_edit(hwnd, IDC_EDIT_ENDPOINT, "", z, false, false).ok()?,
         radio_spki: create_radio_button(hwnd, IDC_RADIO_SPKI, "SPKI Pin (Zero-TOFU)", z, true)
@@ -421,185 +632,623 @@ fn build_controls(hwnd: isize) -> Option<UiControls> {
         edit_preauth: create_edit(hwnd, IDC_EDIT_PREAUTH, "", z, true, false).ok()?,
         lbl_nodename: create_static_text(hwnd, IDC_LBL_NODENAME, "Node Name:", z).ok()?,
         edit_node_name: create_edit(hwnd, IDC_EDIT_NODE_NAME, "", z, false, false).ok()?,
-        btn_enroll_save: create_button(hwnd, IDC_BTN_ENROLL_SAVE, "Enroll && Connect", z, false)
+        btn_enroll_save: create_owner_draw_button(hwnd, IDC_BTN_ENROLL_SAVE, "Enroll & Connect", z)
             .ok()?,
-        btn_update_server: create_button(
+        btn_update_server: create_owner_draw_button(
             hwnd,
             IDC_BTN_UPDATE_SERVER,
-            "Update Server / Pin",
+            "Save Server / Pin (UAC)",
             z,
-            false,
         )
         .ok()?,
+        btn_modal_cancel: create_button(hwnd, IDC_BTN_MODAL_CANCEL, "Cancel", z, false).ok()?,
 
-        lbl_peers: create_static_text(hwnd, IDC_LBL_PEERS, "Peers & Diagnostics:", z).ok()?,
+        // Zone 2 Peers controls
+        lbl_peers: create_static_text(
+            hwnd,
+            IDC_LBL_PEERS,
+            "Search Peers (Name / IP / Node ID):",
+            z,
+        )
+        .ok()?,
         edit_peer_filter: create_edit(hwnd, IDC_EDIT_PEER_FILTER, "", z, false, false).ok()?,
-        btn_ping_peer: create_button(hwnd, IDC_BTN_PING_PEER, "Ping Selected Peer", z, false)
+        btn_peer_all: create_owner_draw_button(hwnd, IDC_BTN_PEER_FILTER_ALL, "All (0)", z).ok()?,
+        btn_peer_online: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_PEER_FILTER_ONLINE,
+            "Online (0)",
+            z,
+        )
+        .ok()?,
+        btn_peer_direct: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_PEER_FILTER_DIRECT,
+            "Direct (0)",
+            z,
+        )
+        .ok()?,
+        btn_peer_relay: create_owner_draw_button(hwnd, IDC_BTN_PEER_FILTER_RELAY, "Relay (0)", z)
+            .ok()?,
+        btn_ping_peer: create_owner_draw_button(hwnd, IDC_BTN_PING_PEER, "Ping Peer", z).ok()?,
+        btn_copy_ip: create_owner_draw_button(hwnd, IDC_BTN_COPY_PEER_IP, "Copy Overlay IP", z)
+            .ok()?,
+        btn_copy_fqdn: create_owner_draw_button(hwnd, IDC_BTN_COPY_PEER_FQDN, "Copy FQDN", z)
             .ok()?,
         list_peers: create_listbox(hwnd, IDC_LIST_PEERS, z).ok()?,
         edit_details: create_edit(hwnd, IDC_EDIT_DETAILS, "", z, false, true).ok()?,
     })
 }
 
-fn layout_controls(hwnd: isize, c: &UiControls) {
-    let dpi = get_dpi_for_window(hwnd);
-    let (cw, ch) = get_client_size(hwnd);
-    let pad = scale(12, dpi);
-    let row_h = scale(24, dpi);
-    let btn_h = scale(28, dpi);
-    let gap = scale(8, dpi);
-    let usable_w = (cw - 2 * pad).max(scale(560, dpi));
-
-    let mut y = pad;
-    set_control_bounds(c.status_title, pad, y, usable_w, row_h);
-    y += row_h + scale(2, dpi);
-    set_control_bounds(c.status_meta, pad, y, usable_w, row_h);
-    y += row_h + scale(2, dpi);
-    set_control_bounds(c.banner_text, pad, y, usable_w, row_h + scale(8, dpi));
-    y += row_h + scale(12, dpi);
-
-    // Row 1 action buttons
-    let bw1 = scale(90, dpi);
-    let bw2 = scale(165, dpi);
-    let bw3 = scale(88, dpi);
-    set_control_bounds(c.btn_connect, pad, y, bw1, btn_h);
-    set_control_bounds(c.btn_disconnect, pad + bw1 + gap, y, bw1, btn_h);
-    set_control_bounds(c.btn_start_repair, pad + (bw1 + gap) * 2, y, bw2, btn_h);
-    set_control_bounds(
-        c.btn_cleanup,
-        pad + (bw1 + gap) * 2 + bw2 + gap,
-        y,
-        bw3,
-        btn_h,
-    );
-    set_control_bounds(
-        c.btn_reset_id,
-        pad + (bw1 + gap) * 2 + bw2 + bw3 + gap * 2,
-        y,
-        scale(112, dpi),
-        btn_h,
-    );
-    y += btn_h + gap;
-
-    // Row 2 diagnostics & lifecycle buttons
-    let bw_net = scale(95, dpi);
-    let bw_bug = scale(110, dpi);
-    let bw_auto = scale(140, dpi);
-    let bw_unin = scale(100, dpi);
-    set_control_bounds(c.btn_netcheck, pad, y, bw_net, btn_h);
-    set_control_bounds(c.btn_bugreport, pad + bw_net + gap, y, bw_bug, btn_h);
-    set_control_bounds(
-        c.chk_autostart,
-        pad + bw_net + bw_bug + gap * 2,
-        y,
-        bw_auto,
-        btn_h,
-    );
-    set_control_bounds(c.btn_uninstall, pad + usable_w - bw_unin, y, bw_unin, btn_h);
-    y += btn_h + gap * 2;
-
-    // Onboarding & server configuration group
-    let paste_w = scale(145, dpi);
-    set_control_bounds(
-        c.lbl_setup,
-        pad,
-        y + scale(3, dpi),
-        usable_w - paste_w - gap,
-        row_h,
-    );
-    set_control_bounds(c.btn_paste_uri, pad + usable_w - paste_w, y, paste_w, btn_h);
-    y += btn_h + gap;
-
-    let lbl_w = scale(115, dpi);
-    let half_w = (usable_w - lbl_w - gap * 2) / 2;
-    set_control_bounds(c.lbl_endpoint, pad, y + scale(3, dpi), lbl_w, row_h);
-    set_control_bounds(c.edit_endpoint, pad + lbl_w, y, half_w, row_h);
-    set_control_bounds(
-        c.radio_spki,
-        pad + lbl_w + half_w + gap,
-        y,
-        scale(155, dpi),
-        row_h,
-    );
-    set_control_bounds(
-        c.radio_system_ca,
-        pad + lbl_w + half_w + gap * 2 + scale(155, dpi),
-        y,
-        scale(175, dpi),
-        row_h,
-    );
-    y += row_h + gap;
-
-    set_control_bounds(c.lbl_pin, pad, y + scale(3, dpi), lbl_w, row_h);
-    set_control_bounds(c.edit_pin, pad + lbl_w, y, usable_w - lbl_w, row_h);
-    y += row_h + gap;
-
-    let name_lbl_w = scale(90, dpi);
-    let name_edit_w = scale(170, dpi);
-    let key_edit_w = (usable_w - lbl_w - name_lbl_w - name_edit_w - gap * 2).max(scale(140, dpi));
-    set_control_bounds(c.lbl_preauth, pad, y + scale(3, dpi), lbl_w, row_h);
-    set_control_bounds(c.edit_preauth, pad + lbl_w, y, key_edit_w, row_h);
-    set_control_bounds(
-        c.lbl_nodename,
-        pad + lbl_w + key_edit_w + gap,
-        y + scale(3, dpi),
-        name_lbl_w,
-        row_h,
-    );
-    set_control_bounds(
-        c.edit_node_name,
-        pad + lbl_w + key_edit_w + gap + name_lbl_w,
-        y,
-        name_edit_w,
-        row_h,
-    );
-    y += row_h + gap;
-
-    let enroll_w = scale(155, dpi);
-    let update_w = scale(165, dpi);
-    set_control_bounds(c.btn_enroll_save, pad + lbl_w, y, enroll_w, btn_h);
-    set_control_bounds(
-        c.btn_update_server,
-        pad + lbl_w + enroll_w + gap,
-        y,
-        update_w,
-        btn_h,
-    );
-    y += btn_h + gap * 2;
-
-    // Peers & Diagnostics section
-    let filter_w = scale(210, dpi);
-    let ping_w = scale(145, dpi);
-    set_control_bounds(
-        c.lbl_peers,
-        pad,
-        y + scale(3, dpi),
-        (usable_w - filter_w - ping_w - gap * 2).max(scale(120, dpi)),
-        row_h,
-    );
-    set_control_bounds(
-        c.edit_peer_filter,
-        pad + usable_w - filter_w - ping_w - gap,
-        y,
-        filter_w,
-        row_h,
-    );
-    set_control_bounds(c.btn_ping_peer, pad + usable_w - ping_w, y, ping_w, btn_h);
-    y += btn_h + gap;
-
-    let rem_h = (ch - y - pad).max(scale(120, dpi));
-    let list_h = (rem_h * 45) / 100;
-    let detail_h = (rem_h - list_h - gap).max(scale(60, dpi));
-    set_control_bounds(c.list_peers, pad, y, usable_w, list_h);
-    set_control_bounds(c.edit_details, pad, y + list_h + gap, usable_w, detail_h);
-}
-
 fn apply_font_to_all(c: &UiControls, font: &OwnedGdiObj) {
     for h in c.all_handles() {
         set_control_font(h, font);
     }
-    for h in c.peer_handles() {
+    for h in c.extra_peer_handles() {
         set_control_font(h, font);
+    }
+}
+
+fn set_many_visible(handles: &[isize], visible: bool) {
+    for &h in handles {
+        if h != 0 {
+            set_control_visible(h, visible);
+        }
+    }
+}
+
+fn sync_zone_visibility_and_layout(st: &DashboardState) {
+    let hwnd = st.hwnd;
+    if hwnd == 0 || st.controls.status_title == 0 {
+        return;
+    }
+    let dpi = st.current_dpi;
+    let (cw, ch) = get_client_size(hwnd);
+    let c = &st.controls;
+    let pad = scale(12, dpi);
+    let inner_pad = scale(24, dpi);
+    let row_h = scale(24, dpi);
+    let btn_h = scale(30, dpi);
+    let gap = scale(8, dpi);
+    let usable_w = (cw - 2 * pad).max(scale(560, dpi));
+    let inner_w = (cw - 2 * inner_pad).max(scale(520, dpi));
+
+    // Accessible status proxy stays non-overlapping (1x1 at top-left, readable by screen readers)
+    set_control_bounds(c.status_title, 0, 0, 1, 1);
+    set_control_visible(c.status_title, false);
+
+    // Hide all dynamic zone controls first, then reveal only active zone / modal controls
+    set_many_visible(
+        &[
+            c.tab_status,
+            c.tab_peers,
+            c.tab_diag_settings,
+            c.btn_connect,
+            c.btn_disconnect,
+            c.btn_start_repair,
+            c.btn_netcheck,
+            c.btn_bugreport,
+            c.btn_cleanup,
+            c.btn_reset_id,
+            c.chk_autostart,
+            c.btn_uninstall,
+            c.btn_open_rotate_modal,
+            c.btn_open_update_server_modal,
+            c.lbl_theme,
+            c.btn_theme_system,
+            c.btn_theme_light,
+            c.btn_theme_dark,
+            c.tab_onboard_uri,
+            c.tab_onboard_manual,
+            c.lbl_setup,
+            c.btn_paste_uri,
+            c.lbl_endpoint,
+            c.edit_endpoint,
+            c.radio_spki,
+            c.radio_system_ca,
+            c.lbl_pin,
+            c.edit_pin,
+            c.lbl_preauth,
+            c.edit_preauth,
+            c.lbl_nodename,
+            c.edit_node_name,
+            c.btn_enroll_save,
+            c.btn_update_server,
+            c.btn_modal_cancel,
+            c.lbl_peers,
+            c.edit_peer_filter,
+            c.btn_peer_all,
+            c.btn_peer_online,
+            c.btn_peer_direct,
+            c.btn_peer_relay,
+            c.btn_ping_peer,
+            c.btn_copy_ip,
+            c.btn_copy_fqdn,
+            c.list_peers,
+            c.edit_details,
+        ],
+        false,
+    );
+
+    let hero_bottom = pad + scale(96, dpi);
+    let nav_y = hero_bottom + scale(10, dpi);
+    let content_y = hero_bottom + scale(64, dpi);
+    let content_bottom = (ch - inner_pad).max(content_y + scale(140, dpi));
+
+    let tabs_visible = st.snapshot.should_show_tab_bar();
+    if tabs_visible {
+        // 3-Tab Navigation Bar visible across ALL enrolled states (`ADR-028`)
+        let tab_w = (usable_w - gap * 2) / 3;
+        set_control_bounds(c.tab_status, pad, nav_y, tab_w, btn_h);
+        set_control_bounds(c.tab_peers, pad + tab_w + gap, nav_y, tab_w, btn_h);
+        set_control_bounds(
+            c.tab_diag_settings,
+            pad + (tab_w + gap) * 2,
+            nav_y,
+            usable_w - (tab_w + gap) * 2,
+            btn_h,
+        );
+        set_many_visible(&[c.tab_status, c.tab_peers, c.tab_diag_settings], true);
+    }
+
+    // Active Zone 3 Modal takes over Zone content cleanly (`ADR-028`)
+    if tabs_visible && let Some(modal) = st.active_modal {
+        layout_zone3_modal(c, dpi, inner_pad, content_y, inner_w, modal);
+        return;
+    }
+
+    // Un-enrolled or service-stopped states
+    if !tabs_visible {
+        if st.snapshot.should_show_onboarding_form() {
+            layout_onboarding_view(c, dpi, inner_pad, content_y, inner_w, st.onboarding_tab);
+        } else {
+            // ServiceStopped / AgentUnavailable recovery panel
+            let cta_w = scale(230, dpi);
+            let unin_w = scale(120, dpi);
+            set_control_bounds(c.btn_start_repair, inner_pad, content_y, cta_w, btn_h);
+            set_control_bounds(
+                c.btn_uninstall,
+                inner_pad + cta_w + gap,
+                content_y,
+                unin_w,
+                btn_h,
+            );
+            let det_y = content_y + btn_h + gap * 2;
+            let det_h = (content_bottom - det_y).max(scale(100, dpi));
+            set_control_bounds(c.edit_details, inner_pad, det_y, inner_w, det_h);
+            set_many_visible(&[c.btn_start_repair, c.btn_uninstall, c.edit_details], true);
+        }
+        return;
+    }
+
+    match st.active_tab {
+        DashboardTab::Status => {
+            let mut y = content_y;
+            let bw1 = scale(130, dpi);
+            let bw2 = scale(130, dpi);
+            let bw3 = scale(205, dpi);
+            set_control_bounds(c.btn_connect, inner_pad, y, bw1, btn_h);
+            set_control_bounds(c.btn_disconnect, inner_pad + bw1 + gap, y, bw2, btn_h);
+            set_control_bounds(
+                c.btn_start_repair,
+                inner_pad + bw1 + bw2 + gap * 2,
+                y,
+                bw3,
+                btn_h,
+            );
+            set_many_visible(&[c.btn_connect, c.btn_disconnect, c.btn_start_repair], true);
+            if st.snapshot.ui_state == DesktopUiState::ReauthRequired {
+                set_control_bounds(
+                    c.btn_open_rotate_modal,
+                    inner_pad + bw1 + bw2 + bw3 + gap * 3,
+                    y,
+                    scale(165, dpi),
+                    btn_h,
+                );
+                set_control_visible(c.btn_open_rotate_modal, true);
+            }
+            y += btn_h + gap * 2;
+            let det_h = (content_bottom - y).max(scale(140, dpi));
+            set_control_bounds(c.edit_details, inner_pad, y, inner_w, det_h);
+            set_control_visible(c.edit_details, true);
+        }
+        DashboardTab::Peers => {
+            let mut y = content_y;
+            let lbl_w = scale(210, dpi);
+            set_control_bounds(c.lbl_peers, inner_pad, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(
+                c.edit_peer_filter,
+                inner_pad + lbl_w + gap,
+                y,
+                (inner_w - lbl_w - gap).max(scale(180, dpi)),
+                row_h,
+            );
+            y += row_h + gap;
+
+            // 4-State Filter Chips (`All / Online / Direct / Relay` + count badges)
+            let chip_w = scale(105, dpi);
+            set_control_bounds(c.btn_peer_all, inner_pad, y, chip_w, btn_h);
+            set_control_bounds(
+                c.btn_peer_online,
+                inner_pad + (chip_w + gap),
+                y,
+                chip_w,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_peer_direct,
+                inner_pad + (chip_w + gap) * 2,
+                y,
+                chip_w,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_peer_relay,
+                inner_pad + (chip_w + gap) * 3,
+                y,
+                chip_w,
+                btn_h,
+            );
+            y += btn_h + gap;
+
+            // Peer action bar: Ping + Copy Overlay IP + Copy FQDN (`US-121`)
+            let ping_w = scale(115, dpi);
+            let copy_ip_w = scale(135, dpi);
+            let copy_fqdn_w = scale(115, dpi);
+            set_control_bounds(c.btn_ping_peer, inner_pad, y, ping_w, btn_h);
+            set_control_bounds(c.btn_copy_ip, inner_pad + ping_w + gap, y, copy_ip_w, btn_h);
+            set_control_bounds(
+                c.btn_copy_fqdn,
+                inner_pad + ping_w + copy_ip_w + gap * 2,
+                y,
+                copy_fqdn_w,
+                btn_h,
+            );
+            y += btn_h + gap;
+
+            let rem_h = (content_bottom - y).max(scale(140, dpi));
+            let list_h = (rem_h * 52) / 100;
+            let detail_h = (rem_h - list_h - gap).max(scale(70, dpi));
+            set_control_bounds(c.list_peers, inner_pad, y, inner_w, list_h);
+            set_control_bounds(
+                c.edit_details,
+                inner_pad,
+                y + list_h + gap,
+                inner_w,
+                detail_h,
+            );
+            set_many_visible(
+                &[
+                    c.lbl_peers,
+                    c.edit_peer_filter,
+                    c.btn_peer_all,
+                    c.btn_peer_online,
+                    c.btn_peer_direct,
+                    c.btn_peer_relay,
+                    c.btn_ping_peer,
+                    c.btn_copy_ip,
+                    c.btn_copy_fqdn,
+                    c.list_peers,
+                    c.edit_details,
+                ],
+                true,
+            );
+        }
+        DashboardTab::DiagnosticsSettings => {
+            let mut y = content_y;
+            // Row 1: Appearance Theme Selector + Launch at Login
+            let theme_lbl_w = scale(62, dpi);
+            let theme_btn_w = scale(84, dpi);
+            set_control_bounds(
+                c.lbl_theme,
+                inner_pad,
+                y + scale(4, dpi),
+                theme_lbl_w,
+                row_h,
+            );
+            set_control_bounds(
+                c.btn_theme_system,
+                inner_pad + theme_lbl_w + gap,
+                y,
+                theme_btn_w,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_theme_light,
+                inner_pad + theme_lbl_w + theme_btn_w + gap * 2,
+                y,
+                theme_btn_w,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_theme_dark,
+                inner_pad + theme_lbl_w + (theme_btn_w + gap) * 2 + gap,
+                y,
+                theme_btn_w,
+                btn_h,
+            );
+            set_control_bounds(
+                c.chk_autostart,
+                inner_pad + inner_w - scale(145, dpi),
+                y,
+                scale(145, dpi),
+                btn_h,
+            );
+            y += btn_h + gap;
+
+            // Row 2: Diagnostics (Netcheck, Bugreport, Cleanup)
+            let bw_net = scale(130, dpi);
+            let bw_bug = scale(165, dpi);
+            let bw_cln = scale(130, dpi);
+            set_control_bounds(c.btn_netcheck, inner_pad, y, bw_net, btn_h);
+            set_control_bounds(c.btn_bugreport, inner_pad + bw_net + gap, y, bw_bug, btn_h);
+            set_control_bounds(
+                c.btn_cleanup,
+                inner_pad + bw_net + bw_bug + gap * 2,
+                y,
+                bw_cln,
+                btn_h,
+            );
+            y += btn_h + gap;
+
+            // Row 3: Identity & Maintenance Modals (`ADR-028`)
+            let bw_rot = scale(155, dpi);
+            let bw_upd = scale(195, dpi);
+            let bw_rst = scale(125, dpi);
+            let bw_uni = scale(110, dpi);
+            set_control_bounds(c.btn_open_rotate_modal, inner_pad, y, bw_rot, btn_h);
+            set_control_bounds(
+                c.btn_open_update_server_modal,
+                inner_pad + bw_rot + gap,
+                y,
+                bw_upd,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_reset_id,
+                inner_pad + bw_rot + bw_upd + gap * 2,
+                y,
+                bw_rst,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_uninstall,
+                inner_pad + inner_w - bw_uni,
+                y,
+                bw_uni,
+                btn_h,
+            );
+            y += btn_h + gap * 2;
+
+            let det_h = (content_bottom - y).max(scale(140, dpi));
+            set_control_bounds(c.edit_details, inner_pad, y, inner_w, det_h);
+            set_many_visible(
+                &[
+                    c.lbl_theme,
+                    c.btn_theme_system,
+                    c.btn_theme_light,
+                    c.btn_theme_dark,
+                    c.chk_autostart,
+                    c.btn_netcheck,
+                    c.btn_bugreport,
+                    c.btn_cleanup,
+                    c.btn_open_rotate_modal,
+                    c.btn_open_update_server_modal,
+                    c.btn_reset_id,
+                    c.btn_uninstall,
+                    c.edit_details,
+                ],
+                true,
+            );
+        }
+    }
+}
+
+fn layout_onboarding_view(
+    c: &UiControls,
+    dpi: u32,
+    x: i32,
+    start_y: i32,
+    w: i32,
+    tab: DesktopOnboardingTab,
+) {
+    let row_h = scale(24, dpi);
+    let btn_h = scale(30, dpi);
+    let gap = scale(8, dpi);
+    let mut y = start_y;
+
+    let tab_w = scale(140, dpi);
+    set_control_bounds(c.tab_onboard_uri, x, y, tab_w, btn_h);
+    set_control_bounds(c.tab_onboard_manual, x + tab_w + gap, y, tab_w, btn_h);
+    set_many_visible(&[c.tab_onboard_uri, c.tab_onboard_manual], true);
+    y += btn_h + gap * 2;
+
+    match tab {
+        DesktopOnboardingTab::JoinUri => {
+            set_control_text(
+                c.lbl_setup,
+                "Copy a `mesh://join?...` URI from your Control Admin, then click Paste below:",
+            );
+            set_control_bounds(c.lbl_setup, x, y, w, row_h);
+            y += row_h + gap;
+            let lbl_w = scale(115, dpi);
+            set_control_bounds(c.lbl_nodename, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_node_name, x + lbl_w, y, scale(240, dpi), row_h);
+            y += row_h + gap * 2;
+            set_control_bounds(c.btn_paste_uri, x, y, scale(210, dpi), btn_h);
+            set_many_visible(
+                &[
+                    c.lbl_setup,
+                    c.lbl_nodename,
+                    c.edit_node_name,
+                    c.btn_paste_uri,
+                ],
+                true,
+            );
+        }
+        DesktopOnboardingTab::Manual => {
+            set_control_text(
+                c.lbl_setup,
+                "Manual Server Enrollment (Zero-TOFU enforced):",
+            );
+            set_control_bounds(c.lbl_setup, x, y, w, row_h);
+            y += row_h + gap;
+
+            let lbl_w = scale(115, dpi);
+            let ep_w = (w - lbl_w - scale(350, dpi) - gap * 2).max(scale(160, dpi));
+            set_control_bounds(c.lbl_endpoint, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_endpoint, x + lbl_w, y, ep_w, row_h);
+            set_control_bounds(
+                c.radio_spki,
+                x + lbl_w + ep_w + gap,
+                y,
+                scale(165, dpi),
+                row_h,
+            );
+            set_control_bounds(
+                c.radio_system_ca,
+                x + lbl_w + ep_w + gap * 2 + scale(165, dpi),
+                y,
+                scale(175, dpi),
+                row_h,
+            );
+            y += row_h + gap;
+
+            set_control_bounds(c.lbl_pin, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_pin, x + lbl_w, y, w - lbl_w, row_h);
+            y += row_h + gap;
+
+            set_control_bounds(c.lbl_preauth, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_preauth, x + lbl_w, y, w - lbl_w, row_h);
+            y += row_h + gap;
+
+            set_control_bounds(c.lbl_nodename, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_node_name, x + lbl_w, y, scale(240, dpi), row_h);
+            y += row_h + gap * 2;
+
+            set_control_text(c.btn_enroll_save, "Enroll & Connect");
+            set_control_bounds(c.btn_enroll_save, x + lbl_w, y, scale(170, dpi), btn_h);
+            set_many_visible(
+                &[
+                    c.lbl_setup,
+                    c.lbl_endpoint,
+                    c.edit_endpoint,
+                    c.radio_spki,
+                    c.radio_system_ca,
+                    c.lbl_pin,
+                    c.edit_pin,
+                    c.lbl_preauth,
+                    c.edit_preauth,
+                    c.lbl_nodename,
+                    c.edit_node_name,
+                    c.btn_enroll_save,
+                ],
+                true,
+            );
+        }
+    }
+}
+
+fn layout_zone3_modal(
+    c: &UiControls,
+    dpi: u32,
+    x: i32,
+    start_y: i32,
+    w: i32,
+    modal: Zone3ModalKind,
+) {
+    let row_h = scale(24, dpi);
+    let btn_h = scale(30, dpi);
+    let gap = scale(8, dpi);
+    let lbl_w = scale(125, dpi);
+    let mut y = start_y;
+
+    match modal {
+        Zone3ModalKind::RotateNodeKey => {
+            set_control_text(
+                c.lbl_setup,
+                "Rotate Node Key — Paste a fresh single-use Pre-Auth Key (UAC):",
+            );
+            set_control_bounds(c.lbl_setup, x, y, w, row_h);
+            y += row_h + gap * 2;
+
+            set_control_bounds(c.lbl_preauth, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_preauth, x + lbl_w, y, w - lbl_w, row_h);
+            y += row_h + gap * 2;
+
+            set_control_text(c.btn_enroll_save, "Rotate Key (UAC)");
+            set_control_bounds(c.btn_enroll_save, x + lbl_w, y, scale(165, dpi), btn_h);
+            set_control_bounds(
+                c.btn_modal_cancel,
+                x + lbl_w + scale(165, dpi) + gap,
+                y,
+                scale(100, dpi),
+                btn_h,
+            );
+            set_many_visible(
+                &[
+                    c.lbl_setup,
+                    c.lbl_preauth,
+                    c.edit_preauth,
+                    c.btn_enroll_save,
+                    c.btn_modal_cancel,
+                ],
+                true,
+            );
+        }
+        Zone3ModalKind::UpdateControlServer => {
+            set_control_text(
+                c.lbl_setup,
+                "Update Control Server / SPKI Pin (Zero-TOFU enforced, UAC):",
+            );
+            set_control_bounds(c.lbl_setup, x, y, w, row_h);
+            y += row_h + gap * 2;
+
+            let ep_w = (w - lbl_w - scale(350, dpi) - gap * 2).max(scale(160, dpi));
+            set_control_bounds(c.lbl_endpoint, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_endpoint, x + lbl_w, y, ep_w, row_h);
+            set_control_bounds(
+                c.radio_spki,
+                x + lbl_w + ep_w + gap,
+                y,
+                scale(165, dpi),
+                row_h,
+            );
+            set_control_bounds(
+                c.radio_system_ca,
+                x + lbl_w + ep_w + gap * 2 + scale(165, dpi),
+                y,
+                scale(175, dpi),
+                row_h,
+            );
+            y += row_h + gap;
+
+            set_control_bounds(c.lbl_pin, x, y + scale(3, dpi), lbl_w, row_h);
+            set_control_bounds(c.edit_pin, x + lbl_w, y, w - lbl_w, row_h);
+            y += row_h + gap * 2;
+
+            set_control_bounds(c.btn_update_server, x + lbl_w, y, scale(195, dpi), btn_h);
+            set_control_bounds(
+                c.btn_modal_cancel,
+                x + lbl_w + scale(195, dpi) + gap,
+                y,
+                scale(100, dpi),
+                btn_h,
+            );
+            set_many_visible(
+                &[
+                    c.lbl_setup,
+                    c.lbl_endpoint,
+                    c.edit_endpoint,
+                    c.radio_spki,
+                    c.radio_system_ca,
+                    c.lbl_pin,
+                    c.edit_pin,
+                    c.btn_update_server,
+                    c.btn_modal_cancel,
+                ],
+                true,
+            );
+        }
     }
 }
 
@@ -630,6 +1279,34 @@ fn sync_zero_tofu_radio_state(c: &UiControls) {
     set_control_enabled(c.edit_pin, use_spki);
 }
 
+fn rebuild_theme_and_repaint(st: &mut DashboardState) {
+    st.palette.clear_brush_cache();
+    st.palette = resolve_palette_for_dpi(st.theme_mode, st.current_dpi);
+    apply_window_dark_titlebar(st.hwnd, st.palette.is_dark_titlebar);
+    tracing::debug!(
+        component = "mesh-gui",
+        event = "theme_palette_rebuilt",
+        mode = ?st.palette.mode,
+        dark = st.palette.is_dark_titlebar,
+        high_contrast = st.palette.is_high_contrast,
+        dpi = st.palette.dpi,
+        "rebuilt GDI/DWM theme palette"
+    );
+    if let Some(font) = &st.palette.font_body {
+        apply_font_to_all(&st.controls, font);
+    }
+    invalidate_window(st.hwnd);
+}
+
+fn show_toast(st: &mut DashboardState, title: &str, body: &str) {
+    st.toast_message = Some(body.to_owned());
+    set_window_timer(st.hwnd, TIMER_TOAST_CLEAR, TOAST_DISPLAY_MS);
+    if let Some(tray) = &st.tray {
+        tray.show_toast_balloon(title, body);
+    }
+    invalidate_window(st.hwnd);
+}
+
 fn refresh_ui_from_state(st: &mut DashboardState) {
     let snapshot = if let Some(poll) = &st.latest_poll {
         derive_desktop_ui_state(StateProbeInputs {
@@ -654,46 +1331,45 @@ fn refresh_ui_from_state(st: &mut DashboardState) {
     };
     st.snapshot = snapshot;
 
-    let c = &st.controls;
+    let display_lbl = st
+        .snapshot
+        .ui_state
+        .display_label(st.snapshot.tunnel_sub_state);
     let headline = st.snapshot.ui_state.headline(st.snapshot.tunnel_sub_state);
-    set_control_text(
-        c.status_title,
-        &format!("State: {} — {headline}", st.snapshot.ui_state.label()),
-    );
+    let accessible_text = format!("State: {display_lbl} — {headline}");
+    if st.last_announced_state != accessible_text {
+        tracing::debug!(
+            component = "mesh-gui",
+            event = "ui_state_changed",
+            state = st.snapshot.ui_state.label(),
+            display_label = display_lbl,
+            "updated desktop UI state"
+        );
+        announce_accessible_label(st.controls.status_title, &accessible_text);
+        st.last_announced_state = accessible_text;
+    }
 
     let status_ref = st.latest_poll.as_ref().and_then(|p| p.status.as_ref());
-    let meta_line = build_meta_line(status_ref, &st.snapshot);
-    set_control_text(c.status_meta, &meta_line);
-
-    let banner = st
-        .snapshot
-        .legacy_banner
-        .as_deref()
-        .or(st.snapshot.version_mismatch_banner.as_deref())
-        .or(st.snapshot.recoverable_error.as_deref())
-        .unwrap_or("");
-    set_control_text(c.banner_text, banner);
-
     if let Some(status) = status_ref
         && !st.form_seeded_from_status
         && let Some(srv) = &status.server_connection
         && !srv.control_endpoint.trim().is_empty()
     {
-        set_control_text(c.edit_endpoint, &srv.control_endpoint);
+        set_control_text(st.controls.edit_endpoint, &srv.control_endpoint);
         let is_pin = matches!(srv.tls_auth_mode, TlsAuthMode::SpkiPin);
-        set_checkbox_checked(c.radio_spki, is_pin);
-        set_checkbox_checked(c.radio_system_ca, !is_pin);
+        set_checkbox_checked(st.controls.radio_spki, is_pin);
+        set_checkbox_checked(st.controls.radio_system_ca, !is_pin);
         if let Some(pin) = &srv.active_pin {
-            set_control_text(c.edit_pin, &pin.to_string());
+            set_control_text(st.controls.edit_pin, &pin.to_string());
         }
         if let Some(node) = &status.node_name {
-            set_control_text(c.edit_node_name, node.as_str());
+            set_control_text(st.controls.edit_node_name, node.as_str());
         }
         st.form_seeded_from_status = true;
     }
 
-    sync_zero_tofu_radio_state(c);
-    set_checkbox_checked(c.chk_autostart, st.autostart_enabled);
+    sync_zero_tofu_radio_state(&st.controls);
+    set_checkbox_checked(st.controls.chk_autostart, st.autostart_enabled);
 
     let ipc_up = !matches!(
         st.snapshot.ui_state,
@@ -714,44 +1390,36 @@ fn refresh_ui_from_state(st: &mut DashboardState) {
                 TunnelSubState::Connected | TunnelSubState::Degraded
             ) | (DesktopUiState::Connecting, _)
         );
-    set_control_enabled(c.btn_connect, can_reconnect);
-    set_control_enabled(c.btn_disconnect, can_disconnect);
-    set_control_enabled(c.btn_start_repair, !st.busy_action);
-    set_control_enabled(c.btn_cleanup, !st.busy_action);
+    set_control_enabled(st.controls.btn_connect, can_reconnect);
+    set_control_enabled(st.controls.btn_disconnect, can_disconnect);
+    set_control_enabled(st.controls.btn_start_repair, !st.busy_action);
+    set_control_enabled(st.controls.btn_cleanup, !st.busy_action);
     set_control_enabled(
-        c.btn_reset_id,
+        st.controls.btn_reset_id,
         !st.busy_action && ipc_up && st.snapshot.enrolled,
     );
-    set_control_enabled(c.btn_netcheck, !st.busy_action && ipc_up);
-    set_control_enabled(c.btn_bugreport, !st.busy_action && ipc_up);
-    set_control_enabled(c.btn_uninstall, !st.busy_action);
+    set_control_enabled(st.controls.btn_netcheck, !st.busy_action && ipc_up);
+    set_control_enabled(st.controls.btn_bugreport, !st.busy_action && ipc_up);
+    set_control_enabled(st.controls.btn_uninstall, !st.busy_action);
     set_control_enabled(
-        c.btn_enroll_save,
-        !st.busy_action
-            && ipc_up
-            && matches!(
-                st.snapshot.ui_state,
-                DesktopUiState::NotEnrolled
-                    | DesktopUiState::ReauthRequired
-                    | DesktopUiState::Revoked
-                    | DesktopUiState::ErrorRecoverable
-            ),
+        st.controls.btn_open_rotate_modal,
+        !st.busy_action && ipc_up && st.snapshot.enrolled,
     );
     set_control_enabled(
-        c.btn_update_server,
+        st.controls.btn_open_update_server_modal,
+        !st.busy_action && ipc_up && st.snapshot.enrolled,
+    );
+    set_control_enabled(st.controls.btn_enroll_save, !st.busy_action && ipc_up);
+    set_control_enabled(
+        st.controls.btn_update_server,
         !st.busy_action && ipc_up && st.snapshot.enrolled,
     );
 
-    if st.snapshot.ui_state == DesktopUiState::ReauthRequired {
-        set_control_text(c.btn_enroll_save, "Rotate Key (UAC)");
-    } else {
-        set_control_text(c.btn_enroll_save, "Enroll && Connect");
-    }
-
+    sync_zone_visibility_and_layout(st);
     refresh_peers_and_details(st);
 
     let tone = icon_tone_for_state(st.snapshot.ui_state, st.snapshot.tunnel_sub_state);
-    let big_px = get_sm_icon_px_for_dpi(get_dpi_for_window(st.hwnd)).max(32);
+    let big_px = get_sm_icon_px_for_dpi(st.current_dpi).max(32);
     if let Ok(win_icon) = create_status_icon_for_px(tone, big_px) {
         set_window_icon(st.hwnd, &win_icon);
         st.window_icon = Some(win_icon);
@@ -759,29 +1427,7 @@ fn refresh_ui_from_state(st: &mut DashboardState) {
     if let Some(tray) = &mut st.tray {
         tray.sync_state(st.hwnd, &st.snapshot);
     }
-}
-
-fn build_meta_line(status: Option<&AgentStatusResponse>, snapshot: &DerivedUiSnapshot) -> String {
-    let ver_tag = match &snapshot.version_indicator {
-        crate::app::AgentVersionIndicator::Compatible(v) => format!("Agent v{v}"),
-        crate::app::AgentVersionIndicator::Mismatch {
-            gui_version,
-            agent_version,
-        } => format!("GUI v{gui_version} != Agent v{agent_version}"),
-        crate::app::AgentVersionIndicator::LegacyPre030 => "Agent <0.3.0 (Legacy)".to_owned(),
-        crate::app::AgentVersionIndicator::Unknown => "Agent v?".to_owned(),
-    };
-    let Some(st) = status else {
-        return format!("GUI v{} | {ver_tag}", env!("CARGO_PKG_VERSION"));
-    };
-    let ip = st
-        .overlay_ip
-        .map_or_else(|| "Unassigned".to_owned(), |v| v.to_string());
-    let name = st.node_name.as_ref().map_or("<unnamed>", NodeName::as_str);
-    format!(
-        "Node: {name} | Overlay IP: {ip} | Peers: {} | {ver_tag}",
-        st.peers.len()
-    )
+    invalidate_window(st.hwnd);
 }
 
 fn refresh_peers_and_details(st: &mut DashboardState) {
@@ -796,7 +1442,48 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
         .and_then(|p| p.status.as_ref())
         .map_or(&[], |s| s.peers.as_slice());
 
-    let filtered = filter_peers(all_peers, &filter_query);
+    // Update 4-state filter chip count badges (`US-120`)
+    let counts = count_peers_by_mode(all_peers);
+    set_control_text(
+        st.controls.btn_peer_all,
+        &format_filter_chip_label(
+            PeerFilterMode::All,
+            counts,
+            Some(&tr_or("peers.filter.all", "All")),
+        ),
+    );
+    set_control_text(
+        st.controls.btn_peer_online,
+        &format_filter_chip_label(
+            PeerFilterMode::Online,
+            counts,
+            Some(&tr_or("peers.filter.online", "Online")),
+        ),
+    );
+    set_control_text(
+        st.controls.btn_peer_direct,
+        &format_filter_chip_label(
+            PeerFilterMode::Direct,
+            counts,
+            Some(&tr_or("peers.filter.direct", "Direct")),
+        ),
+    );
+    set_control_text(
+        st.controls.btn_peer_relay,
+        &format_filter_chip_label(
+            PeerFilterMode::Relay,
+            counts,
+            Some(&tr_or("peers.filter.relay", "Relay")),
+        ),
+    );
+
+    let filtered = if st.peer_filter_mode == PeerFilterMode::All {
+        filter_peers(all_peers, &filter_query)
+    } else if filter_query.trim().is_empty() {
+        filter_peers_by_mode(all_peers, st.peer_filter_mode)
+    } else {
+        filter_peers_combined(all_peers, &filter_query, st.peer_filter_mode)
+    };
     st.displayed_peers = filtered.iter().copied().cloned().collect();
     let labels: Vec<String> = st
         .displayed_peers
@@ -806,24 +1493,43 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
     let new_sel =
         prev_sel_id.and_then(|id| st.displayed_peers.iter().position(|p| p.node_id == id));
     listbox_reset_and_fill(st.controls.list_peers, &labels, new_sel);
-    set_control_enabled(
-        st.controls.btn_ping_peer,
-        !st.busy_action && new_sel.is_some(),
-    );
+
+    let has_peer = new_sel.is_some();
+    set_control_enabled(st.controls.btn_ping_peer, !st.busy_action && has_peer);
+    set_control_enabled(st.controls.btn_copy_ip, has_peer);
+    set_control_enabled(st.controls.btn_copy_fqdn, has_peer);
 
     if let Some(override_text) = &st.detail_override {
         set_control_text(st.controls.edit_details, override_text);
         return;
     }
 
-    if let Some(idx) = new_sel
+    if st.active_tab == DashboardTab::Peers
+        && let Some(idx) = new_sel
         && let Some(peer) = st.displayed_peers.get(idx)
     {
         set_control_text(st.controls.edit_details, &format_peer_detail_summary(peer));
         return;
     }
 
-    if let Some(status) = st.latest_poll.as_ref().and_then(|p| p.status.as_ref()) {
+    let status_ref = st.latest_poll.as_ref().and_then(|p| p.status.as_ref());
+    if st.active_tab == DashboardTab::DiagnosticsSettings {
+        let theme_label = match st.theme_mode {
+            ThemeMode::System => "System",
+            ThemeMode::Light => "Light",
+            ThemeMode::Dark => "Dark",
+        };
+        let locale_label = match st.locale_mode {
+            LocaleMode::System => "System",
+            LocaleMode::En => "English",
+            LocaleMode::Vi => "Tieng Viet",
+        };
+        let summary = format_settings_identity_summary(status_ref, theme_label, locale_label);
+        set_control_text(st.controls.edit_details, &summary);
+        return;
+    }
+
+    if let Some(status) = status_ref {
         set_control_text(st.controls.edit_details, &format_self_network_panel(status));
     } else if let Some(err) = &st.snapshot.recoverable_error {
         set_control_text(st.controls.edit_details, err);
@@ -952,6 +1658,7 @@ fn perform_graceful_exit(st: &mut DashboardState) {
     st.shutdown_started = true;
     let hwnd = st.hwnd;
     kill_window_timer(hwnd, TIMER_SHUTDOWN_POLL);
+    kill_window_timer(hwnd, TIMER_TOAST_CLEAR);
     clear_armed_clipboard(st);
     set_control_text(st.controls.edit_preauth, "");
     if let Some(tray) = &mut st.tray {
@@ -963,6 +1670,30 @@ fn perform_graceful_exit(st: &mut DashboardState) {
     destroy_window(hwnd);
 }
 
+fn is_owner_draw_active(st: &DashboardState, control_id: u16) -> bool {
+    matches!(
+        (control_id, st.active_tab),
+        (IDC_TAB_STATUS, DashboardTab::Status)
+            | (IDC_TAB_PEERS, DashboardTab::Peers)
+            | (IDC_TAB_DIAG_SETTINGS, DashboardTab::DiagnosticsSettings)
+    ) || matches!(
+        (control_id, st.peer_filter_mode),
+        (IDC_BTN_PEER_FILTER_ALL, PeerFilterMode::All)
+            | (IDC_BTN_PEER_FILTER_ONLINE, PeerFilterMode::Online)
+            | (IDC_BTN_PEER_FILTER_DIRECT, PeerFilterMode::Direct)
+            | (IDC_BTN_PEER_FILTER_RELAY, PeerFilterMode::Relay)
+    ) || matches!(
+        (control_id, st.theme_mode),
+        (IDC_BTN_THEME_SYSTEM, ThemeMode::System)
+            | (IDC_BTN_THEME_LIGHT, ThemeMode::Light)
+            | (IDC_BTN_THEME_DARK, ThemeMode::Dark)
+    ) || matches!(
+        (control_id, st.onboarding_tab),
+        (IDC_TAB_ONBOARD_URI, DesktopOnboardingTab::JoinUri)
+            | (IDC_TAB_ONBOARD_MANUAL, DesktopOnboardingTab::Manual)
+    )
+}
+
 impl WindowEventHandler for DashboardApp {
     fn on_create(&self, hwnd: isize) {
         let Ok(mut st) = self.inner.try_borrow_mut() else {
@@ -970,15 +1701,16 @@ impl WindowEventHandler for DashboardApp {
         };
         st.hwnd = hwnd;
         let dpi = get_dpi_for_window(hwnd);
-        if let Ok(font) = create_dpi_ui_font(dpi) {
-            st.ui_font = Some(font);
-        }
+        st.current_dpi = dpi;
+        st.palette = resolve_palette_for_dpi(st.theme_mode, dpi);
+        apply_window_dark_titlebar(hwnd, st.palette.is_dark_titlebar);
+
         if let Some(controls) = build_controls(hwnd) {
-            if let Some(font) = &st.ui_font {
+            if let Some(font) = &st.palette.font_body {
                 apply_font_to_all(&controls, font);
             }
-            layout_controls(hwnd, &controls);
             st.controls = controls;
+            sync_zone_visibility_and_layout(&st);
         }
         let mut tray = TrayStateManager::new(hwnd);
         let _added = tray.ensure_added_or_restore(hwnd, &st.snapshot);
@@ -997,6 +1729,118 @@ impl WindowEventHandler for DashboardApp {
                 return;
             };
             match (control_id, notify_code) {
+                (IDC_TAB_STATUS, WIN_BN_CLICKED) => {
+                    st.active_tab = DashboardTab::Status;
+                    st.active_modal = None;
+                    st.detail_override = None;
+                    refresh_ui_from_state(&mut st);
+                    return;
+                }
+                (IDC_TAB_PEERS, WIN_BN_CLICKED) => {
+                    st.active_tab = DashboardTab::Peers;
+                    st.active_modal = None;
+                    st.detail_override = None;
+                    refresh_ui_from_state(&mut st);
+                    return;
+                }
+                (IDC_TAB_DIAG_SETTINGS, WIN_BN_CLICKED) => {
+                    st.active_tab = DashboardTab::DiagnosticsSettings;
+                    st.active_modal = None;
+                    st.detail_override = None;
+                    refresh_ui_from_state(&mut st);
+                    return;
+                }
+                (IDC_TAB_ONBOARD_URI, WIN_BN_CLICKED) => {
+                    st.onboarding_tab = DesktopOnboardingTab::JoinUri;
+                    sync_zone_visibility_and_layout(&st);
+                    invalidate_window(hwnd);
+                    return;
+                }
+                (IDC_TAB_ONBOARD_MANUAL, WIN_BN_CLICKED) => {
+                    st.onboarding_tab = DesktopOnboardingTab::Manual;
+                    sync_zone_visibility_and_layout(&st);
+                    invalidate_window(hwnd);
+                    return;
+                }
+                (IDC_BTN_OPEN_ROTATE_MODAL, WIN_BN_CLICKED) => {
+                    st.active_tab = DashboardTab::DiagnosticsSettings;
+                    st.active_modal = Some(Zone3ModalKind::RotateNodeKey);
+                    set_control_text(st.controls.edit_preauth, "");
+                    sync_zone_visibility_and_layout(&st);
+                    set_focus_control(st.controls.edit_preauth);
+                    invalidate_window(hwnd);
+                    return;
+                }
+                (IDC_BTN_OPEN_UPDATE_SERVER_MODAL, WIN_BN_CLICKED) => {
+                    st.active_tab = DashboardTab::DiagnosticsSettings;
+                    st.active_modal = Some(Zone3ModalKind::UpdateControlServer);
+                    sync_zero_tofu_radio_state(&st.controls);
+                    sync_zone_visibility_and_layout(&st);
+                    set_focus_control(st.controls.edit_endpoint);
+                    invalidate_window(hwnd);
+                    return;
+                }
+                (IDC_BTN_MODAL_CANCEL, WIN_BN_CLICKED) => {
+                    st.active_modal = None;
+                    set_control_text(st.controls.edit_preauth, "");
+                    refresh_ui_from_state(&mut st);
+                    return;
+                }
+                (
+                    IDC_BTN_THEME_SYSTEM | IDC_BTN_THEME_LIGHT | IDC_BTN_THEME_DARK,
+                    WIN_BN_CLICKED,
+                ) => {
+                    let next_mode = match control_id {
+                        IDC_BTN_THEME_LIGHT => ThemeMode::Light,
+                        IDC_BTN_THEME_DARK => ThemeMode::Dark,
+                        _ => ThemeMode::System,
+                    };
+                    st.theme_mode = next_mode;
+                    let _saved = save_prefs(&UiPrefs {
+                        theme: st.theme_mode,
+                        locale: st.locale_mode,
+                    });
+                    rebuild_theme_and_repaint(&mut st);
+                    refresh_peers_and_details(&mut st);
+                    return;
+                }
+                (
+                    IDC_BTN_PEER_FILTER_ALL
+                    | IDC_BTN_PEER_FILTER_ONLINE
+                    | IDC_BTN_PEER_FILTER_DIRECT
+                    | IDC_BTN_PEER_FILTER_RELAY,
+                    WIN_BN_CLICKED,
+                ) => {
+                    st.peer_filter_mode = match control_id {
+                        IDC_BTN_PEER_FILTER_ONLINE => PeerFilterMode::Online,
+                        IDC_BTN_PEER_FILTER_DIRECT => PeerFilterMode::Direct,
+                        IDC_BTN_PEER_FILTER_RELAY => PeerFilterMode::Relay,
+                        _ => PeerFilterMode::All,
+                    };
+                    st.detail_override = None;
+                    refresh_peers_and_details(&mut st);
+                    invalidate_window(hwnd);
+                    return;
+                }
+                (IDC_BTN_COPY_PEER_IP | IDC_BTN_COPY_PEER_FQDN, WIN_BN_CLICKED) => {
+                    if let Some(idx) = listbox_selected_index(st.controls.list_peers)
+                        && let Some(peer) = st.displayed_peers.get(idx).cloned()
+                    {
+                        let (kind, value) = if control_id == IDC_BTN_COPY_PEER_IP {
+                            (CopyKind::OverlayIp, peer.overlay_ip.to_string())
+                        } else {
+                            (CopyKind::Fqdn, peer.fqdn)
+                        };
+                        match copy_non_secret_peer_value(kind, &value) {
+                            Ok(notice) => show_toast(&mut st, &notice.title, &notice.body),
+                            Err(err) => {
+                                st.active_action_error = Some(err);
+                                refresh_ui_from_state(&mut st);
+                            }
+                        }
+                    }
+                    return;
+                }
                 (IDC_EDIT_ENDPOINT, WIN_EN_CHANGE) => {
                     sync_zero_tofu_radio_state(&st.controls);
                     return;
@@ -1099,7 +1943,8 @@ impl WindowEventHandler for DashboardApp {
                     prompt = Some(PendingUiPrompt::ConfirmUninstall);
                 }
                 (IDC_BTN_ENROLL_SAVE, WIN_BN_CLICKED) => {
-                    let is_rotate = st.snapshot.ui_state == DesktopUiState::ReauthRequired;
+                    let is_rotate = st.active_modal == Some(Zone3ModalKind::RotateNodeKey)
+                        || st.snapshot.ui_state == DesktopUiState::ReauthRequired;
                     prompt = Some(PendingUiPrompt::ConfirmAndRunEnrollment { is_rotate });
                 }
                 (IDC_BTN_UPDATE_SERVER, WIN_BN_CLICKED) => {
@@ -1110,6 +1955,7 @@ impl WindowEventHandler for DashboardApp {
                         &form.spki_pin_raw,
                     ) {
                         Ok((_ep, payload)) => {
+                            st.active_modal = None;
                             begin_privileged_action(&mut st, "Update Server/Pin", payload);
                         }
                         Err(err) => {
@@ -1127,7 +1973,7 @@ impl WindowEventHandler for DashboardApp {
         }
     }
 
-    fn on_timer(&self, _hwnd: isize, timer_id: usize) {
+    fn on_timer(&self, hwnd: isize, timer_id: usize) {
         let mut quit_now = false;
         {
             let Ok(mut st) = self.inner.try_borrow_mut() else {
@@ -1135,6 +1981,10 @@ impl WindowEventHandler for DashboardApp {
             };
             if timer_id == TIMER_CLIPBOARD_WIPE {
                 clear_armed_clipboard(&mut st);
+            } else if timer_id == TIMER_TOAST_CLEAR {
+                kill_window_timer(hwnd, TIMER_TOAST_CLEAR);
+                st.toast_message = None;
+                invalidate_window(hwnd);
             } else if timer_id == TIMER_SHUTDOWN_POLL
                 && let Some(ev) = &st.shutdown_event
                 && wait_event_signaled(ev, 0, "window::shutdown_poll").unwrap_or(false)
@@ -1296,6 +2146,7 @@ impl WindowEventHandler for DashboardApp {
                                     st.detail_override = Some(format!("{action_label}: {summary}"));
                                     if action_label == "Reset Identity" {
                                         st.form_seeded_from_status = false;
+                                        st.active_modal = None;
                                     }
                                     if st.pending_disconnect_and_quit {
                                         quit_now = true;
@@ -1328,7 +2179,10 @@ impl WindowEventHandler for DashboardApp {
     }
 
     fn on_ctrl_v(&self, _hwnd: isize, focused_control_id: u16) {
-        if !matches!(focused_control_id, IDC_EDIT_PREAUTH | IDC_EDIT_ENDPOINT) {
+        if !matches!(
+            focused_control_id,
+            IDC_EDIT_PREAUTH | IDC_EDIT_ENDPOINT | IDC_EDIT_PIN
+        ) {
             return;
         }
         let Ok(mut st) = self.inner.try_borrow_mut() else {
@@ -1345,12 +2199,119 @@ impl WindowEventHandler for DashboardApp {
         let Ok(mut st) = self.inner.try_borrow_mut() else {
             return;
         };
-        if let Ok(font) = create_dpi_ui_font(dpi) {
-            apply_font_to_all(&st.controls, &font);
-            st.ui_font = Some(font);
-        }
-        layout_controls(hwnd, &st.controls);
+        st.current_dpi = dpi.max(72);
+        rebuild_theme_and_repaint(&mut st);
+        sync_zone_visibility_and_layout(&st);
         refresh_ui_from_state(&mut st);
+        let _h = hwnd;
+    }
+
+    fn on_theme_changed(&self, _hwnd: isize) {
+        let Ok(mut st) = self.inner.try_borrow_mut() else {
+            return;
+        };
+        rebuild_theme_and_repaint(&mut st);
+    }
+
+    fn on_ctlcolor(&self, _hwnd: isize, hdc: isize, control_hwnd: isize, msg: u32) -> isize {
+        let Ok(st) = self.inner.try_borrow() else {
+            return 0;
+        };
+        if msg == WIN_WM_CTLCOLORSTATIC {
+            if control_hwnd == st.controls.status_title {
+                set_dc_text_and_bk_color(hdc, st.palette.text_primary, st.palette.bg_color, true);
+                st.palette.bg_brush_raw()
+            } else {
+                set_dc_text_and_bk_color(hdc, st.palette.text_primary, st.palette.card_color, true);
+                st.palette.card_brush_raw()
+            }
+        } else if msg == WIN_WM_CTLCOLOREDIT || msg == WIN_WM_CTLCOLORLISTBOX {
+            set_dc_text_and_bk_color(hdc, st.palette.text_primary, st.palette.card_color, false);
+            st.palette.card_brush_raw()
+        } else {
+            0
+        }
+    }
+
+    fn on_erase_bkgnd(&self, _hwnd: isize, _hdc: isize) -> bool {
+        true
+    }
+
+    fn on_paint(&self, hwnd: isize) -> bool {
+        let Ok(st) = self.inner.try_borrow() else {
+            return false;
+        };
+        let Some(guard) = PaintGuard::begin(hwnd) else {
+            return false;
+        };
+        let (w, h) = get_client_size(hwnd);
+        let status_ref = st.latest_poll.as_ref().and_then(|p| p.status.as_ref());
+        let model = build_status_hero_model(
+            &st.snapshot,
+            status_ref,
+            st.active_tab,
+            st.toast_message.as_deref(),
+        );
+        paint_status_hero_surface(guard.hdc(), w, h, st.current_dpi, &model, &st.palette);
+        true
+    }
+
+    fn on_draw_item(&self, _hwnd: isize, item: &OwnerDrawItem) -> bool {
+        let Ok(st) = self.inner.try_borrow() else {
+            return false;
+        };
+        let text = get_control_text(item.hwnd_item);
+        let disabled = (item.item_state & WIN_ODS_DISABLED) != 0;
+        let pressed = (item.item_state & WIN_ODS_SELECTED) != 0;
+        let focused = (item.item_state & WIN_ODS_FOCUS) != 0;
+        let active = is_owner_draw_active(&st, item.control_id);
+        let is_primary_cta = matches!(
+            item.control_id,
+            IDC_BTN_CONNECT | IDC_BTN_ENROLL_SAVE | IDC_BTN_UPDATE_SERVER
+        );
+        let is_danger_cta = matches!(item.control_id, IDC_BTN_RESET_ID | IDC_BTN_UNINSTALL);
+
+        let (bg_brush, border_pen, text_color) = if disabled {
+            (
+                st.palette.bg_brush.as_ref(),
+                st.palette.border_pen.as_ref(),
+                st.palette.text_secondary,
+            )
+        } else if active || is_primary_cta || pressed {
+            (
+                st.palette.brand_brush.as_ref(),
+                st.palette.brand_border_pen.as_ref(),
+                st.palette.on_accent_text_color(),
+            )
+        } else if is_danger_cta {
+            (
+                st.palette.error_brush.as_ref(),
+                st.palette.border_pen.as_ref(),
+                st.palette.on_accent_text_color(),
+            )
+        } else {
+            (
+                st.palette.card_brush.as_ref(),
+                st.palette.border_pen.as_ref(),
+                st.palette.text_primary,
+            )
+        };
+
+        if let (Some(bg), Some(pen), Some(font)) =
+            (bg_brush, border_pen, st.palette.font_body.as_ref())
+        {
+            let style = OwnerDrawButtonStyle {
+                text: &text,
+                bg_brush: bg,
+                border_pen: pen,
+                text_color,
+                font,
+                focused,
+            };
+            draw_owner_draw_button(item.hdc, &item.rect, &style);
+            return true;
+        }
+        false
     }
 
     fn on_resize(&self, hwnd: isize, _width: i32, _height: i32) {
@@ -1358,14 +2319,15 @@ impl WindowEventHandler for DashboardApp {
             return;
         };
         if st.controls.status_title != 0 {
-            layout_controls(hwnd, &st.controls);
+            sync_zone_visibility_and_layout(&st);
+            invalidate_window(hwnd);
         }
     }
 
     fn on_query_version(&self) -> isize {
         let triple = SemVerTriple::parse(env!("CARGO_PKG_VERSION")).unwrap_or(SemVerTriple {
             major: 0,
-            minor: 3,
+            minor: 4,
             patch: 0,
         });
         isize::try_from(triple.pack_u32()).unwrap_or(0)
@@ -1392,8 +2354,10 @@ impl WindowEventHandler for DashboardApp {
         };
         st.shutdown_started = true;
         kill_window_timer(hwnd, TIMER_SHUTDOWN_POLL);
+        kill_window_timer(hwnd, TIMER_TOAST_CLEAR);
         clear_armed_clipboard(&mut st);
         set_control_text(st.controls.edit_preauth, "");
+        st.palette.clear_brush_cache();
         if let Some(tray) = &mut st.tray {
             tray.remove();
         }
@@ -1434,6 +2398,8 @@ fn handle_tray_menu_command(app: &DashboardApp, hwnd: isize, cmd: u16) {
             }
             IDM_NETCHECK => {
                 st.visible = true;
+                st.active_tab = DashboardTab::DiagnosticsSettings;
+                st.active_modal = None;
                 st.detail_override = Some("Running Netcheck diagnostics...".to_owned());
                 if let Some(poller) = &st.poller {
                     poller.set_dashboard_visible(true);
@@ -1538,6 +2504,7 @@ fn execute_pending_prompt(app: &DashboardApp, hwnd: isize, prompt: PendingUiProm
                     };
                     set_control_text(st.controls.edit_preauth, "");
                     clear_armed_clipboard(&mut st);
+                    st.active_modal = None;
                     let label = if is_rotate {
                         "Rotate Key"
                     } else {
@@ -1571,6 +2538,7 @@ fn execute_pending_prompt(app: &DashboardApp, hwnd: isize, prompt: PendingUiProm
             if let Ok(payload) = serialize_handoff_request_zeroizing(&HandoffRequest::ResetIdentity)
             {
                 set_control_text(st.controls.edit_preauth, "");
+                st.active_modal = None;
                 begin_privileged_action(&mut st, "Reset Identity", payload);
             }
         }
@@ -1642,7 +2610,6 @@ fn execute_pending_prompt(app: &DashboardApp, hwnd: isize, prompt: PendingUiProm
             }
         }
     }
-    let _focus = set_focus_control;
 }
 
 fn resolve_bundle_source_dir() -> PathBuf {

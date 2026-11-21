@@ -11,6 +11,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -22,30 +23,56 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import dev.meshvpn.android.ffi.UiErrorInfo
 import dev.meshvpn.android.ffi.UiErrorKind
 import dev.meshvpn.android.ui.MainUiScreenState
+import dev.meshvpn.android.ui.theme.MeshTokens
 import dev.meshvpn.android.vpn.MeshSessionUiState
-import java.util.Locale
 import uniffi.mesh_mobile_ffi.MobileDaemonState
 import uniffi.mesh_mobile_ffi.MobileNetcheckResponse
-import uniffi.mesh_mobile_ffi.MobilePeerStatus
-import uniffi.mesh_mobile_ffi.MobilePingResponse
 import uniffi.mesh_mobile_ffi.MobileStatusSnapshot
 import uniffi.mesh_mobile_ffi.MobileWarningKind
+
+fun canonicalDaemonStateLabel(state: MobileDaemonState): String =
+    when (state) {
+        MobileDaemonState.STOPPED -> "Disconnected"
+        MobileDaemonState.DEVICE_LOCKED -> "Waiting for Unlock"
+        MobileDaemonState.CONNECTING -> "Connecting"
+        MobileDaemonState.CONNECTED -> "Connected"
+        MobileDaemonState.DEGRADED -> "Degraded"
+        MobileDaemonState.REAUTH_REQUIRED -> "Re-auth Required"
+        MobileDaemonState.REVOKED -> "Device Revoked"
+        MobileDaemonState.SERVER_UPGRADE_REQUIRED -> "Attention Required"
+    }
+
+fun daemonStateSemanticColor(state: MobileDaemonState): Color =
+    when (state) {
+        MobileDaemonState.CONNECTED -> MeshTokens.SemanticSuccess
+        MobileDaemonState.CONNECTING,
+        MobileDaemonState.DEGRADED,
+        MobileDaemonState.REAUTH_REQUIRED,
+        -> MeshTokens.SemanticWarning
+        MobileDaemonState.REVOKED,
+        MobileDaemonState.SERVER_UPGRADE_REQUIRED,
+        -> MeshTokens.SemanticError
+        MobileDaemonState.STOPPED,
+        MobileDaemonState.DEVICE_LOCKED,
+        -> MeshTokens.SemanticNeutral
+    }
 
 @Composable
 fun StatusScreen(
     screenState: MainUiScreenState,
     onToggleTunnel: () -> Unit,
-    onPingPeer: (String) -> Unit,
     onRunNetcheck: () -> Unit,
     onOpenVpnSettings: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
     onOpenDateTimeSettings: () -> Unit,
+    onOpenPeersTab: () -> Unit,
     onOpenSettingsTab: () -> Unit,
     onResetAndReenroll: () -> Unit,
     modifier: Modifier = Modifier,
@@ -87,10 +114,9 @@ fun StatusScreen(
             netcheck = session.lastNetcheckResult,
             onRunNetcheck = onRunNetcheck,
         )
-        PeersSection(
+        PeersSummaryCard(
             snapshot = session.snapshot,
-            lastPing = session.lastPingResult,
-            onPingPeer = onPingPeer,
+            onOpenPeersTab = onOpenPeersTab,
         )
     }
 }
@@ -104,6 +130,9 @@ private fun StatusHeaderCard(
         session.daemonState == MobileDaemonState.CONNECTED ||
             session.daemonState == MobileDaemonState.CONNECTING ||
             session.daemonState == MobileDaemonState.DEGRADED
+    val statusColor = daemonStateSemanticColor(session.daemonState)
+    val stateLabel = canonicalDaemonStateLabel(session.daemonState)
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -114,10 +143,19 @@ private fun StatusHeaderCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = "State: ${session.daemonState.name}",
-                    style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.testTag("daemon_state_label"),
+                AssistChip(
+                    onClick = {},
+                    colors =
+                        AssistChipDefaults.assistChipColors(
+                            labelColor = statusColor,
+                        ),
+                    label = {
+                        Text(
+                            text = stateLabel,
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.testTag("daemon_state_label"),
+                        )
+                    },
                 )
                 AssistChip(
                     onClick = {},
@@ -307,29 +345,46 @@ private fun ActionableErrorSection(
                     color = MaterialTheme.colorScheme.onErrorContainer,
                 )
             }
-            when (error.kind) {
-                UiErrorKind.CLOCK_SKEW ->
-                    OutlinedButton(onClick = onOpenDateTimeSettings) {
-                        Text("Date & Time Settings")
-                    }
-                UiErrorKind.CAPTIVE_PORTAL ->
-                    OutlinedButton(onClick = onOpenNetworkSettings) {
-                        Text("Network Settings")
-                    }
-                UiErrorKind.PIN_MISMATCH ->
-                    OutlinedButton(onClick = onOpenSettingsTab) {
-                        Text("Review Server Pin")
-                    }
-                UiErrorKind.NODE_REVOKED,
-                UiErrorKind.NODE_KEY_EXPIRED,
-                UiErrorKind.KEYSTORE_INVALIDATED,
-                ->
-                    OutlinedButton(onClick = onResetAndReenroll) {
-                        Text("Reset & Re-enroll")
-                    }
-                else -> Unit
-            }
+            ErrorRecoveryButton(
+                kind = error.kind,
+                onOpenDateTimeSettings = onOpenDateTimeSettings,
+                onOpenNetworkSettings = onOpenNetworkSettings,
+                onOpenSettingsTab = onOpenSettingsTab,
+                onResetAndReenroll = onResetAndReenroll,
+            )
         }
+    }
+}
+
+@Composable
+private fun ErrorRecoveryButton(
+    kind: UiErrorKind,
+    onOpenDateTimeSettings: () -> Unit,
+    onOpenNetworkSettings: () -> Unit,
+    onOpenSettingsTab: () -> Unit,
+    onResetAndReenroll: () -> Unit,
+) {
+    when (kind) {
+        UiErrorKind.CLOCK_SKEW ->
+            OutlinedButton(onClick = onOpenDateTimeSettings) {
+                Text("Date & Time Settings")
+            }
+        UiErrorKind.CAPTIVE_PORTAL ->
+            OutlinedButton(onClick = onOpenNetworkSettings) {
+                Text("Network Settings")
+            }
+        UiErrorKind.PIN_MISMATCH ->
+            OutlinedButton(onClick = onOpenSettingsTab) {
+                Text("Review Server Pin")
+            }
+        UiErrorKind.NODE_REVOKED,
+        UiErrorKind.NODE_KEY_EXPIRED,
+        UiErrorKind.KEYSTORE_INVALIDATED,
+        ->
+            OutlinedButton(onClick = onResetAndReenroll) {
+                Text("Reset & Re-enroll")
+            }
+        else -> Unit
     }
 }
 
@@ -403,91 +458,31 @@ private fun NetcheckSection(
 }
 
 @Composable
-private fun PeersSection(
+private fun PeersSummaryCard(
     snapshot: MobileStatusSnapshot?,
-    lastPing: MobilePingResponse?,
-    onPingPeer: (String) -> Unit,
+    onOpenPeersTab: () -> Unit,
 ) {
     val peers = snapshot?.peers.orEmpty()
-    Text("Peers (${peers.size})", style = MaterialTheme.typography.titleMedium)
-    lastPing?.let { ping ->
-        PingSummaryCard(ping = ping)
-    }
-    if (peers.isEmpty()) {
-        Text(
-            text = "No peers visible yet. Connect to receive mesh Netmap.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        return
-    }
-    for (peer in peers) {
-        PeerRowCard(peer = peer, onPingPeer = { onPingPeer(peer.overlayIp) })
-    }
-}
-
-@Composable
-private fun PingSummaryCard(ping: MobilePingResponse) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            val avg =
-                ping.avgRttMs?.let {
-                    String.format(Locale.US, "%.1f ms", it)
-                } ?: "timeout"
-            Text(
-                text = "Last Ping: ${ping.peerName} (${ping.peerOverlayIp}) avg=$avg",
-                style = MaterialTheme.typography.titleMedium,
-            )
-            for (sample in ping.samples) {
-                val rtt = sample.rttMs?.let { String.format(Locale.US, "%.1f ms", it) } ?: "--"
-                Text(
-                    text = "#${sample.seq} via ${sample.via.name}: $rtt",
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.labelMedium,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun PeerRowCard(
-    peer: MobilePeerStatus,
-    onPingPeer: () -> Unit,
-) {
+    val onlineCount = peers.count { it.online }
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier =
                 Modifier
                     .fillMaxWidth()
-                    .padding(12.dp),
+                    .padding(16.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Mesh Peers", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    text = "${peer.name} (${peer.overlayIp})",
-                    style = MaterialTheme.typography.titleMedium,
-                )
-                Text(
-                    text =
-                        "${peer.activePath.name} | online=${peer.online} | " +
-                            "rtt=${peer.rttMs ?: "-"} ms",
+                    text = "$onlineCount online of ${peers.size} total",
                     style = MaterialTheme.typography.bodyMedium,
-                )
-                Text(
-                    text = "RX ${peer.rxBytes} B / TX ${peer.txBytes} B",
-                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            OutlinedButton(onClick = onPingPeer, enabled = peer.online) {
-                Text("Ping")
+            OutlinedButton(onClick = onOpenPeersTab) {
+                Text("View Peers")
             }
         }
     }

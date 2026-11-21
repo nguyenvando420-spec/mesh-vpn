@@ -1,0 +1,342 @@
+import MeshCoreKit
+import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
+
+/// 4-state peer list filter mode (`US-120`, `ADR-028`).
+public enum PeerFilterMode: String, CaseIterable, Sendable {
+    case all
+    case online
+    case direct
+    case relay
+
+    public var displayTitle: String {
+        switch self {
+        case .all: return "All"
+        case .online: return "Online"
+        case .direct: return "Direct"
+        case .relay: return "Relay"
+        }
+    }
+}
+
+/// Counts for each 4-state peer filter chip.
+public struct PeerFilterCounts: Equatable, Sendable {
+    public let all: Int
+    public let online: Int
+    public let direct: Int
+    public let relay: Int
+
+    public init(all: Int, online: Int, direct: Int, relay: Int) {
+        self.all = all
+        self.online = online
+        self.direct = direct
+        self.relay = relay
+    }
+
+    public func count(for mode: PeerFilterMode) -> Int {
+        switch mode {
+        case .all: return all
+        case .online: return online
+        case .direct: return direct
+        case .relay: return relay
+        }
+    }
+}
+
+/// Pure peer filtering and count helpers for `PeersView` and XCTest (`US-120`).
+public enum PeerFilter: Sendable {
+    public static func counts(peers: [MobilePeerStatus]) -> PeerFilterCounts {
+        let onlineCount = peers.filter(\.online).count
+        let directCount = peers.filter { $0.online && $0.activePath == .direct }.count
+        let relayCount = peers.filter { $0.online && $0.activePath == .relay }.count
+        return PeerFilterCounts(
+            all: peers.count,
+            online: onlineCount,
+            direct: directCount,
+            relay: relayCount
+        )
+    }
+
+    public static func filter(
+        peers: [MobilePeerStatus],
+        mode: PeerFilterMode,
+        query: String
+    ) -> [MobilePeerStatus] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return peers.filter { peer in
+            matchesMode(peer, mode: mode) && matchesQuery(peer, needle: needle)
+        }
+    }
+
+    private static func matchesMode(_ peer: MobilePeerStatus, mode: PeerFilterMode) -> Bool {
+        switch mode {
+        case .all:
+            return true
+        case .online:
+            return peer.online
+        case .direct:
+            return peer.online && peer.activePath == .direct
+        case .relay:
+            return peer.online && peer.activePath == .relay
+        }
+    }
+
+    private static func matchesQuery(_ peer: MobilePeerStatus, needle: String) -> Bool {
+        if needle.isEmpty {
+            return true
+        }
+        return peer.name.lowercased().contains(needle)
+            || peer.fqdn.lowercased().contains(needle)
+            || peer.overlayIp.lowercased().contains(needle)
+            || peer.nodeId.lowercased().contains(needle)
+    }
+}
+
+/// Zone 2 tab with peer search, 4-state filter chips, standard IP/FQDN copy, and ping (`US-120`).
+@MainActor
+struct PeersView: View {
+    @ObservedObject var viewModel: AppViewModel
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var searchText = ""
+    @State private var selectedFilter: PeerFilterMode = .all
+    @State private var toastMessage: String?
+    @State private var toastDismissTask: Task<Void, Never>?
+
+    var body: some View {
+        NavigationView {
+            ZStack(alignment: .bottom) {
+                peersList
+                if let toastMessage {
+                    ToastBannerView(message: toastMessage)
+                        .padding(.bottom, 16)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .navigationTitle("Peers")
+            .searchable(
+                text: $searchText,
+                prompt: "Search name, FQDN, IP, or ID"
+            )
+            .refreshable {
+                await viewModel.refreshAllState()
+            }
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    private var peersList: some View {
+        let allPeers = viewModel.statusSnapshot?.peers ?? []
+        let counts = PeerFilter.counts(peers: allPeers)
+        let filtered = PeerFilter.filter(peers: allPeers, mode: selectedFilter, query: searchText)
+
+        return List {
+            Section {
+                PeerFilterBar(
+                    selectedFilter: $selectedFilter,
+                    counts: counts,
+                    colorScheme: colorScheme
+                )
+                .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+            }
+
+            if let ping = viewModel.lastPingResponse {
+                Section("Latest Ping") {
+                    PingSummaryView(ping: ping)
+                }
+            }
+
+            Section {
+                if filtered.isEmpty {
+                    Text(allPeers.isEmpty ? "No peers visible yet." : "No matching peers.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(filtered, id: \.nodeId) { peer in
+                        PeerRowView(
+                            peer: peer,
+                            canPing: viewModel.tunnelStatus == .connected && !viewModel.isBusy,
+                            colorScheme: colorScheme,
+                            onCopyIp: { copyValue(peer.overlayIp, label: "Overlay IP") },
+                            onCopyFqdn: { copyValue(peer.fqdn, label: "FQDN") },
+                            onPing: { Task { await viewModel.pingPeer(peer) } }
+                        )
+                    }
+                }
+                if viewModel.peersTruncatedNotice, let total = viewModel.totalPeerCount {
+                    Text("Showing compact peer slice from \(total) total peers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Peers (\(filtered.count))")
+            }
+        }
+    }
+
+    private func copyValue(_ value: String, label: String) {
+        viewModel.copyNonSecretAddress(value)
+        showToast("Copied \(label): \(value)")
+    }
+
+    private func showToast(_ message: String) {
+        toastDismissTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            toastMessage = message
+        }
+        toastDismissTask = Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                toastMessage = nil
+            }
+        }
+    }
+}
+
+private struct PeerFilterBar: View {
+    @Binding var selectedFilter: PeerFilterMode
+    let counts: PeerFilterCounts
+    let colorScheme: ColorScheme
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(PeerFilterMode.allCases, id: \.self) { mode in
+                    let isSelected = selectedFilter == mode
+                    let activeBg = MeshDesignTokens.brandPrimary(colorScheme: colorScheme)
+                    let chipCount = counts.count(for: mode)
+                    Button {
+                        selectedFilter = mode
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(mode.displayTitle)
+                            Text("\(chipCount)")
+                                .font(.caption2.monospacedDigit().weight(.semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(
+                                    isSelected
+                                        ? Color.white.opacity(0.24)
+                                        : Color.secondary.opacity(0.18)
+                                )
+                                .clipShape(Capsule())
+                        }
+                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(isSelected ? activeBg : Color.secondary.opacity(0.12))
+                        .foregroundStyle(isSelected ? Color.white : Color.primary)
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
+
+@MainActor
+private struct PeerRowView: View {
+    let peer: MobilePeerStatus
+    let canPing: Bool
+    let colorScheme: ColorScheme
+    let onCopyIp: @MainActor () -> Void
+    let onCopyFqdn: @MainActor () -> Void
+    let onPing: @MainActor () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(peer.name)
+                        .font(.headline)
+                    Text(peer.overlayIp)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                    Text(peer.fqdn)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    Text(pathSubtitle)
+                        .font(.caption2)
+                        .foregroundStyle(statusColor)
+                }
+                Spacer()
+                Button("Ping", action: onPing)
+                    .buttonStyle(.bordered)
+                    .disabled(!canPing)
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    onCopyIp()
+                } label: {
+                    Label("Copy IP", systemImage: "doc.on.doc")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+
+                if !peer.fqdn.isEmpty {
+                    Button {
+                        onCopyFqdn()
+                    } label: {
+                        Label("Copy FQDN", systemImage: "doc.on.doc")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var statusColor: Color {
+        let tone: MeshSemanticTone = peer.online ? .success : .neutral
+        return MeshDesignTokens.color(for: tone, colorScheme: colorScheme)
+    }
+
+    private var pathSubtitle: String {
+        let pathText = String(describing: peer.activePath)
+        if let rtt = peer.rttMs {
+            return "\(peer.online ? "Online" : "Offline") | \(pathText) | \(rtt) ms"
+        }
+        return "\(peer.online ? "Online" : "Offline") | \(pathText)"
+    }
+}
+
+private struct PingSummaryView: View {
+    let ping: MobilePingResponse
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Ping \(ping.peerName) (\(ping.peerOverlayIp))")
+                .font(.subheadline.weight(.medium))
+            if let avg = ping.avgRttMs {
+                Text(String(format: "Average RTT: %.1f ms", avg))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(ping.samples, id: \.seq) { sample in
+                let rttText = sample.rttMs.map { String(format: "%.1f ms", $0) } ?? "timeout"
+                Text("Seq \(sample.seq): \(String(describing: sample.via)) \(rttText)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct ToastBannerView: View {
+    let message: String
+
+    var body: some View {
+        Text(message)
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(.ultraThickMaterial)
+            .clipShape(Capsule())
+            .shadow(radius: 4)
+    }
+}

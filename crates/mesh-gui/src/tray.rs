@@ -50,16 +50,28 @@ pub(crate) enum TrayMenuItemModel {
     },
 }
 
+fn tr_or(key: &str, fallback: &str) -> String {
+    let localized = crate::i18n::t(key);
+    if localized.is_empty() {
+        fallback.to_owned()
+    } else {
+        localized.to_owned()
+    }
+}
+
 /// Builds the canonical 9-item System Tray context menu for the active `DerivedUiSnapshot`.
+///
+/// Uses sub-state-aware `display_label` (`ADR-030`) and `i18n::t()` skeleton keys (`US-126`).
 #[must_use]
 pub(crate) fn build_tray_menu_model(
     snapshot: &DerivedUiSnapshot,
     overlay_ip: Option<&str>,
     autostart_enabled: bool,
 ) -> Vec<TrayMenuItemModel> {
+    let state_display = snapshot.ui_state.display_label(snapshot.tunnel_sub_state);
     let status_text = match overlay_ip.filter(|s| !s.is_empty()) {
-        Some(ip) => format!("Status: {} ({ip})", snapshot.ui_state.label()),
-        None => format!("Status: {}", snapshot.ui_state.label()),
+        Some(ip) => format!("Status: {state_display} ({ip})"),
+        None => format!("Status: {state_display}"),
     };
 
     let ipc_ready = !matches!(
@@ -84,21 +96,21 @@ pub(crate) fn build_tray_menu_model(
         TrayMenuItemModel::Separator,
         TrayMenuItemModel::Action {
             id: IDM_OPEN_DASHBOARD,
-            label: "Open Dashboard".to_owned(),
+            label: tr_or("action.open_dashboard", "Open Dashboard"),
             enabled: true,
             checked: false,
             default: true,
         },
         TrayMenuItemModel::Action {
             id: IDM_CONNECT_UP,
-            label: "Connect".to_owned(),
+            label: tr_or("action.connect", "Connect"),
             enabled: connect_enabled,
             checked: false,
             default: false,
         },
         TrayMenuItemModel::Action {
             id: IDM_DISCONNECT,
-            label: "Disconnect".to_owned(),
+            label: tr_or("action.disconnect", "Disconnect"),
             enabled: disconnect_enabled,
             checked: false,
             default: false,
@@ -106,21 +118,21 @@ pub(crate) fn build_tray_menu_model(
         TrayMenuItemModel::Separator,
         TrayMenuItemModel::Action {
             id: IDM_NETCHECK,
-            label: "Run Netcheck Diagnostics".to_owned(),
+            label: tr_or("action.run_netcheck", "Run Netcheck Diagnostics"),
             enabled: ipc_ready,
             checked: false,
             default: false,
         },
         TrayMenuItemModel::Action {
             id: IDM_EXPORT_BUGREPORT,
-            label: "Export Bugreport (.tar)...".to_owned(),
+            label: tr_or("action.export_bugreport", "Export Bugreport (.tar)..."),
             enabled: ipc_ready,
             checked: false,
             default: false,
         },
         TrayMenuItemModel::Action {
             id: IDM_TOGGLE_AUTOSTART,
-            label: "Launch at Login".to_owned(),
+            label: tr_or("settings.launch_at_login", "Launch at Login"),
             enabled: true,
             checked: autostart_enabled,
             default: false,
@@ -128,14 +140,17 @@ pub(crate) fn build_tray_menu_model(
         TrayMenuItemModel::Separator,
         TrayMenuItemModel::Action {
             id: IDM_QUIT_KEEP_BACKGROUND,
-            label: "Quit Mesh VPN (Keep Connected in Background)".to_owned(),
+            label: tr_or(
+                "action.quit_keep_background",
+                "Quit Mesh VPN (Keep Connected in Background)",
+            ),
             enabled: true,
             checked: false,
             default: false,
         },
         TrayMenuItemModel::Action {
             id: IDM_DISCONNECT_AND_QUIT,
-            label: "Disconnect && Quit Mesh VPN".to_owned(),
+            label: tr_or("action.disconnect_and_quit", "Disconnect && Quit Mesh VPN"),
             enabled: true,
             checked: false,
             default: false,
@@ -246,6 +261,13 @@ impl TrayStateManager {
         }
     }
 
+    /// Shows an informational toast balloon (e.g. Copy Overlay IP / FQDN confirmation, `US-121`).
+    pub(crate) fn show_toast_balloon(&self, title: &str, body: &str) {
+        if let Some(icon) = &self.current_icon {
+            let _shown = self.controller.show_info_balloon(icon, title, body);
+        }
+    }
+
     /// Displays the native Win32 tray context menu at the cursor position and returns chosen ID.
     pub(crate) fn show_menu(
         &self,
@@ -282,5 +304,28 @@ impl TrayStateManager {
     /// Removes the tray icon from the Windows notification area prior to process exit.
     pub(crate) fn remove(&mut self) {
         self.controller.remove();
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::{TRAY_ICON_ID, TrayStateManager};
+
+    #[test]
+    fn test_tray_state_manager_constructor_and_surface_bindings() {
+        // Arrange & Act
+        let mgr = TrayStateManager::new(0);
+        let _methods = (
+            TrayStateManager::ensure_added_or_restore,
+            TrayStateManager::sync_state,
+            TrayStateManager::show_minimize_balloon_once,
+            TrayStateManager::show_toast_balloon,
+            TrayStateManager::show_menu,
+            TrayStateManager::remove,
+        );
+
+        // Assert
+        assert_eq!(TRAY_ICON_ID, 1);
+        assert!(format!("{mgr:?}").contains("TrayStateManager"));
     }
 }

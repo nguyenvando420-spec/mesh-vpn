@@ -1,6 +1,9 @@
 package dev.meshvpn.android.ui
 
 import dev.meshvpn.android.ffi.UiErrorKind
+import dev.meshvpn.android.ui.peers.PeerFilterMode
+import dev.meshvpn.android.ui.theme.InMemoryThemePrefsStore
+import dev.meshvpn.android.ui.theme.ThemeMode
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -163,5 +166,76 @@ class MeshMainViewModelTest {
             )
             assertNotNull(state.pendingShareBugreport)
             assertTrue(harness.lastCapturedBridge?.protectSocket(0) == true)
+        }
+
+    @Test
+    fun adminPinsResetWhenNavigatingFromSettingsToPeers() =
+        runTest {
+            // Arrange
+            val harness = MeshTestHarness(tempFolder.newFolder("vm_pins_peers"), this)
+            harness.viewModel.submitJoinUriInput("mesh://join?v=1")
+            harness.viewModel.setConnectOnConfirm(false)
+            harness.viewModel.confirmPendingJoin {}
+            harness.authResult = BiometricGateResult.Authenticated
+            harness.viewModel.selectTab(MainTab.SETTINGS)
+            harness.viewModel.toggleRevealAdminPins()
+            assertTrue(harness.viewModel.screenState.value.isAdminPinsRevealed)
+            assertTrue(harness.viewModel.screenState.value.requireFlagSecure)
+
+            // Act
+            harness.viewModel.selectTab(MainTab.PEERS)
+
+            // Assert
+            val state = harness.viewModel.screenState.value
+            assertEquals(MainTab.PEERS, state.activeTab)
+            assertFalse(state.isAdminPinsRevealed)
+            assertFalse(state.requireFlagSecure)
+        }
+
+    @Test
+    fun flagSecureScopeExcludesPeersTabEvenWhenSensitiveModalWasOpen() =
+        runTest {
+            // Arrange
+            val harness = MeshTestHarness(tempFolder.newFolder("vm_flag_secure"), this)
+            assertTrue(harness.viewModel.screenState.value.requireFlagSecure)
+
+            harness.viewModel.submitJoinUriInput("mesh://join?v=1")
+            harness.viewModel.setConnectOnConfirm(false)
+            harness.viewModel.confirmPendingJoin {}
+            assertFalse(harness.viewModel.screenState.value.requireFlagSecure)
+
+            // Act 1: sensitive modal on SETTINGS enables FLAG_SECURE
+            harness.viewModel.selectTab(MainTab.SETTINGS)
+            harness.viewModel.setSensitiveModalOpen(true)
+            assertTrue(harness.viewModel.screenState.value.requireFlagSecure)
+
+            // Act 2: switching to PEERS clears sensitive flags and disables FLAG_SECURE
+            harness.viewModel.selectTab(MainTab.PEERS)
+            val peersState = harness.viewModel.screenState.value
+            assertFalse(peersState.isSensitiveModalOpen)
+            assertFalse(peersState.requireFlagSecure)
+        }
+
+    @Test
+    fun themeModeAndPeerFiltersPersistAndUpdateScreenState() =
+        runTest {
+            // Arrange
+            val harness = MeshTestHarness(tempFolder.newFolder("vm_theme_filters"), this)
+            val store = InMemoryThemePrefsStore(ThemeMode.DARK)
+
+            // Act
+            harness.viewModel.attachThemePrefs(store)
+            assertEquals(ThemeMode.DARK, harness.viewModel.screenState.value.themeMode)
+
+            harness.viewModel.selectThemeMode(ThemeMode.LIGHT)
+            harness.viewModel.updatePeerSearchQuery("edge")
+            harness.viewModel.selectPeerFilterMode(PeerFilterMode.DIRECT)
+
+            // Assert
+            val state = harness.viewModel.screenState.value
+            assertEquals(ThemeMode.LIGHT, state.themeMode)
+            assertEquals(ThemeMode.LIGHT, store.loadThemeMode())
+            assertEquals("edge", state.peerSearchQuery)
+            assertEquals(PeerFilterMode.DIRECT, state.peerFilterMode)
         }
 }

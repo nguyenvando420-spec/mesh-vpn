@@ -96,6 +96,7 @@ struct MeshApp: App {
     @NSApplicationDelegateAdaptor(MeshAppDelegate.self) private var appDelegate
     @StateObject private var store: DesktopStore
     @StateObject private var lifecycle: AppLifecycleCoordinator
+    @StateObject private var themeManager = ThemeManager()
 
     @MainActor
     init() {
@@ -109,10 +110,12 @@ struct MeshApp: App {
 
     var body: some Scene {
         Window("Mesh VPN", id: "dashboard") {
-            DashboardWindowView(store: store)
+            DashboardWindowView(store: store, themeManager: themeManager)
                 .frame(minWidth: 760, minHeight: 540)
+                .preferredColorScheme(themeManager.preferredColorScheme)
                 .onAppear {
                     appDelegate.store = store
+                    themeManager.applyAppearance()
                     if !CommandLine.arguments.contains("--minimized") {
                         NSApp.setActivationPolicy(.regular)
                         NSApp.activate(ignoringOtherApps: true)
@@ -127,13 +130,17 @@ struct MeshApp: App {
 
         MenuBarExtra {
             MenuBarContentView(store: store, appDelegate: appDelegate)
+                .preferredColorScheme(themeManager.preferredColorScheme)
         } label: {
             Label(
                 "Mesh VPN",
                 systemImage: store.menuBarGroup.symbolName
             )
+            .symbolRenderingMode(.palette)
+            .foregroundStyle(MeshPalette.color(for: store.menuBarGroup))
             .onAppear {
                 appDelegate.store = store
+                themeManager.applyAppearance()
             }
         }
     }
