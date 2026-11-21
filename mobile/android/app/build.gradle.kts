@@ -84,6 +84,12 @@ android {
         }
     }
 
+    bundle {
+        language {
+            enableSplit = false
+        }
+    }
+
     lint {
         warningsAsErrors = true
         abortOnError = true
