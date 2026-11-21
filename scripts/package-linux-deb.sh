@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 BIN_DIR=""
 OUT_DIR=""
-VERSION="0.3.0"
+VERSION="0.4.0"
 DEB_ARCH="amd64"
 DEB_NAME="mesh-vpn-linux-amd64.deb"
 DRY_RUN=0

@@ -222,9 +222,64 @@ try {
             }
         }
     }
+    # 2e. Cross-platform SemVer 0.4.0 synchronization (ADR-031)
+    $CargoToml = Join-Path $RepoRoot "Cargo.toml"
+    if (Test-Path $CargoToml) {
+        $CargoRaw = Get-Content -Path $CargoToml -Raw
+        if ($CargoRaw -notmatch '(?m)^version\s*=\s*"0\.4\.0"\s*$') {
+            Write-Error "SemVer drift in Cargo.toml: expected workspace.package version = `"0.4.0`""
+            exit 1
+        }
+        if ($CargoRaw -match 'version\s*=\s*"0\.3\.0"') {
+            Write-Error "Stale 0.3.0 version found in Cargo.toml"
+            exit 1
+        }
+        $CrateTomls = Get-ChildItem -Path (Join-Path $RepoRoot "crates") -Filter "Cargo.toml" -Recurse -File
+        foreach ($ct in $CrateTomls) {
+            $ctRaw = Get-Content -Path $ct.FullName -Raw
+            if ($ctRaw -match 'version\s*=\s*"0\.3\.0"') {
+                $rel = $ct.FullName.Substring($RepoRoot.Length + 1).Replace("\", "/")
+                Write-Error "Stale 0.3.0 dependency/package version found in $rel"
+                exit 1
+            }
+        }
+        $MacProj = Join-Path $RepoRoot "desktop\macos\project.yml"
+        if ((Test-Path $MacProj) -and ((Get-Content -Path $MacProj -Raw) -notmatch 'MARKETING_VERSION:\s*"0\.4\.0"')) {
+            Write-Error "SemVer drift in desktop/macos/project.yml: expected MARKETING_VERSION: `"0.4.0`""
+            exit 1
+        }
+        $MacUiState = Join-Path $RepoRoot "desktop\macos\MeshDesktopCore\Sources\MeshDesktopCore\Models\DesktopUiState.swift"
+        if ((Test-Path $MacUiState) -and ((Get-Content -Path $MacUiState -Raw) -notmatch 'appBundleVersion\s*=\s*"0\.4\.0"')) {
+            Write-Error "SemVer drift in DesktopUiState.swift: expected appBundleVersion = `"0.4.0`""
+            exit 1
+        }
+        $AndroidGradle = Join-Path $RepoRoot "mobile\android\app\build.gradle.kts"
+        if (Test-Path $AndroidGradle) {
+            $gradleRaw = Get-Content -Path $AndroidGradle -Raw
+            if ($gradleRaw -notmatch 'versionCode\s*=\s*40000\b' -or $gradleRaw -notmatch 'versionName\s*=\s*"0\.4\.0"') {
+                Write-Error "SemVer drift in mobile/android/app/build.gradle.kts: expected versionCode = 40000 and versionName = `"0.4.0`""
+                exit 1
+            }
+        }
+        $IosProj = Join-Path $RepoRoot "mobile\ios\project.yml"
+        if ((Test-Path $IosProj) -and ((Get-Content -Path $IosProj -Raw) -notmatch 'MARKETING_VERSION:\s*"0\.4\.0"')) {
+            Write-Error "SemVer drift in mobile/ios/project.yml: expected MARKETING_VERSION: `"0.4.0`""
+            exit 1
+        }
+        $IosConst = Join-Path $RepoRoot "mobile\ios\MeshCoreKit\Sources\MeshConstants.swift"
+        if ((Test-Path $IosConst) -and ((Get-Content -Path $IosConst -Raw) -notmatch 'agentVersion\s*=\s*"0\.4\.0"')) {
+            Write-Error "SemVer drift in mobile/ios/MeshCoreKit/Sources/MeshConstants.swift: expected agentVersion = `"0.4.0`""
+            exit 1
+        }
+        $DebPkg = Join-Path $RepoRoot "scripts\package-linux-deb.sh"
+        if ((Test-Path $DebPkg) -and ((Get-Content -Path $DebPkg -Raw) -notmatch 'VERSION="0\.4\.0"')) {
+            Write-Error "SemVer drift in scripts/package-linux-deb.sh: expected VERSION=`"0.4.0`""
+            exit 1
+        }
+    }
+
     Write-Host "    Static repository rules PASSED." -ForegroundColor Green
 
-    $CargoToml = Join-Path $RepoRoot "Cargo.toml"
     if (-not (Test-Path $CargoToml)) {
         Write-Host "==> [SKIP] Cargo.toml workspace not yet initialized (pre-Gate-2 design phase). Static checks PASSED." -ForegroundColor Yellow
         exit 0

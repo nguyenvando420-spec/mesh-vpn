@@ -1336,7 +1336,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mesh"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1385,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "data-encoding",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-crypto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-datapath"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-gui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "hyper",
@@ -1480,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-mobile-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-net"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
  "mesh-core",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "mesh-sys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "jni",
  "libc",
@@ -1615,14 +1615,14 @@ dependencies = [
 
 [[package]]
 name = "mesh-uniffi-bindgen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "uniffi",
 ]
 
 [[package]]
 name = "meshd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

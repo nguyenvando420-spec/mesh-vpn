@@ -211,6 +211,49 @@ if [ -d "desktop/macos" ]; then
   fi
 fi
 
+# 2e. Cross-platform SemVer 0.4.0 synchronization (ADR-031)
+if [ -f "Cargo.toml" ]; then
+  if ! grep -qE '^version = "0\.4\.0"$' Cargo.toml; then
+    echo "ERROR: SemVer drift in Cargo.toml: expected workspace.package version = \"0.4.0\"" >&2
+    exit 1
+  fi
+  STALE_CARGO_VER=$(grep -HnE 'version[[:space:]]*=[[:space:]]*"0\.3\.0"' Cargo.toml crates/*/Cargo.toml || true)
+  if [ -n "$STALE_CARGO_VER" ]; then
+    echo "ERROR: Stale 0.3.0 version found in Cargo.toml manifests:" >&2
+    echo "$STALE_CARGO_VER" >&2
+    exit 1
+  fi
+  if [ -f "desktop/macos/project.yml" ] && ! grep -qE 'MARKETING_VERSION:[[:space:]]*"0\.4\.0"' desktop/macos/project.yml; then
+    echo "ERROR: SemVer drift in desktop/macos/project.yml: expected MARKETING_VERSION: \"0.4.0\"" >&2
+    exit 1
+  fi
+  if [ -f "desktop/macos/MeshDesktopCore/Sources/MeshDesktopCore/Models/DesktopUiState.swift" ] && \
+     ! grep -qE 'appBundleVersion[[:space:]]*=[[:space:]]*"0\.4\.0"' desktop/macos/MeshDesktopCore/Sources/MeshDesktopCore/Models/DesktopUiState.swift; then
+    echo "ERROR: SemVer drift in DesktopUiState.swift: expected appBundleVersion = \"0.4.0\"" >&2
+    exit 1
+  fi
+  if [ -f "mobile/android/app/build.gradle.kts" ]; then
+    if ! grep -qE 'versionCode[[:space:]]*=[[:space:]]*40000([^0-9]|$)' mobile/android/app/build.gradle.kts || \
+       ! grep -qE 'versionName[[:space:]]*=[[:space:]]*"0\.4\.0"' mobile/android/app/build.gradle.kts; then
+      echo "ERROR: SemVer drift in mobile/android/app/build.gradle.kts: expected versionCode = 40000 and versionName = \"0.4.0\"" >&2
+      exit 1
+    fi
+  fi
+  if [ -f "mobile/ios/project.yml" ] && ! grep -qE 'MARKETING_VERSION:[[:space:]]*"0\.4\.0"' mobile/ios/project.yml; then
+    echo "ERROR: SemVer drift in mobile/ios/project.yml: expected MARKETING_VERSION: \"0.4.0\"" >&2
+    exit 1
+  fi
+  if [ -f "mobile/ios/MeshCoreKit/Sources/MeshConstants.swift" ] && \
+     ! grep -qE 'agentVersion[[:space:]]*=[[:space:]]*"0\.4\.0"' mobile/ios/MeshCoreKit/Sources/MeshConstants.swift; then
+    echo "ERROR: SemVer drift in MeshConstants.swift: expected agentVersion = \"0.4.0\"" >&2
+    exit 1
+  fi
+  if [ -f "scripts/package-linux-deb.sh" ] && ! grep -qE 'VERSION="0\.4\.0"' scripts/package-linux-deb.sh; then
+    echo "ERROR: SemVer drift in scripts/package-linux-deb.sh: expected VERSION=\"0.4.0\"" >&2
+    exit 1
+  fi
+fi
+
 echo "    Static repository rules PASSED."
 
 if [ ! -f "Cargo.toml" ]; then

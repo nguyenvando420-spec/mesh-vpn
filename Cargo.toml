@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "tools/uniffi-bindgen"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
@@ -37,14 +37,14 @@ wildcard_imports = "deny"
 
 [workspace.dependencies]
 # Internal workspace crates
-mesh-core = { path = "crates/mesh-core", version = "0.3.0" }
-mesh-sys = { path = "crates/mesh-sys", version = "0.3.0" }
-mesh-crypto = { path = "crates/mesh-crypto", version = "0.3.0" }
-mesh-proto = { path = "crates/mesh-proto", version = "0.3.0" }
-mesh-net = { path = "crates/mesh-net", version = "0.3.0" }
-mesh-store = { path = "crates/mesh-store", version = "0.3.0" }
-mesh-datapath = { path = "crates/mesh-datapath", version = "0.3.0" }
-mesh-client = { path = "crates/mesh-client", version = "0.3.0" }
+mesh-core = { path = "crates/mesh-core", version = "0.4.0" }
+mesh-sys = { path = "crates/mesh-sys", version = "0.4.0" }
+mesh-crypto = { path = "crates/mesh-crypto", version = "0.4.0" }
+mesh-proto = { path = "crates/mesh-proto", version = "0.4.0" }
+mesh-net = { path = "crates/mesh-net", version = "0.4.0" }
+mesh-store = { path = "crates/mesh-store", version = "0.4.0" }
+mesh-datapath = { path = "crates/mesh-datapath", version = "0.4.0" }
+mesh-client = { path = "crates/mesh-client", version = "0.4.0" }
 
 # Async runtime & utilities
 tokio = { version = "1.44", features = ["full"] }

@@ -33,7 +33,7 @@ public enum AgentDefaults: Sendable {
     public static let launchdPlistPath = "/Library/LaunchDaemons/internal.mesh.meshd.plist"
     public static let stateDirPath = "/var/db/mesh"
     public static let appBundlePath = "/Applications/Mesh VPN.app"
-    public static let appBundleVersion = "0.3.0"
+    public static let appBundleVersion = "0.4.0"
     public static let loggerSubsystem = "dev.meshvpn.macos"
 
     public static let reservedHostnames: Set<String> = [

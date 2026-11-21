@@ -686,7 +686,7 @@ fn test_macos_bundle_swift_packaging_and_windows_installer_invariants() -> Resul
     assert!(project_yml.contains("ENABLE_APP_SANDBOX: \"NO\""));
     assert!(project_yml.contains("SWIFT_VERSION: \"6.0\""));
     assert!(project_yml.contains("SWIFT_STRICT_CONCURRENCY: complete"));
-    assert!(project_yml.contains("MARKETING_VERSION: \"0.3.0\""));
+    assert!(project_yml.contains("MARKETING_VERSION: \"0.4.0\""));
 
     let info_plist = read_repo_file("desktop/macos/MeshVPNApp/Resources/Info.plist")?;
     assert!(info_plist.contains("<key>LSUIElement</key>"));

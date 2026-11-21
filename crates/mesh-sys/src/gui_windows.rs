@@ -23,9 +23,11 @@ use windows_sys::Win32::Foundation::{
     GENERIC_WRITE, GetLastError, GlobalFree, HANDLE, HLOCAL, HWND, INVALID_HANDLE_VALUE, LPARAM,
     LRESULT, LocalFree, RECT, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, CreateBitmap, CreateFontIndirectW, CreateFontW, DeleteObject, HBRUSH, HGDIOBJ,
-    UpdateWindow,
+    BeginPaint, COLOR_BTNFACE, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC,
+    CreateFontIndirectW, CreateFontW, DeleteDC, DeleteObject, EndPaint, HBRUSH, HDC, HGDIOBJ,
+    InvalidateRect, PAINTSTRUCT, UpdateWindow,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -62,8 +64,9 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+    REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW,
 };
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
@@ -82,6 +85,7 @@ use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessId, OpenEventW, OpenProcessToken, OpenThreadToken, SetEvent,
     Sleep, WaitForMultipleObjects, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -114,14 +118,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     LBS_NOTIFY, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
     MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow,
     NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SM_CXSMICON, SMTO_ABORTIFHUNG, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SW_SHOWNORMAL, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetProcessDPIAware,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_ENDSESSION, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETFONT,
-    WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_EX_CONTROLPARENT, WS_GROUP,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    SM_CXSMICON, SMTO_ABORTIFHUNG, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SendMessageTimeoutW, SendMessageW, SetForegroundWindow,
+    SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    SystemParametersInfoW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
+    WM_ENDSESSION, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WS_BORDER, WS_CHILD, WS_EX_CONTROLPARENT, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows_sys::core::GUID;
 
@@ -356,6 +361,120 @@ impl Drop for OwnedGdiObj {
         if !self.0.is_null() {
             // SAFETY: `self.0` is a live GDI object owned exclusively by `self`.
             let _deleted = unsafe { DeleteObject(self.0) };
+        }
+    }
+}
+
+/// RAII guard deleting a Win32 memory DC (`DeleteDC`) on drop.
+///
+/// Do NOT use for DCs returned by `BeginPaint` (use [`PaintGuard`]) or `GetDC`.
+pub struct OwnedMemDc(isize);
+
+impl OwnedMemDc {
+    /// Creates a memory DC compatible with `hdc_ref` (`CreateCompatibleDC`).
+    ///
+    /// Passing `0` creates a memory DC compatible with the application's current screen.
+    #[must_use]
+    pub fn from_compatible(hdc_ref: isize) -> Option<Self> {
+        // SAFETY: `CreateCompatibleDC` accepts null (`0`) or a live `HDC` and returns a new
+        // memory DC (or null on failure).
+        let mem_dc = unsafe { CreateCompatibleDC(hdc_ref as HDC) };
+        if mem_dc.is_null() {
+            None
+        } else {
+            Some(Self(mem_dc as isize))
+        }
+    }
+
+    /// Borrows the underlying raw `HDC` handle as `isize`.
+    #[must_use]
+    pub const fn as_raw(&self) -> isize {
+        self.0
+    }
+}
+
+impl fmt::Debug for OwnedMemDc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OwnedMemDc(0x{:x})", self.0)
+    }
+}
+
+impl Drop for OwnedMemDc {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            // SAFETY: `self.0` is a live memory DC owned exclusively by `self`.
+            unsafe {
+                DeleteDC(self.0 as _);
+            }
+        }
+    }
+}
+
+/// RAII guard calling `EndPaint` on drop for a `BeginPaint` session.
+pub struct PaintGuard {
+    hwnd: isize,
+    ps: PAINTSTRUCT,
+    hdc: isize,
+}
+
+impl PaintGuard {
+    /// Begins painting for `hwnd` (`BeginPaint`), returning `None` if invalid or failed.
+    #[must_use]
+    pub fn begin(hwnd: isize) -> Option<Self> {
+        if hwnd == 0 {
+            return None;
+        }
+        // SAFETY: `PAINTSTRUCT` does not derive `Default` in `windows-sys 0.59`, and
+        // zero-initialization is valid prior to `BeginPaint`.
+        let mut ps: PAINTSTRUCT = unsafe { std::mem::zeroed() };
+        // SAFETY: `hwnd` is a non-zero live window handle validated by the caller.
+        let hdc = unsafe { BeginPaint(hwnd as HWND, &raw mut ps) };
+        if hdc.is_null() {
+            None
+        } else {
+            Some(Self {
+                hwnd,
+                ps,
+                hdc: hdc as isize,
+            })
+        }
+    }
+
+    /// Returns the paint `HDC` handle as `isize`.
+    #[must_use]
+    pub const fn hdc(&self) -> isize {
+        self.hdc
+    }
+
+    /// Returns the invalid paint rectangle as [`ControlRect`].
+    #[must_use]
+    pub const fn rect(&self) -> ControlRect {
+        ControlRect {
+            x: self.ps.rcPaint.left,
+            y: self.ps.rcPaint.top,
+            w: self.ps.rcPaint.right.saturating_sub(self.ps.rcPaint.left),
+            h: self.ps.rcPaint.bottom.saturating_sub(self.ps.rcPaint.top),
+        }
+    }
+}
+
+impl fmt::Debug for PaintGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "PaintGuard(hwnd=0x{:x}, hdc=0x{:x})",
+            self.hwnd, self.hdc
+        )
+    }
+}
+
+impl Drop for PaintGuard {
+    fn drop(&mut self) {
+        if self.hwnd != 0 {
+            // SAFETY: `self.hwnd` and `self.ps` match the earlier `BeginPaint` call.
+            unsafe {
+                EndPaint(self.hwnd as HWND, &raw const self.ps);
+            }
         }
     }
 }
@@ -3067,6 +3186,178 @@ pub fn post_app_message(hwnd: isize, msg: u32, wparam: usize, lparam: isize) {
     let _posted = unsafe { PostMessageW(hwnd as HWND, msg, wparam, lparam) };
 }
 
+/// Creates a memory DC compatible with `hdc` and a sized off-screen bitmap `(width, height)`.
+#[must_use]
+pub fn create_double_buffer(
+    hdc: isize,
+    width: i32,
+    height: i32,
+) -> Option<(OwnedMemDc, OwnedGdiObj)> {
+    if hdc == 0 || width <= 0 || height <= 0 {
+        return None;
+    }
+    let mem_dc = OwnedMemDc::from_compatible(hdc)?;
+    // SAFETY: `hdc` is a valid non-zero DC and `width`/`height` are strictly positive.
+    let raw_bmp = unsafe { CreateCompatibleBitmap(hdc as HDC, width, height) };
+    let bmp = OwnedGdiObj::from_raw(raw_bmp.cast::<c_void>())?;
+    Some((mem_dc, bmp))
+}
+
+/// Applies or clears the DWM immersive dark titlebar attribute on `hwnd`.
+///
+/// Uses `DWMWA_USE_IMMERSIVE_DARK_MODE` (`20`) and falls back to `19` on older Windows 10 builds.
+pub fn apply_window_dark_titlebar(hwnd: isize, is_dark: bool) {
+    if hwnd == 0 {
+        return;
+    }
+    const DWM_DARK_ATTR_PRE_20H1: u32 = 19;
+    let value: i32 = i32::from(is_dark);
+    let attr = u32::try_from(DWMWA_USE_IMMERSIVE_DARK_MODE).unwrap_or(20);
+    let val_size = u32::try_from(size_of::<i32>()).unwrap_or(4);
+    // SAFETY: `hwnd` is non-zero and `value` is a live stack `i32` matching `val_size`.
+    let hr = unsafe {
+        DwmSetWindowAttribute(
+            hwnd as HWND,
+            attr,
+            (&raw const value).cast::<c_void>(),
+            val_size,
+        )
+    };
+    if hr < 0 {
+        // SAFETY: Pre-20H1 Windows 10 fallback attribute `19` with the same `value` buffer.
+        let _fallback_hr = unsafe {
+            DwmSetWindowAttribute(
+                hwnd as HWND,
+                DWM_DARK_ATTR_PRE_20H1,
+                (&raw const value).cast::<c_void>(),
+                val_size,
+            )
+        };
+    }
+}
+
+fn open_hkcu_subkey_readonly(subkey: &str, operation: &'static str) -> Option<OwnedRegKey> {
+    let subkey_wide = encode_wide_nul_str(subkey, operation).ok()?;
+    let mut raw_key: HKEY = ptr::null_mut();
+    // SAFETY: `subkey_wide` is NUL-terminated UTF-16 under `HKEY_CURRENT_USER`.
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey_wide.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &raw mut raw_key,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    OwnedRegKey::from_raw(raw_key)
+}
+
+/// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
+///
+/// Returns `true` (light theme) when the key or value is absent or unreadable (`ADR-027`).
+#[must_use]
+pub fn read_windows_apps_use_light_theme() -> bool {
+    const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+    const OP: &str = "gui_windows::read_windows_apps_use_light_theme";
+    let Some(key) = open_hkcu_subkey_readonly(SUBKEY, OP) else {
+        return true;
+    };
+    let Ok(val_wide) = encode_wide_nul_str("AppsUseLightTheme", OP) else {
+        return true;
+    };
+    let mut value_type: u32 = 0;
+    let mut data: u32 = 1;
+    let mut data_len = u32::try_from(size_of::<u32>()).unwrap_or(4);
+    // SAFETY: `key` is an open registry handle, `val_wide` is NUL-terminated UTF-16, and
+    // `data` is 4-byte stack storage matching `data_len`.
+    let rc = unsafe {
+        RegQueryValueExW(
+            key.as_raw(),
+            val_wide.as_ptr(),
+            ptr::null_mut(),
+            &raw mut value_type,
+            (&raw mut data).cast::<u8>(),
+            &raw mut data_len,
+        )
+    };
+    if rc == ERROR_SUCCESS && value_type == REG_DWORD && data_len == 4 {
+        data != 0
+    } else {
+        true
+    }
+}
+
+/// Queries whether Windows High Contrast mode is currently active (`SPI_GETHIGHCONTRAST`).
+#[must_use]
+pub fn detect_high_contrast() -> bool {
+    // SAFETY: `HIGHCONTRASTW` is a plain Win32 C struct zero-initialized before setting `cbSize`.
+    let mut hc: HIGHCONTRASTW = unsafe { mem::zeroed() };
+    let cb_size = u32::try_from(size_of::<HIGHCONTRASTW>()).unwrap_or(0);
+    hc.cbSize = cb_size;
+    // SAFETY: `uiParam` and `hc.cbSize` both equal `size_of::<HIGHCONTRASTW>()`.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            cb_size,
+            (&raw mut hc).cast::<c_void>(),
+            0,
+        )
+    };
+    ok != 0 && (hc.dwFlags & HCF_HIGHCONTRASTON) != 0
+}
+
+/// Reads `HKCU\Control Panel\International\LocaleName` and returns `true` for Vietnamese (`vi*`).
+#[must_use]
+pub fn detect_windows_system_locale_is_vi() -> bool {
+    const SUBKEY: &str = r"Control Panel\International";
+    const OP: &str = "gui_windows::detect_windows_system_locale_is_vi";
+    let Some(key) = open_hkcu_subkey_readonly(SUBKEY, OP) else {
+        return false;
+    };
+    let Ok(val_wide) = encode_wide_nul_str("LocaleName", OP) else {
+        return false;
+    };
+    let mut value_type: u32 = 0;
+    let mut buf = [0_u16; 64];
+    let mut byte_len = u32::try_from(size_of_val(&buf)).unwrap_or(128);
+    // SAFETY: `buf` provides `byte_len` writable bytes for `RegQueryValueExW`.
+    let rc = unsafe {
+        RegQueryValueExW(
+            key.as_raw(),
+            val_wide.as_ptr(),
+            ptr::null_mut(),
+            &raw mut value_type,
+            buf.as_mut_ptr().cast::<u8>(),
+            &raw mut byte_len,
+        )
+    };
+    if rc != ERROR_SUCCESS || value_type != REG_SZ {
+        return false;
+    }
+    let units = usize::try_from(byte_len / 2).unwrap_or(0).min(buf.len());
+    let nul_pos = buf
+        .get(..units)
+        .and_then(|s| s.iter().position(|&c| c == 0))
+        .unwrap_or(units);
+    let locale = String::from_utf16_lossy(buf.get(..nul_pos).unwrap_or(&[]));
+    locale.trim().to_ascii_lowercase().starts_with("vi")
+}
+
+/// Invalidates the entire client area of `hwnd` and requests immediate repaint (`UpdateWindow`).
+pub fn invalidate_window(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    // SAFETY: `hwnd` is a non-zero live window handle and null rect invalidates the full client area.
+    unsafe {
+        let _inv = InvalidateRect(hwnd as HWND, ptr::null(), 1);
+        let _upd = UpdateWindow(hwnd as HWND);
+    }
+}
+
 fn get_focused_control_id() -> u16 {
     // SAFETY: Returns focused `HWND` on current thread (or null).
     let focused = unsafe { GetFocus() };
@@ -4231,9 +4522,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        HANDOFF_PIPE_PREFIX, TrayStatusIconKind, UnprivilegedSinkWriter, WIN_ERROR_CANCELLED,
-        create_tray_status_icon, init_common_controls, is_uac_cancelled_error,
+        HANDOFF_PIPE_PREFIX, OwnedMemDc, PaintGuard, TrayStatusIconKind, UnprivilegedSinkWriter,
+        WIN_ERROR_CANCELLED, apply_window_dark_titlebar, create_double_buffer,
+        create_tray_status_icon, detect_high_contrast, detect_windows_system_locale_is_vi,
+        init_common_controls, invalidate_window, is_uac_cancelled_error,
         is_valid_handoff_pipe_name, open_anti_toctou_read_locked,
+        read_windows_apps_use_light_theme,
     };
     use crate::error::SysError;
 
@@ -4325,5 +4619,26 @@ mod tests {
 
         // Assert
         assert!(res.is_ok(), "init_common_controls failed: {res:?}");
+    }
+
+    #[test]
+    fn test_gdi_dwm_raii_and_safe_wrapper_stubs_on_windows() {
+        // Arrange & Act
+        let mem_dc = OwnedMemDc::from_compatible(0);
+        let null_paint = PaintGuard::begin(0);
+        let null_buf = create_double_buffer(0, 64, 32);
+        apply_window_dark_titlebar(0, true);
+        invalidate_window(0);
+        let _light = read_windows_apps_use_light_theme();
+        let _hc = detect_high_contrast();
+        let _is_vi = detect_windows_system_locale_is_vi();
+
+        // Assert
+        assert!(null_paint.is_none());
+        assert!(null_buf.is_none());
+        if let Some(dc) = mem_dc {
+            assert_ne!(dc.as_raw(), 0);
+            assert!(format!("{dc:?}").starts_with("OwnedMemDc(0x"));
+        }
     }
 }

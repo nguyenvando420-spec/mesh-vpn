@@ -16,6 +16,8 @@ mod clipboard;
 mod diagnostics_view;
 #[cfg(target_os = "windows")]
 mod elevation_worker;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod i18n;
 #[cfg(target_os = "windows")]
 mod icons;
 #[cfg(target_os = "windows")]
@@ -26,8 +28,14 @@ mod linux_gui;
 mod onboarding;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod peers_view;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod prefs;
 #[cfg(target_os = "windows")]
 mod single_instance;
+#[cfg(target_os = "windows")]
+mod status_view;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod theme;
 #[cfg(target_os = "windows")]
 mod tray;
 #[cfg(target_os = "windows")]
@@ -75,7 +83,31 @@ fn init_gui_logging(is_worker: bool) -> Option<LogGuard> {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn bind_unified_ui_skeletons() {
+    let _load_prefs = prefs::load_prefs;
+    let _save_prefs = prefs::save_prefs;
+    let _i18n_t = i18n::t;
+    let _i18n_t_for = i18n::t_for;
+    let _modes = (
+        theme::ThemeMode::System,
+        theme::ThemeMode::Light,
+        theme::ThemeMode::Dark,
+        i18n::LocaleMode::System,
+        i18n::LocaleMode::En,
+        i18n::LocaleMode::Vi,
+    );
+    #[cfg(target_os = "windows")]
+    {
+        let _resolve_palette = theme::resolve_palette;
+        let _paint_status_zone = status_view::paint_status_zone;
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    bind_unified_ui_skeletons();
+
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         tracing::info!(
