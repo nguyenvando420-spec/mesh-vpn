@@ -68,8 +68,8 @@ fun countPeersByMode(peers: List<MobilePeerStatus>): PeerFilterCounts =
     PeerFilterCounts(
         all = peers.size,
         online = peers.count { it.online },
-        direct = peers.count { it.activePath == MobileActivePathKind.DIRECT },
-        relay = peers.count { it.activePath == MobileActivePathKind.RELAY },
+        direct = peers.count { it.online && it.activePath == MobileActivePathKind.DIRECT },
+        relay = peers.count { it.online && it.activePath == MobileActivePathKind.RELAY },
     )
 
 fun filterPeers(
@@ -83,8 +83,10 @@ fun filterPeers(
             when (mode) {
                 PeerFilterMode.ALL -> true
                 PeerFilterMode.ONLINE -> peer.online
-                PeerFilterMode.DIRECT -> peer.activePath == MobileActivePathKind.DIRECT
-                PeerFilterMode.RELAY -> peer.activePath == MobileActivePathKind.RELAY
+                PeerFilterMode.DIRECT ->
+                    peer.online && peer.activePath == MobileActivePathKind.DIRECT
+                PeerFilterMode.RELAY ->
+                    peer.online && peer.activePath == MobileActivePathKind.RELAY
             }
         if (!matchesMode) {
             false
@@ -162,52 +164,47 @@ fun PeersScreen(
             }
         }
 
-        if (allPeers.isEmpty()) {
+        if (allPeers.isEmpty() || filteredPeers.isEmpty()) {
             item(span = { GridItemSpan(maxLineSpan) }) {
-                Text(
-                    text = stringResource(R.string.diag_no_peers),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        } else if (filteredPeers.isEmpty()) {
-            item(span = { GridItemSpan(maxLineSpan) }) {
-                Text(
-                    text =
-                        LocaleHelper.tr(
-                            context,
-                            "No peers match the current search or filter.",
-                            "Không có thiết bị nào khớp với tìm kiếm hoặc bộ lọc.",
-                        ),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                PeersEmptyStateMessage(allPeersEmpty = allPeers.isEmpty())
             }
         } else {
             items(items = filteredPeers, key = { it.nodeId }) { peer ->
                 PeerDetailCard(
                     peer = peer,
                     onCopyIp = {
-                        copyNonSecretText(
-                            context = context,
-                            label = ipTitle,
-                            value = peer.overlayIp,
-                            toastMessage = "$copiedLabel: ${peer.overlayIp}",
-                        )
+                        val toast = "$copiedLabel: ${peer.overlayIp}"
+                        copyNonSecretText(context, ipTitle, peer.overlayIp, toast)
                     },
                     onCopyFqdn = {
-                        copyNonSecretText(
-                            context = context,
-                            label = fqdnTitle,
-                            value = peer.fqdn,
-                            toastMessage = "$copiedLabel: ${peer.fqdn}",
-                        )
+                        val toast = "$copiedLabel: ${peer.fqdn}"
+                        copyNonSecretText(context, fqdnTitle, peer.fqdn, toast)
                     },
                     onPingPeer = { onPingPeer(peer.overlayIp) },
                 )
             }
         }
     }
+}
+
+@Composable
+private fun PeersEmptyStateMessage(allPeersEmpty: Boolean) {
+    val context = LocalContext.current
+    val message =
+        if (allPeersEmpty) {
+            stringResource(R.string.diag_no_peers)
+        } else {
+            LocaleHelper.tr(
+                context,
+                "No peers match the current search or filter.",
+                "Không có thiết bị nào khớp với tìm kiếm hoặc bộ lọc.",
+            )
+        }
+    Text(
+        text = message,
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable

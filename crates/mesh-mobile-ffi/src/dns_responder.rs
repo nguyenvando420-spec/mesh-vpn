@@ -2854,13 +2854,24 @@ mod tests {
             std::future::pending::<mesh_core::AppResult<usize>>().await
         }
 
-        let udp_srv = UdpSocket::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| e.to_string())?;
-        let port = udp_srv.local_addr().map_err(|e| e.to_string())?.port();
-        let tcp_srv = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .map_err(|e| e.to_string())?;
+        let (udp_srv, tcp_srv, port) = {
+            let mut held_tcp = Vec::new();
+            let mut bound = None;
+            for _ in 0..128 {
+                let tcp = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let candidate_port = tcp.local_addr().map_err(|e| e.to_string())?.port();
+                match UdpSocket::bind(("127.0.0.1", candidate_port)).await {
+                    Ok(udp) => {
+                        bound = Some((udp, tcp, candidate_port));
+                        break;
+                    }
+                    Err(_) => held_tcp.push(tcp),
+                }
+            }
+            bound.ok_or_else(|| "failed binding matching localhost TCP+UDP port".to_owned())?
+        };
 
         // Build full NOERROR A response (1 answer -> TC=0) vs truncated UDP response (TC=1).
         let q = build_dns_query_bytes(0x4242, "example.org", DNS_TYPE_A, None);

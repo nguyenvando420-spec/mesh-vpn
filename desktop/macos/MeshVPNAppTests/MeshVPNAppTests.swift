@@ -145,4 +145,44 @@ final class MeshVPNAppTests: XCTestCase {
         XCTAssertEqual(DesktopUiState.error.displayTitle, "Attention Required")
         XCTAssertEqual(LocaleMode.allCases, [.system, .vi, .en])
     }
+
+    func testProjectYmlAndInfoPlist_DeclareKnownRegionsAndBundleLocalizations() throws {
+        // Arrange
+        XCTAssertEqual(
+            MeshL10n.inline(en: "Copy", vi: "Sao chép", locale: Locale(identifier: "vi")),
+            "Sao chép"
+        )
+        XCTAssertEqual(
+            MeshL10n.inline(en: "Copy", vi: "Sao chép", locale: Locale(identifier: "en")),
+            "Copy"
+        )
+
+        let macRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let projectYmlURL = macRoot.appendingPathComponent("project.yml")
+        let infoPlistURL = macRoot
+            .appendingPathComponent("MeshVPNApp")
+            .appendingPathComponent("Resources")
+            .appendingPathComponent("Info.plist")
+        guard FileManager.default.fileExists(atPath: projectYmlURL.path),
+              FileManager.default.fileExists(atPath: infoPlistURL.path) else {
+            return
+        }
+
+        // Act
+        let ymlText = try String(contentsOf: projectYmlURL, encoding: .utf8)
+        let plistDict = try XCTUnwrap(
+            NSDictionary(contentsOf: infoPlistURL) as? [String: Any]
+        )
+        let cfLocs = try XCTUnwrap(plistDict["CFBundleLocalizations"] as? [String])
+
+        // Assert
+        XCTAssertTrue(ymlText.contains("developmentLanguage: en"))
+        XCTAssertTrue(ymlText.contains("knownRegions:"))
+        XCTAssertTrue(ymlText.contains("- en"))
+        XCTAssertTrue(ymlText.contains("- vi"))
+        XCTAssertTrue(ymlText.contains("- Base"))
+        XCTAssertEqual(Set(cfLocs), Set(["en", "vi"]))
+    }
 }

@@ -36,6 +36,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
@@ -47,6 +48,7 @@ import com.google.zxing.ReaderException
 import com.google.zxing.common.HybridBinarizer
 import dev.meshvpn.android.LocaleHelper
 import dev.meshvpn.android.data.diagnostics.SafeLogger
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 
 /**
@@ -167,6 +169,15 @@ private fun CameraPreviewScanner(
         val providerFuture = ProcessCameraProvider.getInstance(context)
         val mainExecutor = ContextCompat.getMainExecutor(context)
         val reader = createQrReader()
+        val analyzer =
+            ImageAnalysis.Analyzer { image ->
+                decodeImageProxy(
+                    image = image,
+                    reader = reader,
+                    paused = pausedRef[0],
+                    onDecoded = { decoded -> mainExecutor.execute { onQrDecoded(decoded) } },
+                )
+            }
 
         val listener =
             Runnable {
@@ -174,32 +185,12 @@ private fun CameraPreviewScanner(
                     return@Runnable
                 }
                 try {
-                    val provider = providerFuture.get()
-                    val preview =
-                        Preview.Builder().build().also {
-                            it.surfaceProvider = previewView.surfaceProvider
-                        }
-                    val analysis =
-                        ImageAnalysis
-                            .Builder()
-                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                            .build()
-                    analysis.setAnalyzer(analysisExecutor) { image ->
-                        decodeImageProxy(
-                            image = image,
-                            reader = reader,
-                            paused = pausedRef[0],
-                            onDecoded = { decoded ->
-                                mainExecutor.execute { onQrDecoded(decoded) }
-                            },
-                        )
-                    }
-                    provider.unbindAll()
-                    provider.bindToLifecycle(
-                        lifecycleOwner,
-                        CameraSelector.DEFAULT_BACK_CAMERA,
-                        preview,
-                        analysis,
+                    bindCameraQrUseCases(
+                        provider = providerFuture.get(),
+                        lifecycleOwner = lifecycleOwner,
+                        previewView = previewView,
+                        analysisExecutor = analysisExecutor,
+                        analyzer = analyzer,
                     )
                 } catch (err: Exception) {
                     SafeLogger.w("QrScannerPane", "Unable to start CameraX preview", err)
@@ -237,26 +228,62 @@ private fun CameraPreviewScanner(
             factory = { previewView },
             modifier = Modifier.fillMaxSize(),
         )
-        Text(
-            text =
-                errorMessage ?: if (paused) {
-                    LocaleHelper.tr(
-                        context,
-                        "Review detected server details...",
-                        "Xem lại chi tiết máy chủ đã phát hiện...",
-                    )
-                } else {
-                    LocaleHelper.tr(
-                        context,
-                        "Point camera at Mesh administrator QR code",
-                        "Hướng máy ảnh vào mã QR quản trị viên Mesh",
-                    )
-                },
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onPrimary,
-            modifier = Modifier.padding(12.dp),
-        )
+        CameraScannerOverlayLabel(paused = paused, errorMessage = errorMessage)
     }
+}
+
+private fun bindCameraQrUseCases(
+    provider: ProcessCameraProvider,
+    lifecycleOwner: LifecycleOwner,
+    previewView: PreviewView,
+    analysisExecutor: Executor,
+    analyzer: ImageAnalysis.Analyzer,
+) {
+    val preview =
+        Preview.Builder().build().also {
+            it.surfaceProvider = previewView.surfaceProvider
+        }
+    val analysis =
+        ImageAnalysis
+            .Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+    analysis.setAnalyzer(analysisExecutor, analyzer)
+    provider.unbindAll()
+    provider.bindToLifecycle(
+        lifecycleOwner,
+        CameraSelector.DEFAULT_BACK_CAMERA,
+        preview,
+        analysis,
+    )
+}
+
+@Composable
+private fun CameraScannerOverlayLabel(
+    paused: Boolean,
+    errorMessage: String?,
+) {
+    val context = LocalContext.current
+    val label =
+        errorMessage ?: if (paused) {
+            LocaleHelper.tr(
+                context,
+                "Review detected server details...",
+                "Xem lại chi tiết máy chủ đã phát hiện...",
+            )
+        } else {
+            LocaleHelper.tr(
+                context,
+                "Point camera at Mesh administrator QR code",
+                "Hướng máy ảnh vào mã QR quản trị viên Mesh",
+            )
+        }
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onPrimary,
+        modifier = Modifier.padding(12.dp),
+    )
 }
 
 private fun createQrReader(): MultiFormatReader {

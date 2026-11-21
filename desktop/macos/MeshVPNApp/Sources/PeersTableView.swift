@@ -156,27 +156,33 @@ struct PeersTableView: View {
     private func inspectorMetrics(_ peer: AgentPeerStatus) -> some View {
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
             GridRow {
-                Text("Overlay IP").foregroundStyle(.secondary)
+                Text(MeshL10n.inline(en: "Overlay IP", vi: "IP lớp phủ", locale: loc))
+                    .foregroundStyle(.secondary)
                 Text(peer.overlayIp).font(.body.monospaced()).textSelection(.enabled)
             }
             GridRow {
-                Text("Node ID").foregroundStyle(.secondary)
+                Text(MeshL10n.inline(en: "Node ID", vi: "ID nút", locale: loc))
+                    .foregroundStyle(.secondary)
                 Text(peer.nodeId).font(.caption.monospaced()).textSelection(.enabled)
             }
             GridRow {
-                Text("Direct Endpoint").foregroundStyle(.secondary)
+                Text(MeshL10n.inline(en: "Direct Endpoint", vi: "Điểm cuối trực tiếp", locale: loc))
+                    .foregroundStyle(.secondary)
                 Text(peer.directEndpoint ?? "—").font(.body.monospaced())
             }
             GridRow {
-                Text("Latency (RTT)").foregroundStyle(.secondary)
+                Text(MeshL10n.inline(en: "Latency (RTT)", vi: "Độ trễ (RTT)", locale: loc))
+                    .foregroundStyle(.secondary)
                 Text(peer.rttMs.map { "\($0) ms" } ?? "—")
             }
             GridRow {
-                Text("Traffic RX / TX").foregroundStyle(.secondary)
+                Text(MeshL10n.inline(en: "Traffic RX / TX", vi: "Lưu lượng RX / TX", locale: loc))
+                    .foregroundStyle(.secondary)
                 Text("\(formatBytes(peer.rxBytes)) / \(formatBytes(peer.txBytes))")
             }
             GridRow {
-                Text("Last Handshake").foregroundStyle(.secondary)
+                Text(MeshL10n.inline(en: "Last Handshake", vi: "Bắt tay gần nhất", locale: loc))
+                    .foregroundStyle(.secondary)
                 Text(formatTimestampMs(peer.lastHandshakeAtMs))
             }
         }
@@ -210,11 +216,21 @@ struct PeersTableView: View {
     }
 
     private func pingSummaryBox(_ ping: PingResponse) -> some View {
-        GroupBox("Last Ping Result (\(ping.packetsReceived)/\(ping.packetsSent) received)") {
+        let title = MeshL10n.inline(
+            en: "Last Ping Result (\(ping.packetsReceived)/\(ping.packetsSent) received)",
+            vi: "Kết quả Ping gần nhất (nhận \(ping.packetsReceived)/\(ping.packetsSent))",
+            locale: loc
+        )
+        return GroupBox(title) {
             VStack(alignment: .leading, spacing: 6) {
                 let loss = String(format: "%.1f%%", ping.lossPercent)
                 let avg = ping.rttAvgMs.map { String(format: "%.1f ms", $0) } ?? "—"
-                Text("Loss: \(loss) • Avg RTT: \(avg)")
+                let statsLine = MeshL10n.inline(
+                    en: "Loss: \(loss) • Avg RTT: \(avg)",
+                    vi: "Mất gói: \(loss) • RTT TB: \(avg)",
+                    locale: loc
+                )
+                Text(statsLine)
                     .font(.callout.weight(.medium))
 
                 ForEach(ping.samples, id: \.seq) { sample in
@@ -237,9 +253,15 @@ struct PeersTableView: View {
                 .foregroundStyle(.secondary)
             Text(MeshL10n.tr("diag.no_peers", locale: loc))
                 .font(.headline)
-            Text("Peers from your mesh netmap will appear here automatically.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            Text(
+                MeshL10n.inline(
+                    en: "Peers from your mesh netmap will appear here automatically.",
+                    vi: "Các thiết bị từ bản đồ mạng mesh sẽ tự động hiển thị tại đây.",
+                    locale: loc
+                )
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -280,10 +302,11 @@ struct PeersTableView: View {
 
     private func formatTimestampMs(_ timestampMs: UInt64?) -> String {
         guard let timestampMs, timestampMs > 0 else {
-            return "Never"
+            return MeshL10n.inline(en: "Never", vi: "Chưa bao giờ", locale: loc)
         }
         let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
         let formatter = RelativeDateTimeFormatter()
+        formatter.locale = loc
         formatter.unitsStyle = .short
         return formatter.localizedString(for: date, relativeTo: Date())
     }

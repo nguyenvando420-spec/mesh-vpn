@@ -361,4 +361,46 @@ final class LocalizationParityTests: XCTestCase {
         XCTAssertEqual(enConnected, "Connected")
         XCTAssertEqual(manager.localeMode, .system)
     }
+
+    func test_projectYmlAndInfoPlist_declareKnownRegionsAndBundleLocalizations() throws {
+        // Arrange
+        let bundleLocs = Bundle.main.localizations
+        XCTAssertTrue(bundleLocs.contains("en"), "Bundle.main missing en localization")
+        XCTAssertTrue(bundleLocs.contains("vi"), "Bundle.main missing vi localization")
+        XCTAssertEqual(
+            L10n.inline(en: "Notice", vi: "Thông báo", locale: Locale(identifier: "vi")),
+            "Thông báo"
+        )
+        XCTAssertEqual(
+            L10n.inline(en: "Notice", vi: "Thông báo", locale: Locale(identifier: "en")),
+            "Notice"
+        )
+
+        let iosRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let projectYmlURL = iosRoot.appendingPathComponent("project.yml")
+        let infoPlistURL = iosRoot
+            .appendingPathComponent("MeshApp")
+            .appendingPathComponent("Info.plist")
+        guard FileManager.default.fileExists(atPath: projectYmlURL.path),
+              FileManager.default.fileExists(atPath: infoPlistURL.path) else {
+            return
+        }
+
+        // Act
+        let ymlText = try String(contentsOf: projectYmlURL, encoding: .utf8)
+        let plistDict = try XCTUnwrap(
+            NSDictionary(contentsOf: infoPlistURL) as? [String: Any]
+        )
+        let cfLocs = try XCTUnwrap(plistDict["CFBundleLocalizations"] as? [String])
+
+        // Assert
+        XCTAssertTrue(ymlText.contains("developmentLanguage: en"))
+        XCTAssertTrue(ymlText.contains("knownRegions:"))
+        XCTAssertTrue(ymlText.contains("- en"))
+        XCTAssertTrue(ymlText.contains("- vi"))
+        XCTAssertTrue(ymlText.contains("- Base"))
+        XCTAssertEqual(Set(cfLocs), Set(["en", "vi"]))
+    }
 }

@@ -43,7 +43,8 @@ struct MeshVpnApp: App {
                 }
             }
             .alert(
-                viewModel.activeError?.title ?? "Notice",
+                viewModel.activeError?.title
+                    ?? L10n.inline(en: "Notice", vi: "Thông báo", locale: locale),
                 isPresented: Binding(
                     get: { viewModel.activeError != nil },
                     set: { isPresented in
@@ -77,9 +78,15 @@ private struct PrivacyBlurOverlayView: View {
                     .foregroundStyle(.secondary)
                 Text(L10n.tr("notif.app_name", locale: locale))
                     .font(.headline)
-                Text("Sensitive keys and credentials are hidden.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(
+                    L10n.inline(
+                        en: "Sensitive keys and credentials are hidden.",
+                        vi: "Khóa nhạy cảm và thông tin xác thực đã được ẩn.",
+                        locale: locale
+                    )
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             .padding()
         }

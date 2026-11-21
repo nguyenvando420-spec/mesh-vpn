@@ -207,11 +207,22 @@ struct StatusTab: View {
             }
             if let snapshot = viewModel.statusSnapshot {
                 LabeledValueRow(
-                    title: "Netmap Version",
+                    title: L10n.inline(
+                        en: "Netmap Version",
+                        vi: "Phiên bản Netmap",
+                        locale: locale
+                    ),
                     value: "v\(snapshot.netmapVersion)"
                 )
                 if let nat64 = snapshot.selfNetwork.nat64ActivePrefix {
-                    LabeledValueRow(title: "NAT64 Prefix", value: nat64)
+                    LabeledValueRow(
+                        title: L10n.inline(
+                            en: "NAT64 Prefix",
+                            vi: "Tiền tố NAT64",
+                            locale: locale
+                        ),
+                        value: nat64
+                    )
                 }
             }
             if let banner = viewModel.statusBannerMessage {
@@ -261,10 +272,17 @@ struct StatusTab: View {
 
     @ViewBuilder
     private var warningsSection: some View {
+        let locale = localeManager.resolvedLocale
         let warnings = viewModel.statusSnapshot?.warnings ?? []
         if !warnings.isEmpty {
             let warnColor = MeshDesignTokens.color(for: .warning, colorScheme: colorScheme)
-            Section("Operational Warnings") {
+            Section(
+                L10n.inline(
+                    en: "Operational Warnings",
+                    vi: "Cảnh báo vận hành",
+                    locale: locale
+                )
+            ) {
                 ForEach(warnings.indices, id: \.self) { idx in
                     Label(warnings[idx].message, systemImage: "exclamationmark.triangle.fill")
                         .font(.subheadline)

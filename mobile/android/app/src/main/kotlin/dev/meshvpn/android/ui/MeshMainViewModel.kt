@@ -87,44 +87,52 @@ data class MainUiScreenState(
  * Coordinates Compose screens with [MeshSessionRepository], clipboard scrubbing,
  * `CharArray`-based manual pre-auth submission, `BiometricPrompt` gating, and `FLAG_SECURE`.
  */
-class MeshMainViewModel(
+class MeshMainViewModel private constructor(
     private val sessionRepository: MeshSessionRepository,
     private val ffiGateway: MeshFfiGateway,
     private val clipboardAccess: ClipboardAccess,
     private val authRequester: suspend (AdminAuthPurpose) -> BiometricGateResult,
     private val cleanupDiagnostics: () -> Unit,
-    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    externalScope: CoroutineScope? = null,
-    initialThemePrefs: ThemePrefsStore = InMemoryThemePrefsStore(),
-    initialLocalePrefs: LocalePrefsStore = InMemoryLocalePrefsStore(),
-) : ViewModel() {
+    private val ioDispatcher: CoroutineDispatcher,
+    externalScope: CoroutineScope?,
+    private val preferences: UiPreferencesCoordinator,
+) : ViewModel(),
+    MeshUiPreferencesController by preferences {
+    constructor(
+        sessionRepository: MeshSessionRepository,
+        ffiGateway: MeshFfiGateway,
+        clipboardAccess: ClipboardAccess,
+        authRequester: suspend (AdminAuthPurpose) -> BiometricGateResult,
+        cleanupDiagnostics: () -> Unit,
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+        externalScope: CoroutineScope? = null,
+        initialThemePrefs: ThemePrefsStore = InMemoryThemePrefsStore(),
+        initialLocalePrefs: LocalePrefsStore = InMemoryLocalePrefsStore(),
+    ) : this(
+        sessionRepository = sessionRepository,
+        ffiGateway = ffiGateway,
+        clipboardAccess = clipboardAccess,
+        authRequester = authRequester,
+        cleanupDiagnostics = cleanupDiagnostics,
+        ioDispatcher = ioDispatcher,
+        externalScope = externalScope,
+        preferences =
+            UiPreferencesCoordinator(
+                initialSession = sessionRepository.uiState.value,
+                initialThemePrefs = initialThemePrefs,
+                initialLocalePrefs = initialLocalePrefs,
+            ),
+    )
+
     private val scope: CoroutineScope = externalScope ?: viewModelScope
     private val confirmationLock = Any()
 
     @Volatile
-    private var themePrefsStore: ThemePrefsStore = initialThemePrefs
-
-    @Volatile
-    private var themePrefsAttached = false
-
-    @Volatile
-    private var localePrefsStore: LocalePrefsStore = initialLocalePrefs
-
-    @Volatile
-    private var localePrefsAttached = false
-
-    @Volatile
     private var heldConfirmationRequest: PendingEnrollmentRequest? = null
 
-    private val _screenState =
-        MutableStateFlow(
-            MainUiScreenState(
-                session = sessionRepository.uiState.value,
-                themeMode = initialThemePrefs.loadThemeMode(),
-                localeMode = initialLocalePrefs.loadLocaleMode(),
-            ),
-        )
-    val screenState: StateFlow<MainUiScreenState> = _screenState.asStateFlow()
+    private val _screenState: MutableStateFlow<MainUiScreenState>
+        get() = preferences.screenStateFlow
+    val screenState: StateFlow<MainUiScreenState> = preferences.screenStateFlow.asStateFlow()
 
     init {
         scope.launch {
@@ -135,44 +143,6 @@ class MeshMainViewModel(
                 }
             }
         }
-    }
-
-    fun attachThemePrefs(store: ThemePrefsStore) {
-        if (themePrefsAttached) {
-            return
-        }
-        themePrefsAttached = true
-        themePrefsStore = store
-        val savedMode = store.loadThemeMode()
-        _screenState.update { it.copy(themeMode = savedMode) }
-    }
-
-    fun selectThemeMode(mode: ThemeMode) {
-        themePrefsStore.saveThemeMode(mode)
-        _screenState.update { it.copy(themeMode = mode) }
-    }
-
-    fun attachLocalePrefs(store: LocalePrefsStore) {
-        if (localePrefsAttached) {
-            return
-        }
-        localePrefsAttached = true
-        localePrefsStore = store
-        val savedMode = store.loadLocaleMode()
-        _screenState.update { it.copy(localeMode = savedMode) }
-    }
-
-    fun setLocaleMode(mode: LocaleMode) {
-        localePrefsStore.saveLocaleMode(mode)
-        _screenState.update { it.copy(localeMode = mode) }
-    }
-
-    fun updatePeerSearchQuery(query: String) {
-        _screenState.update { it.copy(peerSearchQuery = query) }
-    }
-
-    fun selectPeerFilterMode(mode: PeerFilterMode) {
-        _screenState.update { it.copy(peerFilterMode = mode) }
     }
 
     fun selectTab(tab: MainTab) {
@@ -194,10 +164,6 @@ class MeshMainViewModel(
 
     fun setConnectOnConfirm(connect: Boolean) {
         _screenState.update { it.copy(connectOnConfirm = connect) }
-    }
-
-    fun setSensitiveModalOpen(open: Boolean) {
-        _screenState.update { it.copy(isSensitiveModalOpen = open) }
     }
 
     fun refreshState() {

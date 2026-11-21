@@ -695,15 +695,36 @@ pub(crate) fn t(key: &str) -> &'static str {
 /// Falls back to English when a Vietnamese entry is absent, or `""` for unknown keys.
 #[must_use]
 pub(crate) fn t_for(key: &str, locale: LocaleMode) -> &'static str {
-    let use_vi = match locale {
-        LocaleMode::System => system_locale_is_vi(),
-        LocaleMode::En => false,
-        LocaleMode::Vi => true,
-    };
-    if use_vi && let Some(val) = lookup_in_table(&VI_STRINGS, key) {
+    if is_vi_locale(locale)
+        && let Some(val) = lookup_in_table(&VI_STRINGS, key)
+    {
         return val;
     }
     lookup_in_table(&EN_STRINGS, key).unwrap_or("")
+}
+
+/// Inline bilingual selector for short transient progress/secondary labels outside the immutable
+/// `213`-key canonical dictionary (`MED-UUI-G3-03`, `ADR-029`).
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) fn tr_inline<'a>(en: &'a str, vi: &'a str) -> &'a str {
+    tr_inline_for(en, vi, current_locale())
+}
+
+/// Pure inline bilingual selector for an explicit [`LocaleMode`] (`MED-UUI-G3-03`).
+#[cfg(any(target_os = "windows", test))]
+#[must_use]
+pub(crate) fn tr_inline_for<'a>(en: &'a str, vi: &'a str, locale: LocaleMode) -> &'a str {
+    if is_vi_locale(locale) { vi } else { en }
+}
+
+#[must_use]
+fn is_vi_locale(locale: LocaleMode) -> bool {
+    match locale {
+        LocaleMode::System => system_locale_is_vi(),
+        LocaleMode::En => false,
+        LocaleMode::Vi => true,
+    }
 }
 
 #[must_use]
@@ -757,6 +778,16 @@ mod tests {
         assert_eq!(t_for("nonexistent.key", LocaleMode::En), "");
         assert_eq!(t_for("nonexistent.key", LocaleMode::Vi), "");
         assert!(!t("tab.status").is_empty());
+        #[cfg(target_os = "windows")]
+        assert!(!super::tr_inline("Running...", "Đang chạy...").is_empty());
+        assert_eq!(
+            super::tr_inline_for("Running...", "Đang chạy...", LocaleMode::En),
+            "Running..."
+        );
+        assert_eq!(
+            super::tr_inline_for("Running...", "Đang chạy...", LocaleMode::Vi),
+            "Đang chạy..."
+        );
         let _active = current_locale();
         let _setter = super::set_locale;
     }

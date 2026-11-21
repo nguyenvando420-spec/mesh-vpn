@@ -19,47 +19,38 @@ fn read_repo_file(rel_path: &str) -> Result<String, String> {
     fs::read_to_string(&full).map_err(|err| format!("failed reading {}: {err}", full.display()))
 }
 
-const WIN_WM_GETDLGCODE: u32 = 0x0087;
-const WIN_DLGC_WANTTAB: isize = 0x0002;
-const WIN_DLGC_WANTCHARS: isize = 0x0080;
-
-const fn eval_wm_getdlgcode(msg: u32, text_input: bool) -> isize {
-    if msg != WIN_WM_GETDLGCODE {
-        return 0;
-    }
-    if text_input {
-        WIN_DLGC_WANTTAB | WIN_DLGC_WANTCHARS
-    } else {
-        WIN_DLGC_WANTTAB
-    }
-}
-
 #[test]
-fn test_wm_getdlgcode_dlgc_wanttab() -> Result<(), String> {
-    // Arrange: verify WM_GETDLGCODE -> DLGC_WANTTAB semantics and Win32 dialog traversal wiring
+fn test_win32_multiline_edit_tab_escape_and_tab_bar_arrows() -> Result<(), String> {
+    // Arrange: verify real runtime Win32 keyboard navigation wiring (`HIGH-UUI-G3-01`, `US-135`)
     let gui_win = read_repo_file("crates/mesh-sys/src/gui_windows.rs")?;
     let window_rs = read_repo_file("crates/mesh-gui/src/window.rs")?;
 
-    // Act
-    let button_dlg_code = eval_wm_getdlgcode(WIN_WM_GETDLGCODE, false);
-    let edit_dlg_code = eval_wm_getdlgcode(WIN_WM_GETDLGCODE, true);
-    let other_msg_code = eval_wm_getdlgcode(0x000F, false);
-
-    // Assert: WM_GETDLGCODE returns DLGC_WANTTAB
-    assert_eq!(button_dlg_code, WIN_DLGC_WANTTAB);
-    assert_eq!(edit_dlg_code & WIN_DLGC_WANTTAB, WIN_DLGC_WANTTAB);
-    assert_eq!(edit_dlg_code & WIN_DLGC_WANTCHARS, WIN_DLGC_WANTCHARS);
-    assert_eq!(other_msg_code, 0);
-
-    // Assert: `window.rs` implements the same WM_GETDLGCODE -> DLGC_WANTTAB contract
-    assert!(window_rs.contains("WIN_WM_GETDLGCODE: u32 = 0x0087"));
-    assert!(window_rs.contains("WIN_DLGC_WANTTAB: isize = 0x0002"));
-    assert!(window_rs.contains("fn dialog_code_for_message("));
+    // Assert: dead #[cfg(test)]-only dialog_code_for_message stub is gone; real runtime hooks exist
+    assert!(!window_rs.contains("fn dialog_code_for_message("));
+    assert!(window_rs.contains("pub(crate) const fn adjacent_dashboard_tab_for_arrow("));
+    assert!(window_rs.contains("fn on_tab_arrow_key("));
     assert!(window_rs.contains("fn ordered_tab_stop_control_ids("));
 
-    // Assert: `gui_windows.rs` enables WS_EX_CONTROLPARENT + IsDialogMessageW + WS_TABSTOP
+    // Assert: `gui_windows.rs` intercepts VK_TAB (multiline EDIT escape) & VK_LEFT/VK_RIGHT
+    // BEFORE `IsDialogMessageW`, and sets `WS_EX_CONTROLPARENT` + `WS_TABSTOP` on all controls.
     assert!(gui_win.contains("WS_EX_CONTROLPARENT"));
-    assert!(gui_win.contains("IsDialogMessageW(hwnd, &raw const msg)"));
+    assert!(gui_win.contains("pub fn is_multiline_edit_control("));
+    assert!(gui_win.contains("pub fn move_dialog_tab_focus("));
+    assert!(gui_win.contains("pub fn handle_dialog_keydown_navigation("));
+    assert!(gui_win.contains("GetNextDlgTabItem("));
+    let nav_pos = gui_win
+        .find("handle_dialog_keydown_navigation(")
+        .ok_or_else(|| {
+            "missing handle_dialog_keydown_navigation call in run_gui_window".to_owned()
+        })?;
+    let is_dlg_pos = gui_win
+        .find("IsDialogMessageW(hwnd, &raw const msg)")
+        .ok_or_else(|| "missing IsDialogMessageW call in run_gui_window".to_owned())?;
+    assert!(
+        nav_pos < is_dlg_pos,
+        "handle_dialog_keydown_navigation must execute BEFORE IsDialogMessageW"
+    );
+
     for control_fn in [
         "pub fn create_button(",
         "pub fn create_owner_draw_button(",
@@ -78,6 +69,15 @@ fn test_wm_getdlgcode_dlgc_wanttab() -> Result<(), String> {
             snippet.contains("WS_TABSTOP"),
             "`{control_fn}` must set WS_TABSTOP for keyboard navigation"
         );
+    }
+
+    // Runtime Win32 verification on Windows host: safe null guards + GetSysColor High-Contrast API
+    #[cfg(target_os = "windows")]
+    {
+        assert!(!mesh_sys::gui_windows::is_multiline_edit_control(0));
+        assert_eq!(mesh_sys::gui_windows::move_dialog_tab_focus(0, 0, false), 0);
+        let hc_colors = mesh_sys::gui_windows::read_system_high_contrast_colors();
+        assert_ne!(hc_colors.window_bg, hc_colors.window_text);
     }
 
     Ok(())

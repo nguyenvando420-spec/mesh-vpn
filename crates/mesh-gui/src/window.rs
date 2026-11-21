@@ -21,17 +21,17 @@ use mesh_sys::gui_windows::{
     activate_existing_gui_window, announce_accessible_label, apply_window_dark_titlebar,
     create_button, create_checkbox, create_edit, create_listbox, create_named_shutdown_event,
     create_owner_draw_button, create_radio_button, create_static_text, destroy_window,
-    draw_owner_draw_button, enable_per_monitor_v2_dpi, find_window_by_class, get_checkbox_checked,
-    get_client_size, get_control_text, get_dpi_for_window, get_sm_icon_px_for_dpi, hide_window,
-    init_common_controls, invalidate_window, is_user_autostart_enabled, kill_window_timer,
-    listbox_reset_and_fill, listbox_selected_index, post_graceful_shutdown_to_window,
-    query_window_version, read_clipboard_utf16_with_seq, read_windows_apps_use_light_theme,
-    register_activate_window_message, register_taskbar_created_message,
-    remove_user_shortcuts_and_autostart, run_gui_window, save_tar_file_dialog,
-    set_checkbox_checked, set_control_bounds, set_control_enabled, set_control_font,
-    set_control_text, set_control_visible, set_dc_text_and_bk_color, set_focus_control,
-    set_user_autostart, set_window_icon, set_window_timer, show_message_box, show_window_and_focus,
-    signal_shutdown_event, wait_event_signaled,
+    detect_high_contrast, draw_owner_draw_button, enable_per_monitor_v2_dpi, find_window_by_class,
+    get_checkbox_checked, get_client_size, get_control_text, get_dpi_for_window,
+    get_sm_icon_px_for_dpi, hide_window, init_common_controls, invalidate_window,
+    is_user_autostart_enabled, kill_window_timer, listbox_reset_and_fill, listbox_selected_index,
+    post_graceful_shutdown_to_window, query_window_version, read_clipboard_utf16_with_seq,
+    read_windows_apps_use_light_theme, register_activate_window_message,
+    register_taskbar_created_message, remove_user_shortcuts_and_autostart, run_gui_window,
+    save_tar_file_dialog, set_checkbox_checked, set_control_bounds, set_control_enabled,
+    set_control_font, set_control_text, set_control_visible, set_dc_text_and_bk_color,
+    set_focus_control, set_user_autostart, set_window_icon, set_window_timer, show_message_box,
+    show_window_and_focus, signal_shutdown_event, wait_event_signaled,
 };
 use zeroize::Zeroizing;
 
@@ -50,7 +50,7 @@ use crate::diagnostics_view::{
     format_settings_identity_summary_localized,
 };
 use crate::elevation_worker::resolve_program_files_mesh_dir;
-use crate::i18n::{LocaleMode, set_locale, t};
+use crate::i18n::{LocaleMode, set_locale, t, tr_inline};
 use crate::icons::{UiIconTone, create_status_icon_for_px, icon_tone_for_state};
 use crate::ipc_poller::{BackgroundIpcController, PolledStateUpdate, UiAsyncEvent};
 use crate::onboarding::{
@@ -144,27 +144,29 @@ const TOAST_DISPLAY_MS: u32 = 4_000;
 const BASE_WIN_W: i32 = 860;
 const BASE_WIN_H: i32 = 660;
 
-/// Win32 `WM_GETDLGCODE` message ID for keyboard dialog traversal (`US-135`).
-#[cfg(test)]
-pub(crate) const WIN_WM_GETDLGCODE: u32 = 0x0087;
-/// Win32 `DLGC_WANTTAB` flag requesting Tab/Shift+Tab navigation (`US-135`).
-#[cfg(test)]
-pub(crate) const WIN_DLGC_WANTTAB: isize = 0x0002;
-/// Win32 `DLGC_WANTCHARS` flag for text edit controls (`US-135`).
-#[cfg(test)]
-pub(crate) const WIN_DLGC_WANTCHARS: isize = 0x0080;
-
-/// Returns the expected Win32 `WM_GETDLGCODE` bitmask for keyboard traversal (`US-135`).
-#[cfg(test)]
+/// Resolves the adjacent 3-tab Dashboard target for `VK_LEFT` (`direction < 0`) or `VK_RIGHT`
+/// (`direction > 0`) when keyboard focus is on one of the 3 top navigation tabs (`US-122` AC3,
+/// `US-135` AC2, `HIGH-UUI-G3-01`).
 #[must_use]
-pub(crate) const fn dialog_code_for_message(msg: u32, text_input: bool) -> isize {
-    if msg != WIN_WM_GETDLGCODE {
-        return 0;
+pub(crate) const fn adjacent_dashboard_tab_for_arrow(
+    focused_control_id: u16,
+    direction: i32,
+) -> Option<(DashboardTab, u16)> {
+    if direction == 0 {
+        return None;
     }
-    if text_input {
-        WIN_DLGC_WANTTAB | WIN_DLGC_WANTCHARS
-    } else {
-        WIN_DLGC_WANTTAB
+    let forward = direction > 0;
+    match (focused_control_id, forward) {
+        (IDC_TAB_STATUS, true) | (IDC_TAB_DIAG_SETTINGS, false) => {
+            Some((DashboardTab::Peers, IDC_TAB_PEERS))
+        }
+        (IDC_TAB_PEERS, true) | (IDC_TAB_STATUS, false) => {
+            Some((DashboardTab::DiagnosticsSettings, IDC_TAB_DIAG_SETTINGS))
+        }
+        (IDC_TAB_DIAG_SETTINGS, true) | (IDC_TAB_PEERS, false) => {
+            Some((DashboardTab::Status, IDC_TAB_STATUS))
+        }
+        _ => None,
     }
 }
 
@@ -310,6 +312,14 @@ pub(crate) fn ordered_tab_stop_control_ids(
     } else {
         ids.extend_from_slice(&[IDC_BTN_START_REPAIR, IDC_BTN_UNINSTALL, IDC_EDIT_DETAILS]);
     }
+    ids.extend_from_slice(&[
+        IDC_BTN_THEME_SYSTEM,
+        IDC_BTN_THEME_LIGHT,
+        IDC_BTN_THEME_DARK,
+        IDC_BTN_LOCALE_SYSTEM,
+        IDC_BTN_LOCALE_VI,
+        IDC_BTN_LOCALE_EN,
+    ]);
     ids
 }
 
@@ -1218,26 +1228,44 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
         return;
     }
 
-    // Un-enrolled or service-stopped states
+    // Un-enrolled or service-stopped states (`HIGH-UUI-G3-02`: always show Theme + Language strip)
     if !tabs_visible {
-        if st.snapshot.should_show_onboarding_form() {
-            layout_onboarding_view(c, dpi, inner_pad, content_y, inner_w, st.onboarding_tab);
-        } else {
-            // ServiceStopped / AgentUnavailable recovery panel
-            let cta_w = scale(230, dpi);
-            let unin_w = scale(120, dpi);
-            set_control_bounds(c.btn_start_repair, inner_pad, content_y, cta_w, btn_h);
-            set_control_bounds(
-                c.btn_uninstall,
-                inner_pad + cta_w + gap,
-                content_y,
-                unin_w,
-                btn_h,
-            );
-            let det_y = content_y + btn_h + gap * 2;
-            let det_h = (content_bottom - det_y).max(scale(100, dpi));
-            set_control_bounds(c.edit_details, inner_pad, det_y, inner_w, det_h);
-            set_many_visible(&[c.btn_start_repair, c.btn_uninstall, c.edit_details], true);
+        let show_onboarding = st.snapshot.should_show_onboarding_form();
+        if show_onboarding {
+            match st.onboarding_tab {
+                DesktopOnboardingTab::JoinUri => {
+                    set_control_text(
+                        c.lbl_setup,
+                        &tr_or(
+                            "onboarding.desktop.subtitle",
+                            "Paste a mesh://join URI or enter your Control server details manually.",
+                        ),
+                    );
+                }
+                DesktopOnboardingTab::Manual => {
+                    set_control_text(
+                        c.lbl_setup,
+                        &tr_or(
+                            "onboarding.desktop.setup_label",
+                            "Control Onboarding / Server Settings:",
+                        ),
+                    );
+                    set_control_text(
+                        c.btn_enroll_save,
+                        &owner_draw_label("onboarding.desktop.enroll_connect", "Enroll & Connect"),
+                    );
+                }
+            }
+        }
+        let placements =
+            compute_non_enrolled_layout_rects(cw, ch, dpi, show_onboarding, st.onboarding_tab);
+        for (ctrl_id, rect) in placements {
+            if let Some(ctrl_hwnd) = control_handle_by_id(c, ctrl_id)
+                && ctrl_hwnd != 0
+            {
+                set_control_bounds(ctrl_hwnd, rect.x, rect.y, rect.w, rect.h);
+                set_control_visible(ctrl_hwnd, true);
+            }
         }
         return;
     }
@@ -1501,118 +1529,251 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
     }
 }
 
-fn layout_onboarding_view(
-    c: &UiControls,
+fn control_handle_by_id(c: &UiControls, id: u16) -> Option<isize> {
+    match id {
+        IDC_TAB_STATUS => Some(c.tab_status),
+        IDC_TAB_PEERS => Some(c.tab_peers),
+        IDC_TAB_DIAG_SETTINGS => Some(c.tab_diag_settings),
+        IDC_BTN_START_REPAIR => Some(c.btn_start_repair),
+        IDC_BTN_UNINSTALL => Some(c.btn_uninstall),
+        IDC_EDIT_DETAILS => Some(c.edit_details),
+        IDC_LBL_THEME => Some(c.lbl_theme),
+        IDC_BTN_THEME_SYSTEM => Some(c.btn_theme_system),
+        IDC_BTN_THEME_LIGHT => Some(c.btn_theme_light),
+        IDC_BTN_THEME_DARK => Some(c.btn_theme_dark),
+        IDC_LBL_LOCALE => Some(c.lbl_locale),
+        IDC_BTN_LOCALE_SYSTEM => Some(c.btn_locale_system),
+        IDC_BTN_LOCALE_VI => Some(c.btn_locale_vi),
+        IDC_BTN_LOCALE_EN => Some(c.btn_locale_en),
+        IDC_TAB_ONBOARD_URI => Some(c.tab_onboard_uri),
+        IDC_TAB_ONBOARD_MANUAL => Some(c.tab_onboard_manual),
+        IDC_LBL_SETUP => Some(c.lbl_setup),
+        IDC_BTN_PASTE_URI => Some(c.btn_paste_uri),
+        IDC_LBL_ENDPOINT => Some(c.lbl_endpoint),
+        IDC_EDIT_ENDPOINT => Some(c.edit_endpoint),
+        IDC_RADIO_SPKI => Some(c.radio_spki),
+        IDC_RADIO_SYSTEM_CA => Some(c.radio_system_ca),
+        IDC_LBL_PIN => Some(c.lbl_pin),
+        IDC_EDIT_PIN => Some(c.edit_pin),
+        IDC_LBL_PREAUTH => Some(c.lbl_preauth),
+        IDC_EDIT_PREAUTH => Some(c.edit_preauth),
+        IDC_LBL_NODENAME => Some(c.lbl_nodename),
+        IDC_EDIT_NODE_NAME => Some(c.edit_node_name),
+        IDC_BTN_ENROLL_SAVE => Some(c.btn_enroll_save),
+        _ => None,
+    }
+}
+
+/// Computes non-overlapping `(control_id, ControlRect)` placements for all `!enrolled` states
+/// (Onboarding `JoinUri`, Onboarding `Manual`, and `ServiceStopped`/`AgentUnavailable` recovery),
+/// always including the compact `Appearance` + `Language` footer strip (`HIGH-UUI-G3-02`).
+#[must_use]
+pub(crate) fn compute_non_enrolled_layout_rects(
+    cw: i32,
+    ch: i32,
     dpi: u32,
-    x: i32,
-    start_y: i32,
-    w: i32,
-    tab: DesktopOnboardingTab,
-) {
+    show_onboarding: bool,
+    onboarding_tab: DesktopOnboardingTab,
+) -> Vec<(u16, ControlRect)> {
+    let pad = scale(12, dpi);
+    let inner_pad = scale(24, dpi);
     let row_h = scale(24, dpi);
     let btn_h = scale(30, dpi);
     let gap = scale(8, dpi);
-    let mut y = start_y;
+    let inner_w = (cw - 2 * inner_pad).max(scale(520, dpi));
+    let hero_bottom = pad + scale(96, dpi);
+    let content_y = hero_bottom + scale(64, dpi);
+    let content_bottom = (ch - inner_pad).max(content_y + scale(140, dpi));
+    let footer_h = btn_h * 2 + gap;
 
-    let tab_w = scale(140, dpi);
-    set_control_bounds(c.tab_onboard_uri, x, y, tab_w, btn_h);
-    set_control_bounds(c.tab_onboard_manual, x + tab_w + gap, y, tab_w, btn_h);
-    set_many_visible(&[c.tab_onboard_uri, c.tab_onboard_manual], true);
-    y += btn_h + gap * 2;
+    let mut rects = Vec::with_capacity(22);
+    let footer_y = if show_onboarding {
+        let mut y = content_y;
+        let tab_w = scale(140, dpi);
+        rects.push((
+            IDC_TAB_ONBOARD_URI,
+            ControlRect::new(inner_pad, y, tab_w, btn_h),
+        ));
+        rects.push((
+            IDC_TAB_ONBOARD_MANUAL,
+            ControlRect::new(inner_pad + tab_w + gap, y, tab_w, btn_h),
+        ));
+        y += btn_h + gap * 2;
 
-    match tab {
-        DesktopOnboardingTab::JoinUri => {
-            set_control_text(
-                c.lbl_setup,
-                &tr_or(
-                    "onboarding.desktop.subtitle",
-                    "Paste a mesh://join URI or enter your Control server details manually.",
-                ),
-            );
-            set_control_bounds(c.lbl_setup, x, y, w, row_h);
-            y += row_h + gap;
-            let lbl_w = scale(115, dpi);
-            set_control_bounds(c.lbl_nodename, x, y + scale(3, dpi), lbl_w, row_h);
-            set_control_bounds(c.edit_node_name, x + lbl_w, y, scale(240, dpi), row_h);
-            y += row_h + gap * 2;
-            set_control_bounds(c.btn_paste_uri, x, y, scale(210, dpi), btn_h);
-            set_many_visible(
-                &[
-                    c.lbl_setup,
-                    c.lbl_nodename,
-                    c.edit_node_name,
-                    c.btn_paste_uri,
-                ],
-                true,
-            );
+        match onboarding_tab {
+            DesktopOnboardingTab::JoinUri => {
+                rects.push((
+                    IDC_LBL_SETUP,
+                    ControlRect::new(inner_pad, y, inner_w, row_h),
+                ));
+                y += row_h + gap;
+                let lbl_w = scale(115, dpi);
+                rects.push((
+                    IDC_LBL_NODENAME,
+                    ControlRect::new(inner_pad, y + scale(3, dpi), lbl_w, row_h),
+                ));
+                rects.push((
+                    IDC_EDIT_NODE_NAME,
+                    ControlRect::new(inner_pad + lbl_w, y, scale(240, dpi), row_h),
+                ));
+                y += row_h + gap * 2;
+                rects.push((
+                    IDC_BTN_PASTE_URI,
+                    ControlRect::new(inner_pad, y, scale(210, dpi), btn_h),
+                ));
+                y += btn_h;
+            }
+            DesktopOnboardingTab::Manual => {
+                rects.push((
+                    IDC_LBL_SETUP,
+                    ControlRect::new(inner_pad, y, inner_w, row_h),
+                ));
+                y += row_h + gap;
+
+                let lbl_w = scale(115, dpi);
+                let ep_w = (inner_w - lbl_w - scale(350, dpi) - gap * 2).max(scale(160, dpi));
+                rects.push((
+                    IDC_LBL_ENDPOINT,
+                    ControlRect::new(inner_pad, y + scale(3, dpi), lbl_w, row_h),
+                ));
+                rects.push((
+                    IDC_EDIT_ENDPOINT,
+                    ControlRect::new(inner_pad + lbl_w, y, ep_w, row_h),
+                ));
+                rects.push((
+                    IDC_RADIO_SPKI,
+                    ControlRect::new(inner_pad + lbl_w + ep_w + gap, y, scale(165, dpi), row_h),
+                ));
+                rects.push((
+                    IDC_RADIO_SYSTEM_CA,
+                    ControlRect::new(
+                        inner_pad + lbl_w + ep_w + gap * 2 + scale(165, dpi),
+                        y,
+                        scale(175, dpi),
+                        row_h,
+                    ),
+                ));
+                y += row_h + gap;
+
+                rects.push((
+                    IDC_LBL_PIN,
+                    ControlRect::new(inner_pad, y + scale(3, dpi), lbl_w, row_h),
+                ));
+                rects.push((
+                    IDC_EDIT_PIN,
+                    ControlRect::new(inner_pad + lbl_w, y, inner_w - lbl_w, row_h),
+                ));
+                y += row_h + gap;
+
+                rects.push((
+                    IDC_LBL_PREAUTH,
+                    ControlRect::new(inner_pad, y + scale(3, dpi), lbl_w, row_h),
+                ));
+                rects.push((
+                    IDC_EDIT_PREAUTH,
+                    ControlRect::new(inner_pad + lbl_w, y, inner_w - lbl_w, row_h),
+                ));
+                y += row_h + gap;
+
+                rects.push((
+                    IDC_LBL_NODENAME,
+                    ControlRect::new(inner_pad, y + scale(3, dpi), lbl_w, row_h),
+                ));
+                rects.push((
+                    IDC_EDIT_NODE_NAME,
+                    ControlRect::new(inner_pad + lbl_w, y, scale(240, dpi), row_h),
+                ));
+                y += row_h + gap * 2;
+
+                rects.push((
+                    IDC_BTN_ENROLL_SAVE,
+                    ControlRect::new(inner_pad + lbl_w, y, scale(170, dpi), btn_h),
+                ));
+                y += btn_h;
+            }
         }
-        DesktopOnboardingTab::Manual => {
-            set_control_text(
-                c.lbl_setup,
-                &tr_or(
-                    "onboarding.desktop.setup_label",
-                    "Control Onboarding / Server Settings:",
-                ),
-            );
-            set_control_bounds(c.lbl_setup, x, y, w, row_h);
-            y += row_h + gap;
+        (content_bottom - footer_h).max(y + gap * 2)
+    } else {
+        // ServiceStopped / AgentUnavailable recovery panel
+        let cta_w = scale(230, dpi);
+        let unin_w = scale(120, dpi);
+        rects.push((
+            IDC_BTN_START_REPAIR,
+            ControlRect::new(inner_pad, content_y, cta_w, btn_h),
+        ));
+        rects.push((
+            IDC_BTN_UNINSTALL,
+            ControlRect::new(inner_pad + cta_w + gap, content_y, unin_w, btn_h),
+        ));
+        let det_y = content_y + btn_h + gap * 2;
+        let det_h = (content_bottom - footer_h - gap * 2 - det_y).max(scale(100, dpi));
+        rects.push((
+            IDC_EDIT_DETAILS,
+            ControlRect::new(inner_pad, det_y, inner_w, det_h),
+        ));
+        det_y + det_h + gap * 2
+    };
 
-            let lbl_w = scale(115, dpi);
-            let ep_w = (w - lbl_w - scale(350, dpi) - gap * 2).max(scale(160, dpi));
-            set_control_bounds(c.lbl_endpoint, x, y + scale(3, dpi), lbl_w, row_h);
-            set_control_bounds(c.edit_endpoint, x + lbl_w, y, ep_w, row_h);
-            set_control_bounds(
-                c.radio_spki,
-                x + lbl_w + ep_w + gap,
-                y,
-                scale(165, dpi),
-                row_h,
-            );
-            set_control_bounds(
-                c.radio_system_ca,
-                x + lbl_w + ep_w + gap * 2 + scale(165, dpi),
-                y,
-                scale(175, dpi),
-                row_h,
-            );
-            y += row_h + gap;
+    // Compact footer strip: Appearance (System/Light/Dark) + Language (System/Tiếng Việt/English)
+    let theme_lbl_w = scale(88, dpi);
+    let theme_btn_w = scale(92, dpi);
+    let locale_btn_w = scale(98, dpi);
+    rects.push((
+        IDC_LBL_THEME,
+        ControlRect::new(inner_pad, footer_y + scale(4, dpi), theme_lbl_w, row_h),
+    ));
+    rects.push((
+        IDC_BTN_THEME_SYSTEM,
+        ControlRect::new(inner_pad + theme_lbl_w + gap, footer_y, theme_btn_w, btn_h),
+    ));
+    rects.push((
+        IDC_BTN_THEME_LIGHT,
+        ControlRect::new(
+            inner_pad + theme_lbl_w + theme_btn_w + gap * 2,
+            footer_y,
+            theme_btn_w,
+            btn_h,
+        ),
+    ));
+    rects.push((
+        IDC_BTN_THEME_DARK,
+        ControlRect::new(
+            inner_pad + theme_lbl_w + (theme_btn_w + gap) * 2 + gap,
+            footer_y,
+            theme_btn_w,
+            btn_h,
+        ),
+    ));
 
-            set_control_bounds(c.lbl_pin, x, y + scale(3, dpi), lbl_w, row_h);
-            set_control_bounds(c.edit_pin, x + lbl_w, y, w - lbl_w, row_h);
-            y += row_h + gap;
+    let loc_y = footer_y + btn_h + gap;
+    rects.push((
+        IDC_LBL_LOCALE,
+        ControlRect::new(inner_pad, loc_y + scale(4, dpi), theme_lbl_w, row_h),
+    ));
+    rects.push((
+        IDC_BTN_LOCALE_SYSTEM,
+        ControlRect::new(inner_pad + theme_lbl_w + gap, loc_y, locale_btn_w, btn_h),
+    ));
+    rects.push((
+        IDC_BTN_LOCALE_VI,
+        ControlRect::new(
+            inner_pad + theme_lbl_w + locale_btn_w + gap * 2,
+            loc_y,
+            locale_btn_w,
+            btn_h,
+        ),
+    ));
+    rects.push((
+        IDC_BTN_LOCALE_EN,
+        ControlRect::new(
+            inner_pad + theme_lbl_w + (locale_btn_w + gap) * 2 + gap,
+            loc_y,
+            locale_btn_w,
+            btn_h,
+        ),
+    ));
 
-            set_control_bounds(c.lbl_preauth, x, y + scale(3, dpi), lbl_w, row_h);
-            set_control_bounds(c.edit_preauth, x + lbl_w, y, w - lbl_w, row_h);
-            y += row_h + gap;
-
-            set_control_bounds(c.lbl_nodename, x, y + scale(3, dpi), lbl_w, row_h);
-            set_control_bounds(c.edit_node_name, x + lbl_w, y, scale(240, dpi), row_h);
-            y += row_h + gap * 2;
-
-            set_control_text(
-                c.btn_enroll_save,
-                &owner_draw_label("onboarding.desktop.enroll_connect", "Enroll & Connect"),
-            );
-            set_control_bounds(c.btn_enroll_save, x + lbl_w, y, scale(170, dpi), btn_h);
-            set_many_visible(
-                &[
-                    c.lbl_setup,
-                    c.lbl_endpoint,
-                    c.edit_endpoint,
-                    c.radio_spki,
-                    c.radio_system_ca,
-                    c.lbl_pin,
-                    c.edit_pin,
-                    c.lbl_preauth,
-                    c.edit_preauth,
-                    c.lbl_nodename,
-                    c.edit_node_name,
-                    c.btn_enroll_save,
-                ],
-                true,
-            );
-        }
-    }
+    rects
 }
 
 fn layout_zone3_modal(
@@ -1759,10 +1920,11 @@ fn sync_zero_tofu_radio_state(c: &UiControls) {
 /// and invalidates `hwnd`. Also refreshes localized strings if `LocaleMode::System` is active.
 fn handle_os_theme_setting_change(st: &mut DashboardState, hwnd: isize) -> bool {
     let target_hwnd = if hwnd != 0 { hwnd } else { st.hwnd };
-    let rebuilt_from_os = if st.theme_mode == ThemeMode::System {
+    let hc_changed = detect_high_contrast() != st.palette.is_high_contrast;
+    let rebuilt_from_os = if st.theme_mode == ThemeMode::System || hc_changed {
         let os_apps_light = read_windows_apps_use_light_theme();
         st.palette.clear_brush_cache();
-        st.palette = resolve_palette_for_dpi(ThemeMode::System, st.current_dpi);
+        st.palette = resolve_palette_for_dpi(st.theme_mode, st.current_dpi);
         apply_window_dark_titlebar(target_hwnd, st.palette.is_dark_titlebar);
         tracing::debug!(
             component = "mesh-gui",
@@ -2121,7 +2283,13 @@ fn trigger_paste_uri_button(st: &mut DashboardState) -> Option<PendingUiPrompt> 
         }
     };
     let Some(raw_text) = maybe_text else {
-        st.active_action_error = Some("Clipboard does not contain UTF-16 text.".to_owned());
+        st.active_action_error = Some(
+            tr_inline(
+                "Clipboard does not contain UTF-16 text.",
+                "Bộ nhớ tạm không chứa văn bản UTF-16.",
+            )
+            .to_owned(),
+        );
         refresh_ui_from_state(st);
         return None;
     };
@@ -2162,7 +2330,8 @@ fn begin_privileged_action(
 ) {
     st.busy_action = true;
     st.active_action_error = None;
-    st.detail_override = Some(format!("Executing `{action_label}`..."));
+    let exec_prefix = tr_inline("Executing", "Đang thực thi");
+    st.detail_override = Some(format!("{exec_prefix} `{action_label}`..."));
     if let Some(poller) = &st.poller {
         poller.spawn_handoff_action(action_label.to_owned(), payload);
     }
@@ -2473,7 +2642,13 @@ impl WindowEventHandler for DashboardApp {
                     prompt = Some(PendingUiPrompt::ConfirmResetIdentity);
                 }
                 (IDC_BTN_NETCHECK, WIN_BN_CLICKED) => {
-                    st.detail_override = Some("Running Netcheck diagnostics...".to_owned());
+                    st.detail_override = Some(
+                        tr_inline(
+                            "Running Netcheck diagnostics...",
+                            "Đang chạy chẩn đoán Netcheck...",
+                        )
+                        .to_owned(),
+                    );
                     if let Some(poller) = &st.poller {
                         poller.spawn_netcheck();
                     }
@@ -2484,7 +2659,10 @@ impl WindowEventHandler for DashboardApp {
                         && let Some(peer) = st.displayed_peers.get(idx)
                     {
                         let target = peer.name.as_str().to_owned();
-                        st.detail_override = Some(format!("Pinging `{target}` (4 probes)..."));
+                        let ping_verb = tr_inline("Pinging", "Đang ping");
+                        let probes_lbl = tr_inline("4 probes", "4 gói thăm dò");
+                        st.detail_override =
+                            Some(format!("{ping_verb} `{target}` ({probes_lbl})..."));
                         if let Some(poller) = &st.poller {
                             poller.spawn_ping(target, 4, false);
                         }
@@ -2672,31 +2850,42 @@ impl WindowEventHandler for DashboardApp {
                         UiAsyncEvent::Netcheck(res) => {
                             st.detail_override = Some(match res {
                                 Ok(r) => format_netcheck_report_localized(&r, t),
-                                Err(err) => {
-                                    format!("Netcheck failed: {}", format_user_facing_error(&err))
-                                }
+                                Err(err) => format!(
+                                    "{}: {}",
+                                    tr_inline("Netcheck failed", "Kiểm tra mạng thất bại"),
+                                    format_user_facing_error(&err)
+                                ),
                             });
                         }
                         UiAsyncEvent::Ping(res) => {
                             st.detail_override = Some(match res {
                                 Ok(r) => format_ping_response_localized(&r, t),
-                                Err(err) => {
-                                    format!("Ping failed: {}", format_user_facing_error(&err))
-                                }
+                                Err(err) => format!(
+                                    "{}: {}",
+                                    tr_inline("Ping failed", "Ping thất bại"),
+                                    format_user_facing_error(&err)
+                                ),
                             });
                         }
                         UiAsyncEvent::Bugreport(res) => match res {
                             Ok((scrubbed, bytes, path)) => {
+                                let saved_lbl =
+                                    tr_inline("Bugreport saved to", "Đã lưu báo cáo lỗi tại");
+                                let size_lbl = tr_inline("Size", "Kích thước");
+                                let bytes_lbl = tr_inline("bytes", "byte");
+                                let redacted_lbl = tr_inline("Redacted secrets", "Bí mật đã che");
                                 st.detail_override = Some(format!(
-                                    "Bugreport saved to {path}\r\n\
-                                     Size: {bytes} bytes | Redacted secrets: {scrubbed}"
+                                    "{saved_lbl} {path}\r\n\
+                                     {size_lbl}: {bytes} {bytes_lbl} | {redacted_lbl}: {scrubbed}"
                                 ));
                                 st.active_action_error = None;
                             }
                             Err(err) => {
                                 let msg_safe = format_user_facing_error(&err);
+                                let failed_lbl =
+                                    tr_inline("Bugreport failed", "Xuất báo cáo lỗi thất bại");
                                 st.active_action_error = Some(msg_safe.clone());
-                                st.detail_override = Some(format!("Bugreport failed: {msg_safe}"));
+                                st.detail_override = Some(format!("{failed_lbl}: {msg_safe}"));
                                 message_box_err = Some(msg_safe);
                             }
                         },
@@ -2879,6 +3068,30 @@ impl WindowEventHandler for DashboardApp {
         false
     }
 
+    fn on_tab_arrow_key(&self, _hwnd: isize, focused_control_id: u16, direction: i32) -> bool {
+        let Ok(mut st) = self.inner.try_borrow_mut() else {
+            return false;
+        };
+        if !st.snapshot.should_show_tab_bar() {
+            return false;
+        }
+        let Some((next_tab, next_ctrl_id)) =
+            adjacent_dashboard_tab_for_arrow(focused_control_id, direction)
+        else {
+            return false;
+        };
+        st.active_tab = next_tab;
+        st.active_modal = None;
+        st.detail_override = None;
+        refresh_ui_from_state(&mut st);
+        if let Some(target_hwnd) = control_handle_by_id(&st.controls, next_ctrl_id)
+            && target_hwnd != 0
+        {
+            set_focus_control(target_hwnd);
+        }
+        true
+    }
+
     fn on_resize(&self, hwnd: isize, _width: i32, _height: i32) {
         let Ok(st) = self.inner.try_borrow() else {
             return;
@@ -2965,7 +3178,13 @@ fn handle_tray_menu_command(app: &DashboardApp, hwnd: isize, cmd: u16) {
                 st.visible = true;
                 st.active_tab = DashboardTab::DiagnosticsSettings;
                 st.active_modal = None;
-                st.detail_override = Some("Running Netcheck diagnostics...".to_owned());
+                st.detail_override = Some(
+                    tr_inline(
+                        "Running Netcheck diagnostics...",
+                        "Đang chạy chẩn đoán Netcheck...",
+                    )
+                    .to_owned(),
+                );
                 if let Some(poller) = &st.poller {
                     poller.set_dashboard_visible(true);
                     poller.spawn_netcheck();
@@ -3012,10 +3231,11 @@ fn execute_pending_prompt(app: &DashboardApp, hwnd: isize, prompt: PendingUiProm
             let Ok(mut st) = app.inner.try_borrow_mut() else {
                 return;
             };
-            st.detail_override = Some(format!(
-                "Streaming redacted bugreport to {}...",
-                dest_path.display()
-            ));
+            let stream_lbl = tr_inline(
+                "Streaming redacted bugreport to",
+                "Đang xuất báo cáo lỗi đã che bí mật tới",
+            );
+            st.detail_override = Some(format!("{stream_lbl} {}...", dest_path.display()));
             if let Some(poller) = &st.poller {
                 poller.spawn_bugreport_export(dest_path);
             }
@@ -3250,25 +3470,104 @@ mod tests {
     }
 
     #[test]
-    fn test_window_accessibility_dialog_code_and_tab_order_invariants() {
-        use crate::app::{DashboardTab, DesktopUiState, TunnelSubState};
+    fn test_window_accessibility_tab_arrows_and_tab_order_invariants() {
+        use mesh_core::NodeId;
+        use mesh_proto::agent_ipc::{AgentStatusResponse, DaemonState, SelfNetworkStatus};
+        use mesh_proto::netmap::NatMappingKind;
+
+        use crate::app::{DashboardTab, DesktopUiState, ServiceProbeKind, TunnelSubState};
         use crate::i18n::{LocaleMode, t_for};
+        use crate::ipc_poller::PolledStateUpdate;
         use crate::onboarding::{DesktopOnboardingTab, Zone3ModalKind};
 
         // Arrange
         let app = DashboardApp::new(false);
+        {
+            let Ok(mut st) = app.inner.try_borrow_mut() else {
+                return;
+            };
+            st.latest_poll = Some(PolledStateUpdate {
+                service_probe: ServiceProbeKind::Running,
+                ipc_connected: true,
+                status: Some(AgentStatusResponse {
+                    daemon_state: DaemonState::Connected,
+                    node_id: Some(NodeId::from_bytes([0x11_u8; 16])),
+                    node_name: None,
+                    fqdn: None,
+                    overlay_ip: None,
+                    overlay_cidr: None,
+                    tun_interface_name: None,
+                    tun_mtu: 1420,
+                    netmap_version: 1,
+                    key_expires_at_ms: None,
+                    server_connection: None,
+                    self_network: SelfNetworkStatus {
+                        local_udp_port: 51820,
+                        bound_physical_interface: None,
+                        nat_type: NatMappingKind::Unknown,
+                        nat_classification_note: None,
+                        overlay_conflict_warning: None,
+                        macos_firewall_warning: None,
+                        candidates: Vec::new(),
+                    },
+                    peers: Vec::new(),
+                }),
+                version_status: None,
+                ipc_error: None,
+            });
+            st.snapshot.enrolled = true;
+            st.snapshot.ui_state = DesktopUiState::Connected;
+            st.snapshot.tunnel_sub_state = TunnelSubState::Connected;
+        }
+
+        // Act: verify 3-tab Left/Right cyclic arrow navigation (`US-122` AC3, `US-135` AC2)
+        assert_eq!(
+            super::adjacent_dashboard_tab_for_arrow(super::IDC_TAB_STATUS, 1),
+            Some((DashboardTab::Peers, super::IDC_TAB_PEERS))
+        );
+        assert_eq!(
+            super::adjacent_dashboard_tab_for_arrow(super::IDC_TAB_PEERS, 1),
+            Some((
+                DashboardTab::DiagnosticsSettings,
+                super::IDC_TAB_DIAG_SETTINGS
+            ))
+        );
+        assert_eq!(
+            super::adjacent_dashboard_tab_for_arrow(super::IDC_TAB_DIAG_SETTINGS, 1),
+            Some((DashboardTab::Status, super::IDC_TAB_STATUS))
+        );
+        assert_eq!(
+            super::adjacent_dashboard_tab_for_arrow(super::IDC_TAB_STATUS, -1),
+            Some((
+                DashboardTab::DiagnosticsSettings,
+                super::IDC_TAB_DIAG_SETTINGS
+            ))
+        );
+        assert_eq!(
+            super::adjacent_dashboard_tab_for_arrow(super::IDC_EDIT_DETAILS, 1),
+            None
+        );
+
+        assert!(app.on_tab_arrow_key(0, super::IDC_TAB_STATUS, 1));
+        {
+            let Ok(st) = app.inner.try_borrow() else {
+                return;
+            };
+            assert_eq!(st.active_tab, DashboardTab::Peers);
+        }
+        assert!(app.on_tab_arrow_key(0, super::IDC_TAB_PEERS, -1));
+        {
+            let Ok(st) = app.inner.try_borrow() else {
+                return;
+            };
+            assert_eq!(st.active_tab, DashboardTab::Status);
+        }
+        assert!(!app.on_tab_arrow_key(0, super::IDC_EDIT_DETAILS, 1));
+
         let Ok(st) = app.inner.try_borrow() else {
             return;
         };
-        let mut enrolled_snap = st.snapshot.clone();
-        enrolled_snap.enrolled = true;
-        enrolled_snap.ui_state = DesktopUiState::Connected;
-        enrolled_snap.tunnel_sub_state = TunnelSubState::Connected;
-
-        // Act
-        let code_btn = super::dialog_code_for_message(super::WIN_WM_GETDLGCODE, false);
-        let code_edit = super::dialog_code_for_message(super::WIN_WM_GETDLGCODE, true);
-        let code_other = super::dialog_code_for_message(0x0001, false);
+        let enrolled_snap = st.snapshot.clone();
         let tab_ids = super::ordered_tab_stop_control_ids(
             &enrolled_snap,
             DashboardTab::DiagnosticsSettings,
@@ -3288,15 +3587,65 @@ mod tests {
         );
 
         // Assert
-        assert_eq!(code_btn, super::WIN_DLGC_WANTTAB);
-        assert_eq!(
-            code_edit,
-            super::WIN_DLGC_WANTTAB | super::WIN_DLGC_WANTCHARS
-        );
-        assert_eq!(code_other, 0);
         assert!(tab_ids.contains(&super::IDC_BTN_LOCALE_VI));
         assert!(modal_ids.contains(&super::IDC_BTN_MODAL_CANCEL));
         assert!(ann_vi.contains("Đã kết nối"));
         assert!(ann_vi.contains("Thiết bị cùng mạng"));
+    }
+
+    #[test]
+    fn test_window_non_enrolled_layouts_expose_theme_and_locale_with_zero_rect_overlap() {
+        use mesh_sys::gui_windows::ControlRect;
+
+        use crate::onboarding::DesktopOnboardingTab;
+
+        let rects_overlap = |a: ControlRect, b: ControlRect| -> bool {
+            let a_right = a.x + a.w;
+            let a_bottom = a.y + a.h;
+            let b_right = b.x + b.w;
+            let b_bottom = b.y + b.h;
+            a.x < b_right && b.x < a_right && a.y < b_bottom && b.y < a_bottom
+        };
+
+        let required_prefs_ids = [
+            super::IDC_LBL_THEME,
+            super::IDC_BTN_THEME_SYSTEM,
+            super::IDC_BTN_THEME_LIGHT,
+            super::IDC_BTN_THEME_DARK,
+            super::IDC_LBL_LOCALE,
+            super::IDC_BTN_LOCALE_SYSTEM,
+            super::IDC_BTN_LOCALE_VI,
+            super::IDC_BTN_LOCALE_EN,
+        ];
+
+        // Arrange & Act & Assert across all 3 !enrolled views and 4 DPI scales (`HIGH-UUI-G3-02`)
+        for dpi in [96_u32, 120, 144, 192] {
+            let cw = super::scale(super::BASE_WIN_W, dpi);
+            let ch = super::scale(super::BASE_WIN_H, dpi);
+            for (show_onboarding, tab) in [
+                (true, DesktopOnboardingTab::JoinUri),
+                (true, DesktopOnboardingTab::Manual),
+                (false, DesktopOnboardingTab::JoinUri),
+            ] {
+                let placements =
+                    super::compute_non_enrolled_layout_rects(cw, ch, dpi, show_onboarding, tab);
+                for req_id in required_prefs_ids {
+                    assert!(
+                        placements.iter().any(|(id, _)| *id == req_id),
+                        "missing quick-pref control {req_id} for onboarding={show_onboarding} tab={tab:?} dpi={dpi}"
+                    );
+                }
+                for (i, (id_a, rect_a)) in placements.iter().enumerate() {
+                    assert!(rect_a.w > 0 && rect_a.h > 0);
+                    for (id_b, rect_b) in placements.iter().skip(i + 1) {
+                        assert!(
+                            !rects_overlap(*rect_a, *rect_b),
+                            "overlapping RECTs ({id_a}={rect_a:?} vs {id_b}={rect_b:?}) \
+                             for onboarding={show_onboarding} tab={tab:?} dpi={dpi}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

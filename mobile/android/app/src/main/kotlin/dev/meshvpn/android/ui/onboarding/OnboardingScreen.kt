@@ -48,10 +48,12 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import dev.meshvpn.android.LocaleHelper
+import dev.meshvpn.android.LocaleMode
 import dev.meshvpn.android.R
 import dev.meshvpn.android.ui.JoinConfirmationUiModel
 import dev.meshvpn.android.ui.MainUiScreenState
 import dev.meshvpn.android.ui.OnboardingMethod
+import dev.meshvpn.android.ui.theme.ThemeMode
 import uniffi.mesh_mobile_ffi.MobileTlsAuthMode
 
 @Composable
@@ -65,6 +67,8 @@ fun OnboardingScreen(
     onConfirmJoin: () -> Unit,
     onCancelConfirmation: () -> Unit,
     modifier: Modifier = Modifier,
+    onSelectThemeMode: (ThemeMode) -> Unit = {},
+    onSelectLocaleMode: (LocaleMode) -> Unit = {},
 ) {
     Column(
         modifier =
@@ -107,6 +111,13 @@ fun OnboardingScreen(
                 )
             }
         }
+
+        OnboardingQuickPreferencesCard(
+            themeMode = screenState.themeMode,
+            localeMode = screenState.localeMode,
+            onSelectThemeMode = onSelectThemeMode,
+            onSelectLocaleMode = onSelectLocaleMode,
+        )
     }
 
     screenState.pendingConfirmation?.let { confirmation ->
@@ -427,69 +438,15 @@ private fun JoinConfirmationDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val context = LocalContext.current
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.confirm_verify_server)) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    LocaleHelper.tr(
-                        context,
-                        "Endpoint: ${confirmation.serverEndpoint}",
-                        "Điểm cuối: ${confirmation.serverEndpoint}",
-                    ),
-                )
-                val trustLabel =
-                    if (confirmation.tlsAuthMode == MobileTlsAuthMode.SPKI_PIN) {
-                        LocaleHelper.tr(context, "Pinned SPKI SHA-256", "Ghim SPKI SHA-256")
-                    } else {
-                        LocaleHelper.tr(
-                            context,
-                            "Android System CA (Domain Verified)",
-                            "CA hệ thống Android (Đã xác minh tên miền)",
-                        )
-                    }
-                Text(
-                    LocaleHelper.tr(
-                        context,
-                        "TLS Policy: $trustLabel",
-                        "Chính sách TLS: $trustLabel",
-                    ),
-                )
-                confirmation.serverPin?.let { pin ->
-                    val pinHeading = LocaleHelper.tr(context, "SPKI Pin:", "Ghim SPKI:")
-                    Text(
-                        text = "$pinHeading\n$pin",
-                        fontFamily = FontFamily.Monospace,
-                        style = MaterialTheme.typography.labelMedium,
-                    )
-                }
-                Text(
-                    LocaleHelper.tr(
-                        context,
-                        "Key Preview: ${confirmation.preauthKeyMasked}",
-                        "Xem trước khóa: ${confirmation.preauthKeyMasked}",
-                    ),
-                )
-                confirmation.nodeName?.let { name ->
-                    Text(
-                        LocaleHelper.tr(
-                            context,
-                            "Device Name: $name",
-                            "Tên thiết bị: $name",
-                        ),
-                    )
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(
-                        checked = connectOnConfirm,
-                        onCheckedChange = onToggleConnect,
-                    )
-                    Text(stringResource(R.string.onboarding_connect_after))
-                }
-            }
+            JoinConfirmationDetails(
+                confirmation = confirmation,
+                connectOnConfirm = connectOnConfirm,
+                onToggleConnect = onToggleConnect,
+            )
         },
         confirmButton = {
             Button(
@@ -514,4 +471,71 @@ private fun JoinConfirmationDialog(
             }
         },
     )
+}
+
+@Composable
+private fun JoinConfirmationDetails(
+    confirmation: JoinConfirmationUiModel,
+    connectOnConfirm: Boolean,
+    onToggleConnect: (Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    val trustLabel =
+        if (confirmation.tlsAuthMode == MobileTlsAuthMode.SPKI_PIN) {
+            LocaleHelper.tr(context, "Pinned SPKI SHA-256", "Ghim SPKI SHA-256")
+        } else {
+            LocaleHelper.tr(
+                context,
+                "Android System CA (Domain Verified)",
+                "CA hệ thống Android (Đã xác minh tên miền)",
+            )
+        }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            LocaleHelper.tr(
+                context,
+                "Endpoint: ${confirmation.serverEndpoint}",
+                "Điểm cuối: ${confirmation.serverEndpoint}",
+            ),
+        )
+        Text(
+            LocaleHelper.tr(
+                context,
+                "TLS Policy: $trustLabel",
+                "Chính sách TLS: $trustLabel",
+            ),
+        )
+        confirmation.serverPin?.let { pin ->
+            val pinHeading = LocaleHelper.tr(context, "SPKI Pin:", "Ghim SPKI:")
+            Text(
+                text = "$pinHeading\n$pin",
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+        Text(
+            LocaleHelper.tr(
+                context,
+                "Key Preview: ${confirmation.preauthKeyMasked}",
+                "Xem trước khóa: ${confirmation.preauthKeyMasked}",
+            ),
+        )
+        confirmation.nodeName?.let { name ->
+            Text(
+                LocaleHelper.tr(
+                    context,
+                    "Device Name: $name",
+                    "Tên thiết bị: $name",
+                ),
+            )
+        }
+        Spacer(modifier = Modifier.height(4.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = connectOnConfirm,
+                onCheckedChange = onToggleConnect,
+            )
+            Text(stringResource(R.string.onboarding_connect_after))
+        }
+    }
 }

@@ -197,37 +197,19 @@ struct DashboardWindowView: View {
     private var nonEnrolledCardContent: some View {
         switch store.uiState {
         case .serviceNotInstalled:
-            DashboardCenteredCard(
-                icon: "shield.slash",
-                tintColor: statusTintColor,
-                title: MeshL10n.tr("state.agent_unavailable", locale: loc),
-                subtitle: "Mesh VPN requires the privileged meshd LaunchDaemon "
-                    + "(\(AgentDefaults.launchdLabel)) to manage utun tunnels and routes."
-            ) {
-                Toggle(
-                    "Add macOS Application Firewall exception for meshd (recommended for P2P)",
-                    isOn: $firewallOptInOnInstall
-                )
-                Button(MeshL10n.tr("service.start_repair", locale: loc)) {
-                    Task { @MainActor in
-                        _ = await store.installOrUpdateService(
-                            firewallOptIn: firewallOptInOnInstall
-                        )
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(store.isBusy)
-                Text("CLI alternative: sudo /bin/sh scripts/install-macos.sh")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-            }
+            serviceNotInstalledCard
         case .serviceStopped:
             DashboardCenteredCard(
                 icon: "pause.circle",
                 tintColor: statusTintColor,
                 title: MeshL10n.tr("state.service_stopped", locale: loc),
-                subtitle: "meshd is installed at \(AgentDefaults.daemonBinaryPath), "
-                    + "but is not listening on \(AgentDefaults.roSocketPath)."
+                subtitle: MeshL10n.inline(
+                    en: "meshd is installed at \(AgentDefaults.daemonBinaryPath), "
+                        + "but is not listening on \(AgentDefaults.roSocketPath).",
+                    vi: "meshd đã cài tại \(AgentDefaults.daemonBinaryPath), "
+                        + "nhưng chưa lắng nghe trên \(AgentDefaults.roSocketPath).",
+                    locale: loc
+                )
             ) {
                 HStack(spacing: 12) {
                     Button(MeshL10n.tr("service.start_repair", locale: loc)) {
@@ -257,6 +239,48 @@ struct DashboardWindowView: View {
             }
         case .connecting, .connected, .reauthRequired, .revoked, .error:
             EmptyView()
+        }
+    }
+
+    private var serviceNotInstalledCard: some View {
+        DashboardCenteredCard(
+            icon: "shield.slash",
+            tintColor: statusTintColor,
+            title: MeshL10n.tr("state.agent_unavailable", locale: loc),
+            subtitle: MeshL10n.inline(
+                en: "Mesh VPN requires the privileged meshd LaunchDaemon "
+                    + "(\(AgentDefaults.launchdLabel)) to manage utun tunnels and routes.",
+                vi: "Mesh VPN cần dịch vụ đặc quyền meshd LaunchDaemon "
+                    + "(\(AgentDefaults.launchdLabel)) để quản lý đường hầm utun và định tuyến.",
+                locale: loc
+            )
+        ) {
+            Toggle(
+                MeshL10n.inline(
+                    en: "Add macOS Application Firewall exception for meshd (P2P)",
+                    vi: "Thêm ngoại lệ Tường lửa macOS cho meshd (khuyên dùng cho P2P)",
+                    locale: loc
+                ),
+                isOn: $firewallOptInOnInstall
+            )
+            Button(MeshL10n.tr("service.start_repair", locale: loc)) {
+                Task { @MainActor in
+                    _ = await store.installOrUpdateService(
+                        firewallOptIn: firewallOptInOnInstall
+                    )
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(store.isBusy)
+            Text(
+                MeshL10n.inline(
+                    en: "CLI alternative: sudo /bin/sh scripts/install-macos.sh",
+                    vi: "Lệnh CLI thay thế: sudo /bin/sh scripts/install-macos.sh",
+                    locale: loc
+                )
+            )
+            .font(.caption.monospaced())
+            .foregroundStyle(.secondary)
         }
     }
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 # ==============================================================================
-# Mesh VPN v0.3.0 — Automated $0 Desktop GUI QA Runner (POSIX / Linux / macOS)
-# Work Package: WP-D-C2 (US-116)
+# Mesh VPN v0.4.0 Unified UI — Automated $0 Desktop GUI QA Runner (POSIX / Linux / macOS)
+# Work Package: WP-U-E0 (US-133, US-134)
 # ==============================================================================
 # Executes:
 #   1. Static security audit (lab/desktop/audit-desktop-security.sh).
@@ -80,6 +80,7 @@ cargo test -p mesh-gui --all-targets --all-features
 cargo test -p mesh-gui --test qa_gdi_leak_gate --all-features
 cargo test -p mesh-gui --test qa_accessibility_unified_ui --all-features
 cargo test -p mesh-gui --test qa_state_label_unification --all-features
+cargo test -p mesh-gui --test security_regression_unified_ui --all-features
 cargo test -p mesh --test qa_desktop_cli_launcher --all-features
 cargo test -p mesh-net --test desktop_ipc_contract --all-features
 cargo test -p mesh-client --test desktop_session_wp_d_a1 --all-features
@@ -143,8 +144,8 @@ MD_SUMMARY="$REPO_ROOT/$OUTPUT_DIR/desktop-qa-summary.md"
 cat > "$JSON_REPORT" <<EOF
 {
   "schema_version": "1.0.0",
-  "sprint": "Sprint 5 (v0.3.0 Desktop GUI)",
-  "work_package": "WP-D-C2 (US-116)",
+  "sprint": "v0.4.0 Unified UI",
+  "work_package": "WP-U-E0 (US-133, US-134)",
   "generated_at_utc": "$END_TS",
   "started_at_utc": "$START_TS",
   "host_os": "$HOST_OS",
@@ -153,12 +154,12 @@ cat > "$JSON_REPORT" <<EOF
   "macos_native_suite_status": "$MACOS_GATE_STATUS",
   "macos_native_suite_details": "$MACOS_GATE_DETAILS",
   "hardware_signoff_required": true,
-  "hardware_protocol_doc": "docs/06-operations/desktop-gui-hardware-acceptance-protocol.md"
+  "hardware_protocol_doc": "docs/06-operations/unified-ui-hardware-acceptance-protocol.md"
 }
 EOF
 
 cat > "$MD_SUMMARY" <<EOF
-# Desktop GUI Automated QA Summary (\`v0.3.0\` / \`WP-D-C2\`)
+# Desktop GUI Automated QA Summary (\`v0.4.0 Unified UI\` / \`WP-U-E0: US-133, US-134\`)
 
 - **Started At (UTC)**: \`$START_TS\`
 - **Completed At (UTC)**: \`$END_TS\`
@@ -166,7 +167,7 @@ cat > "$MD_SUMMARY" <<EOF
 - **Static Security Audit (\`DGUI-AUDIT-01..10\`)**: \`VERIFIED\`
 - **Rust Desktop Suites (\`mesh-gui\`, \`mesh\`, \`mesh-net\`, \`mesh-client\`, \`mesh-core\`)**: \`VERIFIED\`
 - **macOS Native Gate**: \`$MACOS_GATE_STATUS\` ($MACOS_GATE_DETAILS)
-- **Physical Hardware UAT Sign-Off Required**: \`true\` (\`docs/06-operations/desktop-gui-hardware-acceptance-protocol.md\`)
+- **Physical Hardware UAT Sign-Off Required**: \`true\` (\`docs/06-operations/unified-ui-hardware-acceptance-protocol.md\`)
 EOF
 
 echo "[PASS] Desktop GUI QA Runner completed. Artifacts written to $OUTPUT_DIR."

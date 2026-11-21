@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Automated $0 Desktop GUI QA Runner for Mesh VPN v0.3.0 (WP-D-C2 / US-116).
+    Automated $0 Desktop GUI QA Runner for Mesh VPN v0.4.0 Unified UI (WP-U-E0: US-133, US-134).
 .DESCRIPTION
     Executes the full Desktop GUI quality gate on Windows:
       1. Toolchain & SDK auto-detection (mirrors scripts/check.ps1 MSVC vs MinGW fallback).
@@ -129,13 +129,13 @@ Write-Section "[2/5] Running Desktop GUI Rust Automated Test Suites (6 Crates)"
 $TestTargets = @(
     @{
         Id      = "DGUI-QA-02A"
-        Name    = "mesh-gui (--all-targets: unit, gui_unit_tests, gui_windows_unified_ui, i18n_parity_windows, qa_desktop_security_audit, qa_desktop_e2e_ipc, qa_gdi_leak_gate, qa_accessibility_unified_ui, qa_state_label_unification)"
+        Name    = "mesh-gui (--all-targets: unit, gui_unit_tests, gui_windows_unified_ui, i18n_parity_windows, qa_desktop_security_audit, qa_desktop_e2e_ipc, qa_gdi_leak_gate, qa_accessibility_unified_ui, qa_state_label_unification, security_regression_unified_ui)"
         Args    = @("test", "-p", "mesh-gui", "--all-targets", "--all-features")
     },
     @{
         Id      = "DGUI-QA-02A2"
-        Name    = "mesh-gui Unified UI QA gates (qa_gdi_leak_gate, qa_accessibility_unified_ui, qa_state_label_unification)"
-        Args    = @("test", "-p", "mesh-gui", "--test", "qa_gdi_leak_gate", "--test", "qa_accessibility_unified_ui", "--test", "qa_state_label_unification", "--all-features")
+        Name    = "mesh-gui Unified UI QA & Security gates (qa_gdi_leak_gate, qa_accessibility_unified_ui, qa_state_label_unification, security_regression_unified_ui)"
+        Args    = @("test", "-p", "mesh-gui", "--test", "qa_gdi_leak_gate", "--test", "qa_accessibility_unified_ui", "--test", "qa_state_label_unification", "--test", "security_regression_unified_ui", "--all-features")
     },
     @{
         Id      = "DGUI-QA-02B"
@@ -250,8 +250,8 @@ $DurationSec = [Math]::Round(($EndTimeUtc - $StartTimeUtc).TotalSeconds, 2)
 
 $ReportObj = [ordered]@{
     schema_version            = "1.0.0"
-    sprint                    = "Sprint 5 (v0.3.0 Desktop GUI)"
-    work_package              = "WP-D-C2 (US-116)"
+    sprint                    = "v0.4.0 Unified UI"
+    work_package              = "WP-U-E0 (US-133, US-134)"
     generated_at_utc          = $EndTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
     duration_seconds          = $DurationSec
     host_os                   = "windows"
@@ -279,7 +279,7 @@ $ReportObj = [ordered]@{
         }
     )
     hardware_signoff_required = $true
-    hardware_protocol_doc     = "docs/06-operations/desktop-gui-hardware-acceptance-protocol.md"
+    hardware_protocol_doc     = "docs/06-operations/unified-ui-hardware-acceptance-protocol.md"
 }
 
 $JsonReportPath = Join-Path $OutDirPath "desktop-qa-report.json"
@@ -292,13 +292,13 @@ $JsonText = ($ReportObj | ConvertTo-Json -Depth 6) -replace "`r`n", "`n"
 $GeneratedIso = $EndTimeUtc.ToString("yyyy-MM-ddTHH:mm:ssZ")
 $ToolchainStr = $ReportObj.toolchain
 $MdLines = @(
-    '# Desktop GUI Automated QA Summary (`v0.3.0` / `WP-D-C2`)',
+    '# Desktop GUI Automated QA Summary (`v0.4.0 Unified UI` / `WP-U-E0: US-133, US-134`)',
     '',
     ('- **Generated At (UTC)**: `{0}`' -f $GeneratedIso),
     ('- **Host Toolchain**: `{0}`' -f $ToolchainStr),
     ('- **Duration**: `{0}s`' -f $DurationSec),
     ('- **Release Binary (`MeshVPN.exe`)**: `{0}` bytes (`{1} MiB` <= `6.00 MiB` ceiling), PE Subsystem = `{2}` (`IMAGE_SUBSYSTEM_WINDOWS_GUI`)' -f $ExeSize, $SizeMiB, $PeSubsystem),
-    '- **Physical Hardware UAT Sign-Off Required**: `true` (`docs/06-operations/desktop-gui-hardware-acceptance-protocol.md`)',
+    '- **Physical Hardware UAT Sign-Off Required**: `true` (`docs/06-operations/unified-ui-hardware-acceptance-protocol.md`)',
     '',
     '## 1. Host-Verified Automated Gates (`VERIFIED_ON_WINDOWS_HOST`)',
     '',

@@ -5,6 +5,11 @@ options:
     iOS: "15.0"
   xcodeVersion: "16.0"
   createIntermediateGroups: true
+  developmentLanguage: en
+  knownRegions:
+    - en
+    - vi
+    - Base
 settings:
   base:
     IPHONEOS_DEPLOYMENT_TARGET: "15.0"

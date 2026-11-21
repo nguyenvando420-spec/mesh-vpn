@@ -170,10 +170,10 @@ struct PeersView: View {
 
                 if let ping = viewModel.lastPingResponse {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Latest Ping")
+                        Text(L10n.inline(en: "Latest Ping", vi: "Ping gần nhất", locale: locale))
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
-                        PingSummaryView(ping: ping)
+                        PingSummaryView(ping: ping, locale: locale)
                             .padding(12)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(cardBackground)
@@ -214,9 +214,15 @@ struct PeersView: View {
                 }
 
                 if viewModel.peersTruncatedNotice, let total = viewModel.totalPeerCount {
-                    Text("Showing compact peer slice from \(total) total peers.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        L10n.inline(
+                            en: "Showing compact peer slice from \(total) total peers.",
+                            vi: "Đang hiển thị nhóm rút gọn trong tổng số \(total) thiết bị.",
+                            locale: locale
+                        )
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
             }
             .padding(16)
@@ -379,13 +385,19 @@ private struct PeerRowView: View {
 
 private struct PingSummaryView: View {
     let ping: MobilePingResponse
+    let locale: Locale
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Ping \(ping.peerName) (\(ping.peerOverlayIp))")
                 .font(.subheadline.weight(.medium))
             if let avg = ping.avgRttMs {
-                Text(String(format: "Average RTT: %.1f ms", avg))
+                let avgLabel = L10n.inline(
+                    en: String(format: "Average RTT: %.1f ms", avg),
+                    vi: String(format: "RTT trung bình: %.1f ms", avg),
+                    locale: locale
+                )
+                Text(avgLabel)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }

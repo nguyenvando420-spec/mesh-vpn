@@ -69,6 +69,10 @@ public enum MeshL10n: Sendable {
         return bundle.localizedString(forKey: key, value: key, table: nil)
     }
 
+    public static func inline(en: String, vi: String, locale: Locale? = nil) -> String {
+        resolvedLanguageCode(for: locale) == "vi" ? vi : en
+    }
+
     public static func stringsTable(forLanguage lang: String) -> [String: String]? {
         guard let url = Bundle.module.url(
             forResource: "Localizable",

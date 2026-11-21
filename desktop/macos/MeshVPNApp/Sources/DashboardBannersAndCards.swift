@@ -435,14 +435,19 @@ struct StatusTabView: View {
                     Text(relay.isEmpty ? "—" : relay).font(.body.monospaced())
                 }
                 GridRow {
-                    Text("Local UDP / Interface").foregroundStyle(.secondary)
+                    Text(MeshL10n.inline(en: "Local UDP / Interface",
+                                         vi: "UDP cục bộ / Giao diện", locale: loc))
+                        .foregroundStyle(.secondary)
                     let port = store.status?.selfNetwork.localUdpPort ?? 0
                     let iface = store.status?.selfNetwork.boundPhysicalInterface ?? "auto"
                     Text(":\(port) • \(iface)").font(.body.monospaced())
                 }
                 GridRow {
-                    Text("NAT Classification").foregroundStyle(.secondary)
-                    Text(store.status?.selfNetwork.natType.displayLabel ?? "Unknown")
+                    Text(MeshL10n.inline(en: "NAT Classification",
+                                         vi: "Phân loại NAT", locale: loc))
+                        .foregroundStyle(.secondary)
+                    let natUnknown = MeshL10n.inline(en: "Unknown", vi: "Không rõ", locale: loc)
+                    Text(store.status?.selfNetwork.natType.displayLabel ?? natUnknown)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -458,7 +463,7 @@ struct StatusTabView: View {
                 Button(
                     copiedField == label
                         ? MeshL10n.tr("peers.copied_toast", locale: loc)
-                        : "Copy"
+                        : MeshL10n.inline(en: "Copy", vi: "Sao chép", locale: loc)
                 ) {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()

@@ -50,6 +50,7 @@ import dev.meshvpn.android.ui.settings.SettingsScreen
 import dev.meshvpn.android.ui.status.StatusScreen
 import dev.meshvpn.android.ui.theme.MeshTheme
 import dev.meshvpn.android.ui.theme.SharedPrefsThemeStore
+import dev.meshvpn.android.vpn.MeshVpnNotificationHelper
 import dev.meshvpn.android.vpn.MeshVpnService
 
 /**
@@ -108,6 +109,10 @@ class MainActivity : FragmentActivity() {
 
             LaunchedEffect(screenState.requireFlagSecure) {
                 updateFlagSecure(screenState.requireFlagSecure)
+            }
+
+            LaunchedEffect(screenState.localeMode) {
+                MeshVpnNotificationHelper.createChannels(applicationContext)
             }
 
             LaunchedEffect(screenState.pendingShareBugreport) {
@@ -291,6 +296,8 @@ private fun MeshRootScaffold(
                 onConfirmJoin = { viewModel.confirmPendingJoin(onPrepareAndStartVpn) },
                 onCancelConfirmation = viewModel::cancelPendingConfirmation,
                 modifier = Modifier.padding(innerPadding),
+                onSelectThemeMode = viewModel::selectThemeMode,
+                onSelectLocaleMode = viewModel::setLocaleMode,
             )
             return@Scaffold
         }

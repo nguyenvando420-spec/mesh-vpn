@@ -2,6 +2,15 @@ import Foundation
 @testable import MeshDesktopCore
 import XCTest
 
+private struct IconMappingCase {
+    let computed: ComputedDesktopState
+    let symbol: String
+    var tone: SemanticStatusTone?
+    var lightHex: String?
+    var darkHex: String?
+    var expectedGroup: MenuBarStatusGroup?
+}
+
 extension DesktopStoreTests {
     func testDesktopStateMapper_All10States_MapsIconSymbolAndSemanticHexColors() {
         // Arrange
@@ -12,122 +21,115 @@ extension DesktopStoreTests {
             message: "Mismatch",
             requiresPinUpdate: true
         )
+        let offline = IpcClientError.serviceUnavailable("off")
 
         // Act: Compute all 10 canonical desktop states
-        let unavailable = DesktopStateMapper.compute(
-            serviceFilesPresent: false,
-            statusResponse: nil,
-            connectFailure: .serviceUnavailable("off"),
-            lastActionError: nil
-        )
-        let stopped = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: nil,
-            connectFailure: .serviceUnavailable("off"),
-            lastActionError: nil
-        )
-        let notEnrolled = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(daemonState: .stopped),
-            connectFailure: nil,
-            lastActionError: nil
-        )
-        let connecting = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(
-                daemonState: .connecting,
-                nodeId: "n1",
-                serverConnection: conn
+        let cases: [IconMappingCase] = [
+            IconMappingCase(
+                computed: computeState(servicePresent: false, connectFailure: offline),
+                symbol: "shield.slash",
+                lightHex: "#6B7280"
             ),
-            connectFailure: nil,
-            lastActionError: nil
-        )
-        let connected = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(
-                daemonState: .connected,
-                nodeId: "n1",
-                serverConnection: conn
+            IconMappingCase(
+                computed: computeState(connectFailure: offline),
+                symbol: "shield.slash",
+                darkHex: "#9CA3AF"
             ),
-            connectFailure: nil,
-            lastActionError: nil
-        )
-        let degraded = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(
-                daemonState: .degraded,
-                nodeId: "n1",
-                serverConnection: conn
+            IconMappingCase(
+                computed: computeState(status: AgentStatusResponse(daemonState: .stopped)),
+                symbol: "shield",
+                tone: .neutral
             ),
-            connectFailure: nil,
-            lastActionError: nil
-        )
-        let disconnected = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(
-                daemonState: .stopped,
-                nodeId: "n1",
-                serverConnection: conn
+            IconMappingCase(
+                computed: computeState(status: enrolledStatus(.connecting, conn: conn)),
+                symbol: "bolt.shield.fill",
+                lightHex: "#D97706"
             ),
-            connectFailure: nil,
-            lastActionError: nil
-        )
-        let reauth = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(
-                daemonState: .reauthRequired,
-                nodeId: "n1",
-                serverConnection: conn
+            IconMappingCase(
+                computed: computeState(status: enrolledStatus(.connected, conn: conn)),
+                symbol: "checkmark.shield.fill",
+                lightHex: "#16A34A",
+                darkHex: "#4ADE80"
             ),
-            connectFailure: nil,
-            lastActionError: nil
-        )
-        let revoked = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(
-                daemonState: .revoked,
-                nodeId: "n1",
-                serverConnection: conn
+            IconMappingCase(
+                computed: computeState(status: enrolledStatus(.degraded, conn: conn)),
+                symbol: "bolt.shield.fill",
+                darkHex: "#FBBF24"
             ),
-            connectFailure: nil,
-            lastActionError: nil
-        )
-        let recoverableErr = DesktopStateMapper.compute(
-            serviceFilesPresent: true,
-            statusResponse: AgentStatusResponse(
-                daemonState: .stopped,
-                nodeId: "n1",
-                serverConnection: conn
+            IconMappingCase(
+                computed: computeState(status: enrolledStatus(.stopped, conn: conn)),
+                symbol: "shield",
+                lightHex: "#6B7280"
             ),
-            connectFailure: nil,
-            lastActionError: pinErr
-        )
+            IconMappingCase(
+                computed: computeState(status: enrolledStatus(.reauthRequired, conn: conn)),
+                symbol: "key.slash",
+                tone: .warning,
+                lightHex: "#D97706",
+                darkHex: "#FBBF24",
+                expectedGroup: .reauthRequired
+            ),
+            IconMappingCase(
+                computed: computeState(status: enrolledStatus(.revoked, conn: conn)),
+                symbol: "exclamationmark.shield.fill",
+                tone: .error,
+                lightHex: "#DC2626"
+            ),
+            IconMappingCase(
+                computed: computeState(
+                    status: enrolledStatus(.stopped, conn: conn),
+                    lastActionError: pinErr
+                ),
+                symbol: "exclamationmark.shield.fill",
+                darkHex: "#F87171"
+            ),
+        ]
 
         // Assert: Verify symbol, semantic tone, and canonical light/dark hex tokens
-        XCTAssertEqual(unavailable.menuBarGroup.symbolName, "shield.slash")
-        XCTAssertEqual(unavailable.menuBarGroup.lightHex, "#6B7280")
-        XCTAssertEqual(stopped.menuBarGroup.symbolName, "shield.slash")
-        XCTAssertEqual(stopped.menuBarGroup.darkHex, "#9CA3AF")
-        XCTAssertEqual(notEnrolled.menuBarGroup.symbolName, "shield")
-        XCTAssertEqual(notEnrolled.menuBarGroup.semanticTone, .neutral)
-        XCTAssertEqual(connecting.menuBarGroup.symbolName, "bolt.shield.fill")
-        XCTAssertEqual(connecting.menuBarGroup.lightHex, "#D97706")
-        XCTAssertEqual(connected.menuBarGroup.symbolName, "checkmark.shield.fill")
-        XCTAssertEqual(connected.menuBarGroup.lightHex, "#16A34A")
-        XCTAssertEqual(connected.menuBarGroup.darkHex, "#4ADE80")
-        XCTAssertEqual(degraded.menuBarGroup.symbolName, "bolt.shield.fill")
-        XCTAssertEqual(degraded.menuBarGroup.darkHex, "#FBBF24")
-        XCTAssertEqual(disconnected.menuBarGroup.symbolName, "shield")
-        XCTAssertEqual(disconnected.menuBarGroup.lightHex, "#6B7280")
-        XCTAssertEqual(reauth.menuBarGroup, .reauthRequired)
-        XCTAssertEqual(reauth.menuBarGroup.symbolName, "key.slash")
-        XCTAssertEqual(reauth.menuBarGroup.semanticTone, .warning)
-        XCTAssertEqual(reauth.menuBarGroup.lightHex, "#D97706")
-        XCTAssertEqual(reauth.menuBarGroup.darkHex, "#FBBF24")
-        XCTAssertEqual(revoked.menuBarGroup.symbolName, "exclamationmark.shield.fill")
-        XCTAssertEqual(revoked.menuBarGroup.semanticTone, .error)
-        XCTAssertEqual(revoked.menuBarGroup.lightHex, "#DC2626")
-        XCTAssertEqual(recoverableErr.menuBarGroup.symbolName, "exclamationmark.shield.fill")
-        XCTAssertEqual(recoverableErr.menuBarGroup.darkHex, "#F87171")
+        for item in cases {
+            assertIconMapping(item)
+        }
+    }
+
+    private func computeState(
+        servicePresent: Bool = true,
+        status: AgentStatusResponse? = nil,
+        connectFailure: IpcClientError? = nil,
+        lastActionError: DesktopUserFacingError? = nil
+    ) -> ComputedDesktopState {
+        DesktopStateMapper.compute(
+            serviceFilesPresent: servicePresent,
+            statusResponse: status,
+            connectFailure: connectFailure,
+            lastActionError: lastActionError
+        )
+    }
+
+    private func enrolledStatus(
+        _ state: DaemonState,
+        conn: ServerConnectionStatus
+    ) -> AgentStatusResponse {
+        AgentStatusResponse(daemonState: state, nodeId: "n1", serverConnection: conn)
+    }
+
+    private func assertIconMapping(
+        _ item: IconMappingCase,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let group = item.computed.menuBarGroup
+        XCTAssertEqual(group.symbolName, item.symbol, file: file, line: line)
+        if let expectedGroup = item.expectedGroup {
+            XCTAssertEqual(group, expectedGroup, file: file, line: line)
+        }
+        if let expectedTone = item.tone {
+            XCTAssertEqual(group.semanticTone, expectedTone, file: file, line: line)
+        }
+        if let expectedLight = item.lightHex {
+            XCTAssertEqual(group.lightHex, expectedLight, file: file, line: line)
+        }
+        if let expectedDark = item.darkHex {
+            XCTAssertEqual(group.darkHex, expectedDark, file: file, line: line)
+        }
     }
 }

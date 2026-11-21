@@ -75,8 +75,11 @@ struct OnboardingView: View {
             .autocorrectionDisabled()
             .keyboardType(.URL)
 
-            TextField("Port (optional)", text: $viewModel.manualPortText)
-                .keyboardType(.numberPad)
+            TextField(
+                L10n.inline(en: "Port (optional)", vi: "Cổng (tùy chọn)", locale: locale),
+                text: $viewModel.manualPortText
+            )
+            .keyboardType(.numberPad)
 
             Picker(
                 L10n.tr("settings.server_tls", locale: locale),

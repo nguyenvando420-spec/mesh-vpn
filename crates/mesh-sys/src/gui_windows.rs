@@ -25,12 +25,14 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CLEARTYPE_QUALITY, COLOR_BTNFACE, CreateBitmap, CreateCompatibleBitmap,
-    CreateCompatibleDC, CreateFontIndirectW, CreateFontW, CreatePen, CreateSolidBrush,
-    DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-    DeleteObject, DrawFocusRect, DrawTextW, EndPaint, FillRect, GetStockObject, HBRUSH, HDC,
-    HGDIOBJ, InvalidateRect, LOGFONTW, NULL_PEN, OPAQUE, PAINTSTRUCT, PS_SOLID, RoundRect, SRCCOPY,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
+    BeginPaint, BitBlt, CLEARTYPE_QUALITY, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT,
+    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateBitmap,
+    CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreateFontW, CreatePen,
+    CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DeleteDC, DeleteObject, DrawFocusRect, DrawTextW, EndPaint, FillRect, GetStockObject,
+    GetSysColor, HBRUSH, HDC, HGDIOBJ, InvalidateRect, LOGFONTW, NULL_PEN, OPAQUE, PAINTSTRUCT,
+    PS_SOLID, RoundRect, SRCCOPY, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+    UpdateWindow,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -103,7 +105,7 @@ use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, SystemParametersInfoForDpi,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, GetKeyState, SetFocus, VK_CONTROL,
+    EnableWindow, GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_TAB,
 };
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_Desktop, FOLDERID_Programs, FOLDERID_StartMenu, NIF_ICON, NIF_INFO, NIF_MESSAGE,
@@ -116,23 +118,24 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_OWNERDRAW, BS_PUSHBUTTON, CHILDID_SELF, CREATESTRUCTW, CW_USEDEFAULT, CreateIconIndirect,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
     DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD, ES_READONLY,
-    EVENT_OBJECT_NAMECHANGE, FindWindowW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetDlgCtrlID,
-    GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICON_BIG,
-    ICON_SMALL, ICONINFO, IDC_ARROW, IDYES, IsDialogMessageW, KillTimer, LB_ADDSTRING,
-    LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LBS_NOTIFY, LoadCursorW, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow, NONCLIENTMETRICSW, OBJID_CLIENT,
-    PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SM_CXSMICON,
-    SMTO_ABORTIFHUNG, SPI_GETHIGHCONTRAST, SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SW_SHOWNORMAL, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SetProcessDPIAware,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE,
-    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_CONTROLPARENT, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    EVENT_OBJECT_NAMECHANGE, FindWindowW, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetClientRect,
+    GetCursorPos, GetDlgCtrlID, GetMessageW, GetNextDlgTabItem, GetWindowLongPtrW, GetWindowLongW,
+    GetWindowTextLengthW, GetWindowTextW, HICON, HMENU, ICON_BIG, ICON_SMALL, ICONINFO, IDC_ARROW,
+    IDYES, IsDialogMessageW, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
+    LBS_NOTIFY, LoadCursorW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, MoveWindow,
+    NONCLIENTMETRICSW, OBJID_CLIENT, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SM_CXSMICON, SMTO_ABORTIFHUNG, SPI_GETHIGHCONTRAST,
+    SPI_GETNONCLIENTMETRICS, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SendMessageTimeoutW,
+    SendMessageW, SetForegroundWindow, SetProcessDPIAware, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_DRAWITEM, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WM_RBUTTONUP,
+    WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW,
+    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_GROUP, WS_OVERLAPPEDWINDOW,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows_sys::core::GUID;
 
@@ -807,6 +810,13 @@ pub trait WindowEventHandler {
     }
     /// Invoked on `WM_DRAWITEM` for `BS_OWNERDRAW` buttons/tabs/pills (`ADR-027`).
     fn on_draw_item(&self, _hwnd: isize, _item: &OwnerDrawItem) -> bool {
+        false
+    }
+    /// Invoked before `IsDialogMessageW` on `VK_LEFT` (`direction = -1`) or `VK_RIGHT`
+    /// (`direction = 1`) when a child control holds focus (`US-122`, `US-135`).
+    ///
+    /// Return `true` if handled so the message loop consumes the key without further dispatch.
+    fn on_tab_arrow_key(&self, _hwnd: isize, _focused_control_id: u16, _direction: i32) -> bool {
         false
     }
 }
@@ -2683,9 +2693,18 @@ pub fn run_gui_window(spec: GuiWindowSpec<'_>, handler: &dyn WindowEventHandler)
         if status <= 0 {
             break;
         }
-        if msg.message == WM_KEYDOWN && msg.wParam == usize::from(b'V') && is_ctrl_down() {
-            let focused_id = get_focused_control_id();
-            handler.on_ctrl_v(hwnd as isize, focused_id);
+        if msg.message == WM_KEYDOWN {
+            if msg.wParam == usize::from(b'V') && is_ctrl_down() {
+                let focused_id = get_focused_control_id();
+                handler.on_ctrl_v(hwnd as isize, focused_id);
+            } else if handle_dialog_keydown_navigation(
+                hwnd as isize,
+                msg.wParam,
+                is_shift_down(),
+                handler,
+            ) {
+                continue;
+            }
         }
         // SAFETY: `IsDialogMessageW` implements Tab/Shift+Tab keyboard navigation across controls.
         let handled = unsafe { IsDialogMessageW(hwnd, &raw const msg) };
@@ -3812,6 +3831,138 @@ pub fn announce_accessible_label(hwnd: isize, label: &str) {
     }
 }
 
+/// Windows system color palette queried via `GetSysColor` for High-Contrast mode (`UUI-29`,
+/// `US-135` AC3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemHighContrastColors {
+    /// `COLOR_WINDOW` background `COLORREF`.
+    pub window_bg: u32,
+    /// `COLOR_WINDOWTEXT` primary text `COLORREF`.
+    pub window_text: u32,
+    /// `COLOR_HIGHLIGHT` accent/active `COLORREF`.
+    pub highlight: u32,
+    /// `COLOR_HIGHLIGHTTEXT` foreground text on `COLOR_HIGHLIGHT`.
+    pub highlight_text: u32,
+    /// `COLOR_BTNTEXT` button text and high-contrast border `COLORREF`.
+    pub btn_text: u32,
+    /// `COLOR_GRAYTEXT` secondary/disabled text `COLORREF`.
+    pub gray_text: u32,
+}
+
+/// Reads current Windows system colors via `GetSysColor` (`UUI-29`, `US-135` AC3).
+#[must_use]
+pub fn read_system_high_contrast_colors() -> SystemHighContrastColors {
+    // SAFETY: `GetSysColor` is a pure read-only Win32 query taking predefined `COLOR_*` indices.
+    unsafe {
+        SystemHighContrastColors {
+            window_bg: GetSysColor(COLOR_WINDOW),
+            window_text: GetSysColor(COLOR_WINDOWTEXT),
+            highlight: GetSysColor(COLOR_HIGHLIGHT),
+            highlight_text: GetSysColor(COLOR_HIGHLIGHTTEXT),
+            btn_text: GetSysColor(COLOR_BTNTEXT),
+            gray_text: GetSysColor(COLOR_GRAYTEXT),
+        }
+    }
+}
+
+/// Virtual key code for `VK_TAB` (`0x09`).
+pub const WIN_VK_TAB: usize = VK_TAB as usize;
+
+/// Virtual key code for `VK_LEFT` (`0x25`).
+pub const WIN_VK_LEFT: usize = VK_LEFT as usize;
+
+/// Virtual key code for `VK_RIGHT` (`0x27`).
+pub const WIN_VK_RIGHT: usize = VK_RIGHT as usize;
+
+/// Returns the currently focused Win32 `HWND` on the calling thread (`0` if none).
+#[must_use]
+pub fn get_focus_control() -> isize {
+    // SAFETY: `GetFocus` returns the thread's focused `HWND` or null.
+    unsafe { GetFocus() as isize }
+}
+
+/// Returns `true` when `ctrl_hwnd` is a Win32 `EDIT` control with `ES_MULTILINE` style set.
+#[must_use]
+pub fn is_multiline_edit_control(ctrl_hwnd: isize) -> bool {
+    if ctrl_hwnd == 0 {
+        return false;
+    }
+    let hwnd = ctrl_hwnd as HWND;
+    let mut class_buf = [0_u16; 32];
+    let cap = i32::try_from(class_buf.len()).unwrap_or(32);
+    // SAFETY: `class_buf` is valid writable UTF-16 storage of length `cap`.
+    let len = unsafe { GetClassNameW(hwnd, class_buf.as_mut_ptr(), cap) };
+    if len <= 0 {
+        return false;
+    }
+    let used = usize::try_from(len).unwrap_or(0).min(class_buf.len());
+    let class_name = String::from_utf16_lossy(class_buf.get(..used).unwrap_or(&[]));
+    if !class_name.eq_ignore_ascii_case("EDIT") {
+        return false;
+    }
+    // SAFETY: Queries standard `GWL_STYLE` bitmask of a valid `HWND`.
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    let multiline_bit = u32::try_from(ES_MULTILINE).unwrap_or(0);
+    (style & multiline_bit) != 0
+}
+
+/// Moves dialog keyboard focus from `current_ctrl` to the next (or previous when `reverse`)
+/// `WS_TABSTOP` sibling inside `dialog_hwnd` using `GetNextDlgTabItem` + `SetFocus` (`US-135`).
+///
+/// Returns the newly focused `HWND` as `isize`, or `0` if no distinct tab-stop sibling exists.
+#[must_use]
+pub fn move_dialog_tab_focus(dialog_hwnd: isize, current_ctrl: isize, reverse: bool) -> isize {
+    if dialog_hwnd == 0 || current_ctrl == 0 {
+        return 0;
+    }
+    let dlg = dialog_hwnd as HWND;
+    let cur = current_ctrl as HWND;
+    // SAFETY: Queries next/previous visible enabled `WS_TABSTOP` control in `dlg`.
+    let next = unsafe { GetNextDlgTabItem(dlg, cur, i32::from(reverse)) };
+    if next.is_null() || next == cur {
+        return 0;
+    }
+    // SAFETY: Transfers keyboard focus to the valid sibling `HWND` returned by `GetNextDlgTabItem`.
+    let _prev = unsafe { SetFocus(next) };
+    next as isize
+}
+
+/// Intercepts `WM_KEYDOWN` dialog keyboard navigation before `IsDialogMessageW` (`US-122`,
+/// `US-135`):
+/// 1. Escapes `VK_TAB` / `Shift+Tab` out of `ES_MULTILINE` `EDIT` controls (`IDC_EDIT_DETAILS`),
+///    which otherwise return `DLGC_WANTTAB` and trap keyboard focus.
+/// 2. Dispatches `VK_LEFT` / `VK_RIGHT` to [`WindowEventHandler::on_tab_arrow_key`] for 3-tab
+///    bar arrow-key switching.
+///
+/// Returns `true` when consumed so the message loop skips `IsDialogMessageW` and `TranslateMessage`.
+#[must_use]
+pub fn handle_dialog_keydown_navigation(
+    dialog_hwnd: isize,
+    vk_code: usize,
+    shift_down: bool,
+    handler: &dyn WindowEventHandler,
+) -> bool {
+    if dialog_hwnd == 0 {
+        return false;
+    }
+    if vk_code == WIN_VK_TAB {
+        let focused = get_focus_control();
+        if focused != 0 && is_multiline_edit_control(focused) {
+            let _next = move_dialog_tab_focus(dialog_hwnd, focused, shift_down);
+            return true;
+        }
+        return false;
+    }
+    if vk_code == WIN_VK_LEFT || vk_code == WIN_VK_RIGHT {
+        let focused_id = get_focused_control_id();
+        if focused_id != 0 {
+            let direction = if vk_code == WIN_VK_LEFT { -1 } else { 1 };
+            return handler.on_tab_arrow_key(dialog_hwnd, focused_id, direction);
+        }
+    }
+    false
+}
+
 fn get_focused_control_id() -> u16 {
     // SAFETY: Returns focused `HWND` on current thread (or null).
     let focused = unsafe { GetFocus() };
@@ -3826,6 +3977,12 @@ fn get_focused_control_id() -> u16 {
 fn is_ctrl_down() -> bool {
     // SAFETY: Queries current key state of `VK_CONTROL`.
     let state = unsafe { GetKeyState(i32::from(VK_CONTROL)) };
+    state < 0
+}
+
+fn is_shift_down() -> bool {
+    // SAFETY: Queries current key state of `VK_SHIFT`.
+    let state = unsafe { GetKeyState(i32::from(VK_SHIFT)) };
     state < 0
 }
 
@@ -5216,5 +5373,205 @@ mod tests {
         assert_eq!(super::calc_font_height_for_dpi(12, 96), -16);
         assert_eq!(super::calc_font_height_for_dpi(12, 144), -24);
         assert_eq!(super::calc_font_height_for_dpi(10, 192), -27);
+    }
+
+    #[test]
+    fn test_read_system_high_contrast_colors_returns_valid_palette() {
+        // Arrange & Act
+        let colors = super::read_system_high_contrast_colors();
+
+        // Assert: GetSysColor always returns 24-bit BGR COLORREFs with distinct bg vs text
+        assert_eq!(colors.window_bg & 0xFF00_0000, 0);
+        assert_eq!(colors.window_text & 0xFF00_0000, 0);
+        assert_eq!(colors.highlight & 0xFF00_0000, 0);
+        assert_eq!(colors.highlight_text & 0xFF00_0000, 0);
+        assert_eq!(colors.btn_text & 0xFF00_0000, 0);
+        assert_eq!(colors.gray_text & 0xFF00_0000, 0);
+        assert_ne!(colors.window_bg, colors.window_text);
+    }
+
+    #[test]
+    fn test_gui_windows_multiline_edit_tab_escape_and_tab_bar_arrows() {
+        use std::cell::RefCell;
+        use std::mem::{self, size_of};
+        use std::ptr;
+
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, UnregisterClassW,
+            WNDCLASSEXW, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_POPUP, WS_VISIBLE,
+        };
+
+        let _lock = GDI_TEST_LOCK.lock();
+
+        struct TabArrowSpy {
+            tabs: RefCell<[isize; 3]>,
+            last_event: RefCell<Option<(u16, i32)>>,
+        }
+
+        impl super::WindowEventHandler for TabArrowSpy {
+            fn on_create(&self, _hwnd: isize) {}
+            fn on_command(&self, _hwnd: isize, _control_id: u16, _notify_code: u16) {}
+            fn on_timer(&self, _hwnd: isize, _timer_id: usize) {}
+            fn on_tray_callback(&self, _hwnd: isize, _event_msg: u32) {}
+            fn on_taskbar_created(&self, _hwnd: isize) {}
+            fn on_activate_requested(&self, _hwnd: isize) {}
+            fn on_graceful_shutdown(&self, _hwnd: isize) {}
+            fn on_app_message(&self, _hwnd: isize, _msg: u32, _wparam: usize, _lparam: isize) {}
+            fn on_ctrl_v(&self, _hwnd: isize, _focused_control_id: u16) {}
+            fn on_dpi_changed(&self, _hwnd: isize, _dpi: u32) {}
+            fn on_resize(&self, _hwnd: isize, _width: i32, _height: i32) {}
+            fn on_query_version(&self) -> isize {
+                0
+            }
+            fn on_close(&self, _hwnd: isize) -> bool {
+                false
+            }
+            fn on_destroy(&self, _hwnd: isize) {}
+            fn on_tab_arrow_key(
+                &self,
+                _hwnd: isize,
+                focused_control_id: u16,
+                direction: i32,
+            ) -> bool {
+                let ids = [2013_u16, 2014_u16, 2015_u16];
+                let Some(idx) = ids.iter().position(|&id| id == focused_control_id) else {
+                    return false;
+                };
+                let next_idx = if direction < 0 {
+                    (idx + 2) % 3
+                } else {
+                    (idx + 1) % 3
+                };
+                *self.last_event.borrow_mut() = Some((focused_control_id, direction));
+                if let Some(&target_hwnd) = self.tabs.borrow().get(next_idx) {
+                    super::set_focus_control(target_hwnd);
+                }
+                true
+            }
+        }
+
+        // Arrange: create an off-screen visible WS_EX_CONTROLPARENT dialog window with 3 tabs,
+        // a multiline read-only EDIT control (same flags as IDC_EDIT_DETAILS), and a button.
+        let class_name = format!("MeshNavTest_{}", std::process::id());
+        let Ok(class_wide) = super::encode_wide_nul_str(&class_name, "test_class") else {
+            return;
+        };
+        let Ok(title_wide) = super::encode_wide_nul_str("MeshNavTest", "test_title") else {
+            return;
+        };
+        // SAFETY: Current module handle for temporary test window class registration.
+        let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
+        // SAFETY: POD zero-init of `WNDCLASSEXW` before populating fields.
+        let mut wc: WNDCLASSEXW = unsafe { mem::zeroed() };
+        wc.cbSize = u32::try_from(size_of::<WNDCLASSEXW>()).unwrap_or(0);
+        wc.lpfnWndProc = Some(DefWindowProcW);
+        wc.hInstance = hinstance;
+        wc.lpszClassName = class_wide.as_ptr();
+        // SAFETY: Registers temporary test class with valid `class_wide` and `DefWindowProcW`.
+        let atom = unsafe { RegisterClassExW(&raw const wc) };
+        assert_ne!(atom, 0, "RegisterClassExW failed in Win32 nav test");
+
+        // SAFETY: Creates temporary off-screen visible test dialog window on this thread.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                class_wide.as_ptr(),
+                title_wide.as_ptr(),
+                WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN,
+                -24000,
+                -24000,
+                400,
+                200,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                hinstance,
+                ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null(), "CreateWindowExW failed in Win32 nav test");
+        let dlg = hwnd as isize;
+
+        let rect = super::ControlRect::new(8, 8, 100, 28);
+        let tab0 = super::create_owner_draw_button(dlg, 2013, "Status", rect).unwrap_or(0);
+        let tab1 = super::create_owner_draw_button(dlg, 2014, "Peers", rect).unwrap_or(0);
+        let tab2 = super::create_owner_draw_button(dlg, 2015, "Diag", rect).unwrap_or(0);
+        let edit = super::create_edit(dlg, 2044, "Details", rect, false, true).unwrap_or(0);
+        let btn = super::create_button(dlg, 2099, "Next", rect, false).unwrap_or(0);
+        assert_ne!(tab0, 0);
+        assert_ne!(tab1, 0);
+        assert_ne!(tab2, 0);
+        assert_ne!(edit, 0);
+        assert_ne!(btn, 0);
+
+        let spy = TabArrowSpy {
+            tabs: RefCell::new([tab0, tab1, tab2]),
+            last_event: RefCell::new(None),
+        };
+
+        // Act & Assert 1: multiline edit detection + deterministic GetNextDlgTabItem traversal
+        assert!(super::is_multiline_edit_control(edit));
+        assert!(!super::is_multiline_edit_control(btn));
+        assert!(!super::is_multiline_edit_control(tab0));
+        let next_fwd = super::move_dialog_tab_focus(dlg, edit, false);
+        let next_rev = super::move_dialog_tab_focus(dlg, edit, true);
+        assert_eq!(next_fwd, btn, "Tab forward from edit must jump to btn");
+        assert_eq!(next_rev, tab2, "Shift+Tab from edit must jump to tab2");
+
+        // Act & Assert 2: live SetFocus + handle_dialog_keydown_navigation (when desktop interactive)
+        super::set_focus_control(edit);
+        if super::get_focus_control() == edit {
+            assert!(super::handle_dialog_keydown_navigation(
+                dlg,
+                super::WIN_VK_TAB,
+                false,
+                &spy
+            ));
+            assert_ne!(
+                super::get_focus_control(),
+                edit,
+                "Tab must escape multiline readonly EDIT control"
+            );
+
+            super::set_focus_control(edit);
+            assert!(super::handle_dialog_keydown_navigation(
+                dlg,
+                super::WIN_VK_TAB,
+                true,
+                &spy
+            ));
+            assert_ne!(
+                super::get_focus_control(),
+                edit,
+                "Shift+Tab must escape multiline readonly EDIT control"
+            );
+
+            // Arrow right/left on 3-tab bar
+            super::set_focus_control(tab0);
+            assert!(super::handle_dialog_keydown_navigation(
+                dlg,
+                super::WIN_VK_RIGHT,
+                false,
+                &spy
+            ));
+            assert_eq!(*spy.last_event.borrow(), Some((2013, 1)));
+            assert_eq!(super::get_focus_control(), tab1);
+
+            assert!(super::handle_dialog_keydown_navigation(
+                dlg,
+                super::WIN_VK_LEFT,
+                false,
+                &spy
+            ));
+            assert_eq!(*spy.last_event.borrow(), Some((2014, -1)));
+            assert_eq!(super::get_focus_control(), tab0);
+        }
+
+        // SAFETY: Destroys temporary test dialog and unregisters its class cleanly.
+        unsafe {
+            let _destroyed = DestroyWindow(dlg as HWND);
+            let _unreg = UnregisterClassW(class_wide.as_ptr(), hinstance);
+        }
     }
 }

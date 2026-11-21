@@ -45,6 +45,11 @@ public enum L10n: Sendable {
     public static func languageCode(for locale: Locale) -> String {
         locale.identifier.lowercased().hasPrefix("vi") ? "vi" : "en"
     }
+
+    /// Selects an inline bilingual secondary label without modifying the 213-key catalog.
+    public static func inline(en: String, vi: String, locale: Locale) -> String {
+        languageCode(for: locale) == "vi" ? vi : en
+    }
 }
 
 /// Manages `UserDefaults` key `"mesh_locale_mode"` and live `Locale` resolution (`ADR-029`).

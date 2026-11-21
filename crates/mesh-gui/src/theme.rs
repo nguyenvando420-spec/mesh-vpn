@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 #[cfg(target_os = "windows")]
 use mesh_sys::gui_windows::{
-    OwnedGdiObj, create_font_for_dpi, create_solid_brush, create_solid_pen, detect_high_contrast,
+    OwnedGdiObj, SystemHighContrastColors, create_font_for_dpi, create_solid_brush,
+    create_solid_pen, detect_high_contrast, read_system_high_contrast_colors,
     read_windows_apps_use_light_theme,
 };
 use serde::{Deserialize, Serialize};
@@ -115,6 +116,7 @@ pub(crate) struct UiThemePalette {
     pub(crate) semantic_warning: u32,
     pub(crate) semantic_error: u32,
     pub(crate) semantic_neutral: u32,
+    pub(crate) on_accent_text: u32,
 
     // Cached surface & brand GDI objects (`OwnedGdiObj`)
     pub(crate) bg_brush: Option<OwnedGdiObj>,
@@ -210,11 +212,7 @@ impl UiThemePalette {
     /// Returns high-contrast foreground text `COLORREF` for filled brand/semantic pills & CTAs.
     #[must_use]
     pub(crate) const fn on_accent_text_color(&self) -> u32 {
-        if self.is_dark_titlebar {
-            DARK_SURFACE_BG
-        } else {
-            LIGHT_SURFACE_CARD
-        }
+        self.on_accent_text
     }
 
     /// Looks up or lazily caches a solid brush for `color`.
@@ -243,20 +241,43 @@ pub(crate) fn resolve_palette(mode: ThemeMode) -> UiThemePalette {
     resolve_palette_for_dpi(mode, 96)
 }
 
-/// Resolves canonical Light/Dark tokens and DPI-scaled GDI brushes/pens/fonts (`ADR-027`, `ADR-030`).
+/// Returns `true` when a Win32 BGR `COLORREF` (`0x00BBGGRR`) has dark relative luminance.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) const fn is_colorref_dark(color: u32) -> bool {
+    let r = color & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = (color >> 16) & 0xFF;
+    (299 * r + 587 * g + 114 * b) < 128_000
+}
+
+/// Resolves canonical Light/Dark or Windows High-Contrast (`GetSysColor`) tokens and DPI-scaled
+/// GDI brushes/pens/fonts (`ADR-027`, `ADR-030`, `UUI-29`, `US-135` AC3).
 #[cfg(target_os = "windows")]
 #[must_use]
 pub(crate) fn resolve_palette_for_dpi(mode: ThemeMode, dpi: u32) -> UiThemePalette {
+    let high_contrast = detect_high_contrast();
+    let apps_use_light = read_windows_apps_use_light_theme();
+    let sys_colors = high_contrast.then(read_system_high_contrast_colors);
+    resolve_palette_with(mode, dpi, apps_use_light, high_contrast, sys_colors)
+}
+
+/// Purely parameterized palette builder supporting deterministic testing of Light, Dark,
+/// High-Contrast Light (*Desert*), and High-Contrast Dark (*Aquatic/Dusk*) (`MED-UUI-G3-01`).
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) fn resolve_palette_with(
+    mode: ThemeMode,
+    dpi: u32,
+    apps_use_light: bool,
+    high_contrast: bool,
+    sys_colors: Option<SystemHighContrastColors>,
+) -> UiThemePalette {
     let safe_dpi = dpi.max(72);
     let dpi_i32 = i32::try_from(safe_dpi).unwrap_or(96);
-    let high_contrast = detect_high_contrast();
-    let is_dark = match mode {
-        ThemeMode::System => !read_windows_apps_use_light_theme() || high_contrast,
-        ThemeMode::Light => false,
-        ThemeMode::Dark => true,
-    };
 
     let (
+        is_dark,
         bg_color,
         card_color,
         border_color,
@@ -268,34 +289,70 @@ pub(crate) fn resolve_palette_for_dpi(mode: ThemeMode, dpi: u32) -> UiThemePalet
         semantic_warning,
         semantic_error,
         semantic_neutral,
-    ) = if is_dark {
+        on_accent_text,
+    ) = if high_contrast {
+        let hc = sys_colors.unwrap_or_else(read_system_high_contrast_colors);
+        let hc_dark = is_colorref_dark(hc.window_bg);
+        let hc_border = hc.btn_text;
+        let hc_error = if hc.window_text != hc.highlight {
+            hc.window_text
+        } else {
+            hc.btn_text
+        };
         (
-            DARK_SURFACE_BG,
-            DARK_SURFACE_CARD,
-            DARK_SURFACE_BORDER,
-            DARK_TEXT_PRIMARY,
-            DARK_TEXT_SECONDARY,
-            DARK_BRAND_SKY,
-            DARK_BRAND_TEAL_LIGHT,
-            DARK_SEMANTIC_SUCCESS,
-            DARK_SEMANTIC_WARNING,
-            DARK_SEMANTIC_ERROR,
-            DARK_SEMANTIC_NEUTRAL,
+            hc_dark,
+            hc.window_bg,
+            hc.window_bg,
+            hc_border,
+            hc.window_text,
+            hc.gray_text,
+            hc.highlight,
+            hc.highlight,
+            hc.highlight,
+            hc.btn_text,
+            hc_error,
+            hc.gray_text,
+            hc.highlight_text,
         )
     } else {
-        (
-            LIGHT_SURFACE_BG,
-            LIGHT_SURFACE_CARD,
-            LIGHT_SURFACE_BORDER,
-            LIGHT_TEXT_PRIMARY,
-            LIGHT_TEXT_SECONDARY,
-            LIGHT_BRAND_COBALT,
-            LIGHT_BRAND_TEAL,
-            LIGHT_SEMANTIC_SUCCESS,
-            LIGHT_SEMANTIC_WARNING,
-            LIGHT_SEMANTIC_ERROR,
-            LIGHT_SEMANTIC_NEUTRAL,
-        )
+        let is_dark = match mode {
+            ThemeMode::System => !apps_use_light,
+            ThemeMode::Light => false,
+            ThemeMode::Dark => true,
+        };
+        if is_dark {
+            (
+                true,
+                DARK_SURFACE_BG,
+                DARK_SURFACE_CARD,
+                DARK_SURFACE_BORDER,
+                DARK_TEXT_PRIMARY,
+                DARK_TEXT_SECONDARY,
+                DARK_BRAND_SKY,
+                DARK_BRAND_TEAL_LIGHT,
+                DARK_SEMANTIC_SUCCESS,
+                DARK_SEMANTIC_WARNING,
+                DARK_SEMANTIC_ERROR,
+                DARK_SEMANTIC_NEUTRAL,
+                DARK_SURFACE_BG,
+            )
+        } else {
+            (
+                false,
+                LIGHT_SURFACE_BG,
+                LIGHT_SURFACE_CARD,
+                LIGHT_SURFACE_BORDER,
+                LIGHT_TEXT_PRIMARY,
+                LIGHT_TEXT_SECONDARY,
+                LIGHT_BRAND_COBALT,
+                LIGHT_BRAND_TEAL,
+                LIGHT_SEMANTIC_SUCCESS,
+                LIGHT_SEMANTIC_WARNING,
+                LIGHT_SEMANTIC_ERROR,
+                LIGHT_SEMANTIC_NEUTRAL,
+                LIGHT_SURFACE_CARD,
+            )
+        }
     };
 
     UiThemePalette {
@@ -314,6 +371,7 @@ pub(crate) fn resolve_palette_for_dpi(mode: ThemeMode, dpi: u32) -> UiThemePalet
         semantic_warning,
         semantic_error,
         semantic_neutral,
+        on_accent_text,
         bg_brush: create_solid_brush(bg_color),
         card_brush: create_solid_brush(card_color),
         border_pen: create_solid_pen(1, border_color),
@@ -397,5 +455,55 @@ mod tests {
         assert!(dark.warning_brush.is_some());
         assert!(dark.error_brush.is_some());
         assert!(dark.neutral_brush.is_some());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_resolve_palette_with_high_contrast_desert_and_aquatic_overrides_all_modes() {
+        use mesh_sys::gui_windows::SystemHighContrastColors;
+
+        let _lock = super::GDI_TEST_LOCK.lock();
+        // Arrange: Windows 11 High-Contrast Light ("Desert") and Dark ("Aquatic") system colors
+        let desert = SystemHighContrastColors {
+            window_bg: 0x00EF_FAFF,      // #FFFAEF cream light background
+            window_text: 0x0000_3D3D,    // #3D3D00 dark text
+            highlight: 0x0065_5490,      // #905465 highlight
+            highlight_text: 0x00FF_FFFF, // #FFFFFF white on highlight
+            btn_text: 0x0000_2020,       // #202000 dark button text
+            gray_text: 0x005C_6767,      // #67675C muted high-contrast text
+        };
+        let aquatic = SystemHighContrastColors {
+            window_bg: 0x0020_2020,      // #202020 dark background
+            window_text: 0x00FF_FFFF,    // #FFFFFF white text
+            highlight: 0x00F1_EA8E,      // #8EEAF1 cyan highlight
+            highlight_text: 0x0000_0000, // #000000 black on highlight
+            btn_text: 0x00FF_FFFF,       // #FFFFFF white border
+            gray_text: 0x009B_EB3F,      // #3FEB9B green disabled text
+        };
+
+        // Act & Assert: Desert (light HC) stays light across System, Light, AND Dark ThemeMode
+        for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
+            let p = super::resolve_palette_with(mode, 96, false, true, Some(desert));
+            assert!(p.is_high_contrast);
+            assert!(
+                !p.is_dark_titlebar,
+                "Desert light High-Contrast must keep light titlebar for mode {mode:?}"
+            );
+            assert_eq!(p.bg_color, desert.window_bg);
+            assert_eq!(p.text_primary, desert.window_text);
+            assert_eq!(p.brand_primary, desert.highlight);
+            assert_eq!(p.on_accent_text_color(), desert.highlight_text);
+            assert_eq!(p.border_color, desert.btn_text);
+            assert_eq!(p.text_secondary, desert.gray_text);
+        }
+
+        // Act & Assert: Aquatic (dark HC) uses system colors even when ThemeMode::Light is selected
+        let p_aq = super::resolve_palette_with(ThemeMode::Light, 120, true, true, Some(aquatic));
+        assert!(p_aq.is_high_contrast);
+        assert!(p_aq.is_dark_titlebar);
+        assert_eq!(p_aq.bg_color, aquatic.window_bg);
+        assert_eq!(p_aq.text_primary, aquatic.window_text);
+        assert_eq!(p_aq.brand_primary, aquatic.highlight);
+        assert_eq!(p_aq.on_accent_text_color(), aquatic.highlight_text);
     }
 }
