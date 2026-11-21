@@ -434,6 +434,12 @@ class MeshVpnService : VpnService() {
                     l10n.getString(R.string.notification_status_connecting)
                 uiState.daemonState == MobileDaemonState.DEGRADED ->
                     l10n.getString(R.string.notification_status_degraded)
+                uiState.daemonState == MobileDaemonState.REAUTH_REQUIRED ->
+                    l10n.getString(R.string.state_reauth_required)
+                uiState.daemonState == MobileDaemonState.REVOKED ->
+                    l10n.getString(R.string.state_revoked)
+                uiState.daemonState == MobileDaemonState.SERVER_UPGRADE_REQUIRED ->
+                    l10n.getString(R.string.state_error)
                 else -> l10n.getString(R.string.notification_status_stopped)
             }
 

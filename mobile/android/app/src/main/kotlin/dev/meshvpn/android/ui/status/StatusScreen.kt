@@ -1,5 +1,6 @@
 package dev.meshvpn.android.ui.status
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -53,19 +54,22 @@ fun canonicalDaemonStateLabel(state: MobileDaemonState): String =
         MobileDaemonState.SERVER_UPGRADE_REQUIRED -> "Attention Required"
     }
 
+@StringRes
+fun daemonStateLabelRes(state: MobileDaemonState): Int =
+    when (state) {
+        MobileDaemonState.STOPPED -> R.string.state_disconnected
+        MobileDaemonState.DEVICE_LOCKED -> R.string.notif_waiting_unlock
+        MobileDaemonState.CONNECTING -> R.string.state_connecting
+        MobileDaemonState.CONNECTED -> R.string.state_connected
+        MobileDaemonState.DEGRADED -> R.string.state_degraded
+        MobileDaemonState.REAUTH_REQUIRED -> R.string.state_reauth_required
+        MobileDaemonState.REVOKED -> R.string.state_revoked
+        MobileDaemonState.SERVER_UPGRADE_REQUIRED -> R.string.state_error
+    }
+
 @Composable
 private fun localizedDaemonStateLabel(state: MobileDaemonState): String =
-    when (state) {
-        MobileDaemonState.STOPPED -> stringResource(R.string.state_disconnected)
-        MobileDaemonState.DEVICE_LOCKED ->
-            LocaleHelper.tr(LocalContext.current, "Waiting for Unlock", "Đang chờ mở khóa")
-        MobileDaemonState.CONNECTING -> stringResource(R.string.state_connecting)
-        MobileDaemonState.CONNECTED -> stringResource(R.string.state_connected)
-        MobileDaemonState.DEGRADED -> stringResource(R.string.state_degraded)
-        MobileDaemonState.REAUTH_REQUIRED -> stringResource(R.string.state_reauth_required)
-        MobileDaemonState.REVOKED -> stringResource(R.string.state_revoked)
-        MobileDaemonState.SERVER_UPGRADE_REQUIRED -> stringResource(R.string.state_error)
-    }
+    stringResource(daemonStateLabelRes(state))
 
 fun daemonStateSemanticColor(state: MobileDaemonState): Color =
     when (state) {

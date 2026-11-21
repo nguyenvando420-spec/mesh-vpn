@@ -144,6 +144,175 @@ const TOAST_DISPLAY_MS: u32 = 4_000;
 const BASE_WIN_W: i32 = 860;
 const BASE_WIN_H: i32 = 660;
 
+/// Win32 `WM_GETDLGCODE` message ID for keyboard dialog traversal (`US-135`).
+#[cfg(test)]
+pub(crate) const WIN_WM_GETDLGCODE: u32 = 0x0087;
+/// Win32 `DLGC_WANTTAB` flag requesting Tab/Shift+Tab navigation (`US-135`).
+#[cfg(test)]
+pub(crate) const WIN_DLGC_WANTTAB: isize = 0x0002;
+/// Win32 `DLGC_WANTCHARS` flag for text edit controls (`US-135`).
+#[cfg(test)]
+pub(crate) const WIN_DLGC_WANTCHARS: isize = 0x0080;
+
+/// Returns the expected Win32 `WM_GETDLGCODE` bitmask for keyboard traversal (`US-135`).
+#[cfg(test)]
+#[must_use]
+pub(crate) const fn dialog_code_for_message(msg: u32, text_input: bool) -> isize {
+    if msg != WIN_WM_GETDLGCODE {
+        return 0;
+    }
+    if text_input {
+        WIN_DLGC_WANTTAB | WIN_DLGC_WANTCHARS
+    } else {
+        WIN_DLGC_WANTTAB
+    }
+}
+
+/// Formats the canonical MSAA screen-reader announcement sent via `SetWindowTextW` +
+/// `NotifyWinEvent(EVENT_OBJECT_NAMECHANGE)` (`US-139`, zero `IAccessible` COM).
+#[must_use]
+pub(crate) fn format_accessible_status_announcement(
+    snapshot: &DerivedUiSnapshot,
+    active_tab: DashboardTab,
+    tr: impl Fn(&str) -> &'static str,
+) -> String {
+    let pick = |key: &str, fallback: &str| -> String {
+        let localized = tr(key);
+        if localized.is_empty() {
+            fallback.to_owned()
+        } else {
+            localized.to_owned()
+        }
+    };
+    let status_prefix = pick("tab.status", "Status");
+    let display_lbl = pick(
+        snapshot
+            .ui_state
+            .display_label_key(snapshot.tunnel_sub_state),
+        snapshot.ui_state.display_label(snapshot.tunnel_sub_state),
+    );
+    let headline = pick(
+        snapshot.ui_state.headline_key(snapshot.tunnel_sub_state),
+        snapshot.ui_state.headline(snapshot.tunnel_sub_state),
+    );
+    if !snapshot.should_show_tab_bar() {
+        return format!("{status_prefix}: {display_lbl} — {headline}");
+    }
+    let tab_label = match active_tab {
+        DashboardTab::Status => pick("tab.status", "Status"),
+        DashboardTab::Peers => pick("tab.peers", "Peers"),
+        DashboardTab::DiagnosticsSettings => {
+            pick("tab.diagnostics_settings", "Diagnostics & Settings")
+        }
+    };
+    format!("{status_prefix}: {display_lbl} — {headline} ({tab_label})")
+}
+
+/// Returns the ordered interactive `WS_TABSTOP` control IDs visible for the given UI state,
+/// active tab, onboarding tab, and optional Zone 3 modal (`US-135`).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn ordered_tab_stop_control_ids(
+    snapshot: &DerivedUiSnapshot,
+    active_tab: DashboardTab,
+    onboarding_tab: DesktopOnboardingTab,
+    active_modal: Option<Zone3ModalKind>,
+) -> Vec<u16> {
+    let mut ids = Vec::new();
+    let tabs_visible = snapshot.should_show_tab_bar();
+    if tabs_visible {
+        ids.extend_from_slice(&[IDC_TAB_STATUS, IDC_TAB_PEERS, IDC_TAB_DIAG_SETTINGS]);
+        if let Some(modal) = active_modal {
+            match modal {
+                Zone3ModalKind::RotateNodeKey => {
+                    ids.extend_from_slice(&[
+                        IDC_EDIT_PREAUTH,
+                        IDC_BTN_ENROLL_SAVE,
+                        IDC_BTN_MODAL_CANCEL,
+                    ]);
+                }
+                Zone3ModalKind::UpdateControlServer => {
+                    ids.extend_from_slice(&[
+                        IDC_EDIT_ENDPOINT,
+                        IDC_RADIO_SPKI,
+                        IDC_RADIO_SYSTEM_CA,
+                        IDC_EDIT_PIN,
+                        IDC_BTN_UPDATE_SERVER,
+                        IDC_BTN_MODAL_CANCEL,
+                    ]);
+                }
+            }
+            return ids;
+        }
+        match active_tab {
+            DashboardTab::Status => {
+                ids.extend_from_slice(&[IDC_BTN_CONNECT, IDC_BTN_DISCONNECT, IDC_BTN_START_REPAIR]);
+                if snapshot.ui_state == DesktopUiState::ReauthRequired {
+                    ids.push(IDC_BTN_OPEN_ROTATE_MODAL);
+                }
+                ids.push(IDC_EDIT_DETAILS);
+            }
+            DashboardTab::Peers => {
+                ids.extend_from_slice(&[
+                    IDC_EDIT_PEER_FILTER,
+                    IDC_BTN_PEER_FILTER_ALL,
+                    IDC_BTN_PEER_FILTER_ONLINE,
+                    IDC_BTN_PEER_FILTER_DIRECT,
+                    IDC_BTN_PEER_FILTER_RELAY,
+                    IDC_BTN_PING_PEER,
+                    IDC_BTN_COPY_PEER_IP,
+                    IDC_BTN_COPY_PEER_FQDN,
+                    IDC_LIST_PEERS,
+                    IDC_EDIT_DETAILS,
+                ]);
+            }
+            DashboardTab::DiagnosticsSettings => {
+                ids.extend_from_slice(&[
+                    IDC_BTN_THEME_SYSTEM,
+                    IDC_BTN_THEME_LIGHT,
+                    IDC_BTN_THEME_DARK,
+                    IDC_CHK_AUTOSTART,
+                    IDC_BTN_LOCALE_SYSTEM,
+                    IDC_BTN_LOCALE_VI,
+                    IDC_BTN_LOCALE_EN,
+                    IDC_BTN_NETCHECK,
+                    IDC_BTN_BUGREPORT,
+                    IDC_BTN_CLEANUP,
+                    IDC_BTN_OPEN_ROTATE_MODAL,
+                    IDC_BTN_OPEN_UPDATE_SERVER_MODAL,
+                    IDC_BTN_RESET_ID,
+                    IDC_BTN_UNINSTALL,
+                    IDC_EDIT_DETAILS,
+                ]);
+            }
+        }
+        return ids;
+    }
+
+    if snapshot.should_show_onboarding_form() {
+        ids.extend_from_slice(&[IDC_TAB_ONBOARD_URI, IDC_TAB_ONBOARD_MANUAL]);
+        match onboarding_tab {
+            DesktopOnboardingTab::JoinUri => {
+                ids.extend_from_slice(&[IDC_EDIT_NODE_NAME, IDC_BTN_PASTE_URI]);
+            }
+            DesktopOnboardingTab::Manual => {
+                ids.extend_from_slice(&[
+                    IDC_EDIT_ENDPOINT,
+                    IDC_RADIO_SPKI,
+                    IDC_RADIO_SYSTEM_CA,
+                    IDC_EDIT_PIN,
+                    IDC_EDIT_PREAUTH,
+                    IDC_EDIT_NODE_NAME,
+                    IDC_BTN_ENROLL_SAVE,
+                ]);
+            }
+        }
+    } else {
+        ids.extend_from_slice(&[IDC_BTN_START_REPAIR, IDC_BTN_UNINSTALL, IDC_EDIT_DETAILS]);
+    }
+    ids
+}
+
 enum SingleInstanceStartup {
     Primary {
         guard: SingleInstanceGuard,
@@ -1644,6 +1813,7 @@ fn rebuild_theme_and_repaint(st: &mut DashboardState) {
 fn show_toast(st: &mut DashboardState, title: &str, body: &str) {
     st.toast_message = Some(body.to_owned());
     set_window_timer(st.hwnd, TIMER_TOAST_CLEAR, TOAST_DISPLAY_MS);
+    announce_accessible_label(st.controls.status_title, body);
     if let Some(tray) = &st.tray {
         tray.show_toast_balloon(title, body);
     }
@@ -1674,24 +1844,7 @@ fn refresh_ui_from_state(st: &mut DashboardState) {
     };
     st.snapshot = snapshot;
 
-    let display_lbl = tr_or(
-        st.snapshot
-            .ui_state
-            .display_label_key(st.snapshot.tunnel_sub_state),
-        st.snapshot
-            .ui_state
-            .display_label(st.snapshot.tunnel_sub_state),
-    );
-    let headline = tr_or(
-        st.snapshot
-            .ui_state
-            .headline_key(st.snapshot.tunnel_sub_state),
-        st.snapshot.ui_state.headline(st.snapshot.tunnel_sub_state),
-    );
-    let accessible_text = format!(
-        "{}: {display_lbl} — {headline}",
-        tr_or("tab.status", "Status")
-    );
+    let accessible_text = format_accessible_status_announcement(&st.snapshot, st.active_tab, t);
     if st.last_announced_state != accessible_text {
         tracing::debug!(
             component = "mesh-gui",
@@ -3094,5 +3247,56 @@ mod tests {
         st.palette = resolve_palette_for_dpi(ThemeMode::Light, 96);
         assert!(!handle_os_theme_setting_change(&mut st, 0));
         assert!(!st.palette.is_dark_titlebar);
+    }
+
+    #[test]
+    fn test_window_accessibility_dialog_code_and_tab_order_invariants() {
+        use crate::app::{DashboardTab, DesktopUiState, TunnelSubState};
+        use crate::i18n::{LocaleMode, t_for};
+        use crate::onboarding::{DesktopOnboardingTab, Zone3ModalKind};
+
+        // Arrange
+        let app = DashboardApp::new(false);
+        let Ok(st) = app.inner.try_borrow() else {
+            return;
+        };
+        let mut enrolled_snap = st.snapshot.clone();
+        enrolled_snap.enrolled = true;
+        enrolled_snap.ui_state = DesktopUiState::Connected;
+        enrolled_snap.tunnel_sub_state = TunnelSubState::Connected;
+
+        // Act
+        let code_btn = super::dialog_code_for_message(super::WIN_WM_GETDLGCODE, false);
+        let code_edit = super::dialog_code_for_message(super::WIN_WM_GETDLGCODE, true);
+        let code_other = super::dialog_code_for_message(0x0001, false);
+        let tab_ids = super::ordered_tab_stop_control_ids(
+            &enrolled_snap,
+            DashboardTab::DiagnosticsSettings,
+            DesktopOnboardingTab::JoinUri,
+            None,
+        );
+        let modal_ids = super::ordered_tab_stop_control_ids(
+            &enrolled_snap,
+            DashboardTab::DiagnosticsSettings,
+            DesktopOnboardingTab::JoinUri,
+            Some(Zone3ModalKind::RotateNodeKey),
+        );
+        let ann_vi = super::format_accessible_status_announcement(
+            &enrolled_snap,
+            DashboardTab::Peers,
+            |key| t_for(key, LocaleMode::Vi),
+        );
+
+        // Assert
+        assert_eq!(code_btn, super::WIN_DLGC_WANTTAB);
+        assert_eq!(
+            code_edit,
+            super::WIN_DLGC_WANTTAB | super::WIN_DLGC_WANTCHARS
+        );
+        assert_eq!(code_other, 0);
+        assert!(tab_ids.contains(&super::IDC_BTN_LOCALE_VI));
+        assert!(modal_ids.contains(&super::IDC_BTN_MODAL_CANCEL));
+        assert!(ann_vi.contains("Đã kết nối"));
+        assert!(ann_vi.contains("Thiết bị cùng mạng"));
     }
 }

@@ -2,10 +2,13 @@ package dev.meshvpn.android.ui.theme
 
 import android.content.SharedPreferences
 import androidx.compose.ui.graphics.toArgb
+import dev.meshvpn.android.R
 import dev.meshvpn.android.ui.status.canonicalDaemonStateLabel
+import dev.meshvpn.android.ui.status.daemonStateLabelRes
 import dev.meshvpn.android.vpn.MeshVpnService
 import java.lang.reflect.Proxy
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Test
 import uniffi.mesh_mobile_ffi.MobileDaemonState
 
@@ -170,5 +173,29 @@ class ThemeAndNotificationTokensTest {
             "Attention Required",
             canonicalDaemonStateLabel(MobileDaemonState.SERVER_UPGRADE_REQUIRED),
         )
+    }
+
+    @Test
+    fun androidCanonicalLabelNeverPrintsRawEnumAndUsesStringResForAllEightStates() {
+        // Arrange
+        val expectedRes =
+            mapOf(
+                MobileDaemonState.STOPPED to R.string.state_disconnected,
+                MobileDaemonState.DEVICE_LOCKED to R.string.notif_waiting_unlock,
+                MobileDaemonState.CONNECTING to R.string.state_connecting,
+                MobileDaemonState.CONNECTED to R.string.state_connected,
+                MobileDaemonState.DEGRADED to R.string.state_degraded,
+                MobileDaemonState.REAUTH_REQUIRED to R.string.state_reauth_required,
+                MobileDaemonState.REVOKED to R.string.state_revoked,
+                MobileDaemonState.SERVER_UPGRADE_REQUIRED to R.string.state_error,
+            )
+
+        // Act & Assert
+        assertEquals(8, MobileDaemonState.entries.size)
+        for (state in MobileDaemonState.entries) {
+            val label = canonicalDaemonStateLabel(state)
+            assertNotEquals(state.name, label)
+            assertEquals(expectedRes[state], daemonStateLabelRes(state))
+        }
     }
 }

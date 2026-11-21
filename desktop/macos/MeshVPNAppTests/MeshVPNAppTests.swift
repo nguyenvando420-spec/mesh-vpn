@@ -132,4 +132,17 @@ final class MeshVPNAppTests: XCTestCase {
         XCTAssertEqual(MeshL10n.tr("error.auth_failed", locale: Locale(identifier: "vi")),
                        "authentication failed")
     }
+
+    func testCanonicalStateLabels_ReauthAndAgentUnavailable_MatchUnifiedContract() {
+        // Arrange & Act & Assert
+        XCTAssertEqual(DesktopUiState.serviceNotInstalled.displayTitle, "Agent Unavailable")
+        XCTAssertEqual(DesktopUiState.serviceStopped.displayTitle, "Service Stopped")
+        XCTAssertEqual(DesktopUiState.unconfigured.displayTitle, "Not Enrolled")
+        XCTAssertEqual(DesktopUiState.connecting.displayTitle, "Connecting")
+        XCTAssertEqual(DesktopUiState.connected.displayTitle, "Connected")
+        XCTAssertEqual(DesktopUiState.reauthRequired.displayTitle, "Re-auth Required")
+        XCTAssertEqual(DesktopUiState.revoked.displayTitle, "Device Revoked")
+        XCTAssertEqual(DesktopUiState.error.displayTitle, "Attention Required")
+        XCTAssertEqual(LocaleMode.allCases, [.system, .vi, .en])
+    }
 }

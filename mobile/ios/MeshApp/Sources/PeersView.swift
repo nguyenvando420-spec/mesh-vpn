@@ -107,12 +107,20 @@ public enum PeerFilter: Sendable {
     }
 }
 
+/// Adaptive column layout resolver for iPhone (`.compact`) vs iPad (`.regular`) (`US-138`).
+public enum PeersAdaptiveLayout: Sendable {
+    public static func columnCount(for sizeClass: UserInterfaceSizeClass?) -> Int {
+        sizeClass == .regular ? 2 : 1
+    }
+}
+
 /// Zone 2 tab with peer search, 4-state filter chips, standard IP/FQDN copy, and ping (`US-120`).
 @MainActor
 struct PeersView: View {
     @ObservedObject var viewModel: AppViewModel
     @EnvironmentObject var localeManager: LocaleManager
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var searchText = ""
     @State private var selectedFilter: PeerFilterMode = .all
     @State private var toastMessage: String?
@@ -122,7 +130,7 @@ struct PeersView: View {
         let locale = localeManager.resolvedLocale
         NavigationView {
             ZStack(alignment: .bottom) {
-                peersList(locale: locale)
+                peersContent(locale: locale)
                 if let toastMessage {
                     ToastBannerView(message: toastMessage)
                         .padding(.bottom, 16)
@@ -141,55 +149,84 @@ struct PeersView: View {
         .navigationViewStyle(.stack)
     }
 
-    private func peersList(locale: Locale) -> some View {
+    private func peersContent(locale: Locale) -> some View {
         let allPeers = viewModel.statusSnapshot?.peers ?? []
         let counts = PeerFilter.counts(peers: allPeers)
         let filtered = PeerFilter.filter(peers: allPeers, mode: selectedFilter, query: searchText)
+        let columnCount = PeersAdaptiveLayout.columnCount(for: horizontalSizeClass)
+        let gridColumns = Array(
+            repeating: GridItem(.flexible(), spacing: 12, alignment: .top),
+            count: columnCount
+        )
 
-        return List {
-            Section {
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
                 PeerFilterBar(
                     selectedFilter: $selectedFilter,
                     counts: counts,
                     colorScheme: colorScheme,
                     locale: locale
                 )
-                .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
-            }
 
-            if let ping = viewModel.lastPingResponse {
-                Section("Latest Ping") {
-                    PingSummaryView(ping: ping)
+                if let ping = viewModel.lastPingResponse {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Latest Ping")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        PingSummaryView(ping: ping)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(cardBackground)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
                 }
-            }
 
-            Section {
+                Text("\(L10n.tr("tab.peers", locale: locale)) (\(filtered.count))")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
                 if filtered.isEmpty {
                     Text(L10n.tr("diag.no_peers", locale: locale))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(cardBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 } else {
-                    ForEach(filtered, id: \.nodeId) { peer in
-                        PeerRowView(
-                            peer: peer,
-                            canPing: viewModel.tunnelStatus == .connected && !viewModel.isBusy,
-                            colorScheme: colorScheme,
-                            locale: locale,
-                            onCopyIp: { copyValue(peer.overlayIp, locale: locale) },
-                            onCopyFqdn: { copyValue(peer.fqdn, locale: locale) },
-                            onPing: { Task { await viewModel.pingPeer(peer) } }
-                        )
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 12) {
+                        ForEach(filtered, id: \.nodeId) { peer in
+                            PeerRowView(
+                                peer: peer,
+                                canPing: viewModel.tunnelStatus == .connected && !viewModel.isBusy,
+                                colorScheme: colorScheme,
+                                locale: locale,
+                                onCopyIp: { copyValue(peer.overlayIp, locale: locale) },
+                                onCopyFqdn: { copyValue(peer.fqdn, locale: locale) },
+                                onPing: { Task { await viewModel.pingPeer(peer) } }
+                            )
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(cardBackground)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
                     }
                 }
+
                 if viewModel.peersTruncatedNotice, let total = viewModel.totalPeerCount {
                     Text("Showing compact peer slice from \(total) total peers.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-            } header: {
-                Text("\(L10n.tr("tab.peers", locale: locale)) (\(filtered.count))")
             }
+            .padding(16)
         }
+    }
+
+    private var cardBackground: Color {
+        colorScheme == .dark
+            ? Color.secondary.opacity(0.16)
+            : Color.secondary.opacity(0.08)
     }
 
     private func copyValue(_ value: String, locale: Locale) {

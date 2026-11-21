@@ -335,4 +335,30 @@ final class LocalizationParityTests: XCTestCase {
             XCTAssertFalse(viValue.isEmpty)
         }
     }
+
+    @MainActor
+    func test_localeSelectorAllModesAndSec05Ops01Invariant_inVietnameseLocale() throws {
+        // Arrange
+        let suite = "dev.meshvpn.tests.locale.d0.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let manager = LocaleManager(userDefaults: defaults)
+
+        // Act
+        manager.setLocaleMode(.vi)
+        let viLocale = manager.resolvedLocale
+        let viAuthErr = L10n.tr("error.auth_failed", locale: viLocale)
+        let viConnected = L10n.tr("state.connected", locale: viLocale)
+        manager.setLocaleMode(.en)
+        let enConnected = L10n.tr("state.connected", locale: manager.resolvedLocale)
+        manager.setLocaleMode(.system)
+
+        // Assert
+        XCTAssertEqual(LocaleMode.allCases, [.system, .en, .vi])
+        XCTAssertEqual(viAuthErr, "authentication failed")
+        XCTAssertEqual(viConnected, "Đã kết nối")
+        XCTAssertEqual(enConnected, "Connected")
+        XCTAssertEqual(manager.localeMode, .system)
+    }
 }

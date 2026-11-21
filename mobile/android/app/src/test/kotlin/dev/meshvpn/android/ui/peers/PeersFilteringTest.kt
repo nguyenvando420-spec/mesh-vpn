@@ -112,4 +112,14 @@ class PeersFilteringTest {
             filterPeers(peers, "gamma", PeerFilterMode.ONLINE).map { it.name },
         )
     }
+
+    @Test
+    fun tabletLayoutBreakpoint600dpUsesTwoColumnsAndPortraitOneColumn() {
+        // Arrange & Act & Assert
+        assertEquals(600, TABLET_LAYOUT_BREAKPOINT_DP)
+        assertEquals(1, peersGridColumnCount(360))
+        assertEquals(1, peersGridColumnCount(599))
+        assertEquals(2, peersGridColumnCount(600))
+        assertEquals(2, peersGridColumnCount(840))
+    }
 }

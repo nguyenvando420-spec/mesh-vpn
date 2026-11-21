@@ -7,12 +7,16 @@ import android.widget.Toast
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Clear
 import androidx.compose.material.icons.outlined.ContentCopy
@@ -31,6 +35,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -94,6 +99,11 @@ fun filterPeers(
     }
 }
 
+const val TABLET_LAYOUT_BREAKPOINT_DP = 600
+
+fun peersGridColumnCount(screenWidthDp: Int): Int =
+    if (screenWidthDp >= TABLET_LAYOUT_BREAKPOINT_DP) 2 else 1
+
 @Composable
 fun PeersScreen(
     screenState: MainUiScreenState,
@@ -103,6 +113,8 @@ fun PeersScreen(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val columnCount = peersGridColumnCount(screenWidthDp)
     val allPeers = screenState.session.snapshot?.peers.orEmpty()
     val counts = countPeersByMode(allPeers)
     val filteredPeers =
@@ -111,57 +123,68 @@ fun PeersScreen(
             query = screenState.peerSearchQuery,
             mode = screenState.peerFilterMode,
         )
+    val copiedLabel = stringResource(R.string.peers_copied_toast)
+    val ipTitle = stringResource(R.string.peers_copy_overlay_ip)
+    val fqdnTitle = stringResource(R.string.peers_copy_fqdn)
 
-    Column(
-        modifier =
-            modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(columnCount),
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text(
-            text = "${stringResource(R.string.tab_peers)} (${allPeers.size})",
-            style = MaterialTheme.typography.headlineSmall,
-        )
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            Text(
+                text = "${stringResource(R.string.tab_peers)} (${allPeers.size})",
+                style = MaterialTheme.typography.headlineSmall,
+            )
+        }
 
-        PeerSearchField(
-            query = screenState.peerSearchQuery,
-            onQueryChanged = onSearchQueryChanged,
-        )
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            PeerSearchField(
+                query = screenState.peerSearchQuery,
+                onQueryChanged = onSearchQueryChanged,
+            )
+        }
 
-        PeerFilterChipsRow(
-            selected = screenState.peerFilterMode,
-            counts = counts,
-            onSelect = onSelectFilterMode,
-        )
+        item(span = { GridItemSpan(maxLineSpan) }) {
+            PeerFilterChipsRow(
+                selected = screenState.peerFilterMode,
+                counts = counts,
+                onSelect = onSelectFilterMode,
+            )
+        }
 
         screenState.session.lastPingResult?.let { ping ->
-            PeersPingResultCard(ping = ping)
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                PeersPingResultCard(ping = ping)
+            }
         }
 
         if (allPeers.isEmpty()) {
-            Text(
-                text = stringResource(R.string.diag_no_peers),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Text(
+                    text = stringResource(R.string.diag_no_peers),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         } else if (filteredPeers.isEmpty()) {
-            Text(
-                text =
-                    LocaleHelper.tr(
-                        context,
-                        "No peers match the current search or filter.",
-                        "Không có thiết bị nào khớp với tìm kiếm hoặc bộ lọc.",
-                    ),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Text(
+                    text =
+                        LocaleHelper.tr(
+                            context,
+                            "No peers match the current search or filter.",
+                            "Không có thiết bị nào khớp với tìm kiếm hoặc bộ lọc.",
+                        ),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         } else {
-            val copiedLabel = stringResource(R.string.peers_copied_toast)
-            val ipTitle = stringResource(R.string.peers_copy_overlay_ip)
-            val fqdnTitle = stringResource(R.string.peers_copy_fqdn)
-            for (peer in filteredPeers) {
+            items(items = filteredPeers, key = { it.nodeId }) { peer ->
                 PeerDetailCard(
                     peer = peer,
                     onCopyIp = {

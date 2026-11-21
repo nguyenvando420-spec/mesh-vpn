@@ -171,4 +171,28 @@ class LocaleHelperTest {
         assertEquals("Connected", enMap["state_connected"])
         assertEquals("Đã kết nối", viMap["state_connected"])
     }
+
+    @Test
+    fun localeSelectorSupportsThreeWayModesWithoutRestartAndPreservesSec05() {
+        // Arrange
+        val backing = mutableMapOf<String, Any?>()
+        val store = SharedPrefsLocaleStore(createInMemorySharedPrefs(backing))
+        val viMap = parseStringsXml(resolveResFile("values-vi/strings.xml"))
+
+        // Act: switch live across all 3 canonical modes
+        val modes = LocaleMode.entries
+        store.saveLocaleMode(LocaleMode.VI)
+        val afterVi = store.loadLocaleMode()
+        store.saveLocaleMode(LocaleMode.EN)
+        val afterEn = store.loadLocaleMode()
+        store.saveLocaleMode(LocaleMode.SYSTEM)
+        val afterSystem = store.loadLocaleMode()
+
+        // Assert
+        assertEquals(listOf(LocaleMode.SYSTEM, LocaleMode.EN, LocaleMode.VI), modes)
+        assertEquals(LocaleMode.VI, afterVi)
+        assertEquals(LocaleMode.EN, afterEn)
+        assertEquals(LocaleMode.SYSTEM, afterSystem)
+        assertEquals("authentication failed", viMap["error_auth_failed"])
+    }
 }

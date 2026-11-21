@@ -197,4 +197,11 @@ final class UnifiedUiFoundationTests: XCTestCase {
         XCTAssertEqual(viewModel.selectedTab, .peers)
         XCTAssertNil(viewModel.clipboardClearTask)
     }
+
+    func test_peersAdaptiveLayout_usesTwoColumnsForRegularAndOneForCompact() {
+        // Arrange & Act & Assert (`US-138`)
+        XCTAssertEqual(PeersAdaptiveLayout.columnCount(for: .regular), 2)
+        XCTAssertEqual(PeersAdaptiveLayout.columnCount(for: .compact), 1)
+        XCTAssertEqual(PeersAdaptiveLayout.columnCount(for: nil), 1)
+    }
 }

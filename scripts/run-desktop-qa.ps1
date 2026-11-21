@@ -129,8 +129,13 @@ Write-Section "[2/5] Running Desktop GUI Rust Automated Test Suites (6 Crates)"
 $TestTargets = @(
     @{
         Id      = "DGUI-QA-02A"
-        Name    = "mesh-gui (--all-targets: unit, gui_unit_tests, qa_desktop_security_audit, qa_desktop_e2e_ipc)"
+        Name    = "mesh-gui (--all-targets: unit, gui_unit_tests, gui_windows_unified_ui, i18n_parity_windows, qa_desktop_security_audit, qa_desktop_e2e_ipc, qa_gdi_leak_gate, qa_accessibility_unified_ui, qa_state_label_unification)"
         Args    = @("test", "-p", "mesh-gui", "--all-targets", "--all-features")
+    },
+    @{
+        Id      = "DGUI-QA-02A2"
+        Name    = "mesh-gui Unified UI QA gates (qa_gdi_leak_gate, qa_accessibility_unified_ui, qa_state_label_unification)"
+        Args    = @("test", "-p", "mesh-gui", "--test", "qa_gdi_leak_gate", "--test", "qa_accessibility_unified_ui", "--test", "qa_state_label_unification", "--all-features")
     },
     @{
         Id      = "DGUI-QA-02B"

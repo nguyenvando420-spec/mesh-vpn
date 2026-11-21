@@ -297,6 +297,42 @@ final class DesktopCoreTests: XCTestCase {
         XCTAssertEqual(ThemeMode.load(from: defaults), .system)
     }
 
+    func testStateLabelUnification_All8States_MatchCanonicalEnglishTitlesAndL10n() {
+        // Arrange
+        let enLocale = Locale(identifier: "en")
+        let expected: [(DesktopUiState, String)] = [
+            (.serviceNotInstalled, "Agent Unavailable"),
+            (.serviceStopped, "Service Stopped"),
+            (.unconfigured, "Not Enrolled"),
+            (.connecting, "Connecting"),
+            (.connected, "Connected"),
+            (.reauthRequired, "Re-auth Required"),
+            (.revoked, "Device Revoked"),
+            (.error, "Attention Required")
+        ]
+
+        // Act & Assert
+        XCTAssertEqual(expected.count, DesktopUiState.allCases.count)
+        for (state, title) in expected {
+            XCTAssertEqual(state.displayTitle, title)
+            XCTAssertEqual(state.localizedTitle(locale: enLocale), title)
+        }
+        XCTAssertEqual(
+            DesktopUiState.connected.resolvedTitle(
+                isDegradedTunnel: false,
+                isManuallyDisconnected: true
+            ),
+            "Disconnected"
+        )
+        XCTAssertEqual(
+            DesktopUiState.connected.resolvedTitle(
+                isDegradedTunnel: true,
+                isManuallyDisconnected: false
+            ),
+            "Degraded"
+        )
+    }
+
     @MainActor
     private func waitUntilWipeCompletes(
         _ cleaner: ClipboardAutoClear,

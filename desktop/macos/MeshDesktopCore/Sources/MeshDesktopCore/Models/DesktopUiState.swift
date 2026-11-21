@@ -58,12 +58,12 @@ public enum DesktopUiState: String, Equatable, Sendable, CaseIterable {
 
     public var displayTitle: String {
         switch self {
-        case .serviceNotInstalled: return "Service Not Installed"
+        case .serviceNotInstalled: return "Agent Unavailable"
         case .serviceStopped: return "Service Stopped"
         case .unconfigured: return "Not Enrolled"
         case .connecting: return "Connecting"
         case .connected: return "Connected"
-        case .reauthRequired: return "Key Rotation Required"
+        case .reauthRequired: return "Re-auth Required"
         case .revoked: return "Device Revoked"
         case .error: return "Attention Required"
         }

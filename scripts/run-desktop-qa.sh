@@ -74,9 +74,12 @@ else
 fi
 
 echo "================================================================================"
-echo ">>> [3/5] Running Desktop GUI Rust Automated Test Suites"
+echo ">>> [3/5] Running Desktop GUI & Unified UI Rust Automated Test Suites"
 echo "================================================================================"
 cargo test -p mesh-gui --all-targets --all-features
+cargo test -p mesh-gui --test qa_gdi_leak_gate --all-features
+cargo test -p mesh-gui --test qa_accessibility_unified_ui --all-features
+cargo test -p mesh-gui --test qa_state_label_unification --all-features
 cargo test -p mesh --test qa_desktop_cli_launcher --all-features
 cargo test -p mesh-net --test desktop_ipc_contract --all-features
 cargo test -p mesh-client --test desktop_session_wp_d_a1 --all-features
