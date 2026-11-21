@@ -3,9 +3,9 @@ import Foundation
 import XCTest
 
 private struct IconMappingCase {
-    let computed: ComputedDesktopState
+    let computed: DesktopStateMapper.ComputedState
     let symbol: String
-    var tone: SemanticStatusTone?
+    var tone: SemanticColorTone?
     var lightHex: String?
     var darkHex: String?
     var expectedGroup: MenuBarStatusGroup?
@@ -24,7 +24,20 @@ extension DesktopStoreTests {
         let offline = IpcClientError.serviceUnavailable("off")
 
         // Act: Compute all 10 canonical desktop states
-        let cases: [IconMappingCase] = [
+        let cases = makeAll10IconMappingCases(conn: conn, pinErr: pinErr, offline: offline)
+
+        // Assert: Verify symbol, semantic tone, and canonical light/dark hex tokens
+        for item in cases {
+            assertIconMapping(item)
+        }
+    }
+
+    private func makeAll10IconMappingCases(
+        conn: ServerConnectionStatus,
+        pinErr: DesktopUserFacingError,
+        offline: IpcClientError
+    ) -> [IconMappingCase] {
+        [
             IconMappingCase(
                 computed: computeState(servicePresent: false, connectFailure: offline),
                 symbol: "shield.slash",
@@ -82,13 +95,8 @@ extension DesktopStoreTests {
                 ),
                 symbol: "exclamationmark.shield.fill",
                 darkHex: "#F87171"
-            ),
+            )
         ]
-
-        // Assert: Verify symbol, semantic tone, and canonical light/dark hex tokens
-        for item in cases {
-            assertIconMapping(item)
-        }
     }
 
     private func computeState(
@@ -96,7 +104,7 @@ extension DesktopStoreTests {
         status: AgentStatusResponse? = nil,
         connectFailure: IpcClientError? = nil,
         lastActionError: DesktopUserFacingError? = nil
-    ) -> ComputedDesktopState {
+    ) -> DesktopStateMapper.ComputedState {
         DesktopStateMapper.compute(
             serviceFilesPresent: servicePresent,
             statusResponse: status,

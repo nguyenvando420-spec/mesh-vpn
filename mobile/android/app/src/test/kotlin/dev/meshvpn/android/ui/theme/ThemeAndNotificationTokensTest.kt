@@ -13,9 +13,7 @@ import org.junit.Test
 import uniffi.mesh_mobile_ffi.MobileDaemonState
 
 class ThemeAndNotificationTokensTest {
-    private fun createInMemorySharedPrefs(
-        backing: MutableMap<String, Any?>,
-    ): SharedPreferences {
+    private fun createInMemorySharedPrefs(backing: MutableMap<String, Any?>): SharedPreferences {
         val editor =
             Proxy.newProxyInstance(
                 SharedPreferences.Editor::class.java.classLoader,

@@ -7,9 +7,6 @@ final class UnifiedUiFoundationTests: XCTestCase {
     private func makeIsolatedDefaults(suite: String) throws -> UserDefaults {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.removePersistentDomain(forName: suite)
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suite)
-        }
         return defaults
     }
 
@@ -41,6 +38,7 @@ final class UnifiedUiFoundationTests: XCTestCase {
         // Arrange
         let suite = "dev.meshvpn.tests.theme.\(UUID().uuidString)"
         let defaults = try makeIsolatedDefaults(suite: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let manager = ThemeManager(userDefaults: defaults)
 
         // Act & Assert
@@ -64,6 +62,7 @@ final class UnifiedUiFoundationTests: XCTestCase {
         // Arrange
         let suite = "dev.meshvpn.tests.locale.\(UUID().uuidString)"
         let defaults = try makeIsolatedDefaults(suite: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let manager = LocaleManager(userDefaults: defaults)
 
         // Act & Assert
@@ -179,7 +178,7 @@ final class UnifiedUiFoundationTests: XCTestCase {
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("MeshTabTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: tempDir) }
+        defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let store = try CoordinatedAppGroupStore(rootDirectoryURL: tempDir)
         let viewModel = AppViewModel(

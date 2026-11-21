@@ -12,9 +12,7 @@ import org.junit.Test
 import org.w3c.dom.Element
 
 class LocaleHelperTest {
-    private fun createInMemorySharedPrefs(
-        backing: MutableMap<String, Any?>,
-    ): SharedPreferences {
+    private fun createInMemorySharedPrefs(backing: MutableMap<String, Any?>): SharedPreferences {
         val editor =
             Proxy.newProxyInstance(
                 SharedPreferences.Editor::class.java.classLoader,
@@ -148,7 +146,10 @@ class LocaleHelperTest {
         // Arrange
         val enMap = parseStringsXml(resolveResFile("values/strings.xml"))
         val viMap = parseStringsXml(resolveResFile("values-vi/strings.xml"))
-        val rStringFields = R.string::class.java.fields.map { it.name }.toSet()
+        val rStringFields =
+            R.string::class.java.fields
+                .map { it.name }
+                .toSet()
 
         // Act & Assert count & 100% key parity (17 legacy + 213 canonical = 230)
         assertEquals(230, enMap.size)

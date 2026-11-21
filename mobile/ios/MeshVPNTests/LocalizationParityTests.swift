@@ -270,11 +270,11 @@ final class LocalizationParityTests: XCTestCase {
     func test_localeManager_persistsUnderMeshLocaleModeKeyOnUserDefaults() throws {
         // Arrange
         let stdKey = "mesh_locale_mode"
-        let previousValue = UserDefaults.standard.object(forKey: stdKey)
+        let previousString = UserDefaults.standard.string(forKey: stdKey)
         UserDefaults.standard.removeObject(forKey: stdKey)
-        addTeardownBlock {
-            if let previousValue {
-                UserDefaults.standard.set(previousValue, forKey: stdKey)
+        defer {
+            if let previousString {
+                UserDefaults.standard.set(previousString, forKey: stdKey)
             } else {
                 UserDefaults.standard.removeObject(forKey: stdKey)
             }
@@ -342,7 +342,7 @@ final class LocalizationParityTests: XCTestCase {
         let suite = "dev.meshvpn.tests.locale.d0.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defaults.removePersistentDomain(forName: suite)
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        defer { defaults.removePersistentDomain(forName: suite) }
         let manager = LocaleManager(userDefaults: defaults)
 
         // Act

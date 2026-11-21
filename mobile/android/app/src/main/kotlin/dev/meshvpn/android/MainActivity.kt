@@ -40,6 +40,7 @@ import dev.meshvpn.android.ui.ActivityBiometricBridge
 import dev.meshvpn.android.ui.AdminAuthPurpose
 import dev.meshvpn.android.ui.AndroidBiometricAuthenticator
 import dev.meshvpn.android.ui.AndroidClipboardAccess
+import dev.meshvpn.android.ui.BiometricGateResult
 import dev.meshvpn.android.ui.MainTab
 import dev.meshvpn.android.ui.MainUiScreenState
 import dev.meshvpn.android.ui.MeshMainViewModel
@@ -153,8 +154,7 @@ class MainActivity : FragmentActivity() {
         super.onStop()
     }
 
-    private suspend fun authorizeAdminPurpose(purpose: AdminAuthPurpose):
-        dev.meshvpn.android.ui.BiometricGateResult {
+    private suspend fun authorizeAdminPurpose(purpose: AdminAuthPurpose): BiometricGateResult {
         val localized =
             LocaleHelper.wrapActivityContext(
                 activity = this,

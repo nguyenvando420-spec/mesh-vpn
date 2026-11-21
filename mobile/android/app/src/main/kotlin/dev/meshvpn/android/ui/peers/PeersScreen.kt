@@ -117,7 +117,7 @@ fun PeersScreen(
     val context = LocalContext.current
     val screenWidthDp = LocalConfiguration.current.screenWidthDp
     val columnCount = peersGridColumnCount(screenWidthDp)
-    val allPeers = screenState.session.snapshot?.peers.orEmpty()
+    val allPeers = screenState.session.snapshot?.peers ?: emptyList()
     val counts = countPeersByMode(allPeers)
     val filteredPeers =
         filterPeers(
