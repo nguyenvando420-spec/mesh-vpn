@@ -5,10 +5,10 @@
 | **Tên dự án** | Mesh VPN — Self-Hosted Secure Mesh Overlay Network |
 | **Phiên bản phát hành** | `v0.4.0` (Windows · macOS · Android · iOS Unified UI & Bilingual `vi`/`en`) |
 | **Mã tài liệu** | `OPS-GLC-UUI-001` |
-| **Phiên bản tài liệu** | `1.1` (Cập nhật kết quả thực tế `WP-U-E0` & khắc phục Gate 3 Round 1) |
+| **Phiên bản tài liệu** | `1.2` (Cập nhật bằng chứng xanh `3/3` GitHub Actions CI `VERIFIED_AT_CI_$0` sau Gate 3 `A1`) |
 | **Ngày cập nhật** | `2026-11-21` |
 | **Tài liệu tham chiếu** | `docs/05-quality-assurance/unified-ui-{test-plan,dod-verification}.md`, `docs/06-operations/unified-ui-{hardware-acceptance-protocol,operational-runbook}.md` |
-| **Trạng thái Gate** | **3-TIER GATE (`UUI-GL-01..08 VERIFIED_ON_WINDOWS_HOST` · `UUI-GL-09..12 PENDING_CI_RUNNER` · `UUI-GL-13..16 hardware_signoff_required`)** |
+| **Trạng thái Gate** | **3-TIER GATE (`UUI-GL-01..08 VERIFIED_ON_WINDOWS_HOST` · `UUI-GL-09..12 VERIFIED_AT_CI_$0` · `UUI-GL-13..16 hardware_signoff_required`)** |
 
 ---
 
@@ -18,8 +18,8 @@
 flowchart LR
     G1["Cong 1: Rust Host Gates\nVERIFIED_ON_WINDOWS_HOST"]
     G2["Cong 2: Security & SemVer 0.4.0\nWP-U-E0 VERIFIED_ON_WINDOWS_HOST"]
-    G3["Cong 3: Native CI Matrix\nPENDING_CI_RUNNER (macOS/Android/iOS/MSVC/musl)"]
-    G4["Cong 4: Release Packaging\nMeshVPN.exe 2.57 MiB • Universal DMG • APK/AAB"]
+    G3["Cong 3: Native CI Matrix\nVERIFIED_AT_CI_$0 (7/7 CI Gate / Android / iOS)"]
+    G4["Cong 4: Release Packaging\nMeshVPN.exe 2.57 MiB / Universal DMG / APK+AAB"]
     G5["Cong 5: Physical Hardware UAT\nhardware_signoff_required (4 Nen tang)"]
 
     G1 --> G2 --> G3 --> G4 --> G5
@@ -45,13 +45,13 @@ flowchart LR
 | **UUI-GL-07** | Bất biến `SEC-01` (Clipboard 30s wipe chỉ cho `mpk_*`/`mesh://join`, `FLAG_SECURE` không bật trên Peers tab, `0` secret trong `ui-prefs.json`, `MGH1` `0` argv secret), `SEC-05` (`"authentication failed"` không dịch), `OPS-01` (log tiếng Anh), Mobile Security Audit `MOB-SEC-01..16` | `security_regression_unified_ui` (`17/17`, đủ `9/9` bài bắt buộc `US-133`) + `lab/mobile/audit-mobile-security.ps1` (**`16/16` PASS**) | `[x] VERIFIED_ON_WINDOWS_HOST` |
 | **UUI-GL-08** | `cargo deny check advisories bans licenses sources` xanh `100%` (`0` thay đổi `deny.toml`, `0` `androidx.appcompat`, `0` WebView) | `scripts/check.ps1 -Cross` ngoài sandbox trên host Windows (`cargo deny check advisories bans licenses sources` `exit 0`) | `[x] VERIFIED_ON_WINDOWS_HOST` |
 
-### 2.3. Cổng 3 — Ma trận GitHub Actions CI (`PENDING_CI_RUNNER`)
-| Mã | Tiêu chí | Runner | Trạng thái |
+### 2.3. Cổng 3 — Ma trận GitHub Actions CI (`VERIFIED_AT_CI_$0`)
+| Mã | Tiêu chí | Runner / Run URL | Trạng thái |
 |---|---|---|---|
-| **UUI-GL-09** | macOS: `swift test` (`MeshDesktopCore`), `xcodegen`, `swiftlint lint --strict`, `xcodebuild test -scheme MeshVPNApp CODE_SIGNING_ALLOWED=NO` PASS `100%` | `macos-15` | `[ ] PENDING_CI_RUNNER` |
-| **UUI-GL-10** | Android: `./gradlew ktlintCheck detekt lintDebug lintVitalRelease testDebugUnitTest` PASS `100%` + `OnboardingComposeUiTest.kt` (EN) & `OnboardingComposeUiTestVi.kt` (VI) | `ubuntu-latest` | `[ ] PENDING_CI_RUNNER` |
-| **UUI-GL-11** | iOS: `xcodegen`, `swiftlint lint --strict`, `xcodebuild test -scheme MeshApp CODE_SIGNING_ALLOWED=NO` PASS `100%` | `macos-15` | `[ ] PENDING_CI_RUNNER` |
-| **UUI-GL-12** | Linux cross-build `x86_64-unknown-linux-musl` (`linux_gui.rs` + `label()` + `filter_peers(peers, query)`) và Windows MSVC native build/test PASS `100%` | `ubuntu-latest` & `windows-latest` | `[ ] PENDING_CI_RUNNER` |
+| **UUI-GL-09** | macOS: `swift test` (`MeshDesktopCore`), `xcodegen`, `swiftlint lint --strict`, `xcodebuild test -scheme MeshVPNApp CODE_SIGNING_ALLOWED=NO`, Darwin `aarch64`/`x86_64`, Universal `Mesh VPN.app`/DMG PASS `100%` | `macos-15-intel` ([CI Gate #44884759994](https://github.com/nguyenvando420-spec/mesh-vpn/actions/runs/44884759994)) | `[x] VERIFIED_AT_CI_$0` |
+| **UUI-GL-10** | Android: `gradle ktlintCheck detekt lintDebug testDebugUnitTest assembleDebug bundleRelease assembleRelease` & kiểm tra 16 KB PASS `100%` (`OnboardingComposeUiTest*.kt` instrumentation chạy ở `UUI-GL-15` emulator/máy thật) | `ubuntu-latest` ([Mesh Android Native Build #44884760060](https://github.com/nguyenvando420-spec/mesh-vpn/actions/runs/44884760060)) | `[x] VERIFIED_AT_CI_$0` |
+| **UUI-GL-11** | iOS: `build-ios-xcframework.sh`, `xcodegen`, `swiftlint lint --strict`, Simulator `xcodebuild build test -scheme MeshApp` & `.ipa` PASS `100%` | `macos-15` ([Mobile iOS CI #44883437843](https://github.com/nguyenvando420-spec/mesh-vpn/actions/runs/44883437843)) | `[x] VERIFIED_AT_CI_$0` |
+| **UUI-GL-12** | Linux (`scripts/check.sh` + `SLO` + `musl` release + Docker) và Windows MSVC (`scripts/check.ps1` + `gui_unit_tests` + `MeshVPN.exe` release) PASS `100%` | `ubuntu-latest` & `windows-latest` ([CI Gate #44884759994](https://github.com/nguyenvando420-spec/mesh-vpn/actions/runs/44884759994)) | `[x] VERIFIED_AT_CI_$0` |
 
 ### 2.4. Cổng 4 — Nghiệm thu Phần cứng Vật lý (`hardware_signoff_required`)
 | Mã | Tiêu chí | Tài liệu | Trạng thái |
