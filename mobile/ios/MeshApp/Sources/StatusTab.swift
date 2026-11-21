@@ -4,12 +4,18 @@ import SwiftUI
 /// Resolved display label and canonical semantic hex colors for `StatusBadge` (`ADR-030`).
 public struct StatusBadgePresentation: Equatable, Sendable {
     public let label: String
+    public let localizationKey: String
     public let tone: MeshSemanticTone
     public let lightHex: String
     public let darkHex: String
 
-    public init(label: String, tone: MeshSemanticTone) {
+    public init(
+        label: String,
+        tone: MeshSemanticTone,
+        localizationKey: String = "state.disconnected"
+    ) {
         self.label = label
+        self.localizationKey = localizationKey
         self.tone = tone
         self.lightHex = MeshDesignTokens.hexString(for: tone, isDark: false)
         self.darkHex = MeshDesignTokens.hexString(for: tone, isDark: true)
@@ -21,6 +27,7 @@ public struct StatusBadge: View {
     public let status: MeshTunnelConnectionStatus
     public let daemonState: MobileDaemonState?
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.locale) private var locale
 
     public init(
         status: MeshTunnelConnectionStatus,
@@ -33,7 +40,7 @@ public struct StatusBadge: View {
     public var body: some View {
         let resolved = Self.resolve(status: status, daemonState: daemonState)
         let color = MeshDesignTokens.color(for: resolved.tone, colorScheme: colorScheme)
-        Text(resolved.label)
+        Text(L10n.tr(resolved.localizationKey, locale: locale))
             .font(.caption.weight(.semibold))
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
@@ -50,15 +57,35 @@ public struct StatusBadge: View {
         if let daemonState {
             switch daemonState {
             case .revoked:
-                return StatusBadgePresentation(label: "Device Revoked", tone: .error)
+                return StatusBadgePresentation(
+                    label: "Device Revoked",
+                    tone: .error,
+                    localizationKey: "state.revoked"
+                )
             case .reauthRequired:
-                return StatusBadgePresentation(label: "Re-auth Required", tone: .warning)
+                return StatusBadgePresentation(
+                    label: "Re-auth Required",
+                    tone: .warning,
+                    localizationKey: "state.reauth_required"
+                )
             case .serverUpgradeRequired:
-                return StatusBadgePresentation(label: "Attention Required", tone: .error)
+                return StatusBadgePresentation(
+                    label: "Attention Required",
+                    tone: .error,
+                    localizationKey: "state.error"
+                )
             case .deviceLocked:
-                return StatusBadgePresentation(label: "Waiting for Unlock", tone: .neutral)
+                return StatusBadgePresentation(
+                    label: "Waiting for Unlock",
+                    tone: .neutral,
+                    localizationKey: "notif.waiting_unlock"
+                )
             case .degraded where status == .connected || status == .reasserting:
-                return StatusBadgePresentation(label: "Degraded", tone: .warning)
+                return StatusBadgePresentation(
+                    label: "Degraded",
+                    tone: .warning,
+                    localizationKey: "state.degraded"
+                )
             case .stopped, .connecting, .connected, .degraded:
                 break
             }
@@ -66,15 +93,35 @@ public struct StatusBadge: View {
 
         switch status {
         case .connected:
-            return StatusBadgePresentation(label: "Connected", tone: .success)
+            return StatusBadgePresentation(
+                label: "Connected",
+                tone: .success,
+                localizationKey: "state.connected"
+            )
         case .connecting:
-            return StatusBadgePresentation(label: "Connecting", tone: .warning)
+            return StatusBadgePresentation(
+                label: "Connecting",
+                tone: .warning,
+                localizationKey: "state.connecting"
+            )
         case .reasserting:
-            return StatusBadgePresentation(label: "Degraded", tone: .warning)
+            return StatusBadgePresentation(
+                label: "Degraded",
+                tone: .warning,
+                localizationKey: "state.degraded"
+            )
         case .disconnecting:
-            return StatusBadgePresentation(label: "Disconnecting", tone: .neutral)
+            return StatusBadgePresentation(
+                label: "Disconnecting",
+                tone: .neutral,
+                localizationKey: "state.disconnected"
+            )
         case .disconnected, .invalid:
-            return StatusBadgePresentation(label: "Disconnected", tone: .neutral)
+            return StatusBadgePresentation(
+                label: "Disconnected",
+                tone: .neutral,
+                localizationKey: "state.disconnected"
+            )
         }
     }
 }
@@ -99,15 +146,17 @@ struct LabeledValueRow: View {
 @MainActor
 struct StatusTab: View {
     @ObservedObject var viewModel: AppViewModel
+    @EnvironmentObject var localeManager: LocaleManager
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
+        let locale = localeManager.resolvedLocale
         NavigationView {
             List {
-                connectionSection
+                connectionSection(locale: locale)
                 warningsSection
             }
-            .navigationTitle("Mesh VPN")
+            .navigationTitle(L10n.tr("notif.app_name", locale: locale))
             .refreshable {
                 await viewModel.refreshAllState()
             }
@@ -118,6 +167,7 @@ struct StatusTab: View {
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
+                    .accessibilityLabel(L10n.tr("generic.refresh", locale: locale))
                     .disabled(viewModel.isBusy)
                 }
             }
@@ -125,11 +175,11 @@ struct StatusTab: View {
         .navigationViewStyle(.stack)
     }
 
-    private var connectionSection: some View {
-        Section("Tunnel Status") {
+    private func connectionSection(locale: Locale) -> some View {
+        Section(L10n.tr("tab.status", locale: locale)) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(resolvedPresentation.label)
+                    Text(L10n.tr(resolvedPresentation.localizationKey, locale: locale))
                         .font(.headline)
                     if let overlayIp = displayOverlayIp {
                         Text(overlayIp)
@@ -150,7 +200,10 @@ struct StatusTab: View {
             }
 
             if let endpoint = viewModel.bootstrapSummary?.serverEndpoint {
-                LabeledValueRow(title: "Control", value: endpoint)
+                LabeledValueRow(
+                    title: L10n.tr("label.control", locale: locale),
+                    value: endpoint
+                )
             }
             if let snapshot = viewModel.statusSnapshot {
                 LabeledValueRow(
@@ -167,10 +220,10 @@ struct StatusTab: View {
                     .foregroundStyle(.secondary)
             }
 
-            tunnelActionButton
+            tunnelActionButton(locale: locale)
 
             Toggle(
-                "On-Demand Auto-Connect",
+                L10n.tr("action.on_demand", locale: locale),
                 isOn: Binding(
                     get: { viewModel.isOnDemandEnabled },
                     set: { newValue in
@@ -182,10 +235,11 @@ struct StatusTab: View {
         }
     }
 
-    private var tunnelActionButton: some View {
+    private func tunnelActionButton(locale: Locale) -> some View {
         let ctaColor = isConnectedOrConnecting
             ? MeshDesignTokens.color(for: .error, colorScheme: colorScheme)
             : MeshDesignTokens.brandPrimary(colorScheme: colorScheme)
+        let titleKey = isConnectedOrConnecting ? "action.disconnect" : "action.connect"
 
         return Button {
             Task {
@@ -196,7 +250,7 @@ struct StatusTab: View {
                 }
             }
         } label: {
-            Text(isConnectedOrConnecting ? "Disconnect" : "Connect")
+            Text(L10n.tr(titleKey, locale: locale))
                 .fontWeight(.semibold)
                 .frame(maxWidth: .infinity)
         }

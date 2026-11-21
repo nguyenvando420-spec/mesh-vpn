@@ -102,4 +102,34 @@ final class MeshVPNAppTests: XCTestCase {
         XCTAssertEqual(matched.count, 1)
         XCTAssertEqual(counts.direct, 1)
     }
+
+    func testLocaleViTranslations_StateAndTrayAndTabs_ReturnCanonicalVietnameseStrings() {
+        // Arrange
+        let viLocale = Locale(identifier: "vi")
+
+        // Act & Assert
+        XCTAssertEqual(MeshL10n.tr("state.connected", locale: viLocale), "Đã kết nối")
+        XCTAssertEqual(MeshL10n.tr("tray.connected", locale: viLocale), "Mesh VPN - Đã kết nối")
+        XCTAssertEqual(DesktopTabKind.peers.localizedTitle(locale: viLocale), "Thiết bị cùng mạng")
+        XCTAssertEqual(
+            DesktopTabKind.diagnostics.localizedTitle(locale: viLocale),
+            "Chẩn đoán & Cài đặt"
+        )
+    }
+
+    func testLocaleMode_UserDefaultsKeyMeshLocaleMode_PersistsWithoutRestart() {
+        // Arrange
+        let suiteName = "MeshVPN.app.locale.\(UUID().uuidString.prefix(8))"
+        let defaults = UserDefaults(suiteName: suiteName)
+        defer { defaults?.removePersistentDomain(forName: suiteName) }
+
+        // Act
+        LocaleMode.vi.save(to: defaults)
+
+        // Assert
+        XCTAssertEqual(defaults?.string(forKey: "mesh_locale_mode"), "vi")
+        XCTAssertEqual(LocaleMode.load(from: defaults), .vi)
+        XCTAssertEqual(MeshL10n.tr("error.auth_failed", locale: Locale(identifier: "vi")),
+                       "authentication failed")
+    }
 }

@@ -24,9 +24,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import dev.meshvpn.android.LocaleHelper
+import dev.meshvpn.android.R
 import dev.meshvpn.android.ffi.UiErrorInfo
 import dev.meshvpn.android.ffi.UiErrorKind
 import dev.meshvpn.android.ui.MainUiScreenState
@@ -47,6 +51,20 @@ fun canonicalDaemonStateLabel(state: MobileDaemonState): String =
         MobileDaemonState.REAUTH_REQUIRED -> "Re-auth Required"
         MobileDaemonState.REVOKED -> "Device Revoked"
         MobileDaemonState.SERVER_UPGRADE_REQUIRED -> "Attention Required"
+    }
+
+@Composable
+private fun localizedDaemonStateLabel(state: MobileDaemonState): String =
+    when (state) {
+        MobileDaemonState.STOPPED -> stringResource(R.string.state_disconnected)
+        MobileDaemonState.DEVICE_LOCKED ->
+            LocaleHelper.tr(LocalContext.current, "Waiting for Unlock", "Đang chờ mở khóa")
+        MobileDaemonState.CONNECTING -> stringResource(R.string.state_connecting)
+        MobileDaemonState.CONNECTED -> stringResource(R.string.state_connected)
+        MobileDaemonState.DEGRADED -> stringResource(R.string.state_degraded)
+        MobileDaemonState.REAUTH_REQUIRED -> stringResource(R.string.state_reauth_required)
+        MobileDaemonState.REVOKED -> stringResource(R.string.state_revoked)
+        MobileDaemonState.SERVER_UPGRADE_REQUIRED -> stringResource(R.string.state_error)
     }
 
 fun daemonStateSemanticColor(state: MobileDaemonState): Color =
@@ -131,7 +149,7 @@ private fun StatusHeaderCard(
             session.daemonState == MobileDaemonState.CONNECTING ||
             session.daemonState == MobileDaemonState.DEGRADED
     val statusColor = daemonStateSemanticColor(session.daemonState)
-    val stateLabel = canonicalDaemonStateLabel(session.daemonState)
+    val stateLabel = localizedDaemonStateLabel(session.daemonState)
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -184,7 +202,9 @@ private fun StatusHeaderCard(
                         .fillMaxWidth()
                         .testTag("toggle_tunnel_button"),
             ) {
-                Text(if (active) "Disconnect VPN" else "Connect VPN")
+                val toggleRes =
+                    if (active) R.string.action_disconnect_vpn else R.string.action_connect_vpn
+                Text(stringResource(toggleRes))
             }
         }
     }
@@ -196,11 +216,17 @@ private fun WarningBanners(
     onOpenVpnSettings: () -> Unit,
     onOpenNetworkSettings: () -> Unit,
 ) {
+    val context = LocalContext.current
     if (session.isLockdownEnabled) {
         WarningCard(
-            title = "Always-On Lockdown Enabled",
-            detail = "Android 'Block connections without VPN' may interrupt pre-TUN probes.",
-            actionLabel = "Open VPN Settings",
+            title = stringResource(R.string.warn_lockdown),
+            detail =
+                LocaleHelper.tr(
+                    context,
+                    "Android 'Block connections without VPN' may interrupt pre-TUN probes.",
+                    "Chế độ chặn kết nối ngoài VPN của Android có thể làm gián đoạn dò đường.",
+                ),
+            actionLabel = stringResource(R.string.settings_open_vpn_settings),
             onAction = onOpenVpnSettings,
             modifier = Modifier.testTag("warning_lockdown"),
         )
@@ -208,9 +234,14 @@ private fun WarningBanners(
     if (session.isPrivateDnsStrict) {
         val dnsHost = session.privateDnsServerName ?: "hostname"
         WarningCard(
-            title = "Strict Private DNS (:853) Active",
-            detail = "Android Private DNS ($dnsHost) can bypass Mesh Split-DNS for *.mesh names.",
-            actionLabel = "Network Settings",
+            title = stringResource(R.string.warn_private_dns),
+            detail =
+                LocaleHelper.tr(
+                    context,
+                    "Android Private DNS ($dnsHost) can bypass Mesh Split-DNS for *.mesh names.",
+                    "DNS riêng Android ($dnsHost) có thể bỏ qua Split-DNS cho tên miền *.mesh.",
+                ),
+            actionLabel = stringResource(R.string.error_captive_portal),
             onAction = onOpenNetworkSettings,
             modifier = Modifier.testTag("warning_private_dns"),
         )
@@ -367,22 +398,22 @@ private fun ErrorRecoveryButton(
     when (kind) {
         UiErrorKind.CLOCK_SKEW ->
             OutlinedButton(onClick = onOpenDateTimeSettings) {
-                Text("Date & Time Settings")
+                Text(stringResource(R.string.error_clock_skew))
             }
         UiErrorKind.CAPTIVE_PORTAL ->
             OutlinedButton(onClick = onOpenNetworkSettings) {
-                Text("Network Settings")
+                Text(stringResource(R.string.error_captive_portal))
             }
         UiErrorKind.PIN_MISMATCH ->
             OutlinedButton(onClick = onOpenSettingsTab) {
-                Text("Review Server Pin")
+                Text(stringResource(R.string.error_pin_mismatch))
             }
         UiErrorKind.NODE_REVOKED,
         UiErrorKind.NODE_KEY_EXPIRED,
         UiErrorKind.KEYSTORE_INVALIDATED,
         ->
             OutlinedButton(onClick = onResetAndReenroll) {
-                Text("Reset & Re-enroll")
+                Text(stringResource(R.string.error_reset_reenroll))
             }
         else -> Unit
     }
@@ -390,6 +421,7 @@ private fun ErrorRecoveryButton(
 
 @Composable
 private fun SelfTelemetryCard(session: MeshSessionUiState) {
+    val context = LocalContext.current
     val snap = session.snapshot
     val server = snap?.serverConnection
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -397,27 +429,36 @@ private fun SelfTelemetryCard(session: MeshSessionUiState) {
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Text("Tunnel Telemetry", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = stringResource(R.string.diag_tunnel_telemetry),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            val notConfigured = LocaleHelper.tr(context, "Not configured", "Chưa cấu hình")
             val endpoint =
                 server?.controlEndpoint
                     ?: session.bootstrapSummary?.serverEndpoint
-                    ?: "Not configured"
-            Text("Control: $endpoint")
+                    ?: notConfigured
+            Text("${stringResource(R.string.label_control)}: $endpoint")
             if (snap != null) {
                 val net = snap.selfNetwork
-                Text("NAT: ${net.natType.name} | UDP Port: ${net.localUdpPort}")
+                val udpLabel = LocaleHelper.tr(context, "UDP Port", "Cổng UDP")
+                Text("NAT: ${net.natType.name} | $udpLabel: ${net.localUdpPort}")
                 val relayState =
                     if (server?.relayConnected == true) {
-                        "Connected (${server.relayRttMs ?: "-"} ms)"
+                        val connected = stringResource(R.string.state_connected)
+                        "$connected (${server.relayRttMs ?: "-"} ms)"
                     } else {
-                        "Disconnected"
+                        stringResource(R.string.state_disconnected)
                     }
-                Text("Blind Relay: $relayState")
+                Text("${stringResource(R.string.label_blind_relay)}: $relayState")
                 net.boundPhysicalInterface?.let { iface ->
-                    Text("Physical Interface: $iface")
+                    val ifaceLabel =
+                        LocaleHelper.tr(context, "Physical Interface", "Giao diện vật lý")
+                    Text("$ifaceLabel: $iface")
                 }
                 net.nat64ActivePrefix?.let { prefix ->
-                    Text("NAT64 Prefix: $prefix")
+                    val nat64Label = LocaleHelper.tr(context, "NAT64 Prefix", "Tiền tố NAT64")
+                    Text("$nat64Label: $prefix")
                 }
             }
         }
@@ -430,6 +471,7 @@ private fun NetcheckSection(
     netcheck: MobileNetcheckResponse?,
     onRunNetcheck: () -> Unit,
 ) {
+    val context = LocalContext.current
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -440,17 +482,24 @@ private fun NetcheckSection(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Network Check", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    text = stringResource(R.string.diag_network_check),
+                    style = MaterialTheme.typography.titleMedium,
+                )
                 OutlinedButton(onClick = onRunNetcheck, enabled = isConnected) {
-                    Text("Run Netcheck")
+                    Text(stringResource(R.string.diag_run_netcheck))
                 }
             }
             if (netcheck != null) {
-                Text("UDP Reachable: ${netcheck.udpReachable} | NAT: ${netcheck.natType.name}")
+                val udpLabel = LocaleHelper.tr(context, "UDP Reachable", "UDP khả dụng")
+                Text("$udpLabel: ${netcheck.udpReachable} | NAT: ${netcheck.natType.name}")
                 Text("IPv4: ${netcheck.ipv4Available} | IPv6: ${netcheck.ipv6Available}")
+                val relayPrefix = stringResource(R.string.peers_filter_relay)
+                val mappedPart =
+                    netcheck.mappedEndpoint?.let { " | Mapped: $it" } ?: ""
                 Text(
-                    "Relay: ${netcheck.relayConnected} (${netcheck.relayRttMs ?: "-"} ms)" +
-                        (netcheck.mappedEndpoint?.let { " | Mapped: $it" } ?: ""),
+                    "$relayPrefix: ${netcheck.relayConnected} " +
+                        "(${netcheck.relayRttMs ?: "-"} ms)$mappedPart",
                 )
             }
         }
@@ -462,6 +511,7 @@ private fun PeersSummaryCard(
     snapshot: MobileStatusSnapshot?,
     onOpenPeersTab: () -> Unit,
 ) {
+    val context = LocalContext.current
     val peers = snapshot?.peers.orEmpty()
     val onlineCount = peers.count { it.online }
     Card(modifier = Modifier.fillMaxWidth()) {
@@ -474,15 +524,23 @@ private fun PeersSummaryCard(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("Mesh Peers", style = MaterialTheme.typography.titleMedium)
                 Text(
-                    text = "$onlineCount online of ${peers.size} total",
+                    text = stringResource(R.string.tab_peers),
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Text(
+                    text =
+                        LocaleHelper.tr(
+                            context,
+                            "$onlineCount online of ${peers.size} total",
+                            "$onlineCount trực tuyến / ${peers.size} thiết bị",
+                        ),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
             OutlinedButton(onClick = onOpenPeersTab) {
-                Text("View Peers")
+                Text(LocaleHelper.tr(context, "View Peers", "Xem thiết bị"))
             }
         }
     }

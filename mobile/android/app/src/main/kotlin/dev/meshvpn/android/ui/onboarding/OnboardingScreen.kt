@@ -40,11 +40,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import dev.meshvpn.android.LocaleHelper
+import dev.meshvpn.android.R
 import dev.meshvpn.android.ui.JoinConfirmationUiModel
 import dev.meshvpn.android.ui.MainUiScreenState
 import dev.meshvpn.android.ui.OnboardingMethod
@@ -119,13 +123,11 @@ fun OnboardingScreen(
 @Composable
 private fun OnboardingHeaderBanner(isBusy: Boolean) {
     Text(
-        text = "Join Mesh Network",
+        text = stringResource(R.string.onboarding_title),
         style = MaterialTheme.typography.headlineSmall,
     )
     Text(
-        text =
-            "Scan an administrator QR or enter server fingerprint details. " +
-                "Automatic trust-on-first-use is disabled.",
+        text = stringResource(R.string.onboarding_subtitle),
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
@@ -134,7 +136,7 @@ private fun OnboardingHeaderBanner(isBusy: Boolean) {
         leadingIcon = {
             Icon(imageVector = Icons.Outlined.Lock, contentDescription = null)
         },
-        label = { Text("Screen capture blocked (FLAG_SECURE)") },
+        label = { Text(stringResource(R.string.onboarding_flag_secure)) },
     )
     if (isBusy) {
         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -148,9 +150,21 @@ private fun OnboardingMethodTabs(
 ) {
     val methods =
         listOf(
-            Triple(OnboardingMethod.SCAN_QR, "Scan QR", Icons.Outlined.QrCodeScanner),
-            Triple(OnboardingMethod.PASTE_URI, "Paste URI", Icons.Outlined.ContentPaste),
-            Triple(OnboardingMethod.MANUAL, "Manual", Icons.Outlined.Edit),
+            Triple(
+                OnboardingMethod.SCAN_QR,
+                stringResource(R.string.onboarding_tab_scan_qr),
+                Icons.Outlined.QrCodeScanner,
+            ),
+            Triple(
+                OnboardingMethod.PASTE_URI,
+                stringResource(R.string.onboarding_tab_paste_uri),
+                Icons.Outlined.ContentPaste,
+            ),
+            Triple(
+                OnboardingMethod.MANUAL,
+                stringResource(R.string.onboarding_tab_manual),
+                Icons.Outlined.Edit,
+            ),
         )
     TabRow(selectedTabIndex = methods.indexOfFirst { it.first == selected }.coerceAtLeast(0)) {
         methods.forEach { (method, label, icon) ->
@@ -182,7 +196,7 @@ private fun PasteUriSection(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                text = "Import mesh://join URI",
+                text = stringResource(R.string.onboarding_import_uri),
                 style = MaterialTheme.typography.titleMedium,
             )
             Button(
@@ -193,12 +207,12 @@ private fun PasteUriSection(
                         .fillMaxWidth()
                         .testTag("paste_clipboard_clear_button"),
             ) {
-                Text("Paste from Clipboard & Clear Immediately")
+                Text(stringResource(R.string.onboarding_paste_clipboard))
             }
             OutlinedTextField(
                 value = uriDraft,
                 onValueChange = { uriDraft = it },
-                label = { Text("Or enter mesh://join?... URI") },
+                label = { Text(stringResource(R.string.onboarding_or_enter_uri)) },
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions =
                     KeyboardOptions(
@@ -220,7 +234,7 @@ private fun PasteUriSection(
                 enabled = !isBusy && uriDraft.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Review URI Details")
+                Text(stringResource(R.string.onboarding_review_uri))
             }
         }
     }
@@ -249,7 +263,7 @@ private fun ManualJoinSection(
             OutlinedTextField(
                 value = endpoint,
                 onValueChange = { endpoint = it },
-                label = { Text("Control server (host:port)") },
+                label = { Text(stringResource(R.string.onboarding_control_server)) },
                 placeholder = { Text("203.0.113.10:443") },
                 singleLine = true,
                 modifier =
@@ -274,7 +288,7 @@ private fun ManualJoinSection(
             OutlinedTextField(
                 value = preauthKeyDraft,
                 onValueChange = { preauthKeyDraft = it },
-                label = { Text("Pre-auth Key (mpk_...)") },
+                label = { Text(stringResource(R.string.onboarding_preauth_key)) },
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions =
                     KeyboardOptions(
@@ -290,7 +304,7 @@ private fun ManualJoinSection(
             OutlinedTextField(
                 value = nodeName,
                 onValueChange = { nodeName = it },
-                label = { Text("Device Name (optional RFC 1123)") },
+                label = { Text(stringResource(R.string.onboarding_node_name)) },
                 singleLine = true,
                 modifier =
                     Modifier
@@ -309,7 +323,7 @@ private fun ManualJoinSection(
                         .fillMaxWidth()
                         .testTag("manual_submit_button"),
             ) {
-                Text("Review Server & Continue")
+                Text(stringResource(R.string.onboarding_review_server))
             }
         }
     }
@@ -321,11 +335,12 @@ private fun ManualSpkiOrSystemCaFields(
     spkiPin: String,
     onPinChange: (String) -> Unit,
 ) {
+    val context = LocalContext.current
     if (tlsMode == MobileTlsAuthMode.SPKI_PIN) {
         OutlinedTextField(
             value = spkiPin,
             onValueChange = onPinChange,
-            label = { Text("SPKI Pin (sha256:<64 hex>)") },
+            label = { Text(stringResource(R.string.onboarding_spki_pin_label)) },
             singleLine = true,
             modifier =
                 Modifier
@@ -334,7 +349,12 @@ private fun ManualSpkiOrSystemCaFields(
         )
     } else {
         Text(
-            text = "System CA validates DNS domain certificates using Android root store.",
+            text =
+                LocaleHelper.tr(
+                    context,
+                    "System CA validates DNS domain certificates using Android root store.",
+                    "CA hệ thống xác thực chứng chỉ tên miền DNS bằng kho gốc Android.",
+                ),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -350,12 +370,12 @@ private fun TlsModeSelector(
         FilterChip(
             selected = tlsMode == MobileTlsAuthMode.SPKI_PIN,
             onClick = { onSelectMode(MobileTlsAuthMode.SPKI_PIN) },
-            label = { Text("SPKI Pin (Default)") },
+            label = { Text(stringResource(R.string.onboarding_tls_spki_pin)) },
         )
         FilterChip(
             selected = tlsMode == MobileTlsAuthMode.SYSTEM_CA,
             onClick = { onSelectMode(MobileTlsAuthMode.SYSTEM_CA) },
-            label = { Text("System CA (Domain)") },
+            label = { Text(stringResource(R.string.onboarding_tls_system_ca)) },
         )
     }
 }
@@ -407,29 +427,59 @@ private fun JoinConfirmationDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Verify Control Server Identity") },
+        title = { Text(stringResource(R.string.confirm_verify_server)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Endpoint: ${confirmation.serverEndpoint}")
+                Text(
+                    LocaleHelper.tr(
+                        context,
+                        "Endpoint: ${confirmation.serverEndpoint}",
+                        "Điểm cuối: ${confirmation.serverEndpoint}",
+                    ),
+                )
                 val trustLabel =
                     if (confirmation.tlsAuthMode == MobileTlsAuthMode.SPKI_PIN) {
-                        "Pinned SPKI SHA-256"
+                        LocaleHelper.tr(context, "Pinned SPKI SHA-256", "Ghim SPKI SHA-256")
                     } else {
-                        "Android System CA (Domain Verified)"
+                        LocaleHelper.tr(
+                            context,
+                            "Android System CA (Domain Verified)",
+                            "CA hệ thống Android (Đã xác minh tên miền)",
+                        )
                     }
-                Text("TLS Policy: $trustLabel")
+                Text(
+                    LocaleHelper.tr(
+                        context,
+                        "TLS Policy: $trustLabel",
+                        "Chính sách TLS: $trustLabel",
+                    ),
+                )
                 confirmation.serverPin?.let { pin ->
+                    val pinHeading = LocaleHelper.tr(context, "SPKI Pin:", "Ghim SPKI:")
                     Text(
-                        text = "SPKI Pin:\n$pin",
+                        text = "$pinHeading\n$pin",
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.labelMedium,
                     )
                 }
-                Text("Key Preview: ${confirmation.preauthKeyMasked}")
+                Text(
+                    LocaleHelper.tr(
+                        context,
+                        "Key Preview: ${confirmation.preauthKeyMasked}",
+                        "Xem trước khóa: ${confirmation.preauthKeyMasked}",
+                    ),
+                )
                 confirmation.nodeName?.let { name ->
-                    Text("Device Name: $name")
+                    Text(
+                        LocaleHelper.tr(
+                            context,
+                            "Device Name: $name",
+                            "Tên thiết bị: $name",
+                        ),
+                    )
                 }
                 Spacer(modifier = Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -437,7 +487,7 @@ private fun JoinConfirmationDialog(
                         checked = connectOnConfirm,
                         onCheckedChange = onToggleConnect,
                     )
-                    Text("Connect VPN immediately after enrollment")
+                    Text(stringResource(R.string.onboarding_connect_after))
                 }
             }
         },
@@ -446,7 +496,13 @@ private fun JoinConfirmationDialog(
                 onClick = onConfirm,
                 modifier = Modifier.testTag("confirm_join_button"),
             ) {
-                Text(if (connectOnConfirm) "Trust & Connect" else "Trust & Enroll")
+                val labelRes =
+                    if (connectOnConfirm) {
+                        R.string.onboarding_trust_connect
+                    } else {
+                        R.string.onboarding_trust_enroll
+                    }
+                Text(stringResource(labelRes))
             }
         },
         dismissButton = {
@@ -454,7 +510,7 @@ private fun JoinConfirmationDialog(
                 onClick = onDismiss,
                 modifier = Modifier.testTag("cancel_join_button"),
             ) {
-                Text("Cancel")
+                Text(stringResource(R.string.generic_cancel))
             }
         },
     )

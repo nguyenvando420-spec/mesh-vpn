@@ -5,9 +5,12 @@ import SwiftUI
 /// Alert, version mismatch, subnet conflict, firewall, and toast banners in the Dashboard.
 struct DashboardBannersView: View {
     @ObservedObject var store: DesktopStore
+    @EnvironmentObject private var localeManager: LocaleManager
     let onOpenDiagnostics: () -> Void
     let onOpenKeyRotation: () -> Void
     let onConfirmResetIdentity: () -> Void
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -22,7 +25,7 @@ struct DashboardBannersView: View {
                 DashboardWarningBanner(
                     icon: "exclamationmark.triangle.fill",
                     color: MeshPalette.semanticWarning,
-                    title: "Local Network Subnet Conflict",
+                    title: MeshL10n.tr("warn.subnet_conflict", locale: loc),
                     message: conflict,
                     actionTitle: nil,
                     isBusy: store.isBusy,
@@ -33,9 +36,9 @@ struct DashboardBannersView: View {
                 DashboardWarningBanner(
                     icon: "flame.fill",
                     color: MeshPalette.semanticWarning,
-                    title: "macOS Application Firewall Warning",
+                    title: MeshL10n.tr("warn.firewall", locale: loc),
                     message: fwWarn,
-                    actionTitle: "Allow meshd",
+                    actionTitle: MeshL10n.tr("service.firewall_allow", locale: loc),
                     isBusy: store.isBusy
                 ) {
                     Task { @MainActor in
@@ -47,9 +50,9 @@ struct DashboardBannersView: View {
                 DashboardWarningBanner(
                     icon: "bolt.trianglebadge.exclamationmark.fill",
                     color: MeshPalette.semanticWarning,
-                    title: "Tunnel Operating in Degraded Mode",
-                    message: "Direct P2P paths are unavailable; traffic falls back via Relay.",
-                    actionTitle: "Diagnostics",
+                    title: MeshL10n.tr("warn.degraded_tunnel", locale: loc),
+                    message: MeshL10n.tr("warn.degraded_detail", locale: loc),
+                    actionTitle: MeshL10n.tr("tab.diagnostics_settings", locale: loc),
                     isBusy: store.isBusy,
                     action: onOpenDiagnostics
                 )
@@ -63,18 +66,20 @@ struct DashboardBannersView: View {
     private var versionMismatchBanner: some View {
         let message: String = switch store.versionBanner {
         case .legacyPre030:
-            "Installed meshd is legacy (<0.3.0) and lacks desktop IPC endpoints."
+            "\(MeshL10n.tr("warn.legacy_agent", locale: loc)) (<0.3.0)"
         case .mismatch(let daemon, let app):
-            "Running meshd (\(daemon)) differs from Mesh VPN.app (\(app))."
+            MeshL10n.tr("warn.version_mismatch", locale: loc)
+                .replacingOccurrences(of: "{v1}", with: app)
+                .replacingOccurrences(of: "{v2}", with: daemon)
         case .unknown, .matched:
             ""
         }
         return DashboardWarningBanner(
             icon: "arrow.triangle.2.circlepath.circle.fill",
             color: MeshPalette.semanticWarning,
-            title: "Background Service Update Recommended",
+            title: MeshL10n.tr("service.update_recommended", locale: loc),
             message: message,
-            actionTitle: "Update Service",
+            actionTitle: MeshL10n.tr("service.update", locale: loc),
             isBusy: store.isBusy
         ) {
             Task { @MainActor in
@@ -93,17 +98,20 @@ struct DashboardBannersView: View {
             }
             Spacer()
             if error.isPermissionDenied {
-                Button("Start / Repair Service") {
+                Button(MeshL10n.tr("service.start_repair", locale: loc)) {
                     Task { @MainActor in _ = await store.startOrRepairService() }
                 }
             } else if error.requiresPinUpdate {
-                Button("Update Server Pin", action: onOpenDiagnostics)
+                Button(MeshL10n.tr("error.pin_mismatch", locale: loc), action: onOpenDiagnostics)
             } else if error.requiresKeyRotation {
-                Button("Rotate Key...", action: onOpenKeyRotation)
+                Button(MeshL10n.tr("action.rotate_key", locale: loc), action: onOpenKeyRotation)
             } else if error.requiresIdentityReset {
-                Button("Reset Identity...", action: onConfirmResetIdentity)
+                Button(
+                    MeshL10n.tr("action.reset_identity", locale: loc),
+                    action: onConfirmResetIdentity
+                )
             }
-            Button("Dismiss") {
+            Button(MeshL10n.tr("generic.dismiss", locale: loc)) {
                 store.dismissError()
             }
             .buttonStyle(.borderless)
@@ -122,7 +130,7 @@ struct DashboardBannersView: View {
             Text(toast)
                 .font(.callout)
             Spacer()
-            Button("Dismiss") {
+            Button(MeshL10n.tr("generic.dismiss", locale: loc)) {
                 store.dismissToast()
             }
             .buttonStyle(.borderless)
@@ -193,9 +201,12 @@ struct DashboardCenteredCard<Actions: View>: View {
 /// Persistent Header Hero shown above the 3-tab navigation bar across all enrolled states.
 struct ConnectedHeroSummaryView: View {
     @ObservedObject var store: DesktopStore
+    @EnvironmentObject private var localeManager: LocaleManager
     let onOpenKeyRotation: () -> Void
     let onConfirmResetIdentity: () -> Void
     @State private var copiedFeedback: Bool = false
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     init(
         store: DesktopStore,
@@ -225,7 +236,8 @@ struct ConnectedHeroSummaryView: View {
         let badgeColor = MeshPalette.color(for: store.menuBarGroup)
         let badgeTitle = store.uiState.resolvedTitle(
             isDegradedTunnel: store.isDegradedTunnel,
-            isManuallyDisconnected: store.isManuallyDisconnected
+            isManuallyDisconnected: store.isManuallyDisconnected,
+            locale: loc
         )
         return HStack(spacing: 8) {
             Text(store.status?.nodeName ?? "Unnamed Node")
@@ -240,7 +252,11 @@ struct ConnectedHeroSummaryView: View {
                 Text(overlayIp)
                     .font(.body.monospaced())
                     .textSelection(.enabled)
-                Button(copiedFeedback ? "Copied" : "Copy") {
+                Button(
+                    copiedFeedback
+                        ? MeshL10n.tr("peers.copied_toast", locale: loc)
+                        : MeshL10n.tr("peers.copy_overlay_ip", locale: loc)
+                ) {
                     copyStandardText(overlayIp)
                     copiedFeedback = true
                     Task { @MainActor in
@@ -266,7 +282,7 @@ struct ConnectedHeroSummaryView: View {
                     .foregroundStyle(.secondary)
             }
             if let conn = store.status?.serverConnection {
-                Text("Control: \(conn.controlEndpoint)")
+                Text("\(MeshL10n.tr("label.control", locale: loc)): \(conn.controlEndpoint)")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -277,41 +293,45 @@ struct ConnectedHeroSummaryView: View {
     private var heroPrimaryAction: some View {
         switch store.uiState {
         case .reauthRequired:
-            Button("Rotate Key...", action: onOpenKeyRotation)
+            Button(MeshL10n.tr("action.rotate_key", locale: loc), action: onOpenKeyRotation)
                 .buttonStyle(.borderedProminent)
                 .disabled(store.isBusy)
         case .revoked:
-            Button("Reset Identity...", role: .destructive, action: onConfirmResetIdentity)
-                .buttonStyle(.borderedProminent)
-                .disabled(store.isBusy)
+            Button(
+                MeshL10n.tr("action.reset_identity", locale: loc),
+                role: .destructive,
+                action: onConfirmResetIdentity
+            )
+            .buttonStyle(.borderedProminent)
+            .disabled(store.isBusy)
         case .error:
             if store.isManuallyDisconnected {
-                Button("Connect") {
+                Button(MeshL10n.tr("generic.connect", locale: loc)) {
                     Task { @MainActor in _ = await store.connectOneClick() }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(store.isBusy)
             } else {
-                Button("Retry") {
+                Button(MeshL10n.tr("generic.refresh", locale: loc)) {
                     Task { @MainActor in await store.refreshNow() }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(store.isBusy)
             }
         case .connecting:
-            Button("Disconnect") {
+            Button(MeshL10n.tr("generic.disconnect", locale: loc)) {
                 Task { @MainActor in _ = await store.disconnect() }
             }
             .disabled(store.isBusy)
         case .connected:
             if store.isManuallyDisconnected {
-                Button("Connect") {
+                Button(MeshL10n.tr("generic.connect", locale: loc)) {
                     Task { @MainActor in _ = await store.connectOneClick() }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(store.isBusy)
             } else {
-                Button("Disconnect") {
+                Button(MeshL10n.tr("generic.disconnect", locale: loc)) {
                     Task { @MainActor in _ = await store.disconnect() }
                 }
                 .disabled(store.isBusy)
@@ -331,10 +351,13 @@ struct ConnectedHeroSummaryView: View {
 /// Zone 1 (`Status` tab) rendered across all enrolled states (`ADR-028`).
 struct StatusTabView: View {
     @ObservedObject var store: DesktopStore
+    @EnvironmentObject private var localeManager: LocaleManager
     let onOpenKeyRotation: () -> Void
     let onConfirmResetIdentity: () -> Void
     let onOpenDiagnostics: () -> Void
     @State private var copiedField: String?
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     var body: some View {
         ScrollView {
@@ -349,7 +372,7 @@ struct StatusTabView: View {
 
     private var lifecycleStateCard: some View {
         let tint = MeshPalette.color(for: store.menuBarGroup)
-        return GroupBox("Connection Status") {
+        return GroupBox(MeshL10n.tr("tab.status", locale: loc)) {
             HStack(alignment: .center, spacing: 14) {
                 Image(systemName: store.menuBarGroup.symbolName)
                     .font(.system(size: 28))
@@ -369,10 +392,11 @@ struct StatusTabView: View {
     }
 
     private var identityTelemetryCard: some View {
-        GroupBox("Node Identity & Overlay") {
+        GroupBox(MeshL10n.tr("label.overlay", locale: loc)) {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                 GridRow {
-                    Text("Node Name").foregroundStyle(.secondary)
+                    Text(MeshL10n.tr("onboarding.node_name", locale: loc))
+                        .foregroundStyle(.secondary)
                     Text(store.status?.nodeName ?? "—")
                 }
                 GridRow {
@@ -381,17 +405,11 @@ struct StatusTabView: View {
                 }
                 GridRow {
                     Text("Overlay IP").foregroundStyle(.secondary)
-                    copyableValueRow(
-                        value: store.status?.overlayIp,
-                        label: "Overlay IP"
-                    )
+                    copyableValueRow(value: store.status?.overlayIp, label: "Overlay IP")
                 }
                 GridRow {
                     Text("FQDN").foregroundStyle(.secondary)
-                    copyableValueRow(
-                        value: store.status?.fqdn,
-                        label: "FQDN"
-                    )
+                    copyableValueRow(value: store.status?.fqdn, label: "FQDN")
                 }
                 GridRow {
                     Text("Overlay CIDR").foregroundStyle(.secondary)
@@ -404,15 +422,15 @@ struct StatusTabView: View {
     }
 
     private var networkTelemetryCard: some View {
-        GroupBox("Control & Self-Network Telemetry") {
+        GroupBox(MeshL10n.tr("diag.tunnel_telemetry", locale: loc)) {
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
                 GridRow {
-                    Text("Control Endpoint").foregroundStyle(.secondary)
+                    Text(MeshL10n.tr("label.control", locale: loc)).foregroundStyle(.secondary)
                     Text(store.status?.serverConnection?.controlEndpoint ?? "—")
                         .font(.body.monospaced())
                 }
                 GridRow {
-                    Text("Relay Endpoint").foregroundStyle(.secondary)
+                    Text(MeshL10n.tr("label.blind_relay", locale: loc)).foregroundStyle(.secondary)
                     let relay = store.status?.serverConnection?.relayEndpoint ?? ""
                     Text(relay.isEmpty ? "—" : relay).font(.body.monospaced())
                 }
@@ -437,7 +455,11 @@ struct StatusTabView: View {
         if let value, !value.isEmpty {
             HStack(spacing: 8) {
                 Text(value).font(.body.monospaced()).textSelection(.enabled)
-                Button(copiedField == label ? "Copied" : "Copy") {
+                Button(
+                    copiedField == label
+                        ? MeshL10n.tr("peers.copied_toast", locale: loc)
+                        : "Copy"
+                ) {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(value, forType: .string)
@@ -462,30 +484,37 @@ struct StatusTabView: View {
         case .connecting:
             HStack(spacing: 10) {
                 ProgressView().controlSize(.small)
-                Button("Disconnect") {
+                Button(MeshL10n.tr("generic.disconnect", locale: loc)) {
                     Task { @MainActor in _ = await store.disconnect() }
                 }
             }
             .disabled(store.isBusy)
         case .reauthRequired:
             HStack(spacing: 10) {
-                Button("Rotate Pre-Auth Key...", action: onOpenKeyRotation)
+                Button(MeshL10n.tr("action.rotate_key", locale: loc), action: onOpenKeyRotation)
                     .buttonStyle(.borderedProminent)
-                Button("Disconnect") {
+                Button(MeshL10n.tr("generic.disconnect", locale: loc)) {
                     Task { @MainActor in _ = await store.disconnect() }
                 }
             }
             .disabled(store.isBusy)
         case .revoked:
-            Button("Reset Device Identity...", role: .destructive, action: onConfirmResetIdentity)
-                .buttonStyle(.borderedProminent)
-                .disabled(store.isBusy)
+            Button(
+                MeshL10n.tr("action.reset_identity", locale: loc),
+                role: .destructive,
+                action: onConfirmResetIdentity
+            )
+            .buttonStyle(.borderedProminent)
+            .disabled(store.isBusy)
         case .error:
             HStack(spacing: 10) {
-                Button("Start / Repair Service") {
+                Button(MeshL10n.tr("service.start_repair", locale: loc)) {
                     Task { @MainActor in _ = await store.startOrRepairService() }
                 }
-                Button("Diagnostics", action: onOpenDiagnostics)
+                Button(
+                    MeshL10n.tr("tab.diagnostics_settings", locale: loc),
+                    action: onOpenDiagnostics
+                )
             }
             .disabled(store.isBusy)
         default:
@@ -496,23 +525,23 @@ struct StatusTabView: View {
     private var stateHeadline: String {
         switch store.uiState {
         case .connecting:
-            return "Connecting to Mesh Network..."
+            return MeshL10n.tr("headline.connecting", locale: loc)
         case .connected:
             if store.isManuallyDisconnected {
-                return "Disconnected (Identity Saved)"
+                return MeshL10n.tr("headline.disconnected_enrolled", locale: loc)
             }
             if store.isDegradedTunnel {
-                return "Connected (Degraded: Relay Fallback)"
+                return MeshL10n.tr("headline.degraded", locale: loc)
             }
-            return "Connected to Mesh Network"
+            return MeshL10n.tr("headline.connected", locale: loc)
         case .reauthRequired:
-            return "Node Pre-Auth Key Expired"
+            return MeshL10n.tr("headline.reauth", locale: loc)
         case .revoked:
-            return "Device Revoked by Control Server"
+            return MeshL10n.tr("headline.revoked", locale: loc)
         case .error:
-            return store.lastActionError?.title ?? "Daemon Communication Error"
+            return store.lastActionError?.title ?? MeshL10n.tr("headline.error", locale: loc)
         case .serviceNotInstalled, .serviceStopped, .unconfigured:
-            return store.uiState.displayTitle
+            return store.uiState.localizedTitle(locale: loc)
         }
     }
 
@@ -527,9 +556,9 @@ struct StatusTabView: View {
             }
             return "\(store.onlinePeerCount) of \(store.sortedPeers.count) peers online."
         case .reauthRequired:
-            return "Control server requires a fresh mpk_ pre-auth key to reconnect."
+            return MeshL10n.tr("rotation.subtitle", locale: loc)
         case .revoked:
-            return "Reset local identity keys to re-enroll with a new pre-auth key."
+            return MeshL10n.tr("confirm.reset_detail", locale: loc)
         case .error:
             return store.lastActionError?.message
                 ?? "Unable to communicate with meshd admin socket."

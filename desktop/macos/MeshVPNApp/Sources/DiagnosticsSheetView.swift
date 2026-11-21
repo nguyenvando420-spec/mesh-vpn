@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 struct DiagnosticsSheetView: View {
     @ObservedObject var store: DesktopStore
     @ObservedObject var themeManager: ThemeManager
+    @EnvironmentObject private var localeManager: LocaleManager
     let showCloseButton: Bool
     @Environment(\.dismiss) private var dismiss
 
@@ -18,6 +19,8 @@ struct DiagnosticsSheetView: View {
     @State private var confirmResetIdentity: Bool = false
     @State private var confirmUninstallSheet: Bool = false
     @State private var purgeKeysOnUninstall: Bool = false
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     init(
         store: DesktopStore,
@@ -34,14 +37,17 @@ struct DiagnosticsSheetView: View {
             VStack(alignment: .leading, spacing: 18) {
                 if showCloseButton {
                     HStack {
-                        Text("Diagnostics & Service Settings")
+                        Text(MeshL10n.tr("diag.service_settings", locale: loc))
                             .font(.title2.weight(.semibold))
                         Spacer()
-                        Button("Close") { dismiss() }
+                        Button(MeshL10n.tr("generic.close", locale: loc)) { dismiss() }
                             .keyboardShortcut(.cancelAction)
                     }
                 }
-                AppearanceSettingsSection(themeManager: themeManager)
+                AppearanceAndLocaleSection(
+                    themeManager: themeManager,
+                    localeManager: localeManager
+                )
                 netcheckSection
                 bugreportSection
                 updateServerSection
@@ -52,18 +58,15 @@ struct DiagnosticsSheetView: View {
         .onAppear {
             prefillCurrentServerIfNeeded()
         }
-        .alert("Reset Device Identity?", isPresented: $confirmResetIdentity) {
-            Button("Cancel", role: .cancel) {}
-            Button("Reset Identity", role: .destructive) {
+        .alert(MeshL10n.tr("confirm.reset", locale: loc), isPresented: $confirmResetIdentity) {
+            Button(MeshL10n.tr("generic.cancel", locale: loc), role: .cancel) {}
+            Button(MeshL10n.tr("action.reset_identity", locale: loc), role: .destructive) {
                 Task { @MainActor in
                     _ = await store.resetIdentity()
                 }
             }
         } message: {
-            Text(
-                "This permanently removes this node's local WireGuard/control keys and returns "
-                    + "to the Not Enrolled state. A new pre-auth key will be required to rejoin."
-            )
+            Text(MeshL10n.tr("confirm.reset_detail", locale: loc))
         }
         .sheet(isPresented: $confirmUninstallSheet) {
             uninstallConfirmationSheet
@@ -71,10 +74,10 @@ struct DiagnosticsSheetView: View {
     }
 
     private var netcheckSection: some View {
-        GroupBox("Network & NAT Diagnostics") {
+        GroupBox(MeshL10n.tr("diag.netcheck_title", locale: loc)) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
-                    Button("Run Netcheck") {
+                    Button(MeshL10n.tr("diag.run_netcheck", locale: loc)) {
                         Task { @MainActor in
                             _ = await store.runNetcheck()
                         }
@@ -136,10 +139,10 @@ struct DiagnosticsSheetView: View {
     }
 
     private var bugreportSection: some View {
-        GroupBox("Redacted Bugreport Export") {
+        GroupBox(MeshL10n.tr("diag.bugreport_export", locale: loc)) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Export Daemon Diagnostics Archive (.tar)")
+                    Text(MeshL10n.tr("diag.export_archive", locale: loc))
                         .font(.headline)
                     Text(
                         "Private keys, tokens, and pre-auth secrets are redacted by meshd "
@@ -149,7 +152,7 @@ struct DiagnosticsSheetView: View {
                     .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Export Bugreport...") {
+                Button(MeshL10n.tr("diag.export_button", locale: loc)) {
                     promptAndExportBugreport()
                 }
                 .disabled(store.isBusy || store.status == nil)
@@ -178,19 +181,24 @@ struct DiagnosticsSheetView: View {
     }
 
     private var updateServerSection: some View {
-        GroupBox("Control Server Endpoint & SPKI Pin") {
+        GroupBox(MeshL10n.tr("settings.server_endpoint", locale: loc)) {
             VStack(alignment: .leading, spacing: 10) {
-                TextField("Control Endpoint (host or IP[:port])", text: endpointBinding)
-                    .textFieldStyle(.roundedBorder)
+                TextField(
+                    MeshL10n.tr("onboarding.control_server", locale: loc),
+                    text: endpointBinding
+                )
+                .textFieldStyle(.roundedBorder)
 
                 HStack(spacing: 12) {
                     TextField("Port Override (443)", text: $rawPortOverride)
                         .textFieldStyle(.roundedBorder)
                         .frame(maxWidth: 160)
 
-                    Picker("TLS Mode", selection: $tlsAuthMode) {
-                        Text("SPKI Pin").tag(TlsAuthMode.spkiPin)
-                        Text("System CA").tag(TlsAuthMode.systemCa)
+                    Picker("TLS", selection: $tlsAuthMode) {
+                        Text(MeshL10n.tr("onboarding.tls_spki_pin", locale: loc))
+                            .tag(TlsAuthMode.spkiPin)
+                        Text(MeshL10n.tr("onboarding.tls_system_ca", locale: loc))
+                            .tag(TlsAuthMode.systemCa)
                             .disabled(isEndpointIpLiteral)
                     }
                     .disabled(isEndpointIpLiteral)
@@ -203,17 +211,20 @@ struct DiagnosticsSheetView: View {
                 }
 
                 if tlsAuthMode == .spkiPin || isEndpointIpLiteral {
-                    TextField("SPKI SHA-256 Pin (sha256:...)", text: $rawServerPin)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.body.monospaced())
+                    TextField(
+                        MeshL10n.tr("onboarding.spki_pin_label", locale: loc),
+                        text: $rawServerPin
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
                 }
 
                 HStack {
-                    Button("Load Current") {
+                    Button(MeshL10n.tr("settings.load_current", locale: loc)) {
                         prefillCurrentServerIfNeeded(force: true)
                     }
                     Spacer()
-                    Button("Apply Server Update") {
+                    Button(MeshL10n.tr("settings.apply_update", locale: loc)) {
                         Task { @MainActor in
                             let effectiveMode: TlsAuthMode = isEndpointIpLiteral
                                 ? .spkiPin
@@ -239,17 +250,17 @@ struct DiagnosticsSheetView: View {
     }
 
     private var maintenanceAndDangerSection: some View {
-        GroupBox("Service Lifecycle & Recovery") {
+        GroupBox(MeshL10n.tr("diag.service_lifecycle", locale: loc)) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(spacing: 10) {
-                    Button("Clean Up Stale Network State") {
+                    Button(MeshL10n.tr("service.cleanup_stale", locale: loc)) {
                         Task { @MainActor in
                             _ = await store.cleanupStaleState()
                         }
                     }
                     .disabled(store.isBusy || store.status == nil)
 
-                    Button("Allow macOS Firewall") {
+                    Button(MeshL10n.tr("service.firewall_allow", locale: loc)) {
                         Task { @MainActor in
                             _ = await store.enableFirewallException()
                         }
@@ -260,12 +271,12 @@ struct DiagnosticsSheetView: View {
                 }
                 Divider()
                 HStack(spacing: 10) {
-                    Button("Reset Device Identity...", role: .destructive) {
+                    Button(MeshL10n.tr("service.reset_identity", locale: loc), role: .destructive) {
                         confirmResetIdentity = true
                     }
                     .disabled(store.isBusy || store.status == nil)
 
-                    Button("Uninstall Service...", role: .destructive) {
+                    Button(MeshL10n.tr("service.uninstall", locale: loc), role: .destructive) {
                         purgeKeysOnUninstall = false
                         confirmUninstallSheet = true
                     }
@@ -280,7 +291,7 @@ struct DiagnosticsSheetView: View {
 
     private var uninstallConfirmationSheet: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Uninstall Mesh VPN Background Service")
+            Text(MeshL10n.tr("service.uninstall_title", locale: loc))
                 .font(.title3.weight(.semibold))
             Text(
                 "Stops the LaunchDaemon, runs cleanup on routes and utun devices, and removes "
@@ -289,18 +300,19 @@ struct DiagnosticsSheetView: View {
             .font(.callout)
             .foregroundStyle(.secondary)
 
+            let purgeLabel = MeshL10n.tr("service.purge_keys", locale: loc)
             Toggle(
-                "Also purge saved device identity keys (\(AgentDefaults.stateDirPath)/keys.json)",
+                "\(purgeLabel) (\(AgentDefaults.stateDirPath)/keys.json)",
                 isOn: $purgeKeysOnUninstall
             )
 
             HStack {
-                Button("Cancel") {
+                Button(MeshL10n.tr("generic.cancel", locale: loc)) {
                     confirmUninstallSheet = false
                 }
                 .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Uninstall Service", role: .destructive) {
+                Button(MeshL10n.tr("service.uninstall", locale: loc), role: .destructive) {
                     let shouldPurge = purgeKeysOnUninstall
                     confirmUninstallSheet = false
                     Task { @MainActor in
@@ -328,11 +340,11 @@ struct DiagnosticsSheetView: View {
         rawPortOverride = ""
     }
 
-    /// Opens `NSSavePanel` before suspending polling (`IG-DGUI-WA-03`).
+    /// Opens `NSSavePanel` before polling suspension (`IG-DGUI-WA-03`).
     @MainActor
     private func promptAndExportBugreport() {
         let panel = NSSavePanel()
-        panel.title = "Export Redacted Diagnostics Archive"
+        panel.title = MeshL10n.tr("diag.bugreport_export", locale: loc)
         panel.nameFieldStringValue = "mesh-vpn-bugreport.tar"
         panel.allowedContentTypes = [UTType(filenameExtension: "tar") ?? .data]
         panel.canCreateDirectories = true
@@ -345,22 +357,46 @@ struct DiagnosticsSheetView: View {
     }
 }
 
-private struct AppearanceSettingsSection: View {
+private struct AppearanceAndLocaleSection: View {
     @ObservedObject var themeManager: ThemeManager
+    @ObservedObject var localeManager: LocaleManager
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     var body: some View {
-        GroupBox("Appearance & Theme") {
-            HStack(spacing: 12) {
-                Text("Theme Mode")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Picker("Theme Mode", selection: $themeManager.mode) {
-                    ForEach(ThemeMode.allCases) { item in
-                        Text(item.displayLabel).tag(item)
+        GroupBox(MeshL10n.tr("theme.appearance", locale: loc)) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 12) {
+                    Text(MeshL10n.tr("theme.appearance", locale: loc))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Picker(
+                        MeshL10n.tr("theme.appearance", locale: loc),
+                        selection: $themeManager.mode
+                    ) {
+                        ForEach(ThemeMode.allCases) { item in
+                            Text(item.localizedLabel(locale: loc)).tag(item)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 260)
                 }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 260)
+                Divider()
+                HStack(spacing: 12) {
+                    Text(MeshL10n.tr("locale.language", locale: loc))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Picker(
+                        MeshL10n.tr("locale.language", locale: loc),
+                        selection: $localeManager.mode
+                    ) {
+                        ForEach(LocaleMode.allCases) { item in
+                            Text(item.localizedLabel(locale: loc)).tag(item)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 260)
+                }
             }
             .padding(8)
         }

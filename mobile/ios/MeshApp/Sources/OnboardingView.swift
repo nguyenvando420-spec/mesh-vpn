@@ -4,71 +4,18 @@ import SwiftUI
 /// Onboarding screen offering QR Scan, iOS 16+ `PasteButton` / iOS 15 paste, and Manual join.
 struct OnboardingView: View {
     @ObservedObject var viewModel: AppViewModel
+    @EnvironmentObject var localeManager: LocaleManager
     @State private var isShowingScanner = false
 
     var body: some View {
+        let locale = localeManager.resolvedLocale
         NavigationView {
             Form {
-                Section {
-                    Button {
-                        isShowingScanner = true
-                    } label: {
-                        Label("Scan Enrollment QR Code", systemImage: "qrcode.viewfinder")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-
-                    pasteJoinControl
-                } header: {
-                    Text("Quick Join")
-                } footer: {
-                    Text("mesh://join URIs are validated inside this app before confirmation.")
-                }
-
-                Section {
-                    TextField("Control Endpoint (host:port)", text: $viewModel.manualServerEndpoint)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-
-                    TextField("Port Override (optional)", text: $viewModel.manualPortText)
-                        .keyboardType(.numberPad)
-
-                    Picker("TLS Verification", selection: $viewModel.manualTlsAuthMode) {
-                        Text("SPKI Pin (Default)").tag(MobileTlsAuthMode.spkiPin)
-                        Text("System CA").tag(MobileTlsAuthMode.systemCa)
-                    }
-
-                    if viewModel.manualTlsAuthMode == .spkiPin {
-                        TextField("SPKI Pin (sha256:...)", text: $viewModel.manualServerPin)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                    }
-
-                    SecureField("Pre-Auth Token (mpk_...)", text: $viewModel.manualPreauthKey)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-
-                    TextField("Device Name (optional RFC 1123)", text: $viewModel.manualNodeName)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-
-                    Button {
-                        viewModel.prepareManualEnrollment(isRotation: false)
-                    } label: {
-                        if viewModel.isBusy {
-                            ProgressView()
-                                .frame(maxWidth: .infinity)
-                        } else {
-                            Text("Review & Enroll")
-                                .frame(maxWidth: .infinity)
-                        }
-                    }
-                    .disabled(viewModel.isBusy)
-                } header: {
-                    Text("Manual Enrollment")
-                }
+                quickJoinSection(locale: locale)
+                manualEnrollmentSection(locale: locale)
+                languageSection(locale: locale)
             }
-            .navigationTitle("Enroll Mesh VPN")
+            .navigationTitle(L10n.tr("action.enroll", locale: locale))
             .sheet(isPresented: $isShowingScanner) {
                 QrScannerSheetView(
                     onScan: { rawCode in
@@ -79,6 +26,7 @@ struct OnboardingView: View {
                         isShowingScanner = false
                     }
                 )
+                .environment(\.locale, locale)
             }
             .sheet(item: $viewModel.pendingConfirmation) { draft in
                 EnrollmentConfirmationSheet(
@@ -91,13 +39,111 @@ struct OnboardingView: View {
                         }
                     }
                 )
+                .environment(\.locale, locale)
             }
         }
         .navigationViewStyle(.stack)
     }
 
+    private func quickJoinSection(locale: Locale) -> some View {
+        Section {
+            Button {
+                isShowingScanner = true
+            } label: {
+                Label(
+                    L10n.tr("action.scan_qr", locale: locale),
+                    systemImage: "qrcode.viewfinder"
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            pasteJoinControl(locale: locale)
+        } header: {
+            Text(L10n.tr("onboarding.import_uri", locale: locale))
+        } footer: {
+            Text(L10n.tr("onboarding.subtitle", locale: locale))
+        }
+    }
+
+    private func manualEnrollmentSection(locale: Locale) -> some View {
+        Section {
+            TextField(
+                L10n.tr("onboarding.control_server", locale: locale),
+                text: $viewModel.manualServerEndpoint
+            )
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .keyboardType(.URL)
+
+            TextField("Port (optional)", text: $viewModel.manualPortText)
+                .keyboardType(.numberPad)
+
+            Picker(
+                L10n.tr("settings.server_tls", locale: locale),
+                selection: $viewModel.manualTlsAuthMode
+            ) {
+                Text(L10n.tr("onboarding.tls_spki_pin", locale: locale))
+                    .tag(MobileTlsAuthMode.spkiPin)
+                Text(L10n.tr("onboarding.tls_system_ca", locale: locale))
+                    .tag(MobileTlsAuthMode.systemCa)
+            }
+
+            if viewModel.manualTlsAuthMode == .spkiPin {
+                TextField(
+                    L10n.tr("onboarding.spki_pin_label", locale: locale),
+                    text: $viewModel.manualServerPin
+                )
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            }
+
+            SecureField(
+                L10n.tr("onboarding.preauth_key", locale: locale),
+                text: $viewModel.manualPreauthKey
+            )
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+
+            TextField(
+                L10n.tr("onboarding.node_name", locale: locale),
+                text: $viewModel.manualNodeName
+            )
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+
+            Button {
+                viewModel.prepareManualEnrollment(isRotation: false)
+            } label: {
+                if viewModel.isBusy {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                } else {
+                    Text(L10n.tr("onboarding.review_server", locale: locale))
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .disabled(viewModel.isBusy)
+        } header: {
+            Text(L10n.tr("onboarding.tab.manual", locale: locale))
+        }
+    }
+
+    private func languageSection(locale: Locale) -> some View {
+        Section(L10n.tr("locale.language", locale: locale)) {
+            Picker(
+                L10n.tr("locale.language", locale: locale),
+                selection: $localeManager.localeMode
+            ) {
+                ForEach([LocaleMode.system, .vi, .en], id: \.self) { mode in
+                    Text(mode.localizedTitle(locale: locale)).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+    }
+
     @ViewBuilder
-    private var pasteJoinControl: some View {
+    private func pasteJoinControl(locale: Locale) -> some View {
         if #available(iOS 16.0, *) {
             PasteButton(payloadType: String.self) { payloads in
                 if let first = payloads.first {
@@ -109,7 +155,10 @@ struct OnboardingView: View {
             Button {
                 viewModel.pasteFromSystemClipboard()
             } label: {
-                Label("Paste Join URI or Token", systemImage: "doc.on.clipboard")
+                Label(
+                    L10n.tr("onboarding.paste_clipboard", locale: locale),
+                    systemImage: "doc.on.clipboard"
+                )
             }
         }
     }
@@ -122,28 +171,44 @@ struct EnrollmentConfirmationSheet: View {
     let isBusy: Bool
     let onCancel: @MainActor () -> Void
     let onConfirm: @MainActor () -> Void
+    @Environment(\.locale) private var locale
 
     var body: some View {
         NavigationView {
             List {
-                Section("Server Trust Verification") {
-                    LabeledRow(label: "Control Endpoint", value: draft.serverEndpoint)
+                Section(L10n.tr("confirm.verify_server", locale: locale)) {
                     LabeledRow(
-                        label: "TLS Mode",
-                        value: draft.tlsAuthMode == .spkiPin ? "Pinned SPKI SHA-256" : "System CA"
+                        label: L10n.tr("onboarding.control_server", locale: locale),
+                        value: draft.serverEndpoint
                     )
+                    let tlsKey = draft.tlsAuthMode == .spkiPin
+                        ? "onboarding.tls_spki_pin"
+                        : "onboarding.tls_system_ca"
                     LabeledRow(
-                        label: "SPKI Fingerprint",
-                        value: draft.serverPin ?? "None (System CA)"
+                        label: L10n.tr("settings.server_tls", locale: locale),
+                        value: L10n.tr(tlsKey, locale: locale)
+                    )
+                    let fallbackPin = L10n.tr("onboarding.tls_system_ca", locale: locale)
+                    LabeledRow(
+                        label: L10n.tr("onboarding.spki_pin_label", locale: locale),
+                        value: draft.serverPin ?? fallbackPin
                     )
                 }
 
-                Section("Credential Summary") {
-                    LabeledRow(label: "Token Preview", value: draft.maskedPreauthPreview)
-                    LabeledRow(label: "Device Name", value: draft.nodeName ?? "Auto-generated")
+                let credKey = draft.isRotation ? "confirm.rotation" : "confirm.enrollment"
+                Section(L10n.tr(credKey, locale: locale)) {
                     LabeledRow(
-                        label: "Action",
-                        value: draft.isRotation ? "Rotate Existing Identity Key" : "Enroll New Node"
+                        label: L10n.tr("onboarding.preauth_key", locale: locale),
+                        value: draft.maskedPreauthPreview
+                    )
+                    LabeledRow(
+                        label: L10n.tr("onboarding.node_name", locale: locale),
+                        value: draft.nodeName ?? "Auto"
+                    )
+                    let actionKey = draft.isRotation ? "action.rotate_key" : "action.enroll"
+                    LabeledRow(
+                        label: L10n.tr("confirm.verify_before_enroll", locale: locale),
+                        value: L10n.tr(actionKey, locale: locale)
                     )
                 }
 
@@ -155,7 +220,10 @@ struct EnrollmentConfirmationSheet: View {
                             ProgressView()
                                 .frame(maxWidth: .infinity)
                         } else {
-                            Text(draft.isRotation ? "Confirm Key Rotation" : "Confirm & Enroll")
+                            let btnKey = draft.isRotation
+                                ? "confirm.confirm_rotation"
+                                : "onboarding.trust_enroll"
+                            Text(L10n.tr(btnKey, locale: locale))
                                 .fontWeight(.semibold)
                                 .frame(maxWidth: .infinity)
                         }
@@ -163,11 +231,11 @@ struct EnrollmentConfirmationSheet: View {
                     .disabled(isBusy)
                 }
             }
-            .navigationTitle("Confirm Server")
+            .navigationTitle(L10n.tr("action.confirm_server", locale: locale))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: onCancel)
+                    Button(L10n.tr("generic.cancel", locale: locale), action: onCancel)
                         .disabled(isBusy)
                 }
             }

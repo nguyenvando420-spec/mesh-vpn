@@ -28,11 +28,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import dev.meshvpn.android.LocaleHelper
+import dev.meshvpn.android.LocaleMode
+import dev.meshvpn.android.R
 import dev.meshvpn.android.ui.MainUiScreenState
 import dev.meshvpn.android.ui.theme.ThemeMode
 import java.time.Instant
@@ -46,6 +51,7 @@ import uniffi.mesh_mobile_ffi.MobileTlsAuthMode
 fun SettingsScreen(
     screenState: MainUiScreenState,
     onSelectThemeMode: (ThemeMode) -> Unit,
+    onSelectLocaleMode: (LocaleMode) -> Unit,
     onToggleRevealPins: () -> Unit,
     onSensitiveModalChanged: (Boolean) -> Unit,
     onUpdateServerConfig: (String, MobileTlsAuthMode, String) -> Unit,
@@ -81,6 +87,7 @@ fun SettingsScreen(
         activePin = activePin,
         nextPin = nextPin,
         onSelectThemeMode = onSelectThemeMode,
+        onSelectLocaleMode = onSelectLocaleMode,
         onToggleRevealPins = onToggleRevealPins,
         onOpenUpdateServer = {
             onSensitiveModalChanged(true)
@@ -133,6 +140,7 @@ private fun SettingsBody(
     activePin: String?,
     nextPin: String?,
     onSelectThemeMode: (ThemeMode) -> Unit,
+    onSelectLocaleMode: (LocaleMode) -> Unit,
     onToggleRevealPins: () -> Unit,
     onOpenUpdateServer: () -> Unit,
     onOpenRotateKey: () -> Unit,
@@ -155,10 +163,17 @@ private fun SettingsBody(
                 .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("Settings & Security", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            text = stringResource(R.string.settings_section_header),
+            style = MaterialTheme.typography.headlineSmall,
+        )
         AppearanceCard(
             themeMode = screenState.themeMode,
             onSelectThemeMode = onSelectThemeMode,
+        )
+        LanguageCard(
+            localeMode = screenState.localeMode,
+            onSelectLocaleMode = onSelectLocaleMode,
         )
         ServerSecurityCard(
             endpoint = currentEndpoint,
@@ -202,16 +217,19 @@ private fun AppearanceCard(
 ) {
     val options =
         listOf(
-            Triple(ThemeMode.SYSTEM, "System", "theme_option_system"),
-            Triple(ThemeMode.LIGHT, "Light", "theme_option_light"),
-            Triple(ThemeMode.DARK, "Dark", "theme_option_dark"),
+            Triple(ThemeMode.SYSTEM, stringResource(R.string.theme_system), "theme_option_system"),
+            Triple(ThemeMode.LIGHT, stringResource(R.string.theme_light), "theme_option_light"),
+            Triple(ThemeMode.DARK, stringResource(R.string.theme_dark), "theme_option_dark"),
         )
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Appearance", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = stringResource(R.string.theme_appearance),
+                style = MaterialTheme.typography.titleMedium,
+            )
             Row(
                 modifier =
                     Modifier
@@ -223,6 +241,58 @@ private fun AppearanceCard(
                     FilterChip(
                         selected = themeMode == mode,
                         onClick = { onSelectThemeMode(mode) },
+                        label = { Text(label) },
+                        modifier = Modifier.testTag(tag),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LanguageCard(
+    localeMode: LocaleMode,
+    onSelectLocaleMode: (LocaleMode) -> Unit,
+) {
+    val options =
+        listOf(
+            Triple(
+                LocaleMode.SYSTEM,
+                stringResource(R.string.locale_system),
+                "locale_option_system",
+            ),
+            Triple(
+                LocaleMode.VI,
+                stringResource(R.string.locale_vietnamese),
+                "locale_option_vi",
+            ),
+            Triple(
+                LocaleMode.EN,
+                stringResource(R.string.locale_english),
+                "locale_option_en",
+            ),
+        )
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.locale_language),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Row(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .testTag("locale_selector"),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for ((mode, label, tag) in options) {
+                    FilterChip(
+                        selected = localeMode == mode,
+                        onClick = { onSelectLocaleMode(mode) },
                         label = { Text(label) },
                         modifier = Modifier.testTag(tag),
                     )
@@ -296,26 +366,34 @@ private fun ServerSecurityCard(
     onToggleRevealPins: () -> Unit,
     onOpenUpdateServer: () -> Unit,
 ) {
+    val context = LocalContext.current
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Control Server & TLS Pin", style = MaterialTheme.typography.titleMedium)
-            Text("Endpoint: ${endpoint.ifBlank { "Not configured" }}")
-            Text("TLS Mode: ${tlsMode.name}")
+            Text(
+                text = stringResource(R.string.settings_server_tls),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            val notConfigured = LocaleHelper.tr(context, "Not configured", "Chưa cấu hình")
+            Text("Endpoint: ${endpoint.ifBlank { notConfigured }}")
+            Text("${LocaleHelper.tr(context, "TLS Mode", "Chế độ TLS")}: ${tlsMode.name}")
             if (activePin != null) {
                 val displayed = if (pinsRevealed) activePin else maskPin(activePin)
+                val activeHeading =
+                    LocaleHelper.tr(context, "Active SPKI Pin:", "Ghim SPKI hiện tại:")
                 Text(
-                    text = "Active SPKI Pin:\n$displayed",
+                    text = "$activeHeading\n$displayed",
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.testTag("spki_pin_value"),
                 )
             }
             if (pinsRevealed && nextPin != null) {
+                val nextHeading = LocaleHelper.tr(context, "Next Staged Pin:", "Ghim kế tiếp:")
                 Text(
-                    text = "Next Staged Pin:\n$nextPin",
+                    text = "$nextHeading\n$nextPin",
                     fontFamily = FontFamily.Monospace,
                     style = MaterialTheme.typography.labelMedium,
                 )
@@ -327,11 +405,17 @@ private fun ServerSecurityCard(
                         enabled = !isBusy,
                         modifier = Modifier.testTag("reveal_pin_button"),
                     ) {
-                        Text(if (pinsRevealed) "Hide Pin" else "Reveal Full Pin")
+                        val pinBtnRes =
+                            if (pinsRevealed) {
+                                R.string.settings_hide_pin
+                            } else {
+                                R.string.settings_reveal_pin
+                            }
+                        Text(stringResource(pinBtnRes))
                     }
                 }
                 OutlinedButton(onClick = onOpenUpdateServer, enabled = !isBusy) {
-                    Text("Update Server")
+                    Text(stringResource(R.string.settings_update_server))
                 }
             }
         }
@@ -347,22 +431,28 @@ private fun IdentityManagementCard(
     onOpenRotateKey: () -> Unit,
     onOpenResetIdentity: () -> Unit,
 ) {
+    val context = LocalContext.current
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Node Identity & Keystore DEK", style = MaterialTheme.typography.titleMedium)
-            Text("Device Name: ${nodeName ?: "--"}")
+            Text(
+                text = stringResource(R.string.settings_identity_title),
+                style = MaterialTheme.typography.titleMedium,
+            )
+            val nameLabel = LocaleHelper.tr(context, "Device Name", "Tên thiết bị")
+            Text("$nameLabel: ${nodeName ?: "--"}")
             Text(
                 text = "Node ID: ${nodeId ?: "--"}",
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.labelMedium,
             )
-            Text("Key Expires: ${formatExpiryUtc(keyExpiresAtMs)}")
+            val expLabel = LocaleHelper.tr(context, "Key Expires", "Hạn khóa")
+            Text("$expLabel: ${formatExpiryUtc(keyExpiresAtMs)}")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = onOpenRotateKey, enabled = !isBusy) {
-                    Text("Rotate Key")
+                    Text(stringResource(R.string.settings_rotate_key))
                 }
                 Button(
                     onClick = onOpenResetIdentity,
@@ -372,7 +462,7 @@ private fun IdentityManagementCard(
                             containerColor = MaterialTheme.colorScheme.error,
                         ),
                 ) {
-                    Text("Erase Identity")
+                    Text(stringResource(R.string.settings_erase_identity))
                 }
             }
         }
@@ -390,14 +480,17 @@ private fun BootAndAlwaysOnCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Direct Boot & Always-On VPN", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = stringResource(R.string.settings_boot_title),
+                style = MaterialTheme.typography.titleMedium,
+            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Auto-start after unlock",
+                    text = stringResource(R.string.settings_auto_start),
                     modifier = Modifier.weight(1f),
                 )
                 Switch(
@@ -406,7 +499,7 @@ private fun BootAndAlwaysOnCard(
                 )
             }
             OutlinedButton(onClick = onOpenVpnSettings, modifier = Modifier.fillMaxWidth()) {
-                Text("Open Android VPN Settings")
+                Text(stringResource(R.string.settings_open_vpn_settings))
             }
         }
     }
@@ -422,16 +515,25 @@ private fun DiagnosticsCard(
     onExportBugreport: () -> Unit,
     onCleanupDiagnostics: () -> Unit,
 ) {
+    val context = LocalContext.current
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Scrubbed Diagnostics", style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = stringResource(R.string.settings_diag_title),
+                style = MaterialTheme.typography.titleMedium,
+            )
             Text(
                 text =
-                    "Generates a bounded <= 1 MiB .tar archive with all private keys, " +
-                        "tokens, and credentials removed before sharing.",
+                    LocaleHelper.tr(
+                        context,
+                        "Generates a bounded <= 1 MiB .tar archive with all private keys, " +
+                            "tokens, and credentials removed before sharing.",
+                        "Tạo tệp lưu trữ .tar <= 1 MiB đã loại bỏ khóa riêng, mã thông báo " +
+                            "và thông tin bí mật trước khi chia sẻ.",
+                    ),
                 style = MaterialTheme.typography.bodyMedium,
             )
             OutlinedButton(
@@ -439,7 +541,7 @@ private fun DiagnosticsCard(
                 enabled = !isBusy && isConnected,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Run Network Check")
+                Text(stringResource(R.string.diag_run_netcheck))
             }
             if (netcheck != null) {
                 Text(
@@ -454,10 +556,10 @@ private fun DiagnosticsCard(
                 enabled = !isBusy && hasActiveTunnel,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Export & Share Bugreport (Biometric)")
+                Text(stringResource(R.string.settings_export_share))
             }
             OutlinedButton(onClick = onCleanupDiagnostics, modifier = Modifier.fillMaxWidth()) {
-                Text("Purge Cached Bugreports")
+                Text(stringResource(R.string.settings_purge_bugreports))
             }
         }
     }
@@ -471,26 +573,29 @@ private fun UpdateServerConfigDialog(
     onDismiss: () -> Unit,
     onSubmit: (String, MobileTlsAuthMode, String) -> Unit,
 ) {
+    val context = LocalContext.current
     var endpoint by remember { mutableStateOf(initialEndpoint) }
     var tlsMode by remember { mutableStateOf(initialMode) }
     var pin by remember { mutableStateOf(initialPin) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Update Control Server Config") },
+        title = { Text(stringResource(R.string.settings_update_dialog)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val epLabel =
+                    LocaleHelper.tr(context, "Endpoint (host:port)", "Điểm cuối (host:port)")
                 OutlinedTextField(
                     value = endpoint,
                     onValueChange = { endpoint = it },
-                    label = { Text("Endpoint (host:port)") },
+                    label = { Text(epLabel) },
                     singleLine = true,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(
                         selected = tlsMode == MobileTlsAuthMode.SPKI_PIN,
                         onClick = { tlsMode = MobileTlsAuthMode.SPKI_PIN },
-                        label = { Text("SPKI Pin") },
+                        label = { Text(stringResource(R.string.onboarding_tls_spki_pin)) },
                     )
                     FilterChip(
                         selected = tlsMode == MobileTlsAuthMode.SYSTEM_CA,
@@ -498,14 +603,14 @@ private fun UpdateServerConfigDialog(
                             tlsMode = MobileTlsAuthMode.SYSTEM_CA
                             pin = ""
                         },
-                        label = { Text("System CA") },
+                        label = { Text(stringResource(R.string.onboarding_tls_system_ca)) },
                     )
                 }
                 if (tlsMode == MobileTlsAuthMode.SPKI_PIN) {
                     OutlinedTextField(
                         value = pin,
                         onValueChange = { pin = it },
-                        label = { Text("SPKI Pin (sha256:...)") },
+                        label = { Text(stringResource(R.string.onboarding_spki_pin_label)) },
                         singleLine = true,
                     )
                 }
@@ -513,11 +618,11 @@ private fun UpdateServerConfigDialog(
         },
         confirmButton = {
             Button(onClick = { onSubmit(endpoint, tlsMode, pin) }) {
-                Text("Authorize & Save")
+                Text(stringResource(R.string.settings_authorize_save))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.generic_cancel)) }
         },
     )
 }
@@ -534,14 +639,14 @@ private fun RotateKeyDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Rotate Node Identity Key") },
+        title = { Text(stringResource(R.string.rotation_dialog_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Enter a fresh pre-auth key (mpk_...) to re-key this device cleanly.")
+                Text(stringResource(R.string.rotation_subtitle))
                 OutlinedTextField(
                     value = keyDraft,
                     onValueChange = { keyDraft = it },
-                    label = { Text("New Pre-auth Key") },
+                    label = { Text(stringResource(R.string.rotation_new_key)) },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions =
                         KeyboardOptions(
@@ -561,11 +666,11 @@ private fun RotateKeyDialog(
                 },
                 enabled = keyDraft.isNotBlank(),
             ) {
-                Text("Authorize & Rotate")
+                Text(stringResource(R.string.rotation_authorize))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.generic_cancel)) }
         },
     )
 }
@@ -577,13 +682,8 @@ private fun ResetIdentityConfirmDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Erase Local Mesh Identity?") },
-        text = {
-            Text(
-                "This stops the tunnel and permanently wipes Android Keystore DEK, " +
-                    "sealed identity keys, and bootstrap state on this device.",
-            )
-        },
+        title = { Text(stringResource(R.string.settings_erase_dialog)) },
+        text = { Text(stringResource(R.string.settings_erase_detail)) },
         confirmButton = {
             Button(
                 onClick = onConfirm,
@@ -592,11 +692,11 @@ private fun ResetIdentityConfirmDialog(
                         containerColor = MaterialTheme.colorScheme.error,
                     ),
             ) {
-                Text("Authorize & Erase")
+                Text(stringResource(R.string.settings_authorize_erase))
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.generic_cancel)) }
         },
     )
 }

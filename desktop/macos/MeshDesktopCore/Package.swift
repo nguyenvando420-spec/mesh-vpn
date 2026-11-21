@@ -3,6 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "MeshDesktopCore",
+    defaultLocalization: "en",
     platforms: [
         .macOS(.v13)
     ],
@@ -15,7 +16,8 @@ let package = Package(
     targets: [
         .target(
             name: "MeshDesktopCore",
-            path: "Sources/MeshDesktopCore"
+            path: "Sources/MeshDesktopCore",
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "MeshDesktopCoreTests",

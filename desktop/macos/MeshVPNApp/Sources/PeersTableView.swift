@@ -5,12 +5,15 @@ import SwiftUI
 /// Searchable peer directory and inspector displaying path, latency, traffic, and Ping actions.
 struct PeersTableView: View {
     @ObservedObject var store: DesktopStore
+    @EnvironmentObject private var localeManager: LocaleManager
     @State private var searchQuery: String = ""
     @State private var filter: PeerFilterMode = .all
     @State private var selectedPeerId: String?
     @State private var forceDirectPing: Bool = false
     @State private var copyToastMessage: String?
     @State private var toastDismissTask: Task<Void, Never>?
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     private var filterCounts: PeerFilterCounts {
         PeerDirectoryFilter.counts(for: store.sortedPeers)
@@ -57,7 +60,7 @@ struct PeersTableView: View {
         let counts = filterCounts
         return HStack(spacing: 12) {
             TextField(
-                "Search peers by name, FQDN, IP, or node ID...",
+                MeshL10n.tr("peers.search_placeholder", locale: loc),
                 text: $searchQuery
             )
             .textFieldStyle(.roundedBorder)
@@ -79,7 +82,7 @@ struct PeersTableView: View {
             filter = item
         } label: {
             HStack(spacing: 5) {
-                Text(item.rawValue)
+                Text(item.localizedLabel(locale: loc))
                     .font(.callout.weight(isSelected ? .semibold : .regular))
                 Text("\(count)")
                     .font(.caption2.monospacedDigit().weight(.semibold))
@@ -106,7 +109,7 @@ struct PeersTableView: View {
 
     private var peerListPane: some View {
         List(filteredPeers, selection: $selectedPeerId) { peer in
-            PeerRowView(peer: peer)
+            PeerRowView(peer: peer, locale: loc)
                 .tag(peer.nodeId)
         }
         .listStyle(.inset(alternatesRowBackgrounds: true))
@@ -146,7 +149,7 @@ struct PeersTableView: View {
                     .textSelection(.enabled)
             }
             Spacer()
-            PeerPathBadge(online: peer.online, activePath: peer.activePath)
+            PeerPathBadge(online: peer.online, activePath: peer.activePath, locale: loc)
         }
     }
 
@@ -182,14 +185,14 @@ struct PeersTableView: View {
     private func inspectorActions(_ peer: AgentPeerStatus) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Button("Copy Overlay IP") {
-                    copyToPasteboard(peer.overlayIp, label: "Overlay IP")
+                Button(MeshL10n.tr("peers.copy_overlay_ip", locale: loc)) {
+                    copyToPasteboard(peer.overlayIp)
                 }
-                Button("Copy FQDN") {
-                    copyToPasteboard(peer.fqdn, label: "FQDN")
+                Button(MeshL10n.tr("peers.copy_fqdn", locale: loc)) {
+                    copyToPasteboard(peer.fqdn)
                 }
                 Spacer()
-                Button("Ping Peer") {
+                Button(MeshL10n.tr("action.ping", locale: loc)) {
                     Task { @MainActor in
                         _ = await store.pingPeer(
                             target: peer.overlayIp,
@@ -201,7 +204,7 @@ struct PeersTableView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(store.isBusy || !peer.online)
             }
-            Toggle("Force Direct Path Probe", isOn: $forceDirectPing)
+            Toggle(MeshL10n.tr("peers.force_direct", locale: loc), isOn: $forceDirectPing)
                 .font(.caption)
         }
     }
@@ -232,7 +235,7 @@ struct PeersTableView: View {
             Image(systemName: "network")
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
-            Text("No matching peers")
+            Text(MeshL10n.tr("diag.no_peers", locale: loc))
                 .font(.headline)
             Text("Peers from your mesh netmap will appear here automatically.")
                 .font(.callout)
@@ -256,11 +259,11 @@ struct PeersTableView: View {
         .padding(.bottom, 12)
     }
 
-    private func copyToPasteboard(_ text: String, label: String) {
+    private func copyToPasteboard(_ text: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
-        copyToastMessage = "Copied \(label): \(text)"
+        copyToastMessage = "\(MeshL10n.tr("peers.copied_toast", locale: loc)): \(text)"
         toastDismissTask?.cancel()
         toastDismissTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_500_000_000)
@@ -288,6 +291,7 @@ struct PeersTableView: View {
 
 private struct PeerRowView: View {
     let peer: AgentPeerStatus
+    let locale: Locale
 
     var body: some View {
         HStack(spacing: 10) {
@@ -311,7 +315,7 @@ private struct PeerRowView: View {
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
-            PeerPathBadge(online: peer.online, activePath: peer.activePath)
+            PeerPathBadge(online: peer.online, activePath: peer.activePath, locale: locale)
         }
         .padding(.vertical, 2)
     }
@@ -320,6 +324,7 @@ private struct PeerRowView: View {
 private struct PeerPathBadge: View {
     let online: Bool
     let activePath: ActivePathKind
+    let locale: Locale
 
     var body: some View {
         Text(label)
@@ -331,11 +336,11 @@ private struct PeerPathBadge: View {
     }
 
     private var label: String {
-        guard online else { return "Offline" }
+        guard online else { return MeshL10n.tr("peers.badge.offline", locale: locale) }
         switch activePath {
-        case .direct: return "Direct"
-        case .relay: return "Relay"
-        case .none: return "Idle"
+        case .direct: return MeshL10n.tr("peers.filter.direct", locale: locale)
+        case .relay: return MeshL10n.tr("peers.filter.relay", locale: locale)
+        case .none: return MeshL10n.tr("peers.badge.idle", locale: locale)
         }
     }
 

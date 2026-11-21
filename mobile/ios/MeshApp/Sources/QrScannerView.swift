@@ -175,16 +175,17 @@ private final class QrScannerController: UIViewController {
 struct QrScannerSheetView: View {
     let onScan: @MainActor @Sendable (String) -> Void
     let onCancel: @MainActor () -> Void
+    @Environment(\.locale) private var locale
 
     var body: some View {
         NavigationView {
             QrScannerRepresentable(onScan: onScan)
                 .ignoresSafeArea(edges: .bottom)
-                .navigationTitle(Text("Scan Join QR"))
+                .navigationTitle(Text(L10n.tr("onboarding.tab.scan_qr", locale: locale)))
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel", action: onCancel)
+                        Button(L10n.tr("generic.cancel", locale: locale), action: onCancel)
                     }
                 }
         }

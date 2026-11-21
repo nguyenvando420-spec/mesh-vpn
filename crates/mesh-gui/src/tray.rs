@@ -11,6 +11,9 @@ use mesh_sys::gui_windows::{
 
 use crate::app::{DerivedUiSnapshot, DesktopUiState, TunnelSubState};
 #[cfg(target_os = "windows")]
+use crate::i18n::t;
+use crate::i18n::{LocaleMode, current_locale, t_for};
+#[cfg(target_os = "windows")]
 use crate::icons::{UiIconTone, create_status_icon_for_px, icon_tone_for_state};
 
 /// Win32 tray icon numeric ID registered via `Shell_NotifyIconW`.
@@ -50,8 +53,8 @@ pub(crate) enum TrayMenuItemModel {
     },
 }
 
-fn tr_or(key: &str, fallback: &str) -> String {
-    let localized = crate::i18n::t(key);
+fn tr_for_or(key: &str, locale: LocaleMode, fallback: &str) -> String {
+    let localized = t_for(key, locale);
     if localized.is_empty() {
         fallback.to_owned()
     } else {
@@ -59,19 +62,64 @@ fn tr_or(key: &str, fallback: &str) -> String {
     }
 }
 
-/// Builds the canonical 9-item System Tray context menu for the active `DerivedUiSnapshot`.
-///
-/// Uses sub-state-aware `display_label` (`ADR-030`) and `i18n::t()` skeleton keys (`US-126`).
+/// Returns the localized tray tooltip summary for `(ui_state, sub_state)` under `locale` (`US-127`).
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) fn tray_tooltip_for_locale(
+    ui_state: DesktopUiState,
+    sub_state: TunnelSubState,
+    locale: LocaleMode,
+) -> &'static str {
+    let localized = t_for(ui_state.tray_tooltip_key(sub_state), locale);
+    if localized.is_empty() {
+        ui_state.tray_tooltip_summary(sub_state)
+    } else {
+        localized
+    }
+}
+
+/// Escapes single `&` into `&&` for native Win32 `AppendMenuW` display labels so literal `&`
+/// renders instead of an accelerator underline.
+#[cfg(target_os = "windows")]
+fn escape_win32_menu_ampersands(label: &str) -> String {
+    if label.contains("&&") || !label.contains('&') {
+        label.to_owned()
+    } else {
+        label.replace('&', "&&")
+    }
+}
+
+/// Builds the canonical 9-item System Tray context menu for the active `DerivedUiSnapshot`
+/// using the currently active [`LocaleMode`] (`ADR-029`, `ADR-030`, `US-127`, `UUI-35`).
 #[must_use]
 pub(crate) fn build_tray_menu_model(
     snapshot: &DerivedUiSnapshot,
     overlay_ip: Option<&str>,
     autostart_enabled: bool,
 ) -> Vec<TrayMenuItemModel> {
-    let state_display = snapshot.ui_state.display_label(snapshot.tunnel_sub_state);
+    build_tray_menu_model_for_locale(snapshot, overlay_ip, autostart_enabled, current_locale())
+}
+
+/// Pure builder for the canonical 9-item System Tray context menu under an explicit [`LocaleMode`]
+/// (race-free for parallel unit tests, `US-127`, `UUI-35`).
+#[must_use]
+pub(crate) fn build_tray_menu_model_for_locale(
+    snapshot: &DerivedUiSnapshot,
+    overlay_ip: Option<&str>,
+    autostart_enabled: bool,
+    locale: LocaleMode,
+) -> Vec<TrayMenuItemModel> {
+    let status_prefix = tr_for_or("tab.status", locale, "Status");
+    let state_display = tr_for_or(
+        snapshot
+            .ui_state
+            .display_label_key(snapshot.tunnel_sub_state),
+        locale,
+        snapshot.ui_state.display_label(snapshot.tunnel_sub_state),
+    );
     let status_text = match overlay_ip.filter(|s| !s.is_empty()) {
-        Some(ip) => format!("Status: {state_display} ({ip})"),
-        None => format!("Status: {state_display}"),
+        Some(ip) => format!("{status_prefix}: {state_display} ({ip})"),
+        None => format!("{status_prefix}: {state_display}"),
     };
 
     let ipc_ready = !matches!(
@@ -96,21 +144,21 @@ pub(crate) fn build_tray_menu_model(
         TrayMenuItemModel::Separator,
         TrayMenuItemModel::Action {
             id: IDM_OPEN_DASHBOARD,
-            label: tr_or("action.open_dashboard", "Open Dashboard"),
+            label: tr_for_or("action.open_dashboard", locale, "Open Dashboard"),
             enabled: true,
             checked: false,
             default: true,
         },
         TrayMenuItemModel::Action {
             id: IDM_CONNECT_UP,
-            label: tr_or("action.connect", "Connect"),
+            label: tr_for_or("action.connect", locale, "Connect"),
             enabled: connect_enabled,
             checked: false,
             default: false,
         },
         TrayMenuItemModel::Action {
             id: IDM_DISCONNECT,
-            label: tr_or("action.disconnect", "Disconnect"),
+            label: tr_for_or("action.disconnect", locale, "Disconnect"),
             enabled: disconnect_enabled,
             checked: false,
             default: false,
@@ -118,21 +166,25 @@ pub(crate) fn build_tray_menu_model(
         TrayMenuItemModel::Separator,
         TrayMenuItemModel::Action {
             id: IDM_NETCHECK,
-            label: tr_or("action.run_netcheck", "Run Netcheck Diagnostics"),
+            label: tr_for_or("action.run_netcheck", locale, "Run Netcheck Diagnostics"),
             enabled: ipc_ready,
             checked: false,
             default: false,
         },
         TrayMenuItemModel::Action {
             id: IDM_EXPORT_BUGREPORT,
-            label: tr_or("action.export_bugreport", "Export Bugreport (.tar)..."),
+            label: tr_for_or(
+                "action.export_bugreport",
+                locale,
+                "Export Redacted Bugreport",
+            ),
             enabled: ipc_ready,
             checked: false,
             default: false,
         },
         TrayMenuItemModel::Action {
             id: IDM_TOGGLE_AUTOSTART,
-            label: tr_or("settings.launch_at_login", "Launch at Login"),
+            label: tr_for_or("action.launch_at_login", locale, "Launch at Login"),
             enabled: true,
             checked: autostart_enabled,
             default: false,
@@ -140,8 +192,9 @@ pub(crate) fn build_tray_menu_model(
         TrayMenuItemModel::Separator,
         TrayMenuItemModel::Action {
             id: IDM_QUIT_KEEP_BACKGROUND,
-            label: tr_or(
-                "action.quit_keep_background",
+            label: tr_for_or(
+                "action.quit_keep",
+                locale,
                 "Quit Mesh VPN (Keep Connected in Background)",
             ),
             enabled: true,
@@ -150,7 +203,11 @@ pub(crate) fn build_tray_menu_model(
         },
         TrayMenuItemModel::Action {
             id: IDM_DISCONNECT_AND_QUIT,
-            label: tr_or("action.disconnect_and_quit", "Disconnect && Quit Mesh VPN"),
+            label: tr_for_or(
+                "action.disconnect_quit",
+                locale,
+                "Disconnect & Quit Mesh VPN",
+            ),
             enabled: true,
             checked: false,
             default: false,
@@ -213,9 +270,11 @@ impl TrayStateManager {
         let Some(icon) = &self.current_icon else {
             return Ok(());
         };
-        let tooltip = snapshot
-            .ui_state
-            .tray_tooltip_summary(snapshot.tunnel_sub_state);
+        let tooltip = tray_tooltip_for_locale(
+            snapshot.ui_state,
+            snapshot.tunnel_sub_state,
+            current_locale(),
+        );
         self.controller.add_or_restore(icon, tooltip)
     }
 
@@ -233,9 +292,11 @@ impl TrayStateManager {
             self.last_icon_px = icon_px;
         }
         if let Some(icon) = &self.current_icon {
-            let tooltip = snapshot
-                .ui_state
-                .tray_tooltip_summary(snapshot.tunnel_sub_state);
+            let tooltip = tray_tooltip_for_locale(
+                snapshot.ui_state,
+                snapshot.tunnel_sub_state,
+                current_locale(),
+            );
             let _updated = self.controller.update(icon, tooltip);
         }
     }
@@ -248,15 +309,23 @@ impl TrayStateManager {
         let Some(icon) = &self.current_icon else {
             return;
         };
-        if self
-            .controller
-            .show_info_balloon(
-                icon,
-                "Mesh VPN Minimized",
-                "Mesh VPN continues running in the System Tray.",
-            )
-            .is_ok()
-        {
+        let title = {
+            let v = t("diag.bugreport_title");
+            if v.is_empty() {
+                "Mesh VPN Minimized"
+            } else {
+                v
+            }
+        };
+        let body = {
+            let v = t("diag.bugreport_body");
+            if v.is_empty() {
+                "Mesh VPN continues running in the System Tray."
+            } else {
+                v
+            }
+        };
+        if self.controller.show_info_balloon(icon, title, body).is_ok() {
             self.minimize_balloon_shown = true;
         }
     }
@@ -291,7 +360,7 @@ impl TrayStateManager {
                     default,
                 } => TrayMenuEntry::Action {
                     id,
-                    label,
+                    label: escape_win32_menu_ampersands(&label),
                     enabled,
                     checked,
                     default,

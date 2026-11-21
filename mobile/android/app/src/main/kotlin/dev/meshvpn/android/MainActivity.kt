@@ -22,10 +22,15 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -93,8 +98,13 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewModel.attachThemePrefs(SharedPrefsThemeStore(applicationContext))
+        viewModel.attachLocalePrefs(SharedPrefsLocaleStore(applicationContext))
         setContent {
             val screenState by viewModel.screenState.collectAsStateWithLifecycle()
+            val localizedContext =
+                remember(this@MainActivity, screenState.localeMode) {
+                    LocaleHelper.wrapActivityContext(this@MainActivity, screenState.localeMode)
+                }
 
             LaunchedEffect(screenState.requireFlagSecure) {
                 updateFlagSecure(screenState.requireFlagSecure)
@@ -106,14 +116,19 @@ class MainActivity : FragmentActivity() {
                 launchBugreportShareChooser(report)
             }
 
-            MeshTheme(themeMode = screenState.themeMode) {
-                MeshRootScaffold(
-                    screenState = screenState,
-                    viewModel = viewModel,
-                    onPrepareAndStartVpn = { prepareVpnConsentAndStart() },
-                    onStopVpnService = { MeshVpnService.stopTunnelService(this) },
-                    onOpenSystemSettings = { action -> openSystemSettingsScreen(action) },
-                )
+            CompositionLocalProvider(
+                LocalContext provides localizedContext,
+                LocalConfiguration provides localizedContext.resources.configuration,
+            ) {
+                MeshTheme(themeMode = screenState.themeMode) {
+                    MeshRootScaffold(
+                        screenState = screenState,
+                        viewModel = viewModel,
+                        onPrepareAndStartVpn = { prepareVpnConsentAndStart() },
+                        onStopVpnService = { MeshVpnService.stopTunnelService(this) },
+                        onOpenSystemSettings = { action -> openSystemSettingsScreen(action) },
+                    )
+                }
             }
         }
     }
@@ -133,22 +148,48 @@ class MainActivity : FragmentActivity() {
         super.onStop()
     }
 
-    private suspend fun authorizeAdminPurpose(purpose: AdminAuthPurpose) =
-        biometricBridge.authenticate(
-            title = getString(R.string.biometric_prompt_title),
-            subtitle =
-                when (purpose) {
-                    AdminAuthPurpose.REVEAL_SPKI_PIN -> "Reveal Control server SPKI fingerprint"
-                    AdminAuthPurpose.UPDATE_SERVER_CONFIG -> "Authorize Control server update"
-                    AdminAuthPurpose.ROTATE_KEY -> "Authorize node key rotation"
-                    AdminAuthPurpose.EXPORT_BUGREPORT ->
-                        getString(
-                            R.string.biometric_prompt_subtitle,
-                        )
-                    AdminAuthPurpose.RESET_IDENTITY -> "Authorize permanent erasure of local keys"
-                },
-            negativeButtonText = getString(R.string.biometric_prompt_negative),
+    private suspend fun authorizeAdminPurpose(purpose: AdminAuthPurpose):
+        dev.meshvpn.android.ui.BiometricGateResult {
+        val localized =
+            LocaleHelper.wrapActivityContext(
+                activity = this,
+                mode = viewModel.screenState.value.localeMode,
+            )
+        val subtitle =
+            when (purpose) {
+                AdminAuthPurpose.REVEAL_SPKI_PIN ->
+                    LocaleHelper.tr(
+                        localized,
+                        "Reveal Control server SPKI fingerprint",
+                        "Hiện vân tay SPKI máy chủ điều khiển",
+                    )
+                AdminAuthPurpose.UPDATE_SERVER_CONFIG ->
+                    LocaleHelper.tr(
+                        localized,
+                        "Authorize Control server update",
+                        "Ủy quyền cập nhật máy chủ điều khiển",
+                    )
+                AdminAuthPurpose.ROTATE_KEY ->
+                    LocaleHelper.tr(
+                        localized,
+                        "Authorize node key rotation",
+                        "Ủy quyền xoay vòng khóa nút",
+                    )
+                AdminAuthPurpose.EXPORT_BUGREPORT ->
+                    localized.getString(R.string.biometric_prompt_subtitle)
+                AdminAuthPurpose.RESET_IDENTITY ->
+                    LocaleHelper.tr(
+                        localized,
+                        "Authorize permanent erasure of local keys",
+                        "Ủy quyền xóa vĩnh viễn khóa cục bộ",
+                    )
+            }
+        return biometricBridge.authenticate(
+            title = localized.getString(R.string.biometric_prompt_title),
+            subtitle = subtitle,
+            negativeButtonText = localized.getString(R.string.biometric_prompt_negative),
         )
+    }
 
     private fun prepareVpnConsentAndStart() {
         val consentIntent = VpnService.prepare(this)
@@ -192,7 +233,16 @@ class MainActivity : FragmentActivity() {
                 putExtra(Intent.EXTRA_STREAM, shareUri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-        val chooser = Intent.createChooser(sendIntent, getString(R.string.share_bugreport_chooser))
+        val localized =
+            LocaleHelper.wrapActivityContext(
+                activity = this,
+                mode = viewModel.screenState.value.localeMode,
+            )
+        val chooser =
+            Intent.createChooser(
+                sendIntent,
+                localized.getString(R.string.share_bugreport_chooser),
+            )
         try {
             bugreportShareLauncher.launch(chooser)
         } catch (err: Exception) {
@@ -280,6 +330,7 @@ private fun MeshRootScaffold(
                 SettingsScreen(
                     screenState = screenState,
                     onSelectThemeMode = viewModel::selectThemeMode,
+                    onSelectLocaleMode = viewModel::setLocaleMode,
                     onToggleRevealPins = viewModel::toggleRevealAdminPins,
                     onSensitiveModalChanged = viewModel::setSensitiveModalOpen,
                     onUpdateServerConfig = viewModel::updateServerConfigWithAuth,
@@ -306,21 +357,21 @@ private fun MeshBottomNavigation(
             selected = activeTab == MainTab.STATUS,
             onClick = { onSelectTab(MainTab.STATUS) },
             icon = { Icon(imageVector = Icons.Outlined.Shield, contentDescription = null) },
-            label = { Text("Status") },
+            label = { Text(stringResource(R.string.tab_status)) },
             modifier = Modifier.testTag("nav_tab_status"),
         )
         NavigationBarItem(
             selected = activeTab == MainTab.PEERS,
             onClick = { onSelectTab(MainTab.PEERS) },
             icon = { Icon(imageVector = Icons.Outlined.Group, contentDescription = null) },
-            label = { Text("Peers") },
+            label = { Text(stringResource(R.string.tab_peers)) },
             modifier = Modifier.testTag("nav_tab_peers"),
         )
         NavigationBarItem(
             selected = activeTab == MainTab.SETTINGS,
             onClick = { onSelectTab(MainTab.SETTINGS) },
             icon = { Icon(imageVector = Icons.Outlined.Settings, contentDescription = null) },
-            label = { Text("Settings") },
+            label = { Text(stringResource(R.string.tab_settings)) },
             modifier = Modifier.testTag("nav_tab_settings"),
         )
     }

@@ -247,6 +247,8 @@ where
         }
         LinuxGuiLaunchMode::Normal { start_minimized } => {
             let _guard = init_linux_gui_logging(false);
+            let prefs = crate::prefs::load_prefs();
+            crate::i18n::set_locale(prefs.locale);
             run_gui_server_blocking(start_minimized)
         }
     }

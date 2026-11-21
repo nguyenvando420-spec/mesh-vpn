@@ -83,6 +83,19 @@ public enum DesktopUiState: String, Equatable, Sendable, CaseIterable {
         if isManuallyDisconnected { return "Disconnected" }
         return isDegradedTunnel ? "Degraded" : "Connected"
     }
+
+    /// Locale-aware sub-state display label backed by `.lproj` bundle lookup (`ADR-029`).
+    public func resolvedTitle(
+        isDegradedTunnel: Bool,
+        isManuallyDisconnected: Bool,
+        locale: Locale?
+    ) -> String {
+        guard self == .connected else { return localizedTitle(locale: locale) }
+        let key = isManuallyDisconnected
+            ? "state.disconnected"
+            : (isDegradedTunnel ? "state.degraded" : "state.connected")
+        return MeshL10n.tr(key, locale: locale)
+    }
 }
 
 /// Semantic color classification shared across Menu Bar icons, badges, and status cards.

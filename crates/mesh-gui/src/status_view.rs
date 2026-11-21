@@ -13,6 +13,7 @@ use mesh_sys::gui_windows::{
 use crate::app::{
     AgentVersionIndicator, DashboardTab, DerivedUiSnapshot, DesktopUiState, TunnelSubState,
 };
+use crate::i18n::{LocaleMode, current_locale, t, t_for};
 use crate::theme::UiThemePalette;
 
 /// Render model for the custom-drawn Header Hero (Zone 0) and Status Card (Zone 1).
@@ -28,7 +29,7 @@ pub(crate) struct StatusHeroModel {
     pub(crate) enrolled: bool,
 }
 
-/// Builds a [`StatusHeroModel`] from the latest [`DerivedUiSnapshot`] and optional daemon status.
+/// Builds a [`StatusHeroModel`] using the currently active [`LocaleMode`] (`US-127`).
 #[must_use]
 pub(crate) fn build_status_hero_model(
     snapshot: &DerivedUiSnapshot,
@@ -36,14 +37,51 @@ pub(crate) fn build_status_hero_model(
     active_tab: DashboardTab,
     toast_override: Option<&str>,
 ) -> StatusHeroModel {
-    let badge_label = snapshot
+    build_status_hero_model_for_locale(
+        snapshot,
+        status,
+        active_tab,
+        toast_override,
+        current_locale(),
+    )
+}
+
+/// Pure builder for [`StatusHeroModel`] under an explicit [`LocaleMode`] (race-free for tests).
+#[must_use]
+pub(crate) fn build_status_hero_model_for_locale(
+    snapshot: &DerivedUiSnapshot,
+    status: Option<&AgentStatusResponse>,
+    active_tab: DashboardTab,
+    toast_override: Option<&str>,
+    locale: LocaleMode,
+) -> StatusHeroModel {
+    let tr = |key: &str| t_for(key, locale);
+    let badge_key = snapshot
         .ui_state
-        .display_label(snapshot.tunnel_sub_state)
-        .to_owned();
-    let headline = snapshot
-        .ui_state
-        .headline(snapshot.tunnel_sub_state)
-        .to_owned();
+        .display_label_key(snapshot.tunnel_sub_state);
+    let badge_label = {
+        let localized = tr(badge_key);
+        if localized.is_empty() {
+            snapshot
+                .ui_state
+                .display_label(snapshot.tunnel_sub_state)
+                .to_owned()
+        } else {
+            localized.to_owned()
+        }
+    };
+    let headline_key = snapshot.ui_state.headline_key(snapshot.tunnel_sub_state);
+    let headline = {
+        let localized = tr(headline_key);
+        if localized.is_empty() {
+            snapshot
+                .ui_state
+                .headline(snapshot.tunnel_sub_state)
+                .to_owned()
+        } else {
+            localized.to_owned()
+        }
+    };
 
     let ver_tag = match &snapshot.version_indicator {
         AgentVersionIndicator::Compatible(v) => format!("Agent v{v}"),
@@ -55,14 +93,16 @@ pub(crate) fn build_status_hero_model(
         AgentVersionIndicator::Unknown => "Agent v?".to_owned(),
     };
 
+    let overlay_lbl = tr("label.overlay");
+    let peers_lbl = tr("tab.peers");
     let meta_summary = match status {
         Some(st) => {
             let ip = st
                 .overlay_ip
-                .map_or_else(|| "Unassigned".to_owned(), |v| v.to_string());
+                .map_or_else(|| "-".to_owned(), |v| v.to_string());
             let name = st.node_name.as_ref().map_or("<unnamed>", NodeName::as_str);
             format!(
-                "Node: {name} | Overlay IP: {ip} | Peers: {} | {ver_tag}",
+                "{name} | {overlay_lbl}: {ip} | {peers_lbl}: {} | {ver_tag}",
                 st.peers.len()
             )
         }
@@ -71,8 +111,8 @@ pub(crate) fn build_status_hero_model(
 
     let banner_text = toast_override
         .map(ToOwned::to_owned)
-        .or_else(|| snapshot.legacy_banner.clone())
-        .or_else(|| snapshot.version_mismatch_banner.clone())
+        .or_else(|| snapshot.localized_legacy_banner(tr))
+        .or_else(|| snapshot.localized_version_mismatch_banner(tr))
         .or_else(|| snapshot.recoverable_error.clone());
 
     StatusHeroModel {
@@ -231,11 +271,9 @@ pub(crate) fn paint_status_zone(hdc: isize, palette: &UiThemePalette) {
     let default_model = StatusHeroModel {
         ui_state: DesktopUiState::NotEnrolled,
         tunnel_sub_state: TunnelSubState::NotEnrolled,
-        badge_label: DesktopUiState::NotEnrolled
-            .display_label(TunnelSubState::NotEnrolled)
+        badge_label: t(DesktopUiState::NotEnrolled.display_label_key(TunnelSubState::NotEnrolled))
             .to_owned(),
-        headline: DesktopUiState::NotEnrolled
-            .headline(TunnelSubState::NotEnrolled)
+        headline: t(DesktopUiState::NotEnrolled.headline_key(TunnelSubState::NotEnrolled))
             .to_owned(),
         meta_summary: format!("GUI v{}", env!("CARGO_PKG_VERSION")),
         banner_text: None,

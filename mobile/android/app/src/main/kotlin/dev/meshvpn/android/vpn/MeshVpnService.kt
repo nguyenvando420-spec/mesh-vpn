@@ -18,9 +18,12 @@ import android.os.Build
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import dev.meshvpn.android.LocaleHelper
+import dev.meshvpn.android.LocaleMode
 import dev.meshvpn.android.MainActivity
 import dev.meshvpn.android.MeshApplication
 import dev.meshvpn.android.R
+import dev.meshvpn.android.SharedPrefsLocaleStore
 import dev.meshvpn.android.data.diagnostics.SafeLogger
 import dev.meshvpn.android.data.network.UnderlayStateClassifier
 import dev.meshvpn.android.ffi.MeshNativeInit
@@ -372,18 +375,26 @@ class MeshVpnService : VpnService() {
         }
     }
 
+    private fun localizedContext(): Context {
+        val mode =
+            runCatching { SharedPrefsLocaleStore(applicationContext).loadLocaleMode() }
+                .getOrDefault(LocaleMode.SYSTEM)
+        return LocaleHelper.buildLocalizedContext(this, mode)
+    }
+
     private fun createNotificationChannels() {
         val nm = getSystemService(NotificationManager::class.java) ?: return
+        val l10n = localizedContext()
         val tunnelChannel =
             NotificationChannel(
                 CHANNEL_VPN_STATUS,
-                getString(R.string.notification_channel_vpn),
+                l10n.getString(R.string.notification_channel_vpn),
                 NotificationManager.IMPORTANCE_LOW,
             )
         val alertChannel =
             NotificationChannel(
                 CHANNEL_VPN_ALERTS,
-                getString(R.string.notification_channel_alerts),
+                l10n.getString(R.string.notification_channel_alerts),
                 NotificationManager.IMPORTANCE_HIGH,
             )
         nm.createNotificationChannel(tunnelChannel)
@@ -391,6 +402,7 @@ class MeshVpnService : VpnService() {
     }
 
     private fun buildStatusNotification(uiState: MeshSessionUiState): Notification {
+        val l10n = localizedContext()
         val contentIntent =
             PendingIntent.getActivity(
                 this,
@@ -410,28 +422,28 @@ class MeshVpnService : VpnService() {
             when {
                 !uiState.isDeviceUnlocked ||
                     uiState.daemonState == MobileDaemonState.DEVICE_LOCKED ->
-                    getString(R.string.notification_status_waiting_unlock)
+                    l10n.getString(R.string.notification_status_waiting_unlock)
                 uiState.daemonState == MobileDaemonState.CONNECTED -> {
                     val ip =
                         uiState.snapshot?.overlayIp
                             ?: uiState.bootstrapSummary?.overlayIp
                             ?: "mesh"
-                    getString(R.string.notification_status_connected, ip)
+                    l10n.getString(R.string.notification_status_connected, ip)
                 }
                 uiState.daemonState == MobileDaemonState.CONNECTING ->
-                    getString(R.string.notification_status_connecting)
+                    l10n.getString(R.string.notification_status_connecting)
                 uiState.daemonState == MobileDaemonState.DEGRADED ->
-                    getString(R.string.notification_status_degraded)
-                else -> getString(R.string.notification_status_stopped)
+                    l10n.getString(R.string.notification_status_degraded)
+                else -> l10n.getString(R.string.notification_status_stopped)
             }
 
         val warningLines =
             buildList {
                 if (uiState.isLockdownEnabled) {
-                    add(getString(R.string.notification_warning_lockdown))
+                    add(l10n.getString(R.string.notification_warning_lockdown))
                 }
                 if (uiState.isPrivateDnsStrict) {
-                    add(getString(R.string.notification_warning_private_dns))
+                    add(l10n.getString(R.string.notification_warning_private_dns))
                 }
             }
         val channelId = if (warningLines.isNotEmpty()) CHANNEL_VPN_ALERTS else CHANNEL_VPN_STATUS
@@ -441,14 +453,14 @@ class MeshVpnService : VpnService() {
                 .Builder(this, channelId)
                 .setSmallIcon(R.drawable.ic_vpn_key)
                 .setColor(notificationColorForState(uiState.daemonState))
-                .setContentTitle(getString(R.string.notification_title))
+                .setContentTitle(l10n.getString(R.string.notification_title))
                 .setContentText(warningLines.firstOrNull() ?: statusText)
                 .setContentIntent(contentIntent)
                 .setOngoing(uiState.daemonState != MobileDaemonState.STOPPED)
                 .setOnlyAlertOnce(warningLines.isEmpty())
                 .addAction(
                     R.drawable.ic_vpn_key,
-                    getString(R.string.notification_action_disconnect),
+                    l10n.getString(R.string.notification_action_disconnect),
                     disconnectIntent,
                 )
 

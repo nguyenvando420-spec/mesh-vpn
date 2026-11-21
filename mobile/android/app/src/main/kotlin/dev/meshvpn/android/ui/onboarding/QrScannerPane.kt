@@ -45,6 +45,7 @@ import com.google.zxing.NotFoundException
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.ReaderException
 import com.google.zxing.common.HybridBinarizer
+import dev.meshvpn.android.LocaleHelper
 import dev.meshvpn.android.data.diagnostics.SafeLogger
 import java.util.concurrent.Executors
 
@@ -72,7 +73,12 @@ fun QrScannerPane(
         ) { granted ->
             hasCameraPermission = granted
             if (!granted) {
-                cameraError = "Camera permission is required to scan join QR codes."
+                cameraError =
+                    LocaleHelper.tr(
+                        context,
+                        "Camera permission is required to scan join QR codes.",
+                        "Cần quyền máy ảnh để quét mã QR tham gia.",
+                    )
             }
         }
 
@@ -100,23 +106,39 @@ private fun CameraPermissionCard(
     onRequestPermission: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     Card(modifier = modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
-                text = "Camera permission needed",
+                text =
+                    LocaleHelper.tr(
+                        context,
+                        "Camera permission needed",
+                        "Cần quyền máy ảnh",
+                    ),
                 style = MaterialTheme.typography.titleMedium,
             )
             Text(
                 text =
                     errorMessage
-                        ?: "Mesh VPN scans the administrator QR offline on-device using CameraX.",
+                        ?: LocaleHelper.tr(
+                            context,
+                            "Mesh VPN scans the administrator QR offline on-device using CameraX.",
+                            "Mesh VPN quét mã QR quản trị viên ngoại tuyến bằng CameraX.",
+                        ),
                 style = MaterialTheme.typography.bodyMedium,
             )
             Button(onClick = onRequestPermission) {
-                Text("Grant Camera Permission")
+                Text(
+                    LocaleHelper.tr(
+                        context,
+                        "Grant Camera Permission",
+                        "Cấp quyền máy ảnh",
+                    ),
+                )
             }
         }
     }
@@ -181,7 +203,13 @@ private fun CameraPreviewScanner(
                     )
                 } catch (err: Exception) {
                     SafeLogger.w("QrScannerPane", "Unable to start CameraX preview", err)
-                    onCameraError("Camera preview unavailable; use Paste URI or Manual tab.")
+                    onCameraError(
+                        LocaleHelper.tr(
+                            context,
+                            "Camera preview unavailable; use Paste URI or Manual tab.",
+                            "Xem trước máy ảnh không khả dụng; hãy dùng Dán URI hoặc Thủ công.",
+                        ),
+                    )
                 }
             }
         providerFuture.addListener(listener, mainExecutor)
@@ -212,9 +240,17 @@ private fun CameraPreviewScanner(
         Text(
             text =
                 errorMessage ?: if (paused) {
-                    "Review detected server details..."
+                    LocaleHelper.tr(
+                        context,
+                        "Review detected server details...",
+                        "Xem lại chi tiết máy chủ đã phát hiện...",
+                    )
                 } else {
-                    "Point camera at Mesh administrator QR code"
+                    LocaleHelper.tr(
+                        context,
+                        "Point camera at Mesh administrator QR code",
+                        "Hướng máy ảnh vào mã QR quản trị viên Mesh",
+                    )
                 },
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onPrimary,

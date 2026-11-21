@@ -97,6 +97,7 @@ struct MeshApp: App {
     @StateObject private var store: DesktopStore
     @StateObject private var lifecycle: AppLifecycleCoordinator
     @StateObject private var themeManager = ThemeManager()
+    @StateObject private var localeManager = LocaleManager()
 
     @MainActor
     init() {
@@ -110,18 +111,24 @@ struct MeshApp: App {
 
     var body: some Scene {
         Window("Mesh VPN", id: "dashboard") {
-            DashboardWindowView(store: store, themeManager: themeManager)
-                .frame(minWidth: 760, minHeight: 540)
-                .preferredColorScheme(themeManager.preferredColorScheme)
-                .onAppear {
-                    appDelegate.store = store
-                    themeManager.applyAppearance()
-                    if !CommandLine.arguments.contains("--minimized") {
-                        NSApp.setActivationPolicy(.regular)
-                        NSApp.activate(ignoringOtherApps: true)
-                        store.setDashboardOpen(true)
-                    }
+            DashboardWindowView(
+                store: store,
+                themeManager: themeManager,
+                localeManager: localeManager
+            )
+            .frame(minWidth: 760, minHeight: 540)
+            .preferredColorScheme(themeManager.preferredColorScheme)
+            .environmentObject(localeManager)
+            .environment(\.locale, localeManager.effectiveLocale)
+            .onAppear {
+                appDelegate.store = store
+                themeManager.applyAppearance()
+                if !CommandLine.arguments.contains("--minimized") {
+                    NSApp.setActivationPolicy(.regular)
+                    NSApp.activate(ignoringOtherApps: true)
+                    store.setDashboardOpen(true)
                 }
+            }
         }
         .defaultSize(width: 860, height: 620)
         .commands {
@@ -129,8 +136,14 @@ struct MeshApp: App {
         }
 
         MenuBarExtra {
-            MenuBarContentView(store: store, appDelegate: appDelegate)
-                .preferredColorScheme(themeManager.preferredColorScheme)
+            MenuBarContentView(
+                store: store,
+                appDelegate: appDelegate,
+                localeManager: localeManager
+            )
+            .preferredColorScheme(themeManager.preferredColorScheme)
+            .environmentObject(localeManager)
+            .environment(\.locale, localeManager.effectiveLocale)
         } label: {
             Label(
                 "Mesh VPN",
@@ -150,7 +163,10 @@ struct MeshApp: App {
 private struct MenuBarContentView: View {
     @ObservedObject var store: DesktopStore
     let appDelegate: MeshAppDelegate
+    @ObservedObject var localeManager: LocaleManager
     @Environment(\.openWindow) private var openWindow
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -164,7 +180,7 @@ private struct MenuBarContentView: View {
             peersSubmenuSection
             Divider()
             launchAtLoginToggle
-            Button("Open Dashboard...") {
+            Button(MeshL10n.tr("action.open_dashboard", locale: loc)) {
                 bringDashboardToFront()
             }
             .keyboardShortcut("o")
@@ -188,33 +204,37 @@ private struct MenuBarContentView: View {
     private var primaryActionSection: some View {
         switch store.uiState {
         case .serviceNotInstalled:
-            Button("Install Background Service...") {
+            Button(MeshL10n.tr("service.start_repair", locale: loc)) {
                 bringDashboardToFront()
             }
         case .serviceStopped:
-            Button("Start Background Service") {
+            Button(MeshL10n.tr("service.start_repair", locale: loc)) {
                 Task { _ = await store.startOrRepairService() }
             }
         case .unconfigured:
-            Button("Join Mesh Network...") {
+            Button(MeshL10n.tr("action.enroll", locale: loc)) {
                 bringDashboardToFront()
             }
         case .connecting:
-            Button("Disconnect") {
+            Button(MeshL10n.tr("action.disconnect", locale: loc)) {
                 Task { _ = await store.disconnect() }
             }
         case .connected:
             if store.isManuallyDisconnected {
-                Button("Connect") {
+                Button(MeshL10n.tr("action.connect", locale: loc)) {
                     Task { _ = await store.connectOneClick() }
                 }
             } else {
-                Button("Disconnect") {
+                Button(MeshL10n.tr("action.disconnect", locale: loc)) {
                     Task { _ = await store.disconnect() }
                 }
             }
-        case .reauthRequired, .revoked, .error:
-            Button("Attention Required — Open Dashboard") {
+        case .reauthRequired:
+            Button(MeshL10n.tr("action.rotate_key", locale: loc)) {
+                bringDashboardToFront()
+            }
+        case .revoked, .error:
+            Button(MeshL10n.tr("action.open_dashboard", locale: loc)) {
                 bringDashboardToFront()
             }
         }
@@ -223,7 +243,7 @@ private struct MenuBarContentView: View {
     @ViewBuilder
     private var copyOverlayIpSection: some View {
         if let ip = store.status?.overlayIp, !ip.isEmpty {
-            Button("Copy Overlay IP (\(ip))") {
+            Button("\(MeshL10n.tr("peers.copy_overlay_ip", locale: loc)) (\(ip))") {
                 let pasteboard = NSPasteboard.general
                 pasteboard.clearContents()
                 pasteboard.setString(ip, forType: .string)
@@ -235,7 +255,8 @@ private struct MenuBarContentView: View {
     private var peersSubmenuSection: some View {
         let peers = store.sortedPeers
         if !peers.isEmpty {
-            Menu("Peers (\(store.onlinePeerCount)/\(peers.count) Online)") {
+            let peersLabel = MeshL10n.tr("tab.peers", locale: loc)
+            Menu("\(peersLabel) (\(store.onlinePeerCount)/\(peers.count))") {
                 ForEach(peers.prefix(15)) { peer in
                     Button(peerMenuTitle(peer)) {
                         let pasteboard = NSPasteboard.general
@@ -245,7 +266,7 @@ private struct MenuBarContentView: View {
                 }
                 if peers.count > 15 {
                     Divider()
-                    Button("Show All \(peers.count) Peers in Dashboard...") {
+                    Button(MeshL10n.tr("action.open_dashboard", locale: loc)) {
                         bringDashboardToFront()
                     }
                 }
@@ -255,7 +276,7 @@ private struct MenuBarContentView: View {
 
     private var launchAtLoginToggle: some View {
         Toggle(
-            "Launch at Login",
+            MeshL10n.tr("action.launch_at_login", locale: loc),
             isOn: Binding(
                 get: { store.launchAtLoginEnabled },
                 set: { store.setLaunchAtLogin($0) }
@@ -265,11 +286,11 @@ private struct MenuBarContentView: View {
 
     @ViewBuilder
     private var quitSection: some View {
-        Button("Quit Mesh VPN (Keep Connected in Background)") {
+        Button(MeshL10n.tr("action.quit_keep", locale: loc)) {
             store.prepareForKeepConnectedQuit()
             NSApp.terminate(nil)
         }
-        Button("Disconnect & Quit Mesh VPN") {
+        Button(MeshL10n.tr("action.disconnect_quit", locale: loc)) {
             Task { @MainActor in
                 await store.disconnectAndPrepareForQuit()
                 NSApp.terminate(nil)
@@ -286,33 +307,43 @@ private struct MenuBarContentView: View {
     }
 
     private var statusSummaryLine: String {
+        let key: String
         switch store.uiState {
+        case .serviceNotInstalled: key = "tray.agent_unavailable"
+        case .serviceStopped: key = "tray.service_stopped"
+        case .unconfigured: key = "tray.not_enrolled"
+        case .connecting: key = "tray.connecting"
         case .connected:
             if store.isManuallyDisconnected {
-                return "Status: Disconnected (Identity Saved)"
+                key = "tray.disconnected"
+            } else if store.isDegradedTunnel {
+                key = "tray.degraded"
+            } else {
+                key = "tray.connected"
             }
-            if store.isDegradedTunnel {
-                return "Status: Degraded (Tunnel Warning)"
-            }
-            return "Status: Connected (\(store.onlinePeerCount) peers)"
-        default:
-            return "Status: \(store.uiState.displayTitle)"
+        case .reauthRequired: key = "tray.reauth"
+        case .revoked: key = "tray.revoked"
+        case .error: key = "tray.attention"
         }
+        return MeshL10n.tr(key, locale: loc)
     }
 
     private var versionWarningLabel: String {
         switch store.versionBanner {
         case .legacyPre030:
-            return "Daemon Legacy (<0.3.0) — Update Service"
+            return MeshL10n.tr("warn.legacy_agent", locale: loc)
         case .mismatch(let daemon, let app):
-            return "Version Mismatch: Daemon \(daemon) vs App \(app)"
+            return MeshL10n.tr("warn.version_mismatch", locale: loc)
+                .replacingOccurrences(of: "{v1}", with: app)
+                .replacingOccurrences(of: "{v2}", with: daemon)
         case .unknown, .matched:
             return ""
         }
     }
 
     private func peerMenuTitle(_ peer: AgentPeerStatus) -> String {
-        let state = peer.online ? peer.activePath.rawValue.uppercased() : "OFFLINE"
+        let offlineLabel = MeshL10n.tr("peers.badge.offline", locale: loc)
+        let state = peer.online ? peer.activePath.rawValue.uppercased() : offlineLabel
         return "\(peer.name) — \(peer.overlayIp) [\(state)]"
     }
 

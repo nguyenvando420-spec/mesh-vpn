@@ -22,6 +22,20 @@ public enum AppTab: String, CaseIterable, Hashable, Sendable {
     case status
     case peers
     case settings
+
+    /// Canonical glossary key for the tab label (`ADR-029`).
+    public var localizationKey: String {
+        switch self {
+        case .status: return "tab.status"
+        case .peers: return "tab.peers"
+        case .settings: return "tab.settings"
+        }
+    }
+
+    /// Localized tab label resolved via `L10n.tr(_:locale:)`.
+    public func localizedTitle(locale: Locale) -> String {
+        L10n.tr(localizationKey, locale: locale)
+    }
 }
 
 /// Main `@MainActor` state store driving `MeshApp` SwiftUI screens, tunnel control, and IPC.

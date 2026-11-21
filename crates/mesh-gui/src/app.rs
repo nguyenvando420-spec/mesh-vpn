@@ -123,6 +123,78 @@ impl DesktopUiState {
             Self::ErrorRecoverable => "Mesh VPN - Attention Needed",
         }
     }
+
+    /// Canonical Discovery v1.1 §4.1 i18n key for [`Self::display_label`] (`US-127`).
+    #[cfg(any(target_os = "windows", test))]
+    #[must_use]
+    pub(crate) const fn display_label_key(self, sub_state: TunnelSubState) -> &'static str {
+        match self {
+            Self::AgentUnavailable => "state.agent_unavailable",
+            Self::ServiceStopped => "state.service_stopped",
+            Self::NotEnrolled => "state.not_enrolled",
+            Self::Connecting => "state.connecting",
+            Self::Connected => match sub_state {
+                TunnelSubState::Connected => "state.connected",
+                TunnelSubState::Degraded => "state.degraded",
+                TunnelSubState::Disconnected => "state.disconnected",
+                TunnelSubState::Connecting => "state.connecting",
+                TunnelSubState::NotEnrolled => "state.not_enrolled",
+                TunnelSubState::ReauthRequired => "state.reauth_required",
+                TunnelSubState::Revoked => "state.revoked",
+            },
+            Self::ReauthRequired => "state.reauth_required",
+            Self::Revoked => "state.revoked",
+            Self::ErrorRecoverable => "state.error",
+        }
+    }
+
+    /// Canonical Discovery v1.1 §4.1 i18n key for [`Self::headline`] (`US-127`).
+    #[cfg(any(target_os = "windows", test))]
+    #[must_use]
+    pub(crate) const fn headline_key(self, sub_state: TunnelSubState) -> &'static str {
+        match self {
+            Self::AgentUnavailable => "headline.agent_unreachable",
+            Self::ServiceStopped => "headline.service_stopped",
+            Self::NotEnrolled => "headline.setup",
+            Self::Connecting => "headline.connecting",
+            Self::Connected => match sub_state {
+                TunnelSubState::Connected => "headline.connected",
+                TunnelSubState::Degraded => "headline.degraded",
+                TunnelSubState::Disconnected => "headline.disconnected_enrolled",
+                TunnelSubState::Connecting => "headline.connecting",
+                TunnelSubState::NotEnrolled => "headline.setup",
+                TunnelSubState::ReauthRequired => "headline.reauth",
+                TunnelSubState::Revoked => "headline.revoked",
+            },
+            Self::ReauthRequired => "headline.reauth",
+            Self::Revoked => "headline.revoked",
+            Self::ErrorRecoverable => "headline.error",
+        }
+    }
+
+    /// Canonical Discovery v1.1 §4.1 i18n key for [`Self::tray_tooltip_summary`] (`US-127`).
+    #[cfg(any(target_os = "windows", test))]
+    #[must_use]
+    pub(crate) const fn tray_tooltip_key(self, sub_state: TunnelSubState) -> &'static str {
+        match self {
+            Self::AgentUnavailable => "tray.agent_unavailable",
+            Self::ServiceStopped => "tray.service_stopped",
+            Self::NotEnrolled => "tray.not_enrolled",
+            Self::Connecting => "tray.connecting",
+            Self::Connected => match sub_state {
+                TunnelSubState::Connected => "tray.connected",
+                TunnelSubState::Degraded => "tray.degraded",
+                TunnelSubState::Disconnected => "tray.disconnected",
+                TunnelSubState::Connecting => "tray.connecting",
+                TunnelSubState::NotEnrolled => "tray.not_enrolled",
+                TunnelSubState::ReauthRequired => "tray.reauth",
+                TunnelSubState::Revoked => "tray.revoked",
+            },
+            Self::ReauthRequired => "tray.reauth",
+            Self::Revoked => "tray.revoked",
+            Self::ErrorRecoverable => "tray.attention",
+        }
+    }
 }
 
 /// Fine-grained daemon tunnel sub-state mapped inside `DesktopUiState`.
@@ -209,6 +281,46 @@ impl DerivedUiSnapshot {
                 self.ui_state,
                 DesktopUiState::AgentUnavailable | DesktopUiState::ServiceStopped
             )
+    }
+
+    /// Returns a localized legacy-agent banner via `tr` when `LegacyPre030` is detected (`US-127`).
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub(crate) fn localized_legacy_banner(
+        &self,
+        tr: impl Fn(&str) -> &'static str,
+    ) -> Option<String> {
+        if matches!(self.version_indicator, AgentVersionIndicator::LegacyPre030) {
+            let localized = tr("warn.legacy_agent");
+            if !localized.is_empty() {
+                return Some(localized.to_owned());
+            }
+        }
+        self.legacy_banner.clone()
+    }
+
+    /// Returns a localized version-mismatch banner via `tr` when GUI/Agent versions diverge (`US-127`).
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub(crate) fn localized_version_mismatch_banner(
+        &self,
+        tr: impl Fn(&str) -> &'static str,
+    ) -> Option<String> {
+        if let AgentVersionIndicator::Mismatch {
+            gui_version,
+            agent_version,
+        } = &self.version_indicator
+        {
+            let template = tr("warn.version_mismatch");
+            if !template.is_empty() {
+                return Some(
+                    template
+                        .replace("{v1}", gui_version)
+                        .replace("{v2}", agent_version),
+                );
+            }
+        }
+        self.version_mismatch_banner.clone()
     }
 }
 
@@ -514,6 +626,24 @@ mod tests {
         });
         assert!(!snap.should_show_tab_bar());
         assert!(!snap.should_show_onboarding_form());
+        assert_eq!(DesktopUiState::Connected.label(), "Enrolled");
+        assert_eq!(
+            DesktopUiState::Connected.display_label_key(TunnelSubState::Connected),
+            "state.connected"
+        );
+        assert_eq!(
+            DesktopUiState::Connected.headline_key(TunnelSubState::Connected),
+            "headline.connected"
+        );
+        assert_eq!(
+            DesktopUiState::Connected.tray_tooltip_key(TunnelSubState::Connected),
+            "tray.connected"
+        );
+        #[cfg(target_os = "windows")]
+        {
+            assert!(snap.localized_legacy_banner(|_| "").is_none());
+            assert!(snap.localized_version_mismatch_banner(|_| "").is_none());
+        }
 
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {

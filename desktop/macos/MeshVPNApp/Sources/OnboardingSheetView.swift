@@ -12,6 +12,7 @@ enum OnboardingMode: Equatable {
 struct OnboardingSheetView: View {
     @ObservedObject var store: DesktopStore
     let mode: OnboardingMode
+    @EnvironmentObject private var localeManager: LocaleManager
     @Environment(\.dismiss) private var dismiss
 
     @State private var selectedTab: OnboardingTab = .joinUri
@@ -23,11 +24,20 @@ struct OnboardingSheetView: View {
     @State private var rawNodeName: String = ""
     @State private var pastedUriPreview: String = ""
 
+    private var loc: Locale { localeManager.effectiveLocale }
+
     private enum OnboardingTab: String, CaseIterable, Identifiable {
-        case joinUri = "Join URI"
-        case manualForm = "Manual Setup"
+        case joinUri
+        case manualForm
 
         var id: String { rawValue }
+
+        func localizedTitle(locale: Locale) -> String {
+            switch self {
+            case .joinUri: return MeshL10n.tr("onboarding.desktop.tab.join_uri", locale: locale)
+            case .manualForm: return MeshL10n.tr("onboarding.desktop.tab.manual", locale: locale)
+            }
+        }
     }
 
     var body: some View {
@@ -40,6 +50,7 @@ struct OnboardingSheetView: View {
                 EnrollmentConfirmationSection(
                     draft: draft,
                     isBusy: store.isBusy,
+                    locale: loc,
                     onCancel: {
                         store.cancelEnrollmentDraft()
                     },
@@ -65,14 +76,18 @@ struct OnboardingSheetView: View {
     private var headerSection: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
-                Text(mode == .keyRotation ? "Rotate Node Pre-Auth Key" : "Join Mesh VPN Network")
-                    .font(.title2.weight(.semibold))
+                Text(
+                    mode == .keyRotation
+                        ? MeshL10n.tr("rotation.title", locale: loc)
+                        : MeshL10n.tr("onboarding.desktop.title", locale: loc)
+                )
+                .font(.title2.weight(.semibold))
                 Text(headerSubtitle)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Close") {
+            Button(MeshL10n.tr("generic.close", locale: loc)) {
                 store.cancelEnrollmentDraft()
                 rawPreauthKey = ""
                 pastedUriPreview = ""
@@ -84,17 +99,17 @@ struct OnboardingSheetView: View {
 
     private var headerSubtitle: String {
         if mode == .keyRotation {
-            return "Provide a fresh mpk_ pre-auth key to renew this node's credentials."
+            return MeshL10n.tr("rotation.subtitle", locale: loc)
         }
-        return "Paste a mesh://join URI or enter your Control server details manually."
+        return MeshL10n.tr("onboarding.desktop.subtitle", locale: loc)
     }
 
     @ViewBuilder
     private var draftInputSection: some View {
         if mode == .initialEnrollment {
-            Picker("Setup Method", selection: $selectedTab) {
+            Picker("", selection: $selectedTab) {
                 ForEach(OnboardingTab.allCases) { tab in
-                    Text(tab.rawValue).tag(tab)
+                    Text(tab.localizedTitle(locale: loc)).tag(tab)
                 }
             }
             .pickerStyle(.segmented)
@@ -112,7 +127,7 @@ struct OnboardingSheetView: View {
 
     private var joinUriInputForm: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Paste an onboarding link (`mesh://join?v=1&ep=...&pin=...&key=mpk_...`).")
+            Text(MeshL10n.tr("onboarding.import_uri", locale: loc))
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
@@ -122,7 +137,7 @@ struct OnboardingSheetView: View {
                         handleJoinUriPaste(first)
                     }
                 }
-                Button("Paste from Clipboard") {
+                Button(MeshL10n.tr("onboarding.paste_clipboard", locale: loc)) {
                     if let clip = NSPasteboard.general.string(forType: .string) {
                         handleJoinUriPaste(clip)
                     }
@@ -130,7 +145,7 @@ struct OnboardingSheetView: View {
                 Spacer()
             }
 
-            SecureField("Or paste mesh://join?... URI here", text: uriInputBinding)
+            SecureField(MeshL10n.tr("onboarding.or_enter_uri", locale: loc), text: uriInputBinding)
                 .textFieldStyle(.roundedBorder)
 
             if !pastedUriPreview.isEmpty {
@@ -142,7 +157,7 @@ struct OnboardingSheetView: View {
 
             HStack {
                 Spacer()
-                Button("Review Connection Details") {
+                Button(MeshL10n.tr("onboarding.desktop.review", locale: loc)) {
                     _ = store.handlePastedOnboardingInput(pastedUriPreview)
                 }
                 .buttonStyle(.borderedProminent)
@@ -194,8 +209,11 @@ struct OnboardingSheetView: View {
 
     private var manualEnrollmentForm: some View {
         Form {
-            TextField("Control Endpoint (host or IP[:port])", text: endpointInputBinding)
-                .textFieldStyle(.roundedBorder)
+            TextField(
+                MeshL10n.tr("onboarding.control_server", locale: loc),
+                text: endpointInputBinding
+            )
+            .textFieldStyle(.roundedBorder)
 
             if let preview = normalizedEndpointPreview {
                 Text("Normalized target: \(preview)")
@@ -206,9 +224,9 @@ struct OnboardingSheetView: View {
             TextField("Port Override (optional, defaults to 443)", text: $rawPortOverride)
                 .textFieldStyle(.roundedBorder)
 
-            Picker("TLS Trust Mode", selection: $tlsAuthMode) {
-                Text("SPKI SHA-256 Pin (Zero-TOFU)").tag(TlsAuthMode.spkiPin)
-                Text("System CA (DNS Hostnames Only)").tag(TlsAuthMode.systemCa)
+            Picker("TLS", selection: $tlsAuthMode) {
+                Text(MeshL10n.tr("onboarding.tls_spki_pin", locale: loc)).tag(TlsAuthMode.spkiPin)
+                Text(MeshL10n.tr("onboarding.tls_system_ca", locale: loc)).tag(TlsAuthMode.systemCa)
                     .disabled(isCurrentEndpointIpLiteral)
             }
             .disabled(isCurrentEndpointIpLiteral)
@@ -220,20 +238,23 @@ struct OnboardingSheetView: View {
             }
 
             if tlsAuthMode == .spkiPin || isCurrentEndpointIpLiteral {
-                TextField("Server SPKI Pin (sha256:<64-hex>)", text: $rawServerPin)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospaced())
+                TextField(
+                    MeshL10n.tr("onboarding.spki_pin_label", locale: loc),
+                    text: $rawServerPin
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.body.monospaced())
             }
 
-            SecureField("Pre-Auth Key (mpk_...)", text: preauthKeyBinding)
+            SecureField(MeshL10n.tr("onboarding.preauth_key", locale: loc), text: preauthKeyBinding)
                 .textFieldStyle(.roundedBorder)
 
-            TextField("Node Name (optional RFC 1123 hostname)", text: $rawNodeName)
+            TextField(MeshL10n.tr("onboarding.node_name", locale: loc), text: $rawNodeName)
                 .textFieldStyle(.roundedBorder)
 
             HStack {
                 Spacer()
-                Button("Review Connection Details") {
+                Button(MeshL10n.tr("onboarding.desktop.review", locale: loc)) {
                     let input = ManualOnboardingInput(
                         rawEndpoint: rawEndpoint,
                         rawPortOverride: rawPortOverride,
@@ -253,9 +274,9 @@ struct OnboardingSheetView: View {
     private var keyRotationForm: some View {
         Form {
             if let endpoint = store.status?.serverConnection?.controlEndpoint {
-                LabeledContent("Control Endpoint", value: endpoint)
+                LabeledContent(MeshL10n.tr("label.control", locale: loc), value: endpoint)
             }
-            SecureField("New Pre-Auth Key (mpk_...)", text: preauthKeyBinding)
+            SecureField(MeshL10n.tr("rotation.new_key", locale: loc), text: preauthKeyBinding)
                 .textFieldStyle(.roundedBorder)
 
             HStack {
@@ -264,13 +285,13 @@ struct OnboardingSheetView: View {
                         applyRotationClipboardPaste(first)
                     }
                 }
-                Button("Paste Key") {
+                Button(MeshL10n.tr("onboarding.paste_clipboard", locale: loc)) {
                     if let clip = NSPasteboard.general.string(forType: .string) {
                         applyRotationClipboardPaste(clip)
                     }
                 }
                 Spacer()
-                Button("Review Key Rotation") {
+                Button(MeshL10n.tr("rotation.review_key", locale: loc)) {
                     _ = store.prepareKeyRotationDraft(rawPreauthKey: rawPreauthKey)
                 }
                 .buttonStyle(.borderedProminent)
@@ -315,7 +336,7 @@ struct OnboardingSheetView: View {
                 Text(error.message).font(.callout)
             }
             Spacer()
-            Button("Dismiss") {
+            Button(MeshL10n.tr("generic.dismiss", locale: loc)) {
                 store.dismissError()
             }
             .buttonStyle(.borderless)
@@ -332,6 +353,7 @@ struct OnboardingSheetView: View {
 private struct EnrollmentConfirmationSection: View {
     let draft: EnrollmentConfirmationDraft
     let isBusy: Bool
+    let locale: Locale
     let onCancel: () -> Void
     let onConfirm: () -> Void
 
@@ -339,23 +361,26 @@ private struct EnrollmentConfirmationSection: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(
                 draft.isRotation
-                    ? "Confirm Key Rotation"
-                    : "Verify Server Trust Before Enrolling"
+                    ? MeshL10n.tr("confirm.confirm_rotation", locale: locale)
+                    : MeshL10n.tr("confirm.verify_before_enroll", locale: locale)
             )
             .font(.headline)
 
             GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
-                    LabeledContent("Control Endpoint", value: draft.serverEndpoint)
                     LabeledContent(
-                        "TLS Mode",
+                        MeshL10n.tr("label.control", locale: locale),
+                        value: draft.serverEndpoint
+                    )
+                    LabeledContent(
+                        "TLS",
                         value: draft.tlsAuthMode == .spkiPin
-                            ? "SPKI SHA-256 Pin (Zero-TOFU)"
-                            : "System CA"
+                            ? MeshL10n.tr("onboarding.tls_spki_pin", locale: locale)
+                            : MeshL10n.tr("onboarding.tls_system_ca", locale: locale)
                     )
                     if let pin = draft.serverPin {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Server SPKI Fingerprint")
+                            Text(MeshL10n.tr("onboarding.spki_pin_label", locale: locale))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text(pin)
@@ -363,18 +388,28 @@ private struct EnrollmentConfirmationSection: View {
                                 .textSelection(.enabled)
                         }
                     }
-                    LabeledContent("Node Name", value: draft.nodeName ?? "(OS hostname)")
-                    LabeledContent("Pre-Auth Key", value: draft.maskedPreauthPreview)
+                    LabeledContent(
+                        MeshL10n.tr("onboarding.node_name", locale: locale),
+                        value: draft.nodeName ?? "(OS hostname)"
+                    )
+                    LabeledContent(
+                        MeshL10n.tr("onboarding.preauth_key", locale: locale),
+                        value: draft.maskedPreauthPreview
+                    )
                 }
                 .padding(6)
             }
 
             HStack {
-                Button("Back / Edit") {
+                Button(MeshL10n.tr("confirm.back_edit", locale: locale)) {
                     onCancel()
                 }
                 Spacer()
-                Button(draft.isRotation ? "Rotate Key & Reconnect" : "Trust & Connect") {
+                Button(
+                    draft.isRotation
+                        ? MeshL10n.tr("rotation.rotate_reconnect", locale: locale)
+                        : MeshL10n.tr("confirm.trust_connect", locale: locale)
+                ) {
                     onConfirm()
                 }
                 .buttonStyle(.borderedProminent)

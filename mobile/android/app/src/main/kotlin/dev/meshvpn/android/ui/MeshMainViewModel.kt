@@ -2,6 +2,9 @@ package dev.meshvpn.android.ui
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import dev.meshvpn.android.InMemoryLocalePrefsStore
+import dev.meshvpn.android.LocaleMode
+import dev.meshvpn.android.LocalePrefsStore
 import dev.meshvpn.android.data.diagnostics.BugreportShareManager
 import dev.meshvpn.android.data.network.OnboardingInputValidator
 import dev.meshvpn.android.ffi.FfiErrorMapper
@@ -58,6 +61,7 @@ data class MainUiScreenState(
     val session: MeshSessionUiState = MeshSessionUiState(),
     val activeTab: MainTab = MainTab.STATUS,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    val localeMode: LocaleMode = LocaleMode.SYSTEM,
     val peerSearchQuery: String = "",
     val peerFilterMode: PeerFilterMode = PeerFilterMode.ALL,
     val onboardingMethod: OnboardingMethod = OnboardingMethod.SCAN_QR,
@@ -92,6 +96,7 @@ class MeshMainViewModel(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     externalScope: CoroutineScope? = null,
     initialThemePrefs: ThemePrefsStore = InMemoryThemePrefsStore(),
+    initialLocalePrefs: LocalePrefsStore = InMemoryLocalePrefsStore(),
 ) : ViewModel() {
     private val scope: CoroutineScope = externalScope ?: viewModelScope
     private val confirmationLock = Any()
@@ -103,6 +108,12 @@ class MeshMainViewModel(
     private var themePrefsAttached = false
 
     @Volatile
+    private var localePrefsStore: LocalePrefsStore = initialLocalePrefs
+
+    @Volatile
+    private var localePrefsAttached = false
+
+    @Volatile
     private var heldConfirmationRequest: PendingEnrollmentRequest? = null
 
     private val _screenState =
@@ -110,6 +121,7 @@ class MeshMainViewModel(
             MainUiScreenState(
                 session = sessionRepository.uiState.value,
                 themeMode = initialThemePrefs.loadThemeMode(),
+                localeMode = initialLocalePrefs.loadLocaleMode(),
             ),
         )
     val screenState: StateFlow<MainUiScreenState> = _screenState.asStateFlow()
@@ -138,6 +150,21 @@ class MeshMainViewModel(
     fun selectThemeMode(mode: ThemeMode) {
         themePrefsStore.saveThemeMode(mode)
         _screenState.update { it.copy(themeMode = mode) }
+    }
+
+    fun attachLocalePrefs(store: LocalePrefsStore) {
+        if (localePrefsAttached) {
+            return
+        }
+        localePrefsAttached = true
+        localePrefsStore = store
+        val savedMode = store.loadLocaleMode()
+        _screenState.update { it.copy(localeMode = savedMode) }
+    }
+
+    fun setLocaleMode(mode: LocaleMode) {
+        localePrefsStore.saveLocaleMode(mode)
+        _screenState.update { it.copy(localeMode = mode) }
     }
 
     fun updatePeerSearchQuery(query: String) {
@@ -497,10 +524,12 @@ class MeshMainViewModel(
                     sessionRepository.resetLocalIdentity()
                     cleanupDiagnostics()
                     val currentTheme = _screenState.value.themeMode
+                    val currentLocale = _screenState.value.localeMode
                     _screenState.update {
                         MainUiScreenState(
                             session = sessionRepository.uiState.value,
                             themeMode = currentTheme,
+                            localeMode = currentLocale,
                             infoBanner = "Local keys and Mesh state erased.",
                         )
                     }

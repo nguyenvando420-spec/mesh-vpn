@@ -6,10 +6,13 @@ import SwiftUI
 struct MeshVpnApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = AppViewModel.makeLive()
+    @StateObject private var themeManager = ThemeManager()
+    @StateObject private var localeManager = LocaleManager()
     @State private var isPrivacyScreenActive = false
 
     var body: some Scene {
         WindowGroup {
+            let locale = localeManager.resolvedLocale
             ZStack {
                 if viewModel.isEnrolled {
                     DashboardView(viewModel: viewModel)
@@ -18,10 +21,14 @@ struct MeshVpnApp: App {
                 }
 
                 if isPrivacyScreenActive {
-                    PrivacyBlurOverlayView()
+                    PrivacyBlurOverlayView(locale: locale)
                         .transition(.opacity)
                 }
             }
+            .environmentObject(themeManager)
+            .environmentObject(localeManager)
+            .preferredColorScheme(themeManager.preferredColorScheme)
+            .environment(\.locale, locale)
             .task {
                 await viewModel.startObserving()
             }
@@ -46,7 +53,7 @@ struct MeshVpnApp: App {
                     }
                 )
             ) {
-                Button("OK", role: .cancel) {
+                Button(L10n.tr("generic.close", locale: locale), role: .cancel) {
                     viewModel.activeError = nil
                 }
             } message: {
@@ -57,6 +64,8 @@ struct MeshVpnApp: App {
 }
 
 private struct PrivacyBlurOverlayView: View {
+    let locale: Locale
+
     var body: some View {
         ZStack {
             Rectangle()
@@ -66,7 +75,7 @@ private struct PrivacyBlurOverlayView: View {
                 Image(systemName: "lock.shield.fill")
                     .font(.system(size: 44))
                     .foregroundStyle(.secondary)
-                Text("Mesh VPN")
+                Text(L10n.tr("notif.app_name", locale: locale))
                     .font(.headline)
                 Text("Sensitive keys and credentials are hidden.")
                     .font(.caption)

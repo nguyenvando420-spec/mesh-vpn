@@ -25,12 +25,13 @@ use mesh_sys::gui_windows::{
     get_client_size, get_control_text, get_dpi_for_window, get_sm_icon_px_for_dpi, hide_window,
     init_common_controls, invalidate_window, is_user_autostart_enabled, kill_window_timer,
     listbox_reset_and_fill, listbox_selected_index, post_graceful_shutdown_to_window,
-    query_window_version, read_clipboard_utf16_with_seq, register_activate_window_message,
-    register_taskbar_created_message, remove_user_shortcuts_and_autostart, run_gui_window,
-    save_tar_file_dialog, set_checkbox_checked, set_control_bounds, set_control_enabled,
-    set_control_font, set_control_text, set_control_visible, set_dc_text_and_bk_color,
-    set_focus_control, set_user_autostart, set_window_icon, set_window_timer, show_message_box,
-    show_window_and_focus, signal_shutdown_event, wait_event_signaled,
+    query_window_version, read_clipboard_utf16_with_seq, read_windows_apps_use_light_theme,
+    register_activate_window_message, register_taskbar_created_message,
+    remove_user_shortcuts_and_autostart, run_gui_window, save_tar_file_dialog,
+    set_checkbox_checked, set_control_bounds, set_control_enabled, set_control_font,
+    set_control_text, set_control_visible, set_dc_text_and_bk_color, set_focus_control,
+    set_user_autostart, set_window_icon, set_window_timer, show_message_box, show_window_and_focus,
+    signal_shutdown_event, wait_event_signaled,
 };
 use zeroize::Zeroizing;
 
@@ -44,11 +45,12 @@ use crate::clipboard::{
     copy_non_secret_peer_value, looks_like_sensitive_paste,
 };
 use crate::diagnostics_view::{
-    DEFAULT_BUGREPORT_FILENAME, format_netcheck_report, format_self_network_panel,
-    format_settings_identity_summary,
+    DEFAULT_BUGREPORT_FILENAME, build_locale_selector_labels, build_theme_selector_labels,
+    format_netcheck_report_localized, format_self_network_panel_localized,
+    format_settings_identity_summary_localized,
 };
 use crate::elevation_worker::resolve_program_files_mesh_dir;
-use crate::i18n::{LocaleMode, t};
+use crate::i18n::{LocaleMode, set_locale, t};
 use crate::icons::{UiIconTone, create_status_icon_for_px, icon_tone_for_state};
 use crate::ipc_poller::{BackgroundIpcController, PolledStateUpdate, UiAsyncEvent};
 use crate::onboarding::{
@@ -59,8 +61,8 @@ use crate::onboarding::{
 };
 use crate::peers_view::{
     PeerFilterMode, count_peers_by_mode, filter_peers, filter_peers_by_mode, filter_peers_combined,
-    format_filter_chip_label, format_peer_detail_summary, format_peer_list_entry,
-    format_ping_response,
+    format_filter_chip_label, format_peer_detail_summary_localized,
+    format_peer_list_entry_localized, format_ping_response_localized,
 };
 use crate::prefs::{UiPrefs, load_prefs, save_prefs};
 use crate::single_instance::{
@@ -98,6 +100,10 @@ const IDC_BTN_THEME_SYSTEM: u16 = 2050;
 const IDC_BTN_THEME_LIGHT: u16 = 2051;
 const IDC_BTN_THEME_DARK: u16 = 2052;
 const IDC_LBL_THEME: u16 = 2053;
+const IDC_LBL_LOCALE: u16 = 2056;
+const IDC_BTN_LOCALE_SYSTEM: u16 = 2057;
+const IDC_BTN_LOCALE_VI: u16 = 2058;
+const IDC_BTN_LOCALE_EN: u16 = 2059;
 
 // Onboarding (2-tab Join URI / Manual) & Zone 3 modal inputs
 const IDC_LBL_SETUP: u16 = 2020;
@@ -280,6 +286,10 @@ struct UiControls {
     btn_theme_system: isize,
     btn_theme_light: isize,
     btn_theme_dark: isize,
+    lbl_locale: isize,
+    btn_locale_system: isize,
+    btn_locale_vi: isize,
+    btn_locale_en: isize,
 
     // Onboarding (2-tab) & Zone 3 modal shared inputs
     tab_onboard_uri: isize,
@@ -361,8 +371,12 @@ impl UiControls {
         ]
     }
 
-    fn extra_peer_handles(&self) -> [isize; 6] {
+    fn extra_peer_handles(&self) -> [isize; 10] {
         [
+            self.lbl_locale,
+            self.btn_locale_system,
+            self.btn_locale_vi,
+            self.btn_locale_en,
             self.btn_peer_relay,
             self.btn_ping_peer,
             self.btn_copy_ip,
@@ -407,6 +421,7 @@ struct DashboardState {
 impl DashboardState {
     fn new(initially_visible: bool) -> Self {
         let prefs = load_prefs();
+        set_locale(prefs.locale);
         let initial_snapshot = derive_desktop_ui_state(StateProbeInputs {
             gui_version: env!("CARGO_PKG_VERSION"),
             service_probe: ServiceProbeKind::Unknown,
@@ -475,27 +490,43 @@ fn scale(px96: i32, dpi: u32) -> i32 {
     ((px96 * i32::try_from(dpi.max(72)).unwrap_or(96)) + 48) / 96
 }
 
+fn owner_draw_label(key: &str, fallback: &str) -> String {
+    tr_or(key, fallback).replace("&&", "&")
+}
+
 fn build_controls(hwnd: isize) -> Option<UiControls> {
     let z = ControlRect::new(0, 0, 100, 24);
+    let theme_lbls = build_theme_selector_labels(t);
+    let locale_lbls = build_locale_selector_labels(t);
     Some(UiControls {
         // Accessible screen-reader label proxy (kept off-visual or 1x1 while GDI hero paints visually)
-        status_title: create_static_text(hwnd, IDC_STATUS_TITLE, "Initializing Mesh VPN...", z)
-            .ok()?,
+        status_title: create_static_text(
+            hwnd,
+            IDC_STATUS_TITLE,
+            &tr_or("state.connecting", "Connecting"),
+            z,
+        )
+        .ok()?,
 
         // 3-Tab Navigation (`BS_OWNERDRAW` + `WS_TABSTOP`)
         tab_status: create_owner_draw_button(
             hwnd,
             IDC_TAB_STATUS,
-            &tr_or("tab.status", "Status"),
+            &owner_draw_label("tab.status", "Status"),
             z,
         )
         .ok()?,
-        tab_peers: create_owner_draw_button(hwnd, IDC_TAB_PEERS, &tr_or("tab.peers", "Peers"), z)
-            .ok()?,
+        tab_peers: create_owner_draw_button(
+            hwnd,
+            IDC_TAB_PEERS,
+            &owner_draw_label("tab.peers", "Peers"),
+            z,
+        )
+        .ok()?,
         tab_diag_settings: create_owner_draw_button(
             hwnd,
             IDC_TAB_DIAG_SETTINGS,
-            &tr_or("tab.diagnostics_settings", "Diagnostics & Settings"),
+            &owner_draw_label("tab.diagnostics_settings", "Diagnostics & Settings"),
             z,
         )
         .ok()?,
@@ -504,21 +535,21 @@ fn build_controls(hwnd: isize) -> Option<UiControls> {
         btn_connect: create_owner_draw_button(
             hwnd,
             IDC_BTN_CONNECT,
-            &tr_or("action.connect", "Connect"),
+            &owner_draw_label("action.connect", "Connect"),
             z,
         )
         .ok()?,
         btn_disconnect: create_owner_draw_button(
             hwnd,
             IDC_BTN_DISCONNECT,
-            &tr_or("action.disconnect", "Disconnect"),
+            &owner_draw_label("action.disconnect", "Disconnect"),
             z,
         )
         .ok()?,
         btn_start_repair: create_owner_draw_button(
             hwnd,
             IDC_BTN_START_REPAIR,
-            &tr_or("win.start_update_service", "Start / Update Service (UAC)"),
+            &owner_draw_label("win.start_update_service", "Start / Update Service (UAC)"),
             z,
         )
         .ok()?,
@@ -527,156 +558,374 @@ fn build_controls(hwnd: isize) -> Option<UiControls> {
         btn_netcheck: create_owner_draw_button(
             hwnd,
             IDC_BTN_NETCHECK,
-            &tr_or("action.run_netcheck", "Run Netcheck"),
+            &owner_draw_label("win.netcheck", "Netcheck"),
             z,
         )
         .ok()?,
         btn_bugreport: create_owner_draw_button(
             hwnd,
             IDC_BTN_BUGREPORT,
-            &tr_or("action.export_bugreport", "Export Bugreport..."),
+            &owner_draw_label("win.bugreport", "Bugreport..."),
             z,
         )
         .ok()?,
-        btn_cleanup: create_owner_draw_button(hwnd, IDC_BTN_CLEANUP, "Cleanup Routes", z).ok()?,
+        btn_cleanup: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_CLEANUP,
+            &owner_draw_label("win.cleanup", "Cleanup"),
+            z,
+        )
+        .ok()?,
         btn_reset_id: create_owner_draw_button(
             hwnd,
             IDC_BTN_RESET_ID,
-            &tr_or("action.reset_identity", "Reset Identity"),
+            &owner_draw_label("win.reset_identity", "Reset Identity"),
             z,
         )
         .ok()?,
         chk_autostart: create_checkbox(
             hwnd,
             IDC_CHK_AUTOSTART,
-            &tr_or("settings.launch_at_login", "Launch at Login"),
+            &tr_or("action.launch_at_login", "Launch at Login"),
             z,
         )
         .ok()?,
-        btn_uninstall: create_owner_draw_button(hwnd, IDC_BTN_UNINSTALL, "Uninstall...", z).ok()?,
+        btn_uninstall: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_UNINSTALL,
+            &owner_draw_label("win.uninstall", "Uninstall..."),
+            z,
+        )
+        .ok()?,
         btn_open_rotate_modal: create_owner_draw_button(
             hwnd,
             IDC_BTN_OPEN_ROTATE_MODAL,
-            &tr_or("action.rotate_key", "Rotate Node Key..."),
+            &owner_draw_label("action.rotate_key", "Rotate Node Key"),
             z,
         )
         .ok()?,
         btn_open_update_server_modal: create_owner_draw_button(
             hwnd,
             IDC_BTN_OPEN_UPDATE_SERVER_MODAL,
-            &tr_or("settings.update_server", "Update Server / SPKI Pin..."),
+            &owner_draw_label("win.update_server_pin", "Update Server / Pin"),
             z,
         )
         .ok()?,
-        lbl_theme: create_static_text(hwnd, IDC_LBL_THEME, "Theme:", z).ok()?,
+        lbl_theme: create_static_text(hwnd, IDC_LBL_THEME, &theme_lbls.section_label, z).ok()?,
         btn_theme_system: create_owner_draw_button(
             hwnd,
             IDC_BTN_THEME_SYSTEM,
-            &tr_or("theme.system", "System"),
+            &theme_lbls.system,
             z,
         )
         .ok()?,
-        btn_theme_light: create_owner_draw_button(
+        btn_theme_light: create_owner_draw_button(hwnd, IDC_BTN_THEME_LIGHT, &theme_lbls.light, z)
+            .ok()?,
+        btn_theme_dark: create_owner_draw_button(hwnd, IDC_BTN_THEME_DARK, &theme_lbls.dark, z)
+            .ok()?,
+        lbl_locale: create_static_text(hwnd, IDC_LBL_LOCALE, &locale_lbls.section_label, z).ok()?,
+        btn_locale_system: create_owner_draw_button(
             hwnd,
-            IDC_BTN_THEME_LIGHT,
-            &tr_or("theme.light", "Light"),
+            IDC_BTN_LOCALE_SYSTEM,
+            &locale_lbls.system,
             z,
         )
         .ok()?,
-        btn_theme_dark: create_owner_draw_button(
+        btn_locale_vi: create_owner_draw_button(
             hwnd,
-            IDC_BTN_THEME_DARK,
-            &tr_or("theme.dark", "Dark"),
+            IDC_BTN_LOCALE_VI,
+            &locale_lbls.vietnamese,
             z,
         )
         .ok()?,
+        btn_locale_en: create_owner_draw_button(hwnd, IDC_BTN_LOCALE_EN, &locale_lbls.english, z)
+            .ok()?,
 
         // Onboarding 2-tab switchers & inputs (reused cleanly by Zone 3 modals when open)
         tab_onboard_uri: create_owner_draw_button(
             hwnd,
             IDC_TAB_ONBOARD_URI,
-            &tr_or("onboarding.desktop.tab.join_uri", "Join URI"),
+            &owner_draw_label("onboarding.desktop.tab.join_uri", "Join URI"),
             z,
         )
         .ok()?,
         tab_onboard_manual: create_owner_draw_button(
             hwnd,
             IDC_TAB_ONBOARD_MANUAL,
-            &tr_or("onboarding.desktop.tab.manual", "Manual Setup"),
+            &owner_draw_label("onboarding.desktop.tab.manual", "Manual Setup"),
             z,
         )
         .ok()?,
-        lbl_setup: create_static_text(hwnd, IDC_LBL_SETUP, "Set Up Mesh VPN:", z).ok()?,
+        lbl_setup: create_static_text(
+            hwnd,
+            IDC_LBL_SETUP,
+            &tr_or(
+                "onboarding.desktop.setup_label",
+                "Control Onboarding / Server Settings:",
+            ),
+            z,
+        )
+        .ok()?,
         btn_paste_uri: create_owner_draw_button(
             hwnd,
             IDC_BTN_PASTE_URI,
-            "Paste mesh:// Join URI",
+            &owner_draw_label("onboarding.desktop.paste_uri", "Paste mesh:// URI"),
             z,
         )
         .ok()?,
-        lbl_endpoint: create_static_text(hwnd, IDC_LBL_ENDPOINT, "Control Server:", z).ok()?,
+        lbl_endpoint: create_static_text(
+            hwnd,
+            IDC_LBL_ENDPOINT,
+            &tr_or("onboarding.control_server", "Control server (host:port)"),
+            z,
+        )
+        .ok()?,
         edit_endpoint: create_edit(hwnd, IDC_EDIT_ENDPOINT, "", z, false, false).ok()?,
-        radio_spki: create_radio_button(hwnd, IDC_RADIO_SPKI, "SPKI Pin (Zero-TOFU)", z, true)
-            .ok()?,
+        radio_spki: create_radio_button(
+            hwnd,
+            IDC_RADIO_SPKI,
+            &tr_or("onboarding.tls_spki_pin", "SPKI Pin (Default)"),
+            z,
+            true,
+        )
+        .ok()?,
         radio_system_ca: create_radio_button(
             hwnd,
             IDC_RADIO_SYSTEM_CA,
-            "System CA (Domain Only)",
+            &tr_or("onboarding.tls_system_ca", "System CA (Domain)"),
             z,
             false,
         )
         .ok()?,
-        lbl_pin: create_static_text(hwnd, IDC_LBL_PIN, "SPKI Pin:", z).ok()?,
-        edit_pin: create_edit(hwnd, IDC_EDIT_PIN, "", z, false, false).ok()?,
-        lbl_preauth: create_static_text(hwnd, IDC_LBL_PREAUTH, "Pre-Auth Key:", z).ok()?,
-        edit_preauth: create_edit(hwnd, IDC_EDIT_PREAUTH, "", z, true, false).ok()?,
-        lbl_nodename: create_static_text(hwnd, IDC_LBL_NODENAME, "Node Name:", z).ok()?,
-        edit_node_name: create_edit(hwnd, IDC_EDIT_NODE_NAME, "", z, false, false).ok()?,
-        btn_enroll_save: create_owner_draw_button(hwnd, IDC_BTN_ENROLL_SAVE, "Enroll & Connect", z)
-            .ok()?,
-        btn_update_server: create_owner_draw_button(
+        lbl_pin: create_static_text(
             hwnd,
-            IDC_BTN_UPDATE_SERVER,
-            "Save Server / Pin (UAC)",
+            IDC_LBL_PIN,
+            &tr_or("onboarding.spki_pin_label", "SPKI Pin (sha256:<64 hex>)"),
             z,
         )
         .ok()?,
-        btn_modal_cancel: create_button(hwnd, IDC_BTN_MODAL_CANCEL, "Cancel", z, false).ok()?,
+        edit_pin: create_edit(hwnd, IDC_EDIT_PIN, "", z, false, false).ok()?,
+        lbl_preauth: create_static_text(
+            hwnd,
+            IDC_LBL_PREAUTH,
+            &tr_or("onboarding.preauth_key", "Pre-auth Key (mpk_...)"),
+            z,
+        )
+        .ok()?,
+        edit_preauth: create_edit(hwnd, IDC_EDIT_PREAUTH, "", z, true, false).ok()?,
+        lbl_nodename: create_static_text(
+            hwnd,
+            IDC_LBL_NODENAME,
+            &tr_or("onboarding.node_name", "Device Name (optional RFC 1123)"),
+            z,
+        )
+        .ok()?,
+        edit_node_name: create_edit(hwnd, IDC_EDIT_NODE_NAME, "", z, false, false).ok()?,
+        btn_enroll_save: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_ENROLL_SAVE,
+            &owner_draw_label("onboarding.desktop.enroll_connect", "Enroll & Connect"),
+            z,
+        )
+        .ok()?,
+        btn_update_server: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_UPDATE_SERVER,
+            &owner_draw_label("settings.apply_update", "Apply Server Update"),
+            z,
+        )
+        .ok()?,
+        btn_modal_cancel: create_button(
+            hwnd,
+            IDC_BTN_MODAL_CANCEL,
+            &tr_or("generic.cancel", "Cancel"),
+            z,
+            false,
+        )
+        .ok()?,
 
         // Zone 2 Peers controls
         lbl_peers: create_static_text(
             hwnd,
             IDC_LBL_PEERS,
-            "Search Peers (Name / IP / Node ID):",
+            &tr_or("peers.search_placeholder", "Search peers..."),
             z,
         )
         .ok()?,
         edit_peer_filter: create_edit(hwnd, IDC_EDIT_PEER_FILTER, "", z, false, false).ok()?,
-        btn_peer_all: create_owner_draw_button(hwnd, IDC_BTN_PEER_FILTER_ALL, "All (0)", z).ok()?,
+        btn_peer_all: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_PEER_FILTER_ALL,
+            &format!("{} (0)", tr_or("peers.filter.all", "All")),
+            z,
+        )
+        .ok()?,
         btn_peer_online: create_owner_draw_button(
             hwnd,
             IDC_BTN_PEER_FILTER_ONLINE,
-            "Online (0)",
+            &format!("{} (0)", tr_or("peers.filter.online", "Online")),
             z,
         )
         .ok()?,
         btn_peer_direct: create_owner_draw_button(
             hwnd,
             IDC_BTN_PEER_FILTER_DIRECT,
-            "Direct (0)",
+            &format!("{} (0)", tr_or("peers.filter.direct", "Direct")),
             z,
         )
         .ok()?,
-        btn_peer_relay: create_owner_draw_button(hwnd, IDC_BTN_PEER_FILTER_RELAY, "Relay (0)", z)
-            .ok()?,
-        btn_ping_peer: create_owner_draw_button(hwnd, IDC_BTN_PING_PEER, "Ping Peer", z).ok()?,
-        btn_copy_ip: create_owner_draw_button(hwnd, IDC_BTN_COPY_PEER_IP, "Copy Overlay IP", z)
-            .ok()?,
-        btn_copy_fqdn: create_owner_draw_button(hwnd, IDC_BTN_COPY_PEER_FQDN, "Copy FQDN", z)
-            .ok()?,
+        btn_peer_relay: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_PEER_FILTER_RELAY,
+            &format!("{} (0)", tr_or("peers.filter.relay", "Relay")),
+            z,
+        )
+        .ok()?,
+        btn_ping_peer: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_PING_PEER,
+            &owner_draw_label("peers.ping_selected", "Ping Selected Peer"),
+            z,
+        )
+        .ok()?,
+        btn_copy_ip: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_COPY_PEER_IP,
+            &owner_draw_label("peers.copy_overlay_ip", "Copy Overlay IP"),
+            z,
+        )
+        .ok()?,
+        btn_copy_fqdn: create_owner_draw_button(
+            hwnd,
+            IDC_BTN_COPY_PEER_FQDN,
+            &owner_draw_label("peers.copy_fqdn", "Copy FQDN"),
+            z,
+        )
+        .ok()?,
         list_peers: create_listbox(hwnd, IDC_LIST_PEERS, z).ok()?,
         edit_details: create_edit(hwnd, IDC_EDIT_DETAILS, "", z, false, true).ok()?,
     })
+}
+
+/// Re-applies all localized Win32 control captions immediately after a live locale switch (`US-127`).
+fn apply_localized_control_texts(c: &UiControls) {
+    if c.status_title == 0 {
+        return;
+    }
+    let theme_lbls = build_theme_selector_labels(t);
+    let locale_lbls = build_locale_selector_labels(t);
+    set_control_text(c.tab_status, &owner_draw_label("tab.status", "Status"));
+    set_control_text(c.tab_peers, &owner_draw_label("tab.peers", "Peers"));
+    set_control_text(
+        c.tab_diag_settings,
+        &owner_draw_label("tab.diagnostics_settings", "Diagnostics & Settings"),
+    );
+    set_control_text(
+        c.btn_connect,
+        &owner_draw_label("action.connect", "Connect"),
+    );
+    set_control_text(
+        c.btn_disconnect,
+        &owner_draw_label("action.disconnect", "Disconnect"),
+    );
+    set_control_text(
+        c.btn_start_repair,
+        &owner_draw_label("win.start_update_service", "Start / Update Service (UAC)"),
+    );
+    set_control_text(
+        c.btn_netcheck,
+        &owner_draw_label("win.netcheck", "Netcheck"),
+    );
+    set_control_text(
+        c.btn_bugreport,
+        &owner_draw_label("win.bugreport", "Bugreport..."),
+    );
+    set_control_text(c.btn_cleanup, &owner_draw_label("win.cleanup", "Cleanup"));
+    set_control_text(
+        c.btn_reset_id,
+        &owner_draw_label("win.reset_identity", "Reset Identity"),
+    );
+    set_control_text(
+        c.chk_autostart,
+        &tr_or("action.launch_at_login", "Launch at Login"),
+    );
+    set_control_text(
+        c.btn_uninstall,
+        &owner_draw_label("win.uninstall", "Uninstall..."),
+    );
+    set_control_text(
+        c.btn_open_rotate_modal,
+        &owner_draw_label("action.rotate_key", "Rotate Node Key"),
+    );
+    set_control_text(
+        c.btn_open_update_server_modal,
+        &owner_draw_label("win.update_server_pin", "Update Server / Pin"),
+    );
+    set_control_text(c.lbl_theme, &theme_lbls.section_label);
+    set_control_text(c.btn_theme_system, &theme_lbls.system);
+    set_control_text(c.btn_theme_light, &theme_lbls.light);
+    set_control_text(c.btn_theme_dark, &theme_lbls.dark);
+    set_control_text(c.lbl_locale, &locale_lbls.section_label);
+    set_control_text(c.btn_locale_system, &locale_lbls.system);
+    set_control_text(c.btn_locale_vi, &locale_lbls.vietnamese);
+    set_control_text(c.btn_locale_en, &locale_lbls.english);
+    set_control_text(
+        c.tab_onboard_uri,
+        &owner_draw_label("onboarding.desktop.tab.join_uri", "Join URI"),
+    );
+    set_control_text(
+        c.tab_onboard_manual,
+        &owner_draw_label("onboarding.desktop.tab.manual", "Manual Setup"),
+    );
+    set_control_text(
+        c.btn_paste_uri,
+        &owner_draw_label("onboarding.desktop.paste_uri", "Paste mesh:// URI"),
+    );
+    set_control_text(
+        c.lbl_endpoint,
+        &tr_or("onboarding.control_server", "Control server (host:port)"),
+    );
+    set_control_text(
+        c.radio_spki,
+        &tr_or("onboarding.tls_spki_pin", "SPKI Pin (Default)"),
+    );
+    set_control_text(
+        c.radio_system_ca,
+        &tr_or("onboarding.tls_system_ca", "System CA (Domain)"),
+    );
+    set_control_text(
+        c.lbl_pin,
+        &tr_or("onboarding.spki_pin_label", "SPKI Pin (sha256:<64 hex>)"),
+    );
+    set_control_text(
+        c.lbl_preauth,
+        &tr_or("onboarding.preauth_key", "Pre-auth Key (mpk_...)"),
+    );
+    set_control_text(
+        c.lbl_nodename,
+        &tr_or("onboarding.node_name", "Device Name (optional RFC 1123)"),
+    );
+    set_control_text(
+        c.btn_update_server,
+        &owner_draw_label("settings.apply_update", "Apply Server Update"),
+    );
+    set_control_text(c.btn_modal_cancel, &tr_or("generic.cancel", "Cancel"));
+    set_control_text(
+        c.lbl_peers,
+        &tr_or("peers.search_placeholder", "Search peers..."),
+    );
+    set_control_text(
+        c.btn_ping_peer,
+        &owner_draw_label("peers.ping_selected", "Ping Selected Peer"),
+    );
+    set_control_text(
+        c.btn_copy_ip,
+        &owner_draw_label("peers.copy_overlay_ip", "Copy Overlay IP"),
+    );
+    set_control_text(
+        c.btn_copy_fqdn,
+        &owner_draw_label("peers.copy_fqdn", "Copy FQDN"),
+    );
 }
 
 fn apply_font_to_all(c: &UiControls, font: &OwnedGdiObj) {
@@ -737,6 +986,10 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
             c.btn_theme_system,
             c.btn_theme_light,
             c.btn_theme_dark,
+            c.lbl_locale,
+            c.btn_locale_system,
+            c.btn_locale_vi,
+            c.btn_locale_en,
             c.tab_onboard_uri,
             c.tab_onboard_manual,
             c.lbl_setup,
@@ -936,8 +1189,8 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
         DashboardTab::DiagnosticsSettings => {
             let mut y = content_y;
             // Row 1: Appearance Theme Selector + Launch at Login
-            let theme_lbl_w = scale(62, dpi);
-            let theme_btn_w = scale(84, dpi);
+            let theme_lbl_w = scale(88, dpi);
+            let theme_btn_w = scale(92, dpi);
             set_control_bounds(
                 c.lbl_theme,
                 inner_pad,
@@ -968,14 +1221,46 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
             );
             set_control_bounds(
                 c.chk_autostart,
-                inner_pad + inner_w - scale(145, dpi),
+                inner_pad + inner_w - scale(165, dpi),
                 y,
-                scale(145, dpi),
+                scale(165, dpi),
                 btn_h,
             );
             y += btn_h + gap;
 
-            // Row 2: Diagnostics (Netcheck, Bugreport, Cleanup)
+            // Row 2: 3-way Language Selector (`System / Tiếng Việt / English`, `US-127`, `US-131`)
+            let locale_btn_w = scale(98, dpi);
+            set_control_bounds(
+                c.lbl_locale,
+                inner_pad,
+                y + scale(4, dpi),
+                theme_lbl_w,
+                row_h,
+            );
+            set_control_bounds(
+                c.btn_locale_system,
+                inner_pad + theme_lbl_w + gap,
+                y,
+                locale_btn_w,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_locale_vi,
+                inner_pad + theme_lbl_w + locale_btn_w + gap * 2,
+                y,
+                locale_btn_w,
+                btn_h,
+            );
+            set_control_bounds(
+                c.btn_locale_en,
+                inner_pad + theme_lbl_w + (locale_btn_w + gap) * 2 + gap,
+                y,
+                locale_btn_w,
+                btn_h,
+            );
+            y += btn_h + gap;
+
+            // Row 3: Diagnostics (Netcheck, Bugreport, Cleanup)
             let bw_net = scale(130, dpi);
             let bw_bug = scale(165, dpi);
             let bw_cln = scale(130, dpi);
@@ -990,7 +1275,7 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
             );
             y += btn_h + gap;
 
-            // Row 3: Identity & Maintenance Modals (`ADR-028`)
+            // Row 4: Identity & Maintenance Modals (`ADR-028`)
             let bw_rot = scale(155, dpi);
             let bw_upd = scale(195, dpi);
             let bw_rst = scale(125, dpi);
@@ -1019,7 +1304,7 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
             );
             y += btn_h + gap * 2;
 
-            let det_h = (content_bottom - y).max(scale(140, dpi));
+            let det_h = (content_bottom - y).max(scale(110, dpi));
             set_control_bounds(c.edit_details, inner_pad, y, inner_w, det_h);
             set_many_visible(
                 &[
@@ -1027,6 +1312,10 @@ fn sync_zone_visibility_and_layout(st: &DashboardState) {
                     c.btn_theme_system,
                     c.btn_theme_light,
                     c.btn_theme_dark,
+                    c.lbl_locale,
+                    c.btn_locale_system,
+                    c.btn_locale_vi,
+                    c.btn_locale_en,
                     c.chk_autostart,
                     c.btn_netcheck,
                     c.btn_bugreport,
@@ -1066,7 +1355,10 @@ fn layout_onboarding_view(
         DesktopOnboardingTab::JoinUri => {
             set_control_text(
                 c.lbl_setup,
-                "Copy a `mesh://join?...` URI from your Control Admin, then click Paste below:",
+                &tr_or(
+                    "onboarding.desktop.subtitle",
+                    "Paste a mesh://join URI or enter your Control server details manually.",
+                ),
             );
             set_control_bounds(c.lbl_setup, x, y, w, row_h);
             y += row_h + gap;
@@ -1088,7 +1380,10 @@ fn layout_onboarding_view(
         DesktopOnboardingTab::Manual => {
             set_control_text(
                 c.lbl_setup,
-                "Manual Server Enrollment (Zero-TOFU enforced):",
+                &tr_or(
+                    "onboarding.desktop.setup_label",
+                    "Control Onboarding / Server Settings:",
+                ),
             );
             set_control_bounds(c.lbl_setup, x, y, w, row_h);
             y += row_h + gap;
@@ -1125,7 +1420,10 @@ fn layout_onboarding_view(
             set_control_bounds(c.edit_node_name, x + lbl_w, y, scale(240, dpi), row_h);
             y += row_h + gap * 2;
 
-            set_control_text(c.btn_enroll_save, "Enroll & Connect");
+            set_control_text(
+                c.btn_enroll_save,
+                &owner_draw_label("onboarding.desktop.enroll_connect", "Enroll & Connect"),
+            );
             set_control_bounds(c.btn_enroll_save, x + lbl_w, y, scale(170, dpi), btn_h);
             set_many_visible(
                 &[
@@ -1166,7 +1464,10 @@ fn layout_zone3_modal(
         Zone3ModalKind::RotateNodeKey => {
             set_control_text(
                 c.lbl_setup,
-                "Rotate Node Key — Paste a fresh single-use Pre-Auth Key (UAC):",
+                &tr_or(
+                    "rotation.subtitle",
+                    "Provide a fresh mpk_ pre-auth key to renew this node's credentials.",
+                ),
             );
             set_control_bounds(c.lbl_setup, x, y, w, row_h);
             y += row_h + gap * 2;
@@ -1175,11 +1476,14 @@ fn layout_zone3_modal(
             set_control_bounds(c.edit_preauth, x + lbl_w, y, w - lbl_w, row_h);
             y += row_h + gap * 2;
 
-            set_control_text(c.btn_enroll_save, "Rotate Key (UAC)");
-            set_control_bounds(c.btn_enroll_save, x + lbl_w, y, scale(165, dpi), btn_h);
+            set_control_text(
+                c.btn_enroll_save,
+                &owner_draw_label("rotation.rotate_reconnect", "Rotate Key & Reconnect"),
+            );
+            set_control_bounds(c.btn_enroll_save, x + lbl_w, y, scale(185, dpi), btn_h);
             set_control_bounds(
                 c.btn_modal_cancel,
-                x + lbl_w + scale(165, dpi) + gap,
+                x + lbl_w + scale(185, dpi) + gap,
                 y,
                 scale(100, dpi),
                 btn_h,
@@ -1198,7 +1502,7 @@ fn layout_zone3_modal(
         Zone3ModalKind::UpdateControlServer => {
             set_control_text(
                 c.lbl_setup,
-                "Update Control Server / SPKI Pin (Zero-TOFU enforced, UAC):",
+                &tr_or("settings.update_dialog", "Update Control Server Config"),
             );
             set_control_bounds(c.lbl_setup, x, y, w, row_h);
             y += row_h + gap * 2;
@@ -1279,6 +1583,45 @@ fn sync_zero_tofu_radio_state(c: &UiControls) {
     set_control_enabled(c.edit_pin, use_spki);
 }
 
+/// Handles `WM_SETTINGCHANGE` / `WM_THEMECHANGED` live OS theme reload (`US-125`, `IG-UUI-G2-01`).
+///
+/// When `ThemeMode::System` is active, queries `read_windows_apps_use_light_theme()` (never
+/// undocumented `ShouldAppsUseDarkMode()`), rebuilds `UiThemePalette`, updates the DWM titlebar,
+/// and invalidates `hwnd`. Also refreshes localized strings if `LocaleMode::System` is active.
+fn handle_os_theme_setting_change(st: &mut DashboardState, hwnd: isize) -> bool {
+    let target_hwnd = if hwnd != 0 { hwnd } else { st.hwnd };
+    let rebuilt_from_os = if st.theme_mode == ThemeMode::System {
+        let os_apps_light = read_windows_apps_use_light_theme();
+        st.palette.clear_brush_cache();
+        st.palette = resolve_palette_for_dpi(ThemeMode::System, st.current_dpi);
+        apply_window_dark_titlebar(target_hwnd, st.palette.is_dark_titlebar);
+        tracing::debug!(
+            component = "mesh-gui",
+            event = "wm_settingchange_theme_reloaded",
+            apps_use_light_theme = os_apps_light,
+            dark_titlebar = st.palette.is_dark_titlebar,
+            high_contrast = st.palette.is_high_contrast,
+            dpi = st.palette.dpi,
+            "rebuilt theme palette in response to WM_SETTINGCHANGE/WM_THEMECHANGED"
+        );
+        if let Some(font) = &st.palette.font_body {
+            apply_font_to_all(&st.controls, font);
+        }
+        invalidate_window(target_hwnd);
+        true
+    } else {
+        apply_window_dark_titlebar(target_hwnd, st.palette.is_dark_titlebar);
+        invalidate_window(target_hwnd);
+        false
+    };
+
+    if st.locale_mode == LocaleMode::System && st.controls.status_title != 0 {
+        apply_localized_control_texts(&st.controls);
+        refresh_ui_from_state(st);
+    }
+    rebuilt_from_os
+}
+
 fn rebuild_theme_and_repaint(st: &mut DashboardState) {
     st.palette.clear_brush_cache();
     st.palette = resolve_palette_for_dpi(st.theme_mode, st.current_dpi);
@@ -1331,18 +1674,33 @@ fn refresh_ui_from_state(st: &mut DashboardState) {
     };
     st.snapshot = snapshot;
 
-    let display_lbl = st
-        .snapshot
-        .ui_state
-        .display_label(st.snapshot.tunnel_sub_state);
-    let headline = st.snapshot.ui_state.headline(st.snapshot.tunnel_sub_state);
-    let accessible_text = format!("State: {display_lbl} — {headline}");
+    let display_lbl = tr_or(
+        st.snapshot
+            .ui_state
+            .display_label_key(st.snapshot.tunnel_sub_state),
+        st.snapshot
+            .ui_state
+            .display_label(st.snapshot.tunnel_sub_state),
+    );
+    let headline = tr_or(
+        st.snapshot
+            .ui_state
+            .headline_key(st.snapshot.tunnel_sub_state),
+        st.snapshot.ui_state.headline(st.snapshot.tunnel_sub_state),
+    );
+    let accessible_text = format!(
+        "{}: {display_lbl} — {headline}",
+        tr_or("tab.status", "Status")
+    );
     if st.last_announced_state != accessible_text {
         tracing::debug!(
             component = "mesh-gui",
             event = "ui_state_changed",
             state = st.snapshot.ui_state.label(),
-            display_label = display_lbl,
+            display_label = st
+                .snapshot
+                .ui_state
+                .display_label(st.snapshot.tunnel_sub_state),
             "updated desktop UI state"
         );
         announce_accessible_label(st.controls.status_title, &accessible_text);
@@ -1442,14 +1800,14 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
         .and_then(|p| p.status.as_ref())
         .map_or(&[], |s| s.peers.as_slice());
 
-    // Update 4-state filter chip count badges (`US-120`)
+    // Update 4-state filter chip count badges (`US-120`, `US-127`)
     let counts = count_peers_by_mode(all_peers);
     set_control_text(
         st.controls.btn_peer_all,
         &format_filter_chip_label(
             PeerFilterMode::All,
             counts,
-            Some(&tr_or("peers.filter.all", "All")),
+            Some(&tr_or(PeerFilterMode::All.label_key(), "All")),
         ),
     );
     set_control_text(
@@ -1457,7 +1815,7 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
         &format_filter_chip_label(
             PeerFilterMode::Online,
             counts,
-            Some(&tr_or("peers.filter.online", "Online")),
+            Some(&tr_or(PeerFilterMode::Online.label_key(), "Online")),
         ),
     );
     set_control_text(
@@ -1465,7 +1823,7 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
         &format_filter_chip_label(
             PeerFilterMode::Direct,
             counts,
-            Some(&tr_or("peers.filter.direct", "Direct")),
+            Some(&tr_or(PeerFilterMode::Direct.label_key(), "Direct")),
         ),
     );
     set_control_text(
@@ -1473,7 +1831,7 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
         &format_filter_chip_label(
             PeerFilterMode::Relay,
             counts,
-            Some(&tr_or("peers.filter.relay", "Relay")),
+            Some(&tr_or(PeerFilterMode::Relay.label_key(), "Relay")),
         ),
     );
 
@@ -1488,7 +1846,7 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
     let labels: Vec<String> = st
         .displayed_peers
         .iter()
-        .map(format_peer_list_entry)
+        .map(|peer| format_peer_list_entry_localized(peer, t))
         .collect();
     let new_sel =
         prev_sel_id.and_then(|id| st.displayed_peers.iter().position(|p| p.node_id == id));
@@ -1508,35 +1866,42 @@ fn refresh_peers_and_details(st: &mut DashboardState) {
         && let Some(idx) = new_sel
         && let Some(peer) = st.displayed_peers.get(idx)
     {
-        set_control_text(st.controls.edit_details, &format_peer_detail_summary(peer));
+        set_control_text(
+            st.controls.edit_details,
+            &format_peer_detail_summary_localized(peer, t),
+        );
         return;
     }
 
     let status_ref = st.latest_poll.as_ref().and_then(|p| p.status.as_ref());
     if st.active_tab == DashboardTab::DiagnosticsSettings {
         let theme_label = match st.theme_mode {
-            ThemeMode::System => "System",
-            ThemeMode::Light => "Light",
-            ThemeMode::Dark => "Dark",
+            ThemeMode::System => tr_or("theme.system", "System"),
+            ThemeMode::Light => tr_or("theme.light", "Light"),
+            ThemeMode::Dark => tr_or("theme.dark", "Dark"),
         };
         let locale_label = match st.locale_mode {
-            LocaleMode::System => "System",
-            LocaleMode::En => "English",
-            LocaleMode::Vi => "Tieng Viet",
+            LocaleMode::System => tr_or("locale.system", "System"),
+            LocaleMode::En => tr_or("locale.english", "English"),
+            LocaleMode::Vi => tr_or("locale.vietnamese", "Tiếng Việt"),
         };
-        let summary = format_settings_identity_summary(status_ref, theme_label, locale_label);
+        let summary =
+            format_settings_identity_summary_localized(status_ref, &theme_label, &locale_label, t);
         set_control_text(st.controls.edit_details, &summary);
         return;
     }
 
     if let Some(status) = status_ref {
-        set_control_text(st.controls.edit_details, &format_self_network_panel(status));
+        set_control_text(
+            st.controls.edit_details,
+            &format_self_network_panel_localized(status, t),
+        );
     } else if let Some(err) = &st.snapshot.recoverable_error {
         set_control_text(st.controls.edit_details, err);
     } else {
         set_control_text(
             st.controls.edit_details,
-            "Waiting for MeshVpnAgent status on \\\\.\\pipe\\mesh-agent-ro...",
+            &tr_or("state.agent_unavailable", "Agent Unavailable"),
         );
     }
 }
@@ -1688,6 +2053,11 @@ fn is_owner_draw_active(st: &DashboardState, control_id: u16) -> bool {
             | (IDC_BTN_THEME_LIGHT, ThemeMode::Light)
             | (IDC_BTN_THEME_DARK, ThemeMode::Dark)
     ) || matches!(
+        (control_id, st.locale_mode),
+        (IDC_BTN_LOCALE_SYSTEM, LocaleMode::System)
+            | (IDC_BTN_LOCALE_VI, LocaleMode::Vi)
+            | (IDC_BTN_LOCALE_EN, LocaleMode::En)
+    ) || matches!(
         (control_id, st.onboarding_tab),
         (IDC_TAB_ONBOARD_URI, DesktopOnboardingTab::JoinUri)
             | (IDC_TAB_ONBOARD_MANUAL, DesktopOnboardingTab::Manual)
@@ -1796,12 +2166,49 @@ impl WindowEventHandler for DashboardApp {
                         _ => ThemeMode::System,
                     };
                     st.theme_mode = next_mode;
-                    let _saved = save_prefs(&UiPrefs {
+                    if let Err(err) = save_prefs(&UiPrefs {
                         theme: st.theme_mode,
                         locale: st.locale_mode,
-                    });
+                    }) {
+                        tracing::warn!(
+                            component = "mesh-gui",
+                            event = "ui_prefs_save_failed",
+                            error = %err,
+                            "failed saving theme preference"
+                        );
+                    }
                     rebuild_theme_and_repaint(&mut st);
                     refresh_peers_and_details(&mut st);
+                    return;
+                }
+                (IDC_BTN_LOCALE_SYSTEM | IDC_BTN_LOCALE_VI | IDC_BTN_LOCALE_EN, WIN_BN_CLICKED) => {
+                    let next_locale = match control_id {
+                        IDC_BTN_LOCALE_VI => LocaleMode::Vi,
+                        IDC_BTN_LOCALE_EN => LocaleMode::En,
+                        _ => LocaleMode::System,
+                    };
+                    st.locale_mode = next_locale;
+                    set_locale(next_locale);
+                    if let Err(err) = save_prefs(&UiPrefs {
+                        theme: st.theme_mode,
+                        locale: st.locale_mode,
+                    }) {
+                        tracing::warn!(
+                            component = "mesh-gui",
+                            event = "ui_prefs_save_failed",
+                            error = %err,
+                            "failed saving locale preference"
+                        );
+                    }
+                    tracing::info!(
+                        component = "mesh-gui",
+                        event = "ui_locale_changed",
+                        locale = ?next_locale,
+                        "switched desktop UI locale live without daemon restart"
+                    );
+                    st.detail_override = None;
+                    apply_localized_control_texts(&st.controls);
+                    refresh_ui_from_state(&mut st);
                     return;
                 }
                 (
@@ -1832,7 +2239,12 @@ impl WindowEventHandler for DashboardApp {
                             (CopyKind::Fqdn, peer.fqdn)
                         };
                         match copy_non_secret_peer_value(kind, &value) {
-                            Ok(notice) => show_toast(&mut st, &notice.title, &notice.body),
+                            Ok(_notice) => {
+                                let toast_title =
+                                    tr_or("peers.copied_toast", "Copied to clipboard");
+                                let toast_body = format!("{toast_title}: {value}");
+                                show_toast(&mut st, &toast_title, &toast_body);
+                            }
                             Err(err) => {
                                 st.active_action_error = Some(err);
                                 refresh_ui_from_state(&mut st);
@@ -2106,7 +2518,7 @@ impl WindowEventHandler for DashboardApp {
                     match ev {
                         UiAsyncEvent::Netcheck(res) => {
                             st.detail_override = Some(match res {
-                                Ok(r) => format_netcheck_report(&r),
+                                Ok(r) => format_netcheck_report_localized(&r, t),
                                 Err(err) => {
                                     format!("Netcheck failed: {}", format_user_facing_error(&err))
                                 }
@@ -2114,7 +2526,7 @@ impl WindowEventHandler for DashboardApp {
                         }
                         UiAsyncEvent::Ping(res) => {
                             st.detail_override = Some(match res {
-                                Ok(r) => format_ping_response(&r),
+                                Ok(r) => format_ping_response_localized(&r, t),
                                 Err(err) => {
                                     format!("Ping failed: {}", format_user_facing_error(&err))
                                 }
@@ -2206,11 +2618,11 @@ impl WindowEventHandler for DashboardApp {
         let _h = hwnd;
     }
 
-    fn on_theme_changed(&self, _hwnd: isize) {
+    fn on_theme_changed(&self, hwnd: isize) {
         let Ok(mut st) = self.inner.try_borrow_mut() else {
             return;
         };
-        rebuild_theme_and_repaint(&mut st);
+        let _rebuilt = handle_os_theme_setting_change(&mut st, hwnd);
     }
 
     fn on_ctlcolor(&self, _hwnd: isize, hdc: isize, control_hwnd: isize, msg: u32) -> isize {
@@ -2488,10 +2900,15 @@ fn execute_pending_prompt(app: &DashboardApp, hwnd: isize, prompt: PendingUiProm
                 }
             };
 
-            let summary = draft.format_confirmation_summary();
+            let summary = draft.format_confirmation_summary_localized(t);
+            let title_key = if is_rotate {
+                "confirm.rotation"
+            } else {
+                "confirm.enrollment"
+            };
             if !show_message_box(
                 hwnd,
-                "Confirm Mesh VPN Enrollment",
+                &tr_or(title_key, "Confirm Mesh Node Enrollment"),
                 &summary,
                 MessageBoxKind::ConfirmYesNo,
             ) {
@@ -2522,11 +2939,19 @@ fn execute_pending_prompt(app: &DashboardApp, hwnd: isize, prompt: PendingUiProm
             }
         }
         PendingUiPrompt::ConfirmResetIdentity => {
+            let confirm_title = tr_or("win.confirm_reset", "Confirm Reset Identity");
+            let confirm_body = format!(
+                "{}\r\n{}",
+                tr_or("confirm.reset", "Reset Device Identity?"),
+                tr_or(
+                    "confirm.reset_detail",
+                    "This removes the VPN profile, sealed node keys, and Keychain DEK."
+                )
+            );
             let confirmed = show_message_box(
                 hwnd,
-                "Confirm Reset Identity",
-                "This clears local node keys so you can enroll with a new Pre-Auth Key.\r\n\
-                 Proceed with UAC elevation?",
+                &confirm_title,
+                &confirm_body,
                 MessageBoxKind::ConfirmYesNo,
             );
             if !confirmed {
@@ -2543,21 +2968,29 @@ fn execute_pending_prompt(app: &DashboardApp, hwnd: isize, prompt: PendingUiProm
             }
         }
         PendingUiPrompt::ConfirmUninstall => {
+            let uninstall_title = tr_or("win.confirm_uninstall", "Uninstall Mesh VPN");
+            let uninstall_body = tr_or(
+                "service.uninstall_title",
+                "Uninstall Mesh VPN Background Service",
+            );
             let proceed = show_message_box(
                 hwnd,
-                "Uninstall Mesh VPN",
-                "Stop and remove MeshVpnAgent service and binaries?\r\n\
-                 Click Yes to continue (next prompt asks whether to keep keys.json).",
+                &uninstall_title,
+                &uninstall_body,
                 MessageBoxKind::ConfirmYesNo,
             );
             if !proceed {
                 return;
             }
+            let purge_title = tr_or("win.purge_keys_q", "Purge Identity Keys?");
+            let purge_body = tr_or(
+                "service.purge_keys",
+                "Also purge saved device identity keys",
+            );
             let purge_keys = show_message_box(
                 hwnd,
-                "Purge Identity Keys?",
-                "Also delete saved keys.json and bootstrap.toml from C:\\ProgramData\\Mesh?\r\n\
-                 Click Yes to purge, or No to preserve keys for reinstall.",
+                &purge_title,
+                &purge_body,
                 MessageBoxKind::ConfirmYesNo,
             );
             let _cleaned_hkcu = cleanup_current_user_autostart_and_shortcuts();
@@ -2620,4 +3053,46 @@ fn resolve_bundle_source_dir() -> PathBuf {
     }
     let pf = std::env::var_os("ProgramFiles").map(PathBuf::from);
     resolve_program_files_mesh_dir(pf.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use mesh_sys::gui_windows::{
+        WindowEventHandler, detect_high_contrast, read_windows_apps_use_light_theme,
+    };
+
+    use super::{DashboardApp, handle_os_theme_setting_change};
+    use crate::i18n::LocaleMode;
+    use crate::theme::{GDI_TEST_LOCK, ThemeMode, resolve_palette_for_dpi};
+
+    #[test]
+    fn test_window_wm_settingchange_rebuilds_palette_for_system_theme_mode() {
+        let _lock = GDI_TEST_LOCK.lock();
+        // Arrange: start in explicit Dark, switch to System, then trigger WM_SETTINGCHANGE
+        let app = DashboardApp::new(false);
+        {
+            let Ok(mut st) = app.inner.try_borrow_mut() else {
+                return;
+            };
+            st.theme_mode = ThemeMode::System;
+            st.locale_mode = LocaleMode::En;
+            st.palette = resolve_palette_for_dpi(ThemeMode::Dark, 96);
+            assert!(handle_os_theme_setting_change(&mut st, 0));
+            let expected_dark = !read_windows_apps_use_light_theme() || detect_high_contrast();
+            assert_eq!(st.palette.is_dark_titlebar, expected_dark);
+            assert_eq!(st.palette.mode, ThemeMode::System);
+        }
+
+        // Act: dispatch WindowEventHandler::on_theme_changed directly (WM_SETTINGCHANGE hook)
+        app.on_theme_changed(0);
+
+        // Assert: explicit Light mode stays pinned even when WM_SETTINGCHANGE fires
+        let Ok(mut st) = app.inner.try_borrow_mut() else {
+            return;
+        };
+        st.theme_mode = ThemeMode::Light;
+        st.palette = resolve_palette_for_dpi(ThemeMode::Light, 96);
+        assert!(!handle_os_theme_setting_change(&mut st, 0));
+        assert!(!st.palette.is_dark_titlebar);
+    }
 }

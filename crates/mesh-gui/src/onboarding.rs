@@ -127,6 +127,7 @@ impl EnrollmentConfirmationDraft {
     }
 
     /// Formats the confirmation modal message shown before launching UAC (`US-105`).
+    #[cfg(any(target_os = "linux", test))]
     #[must_use]
     pub(crate) fn format_confirmation_summary(&self) -> String {
         let tls_summary = match self.server_pin {
@@ -154,6 +155,65 @@ impl EnrollmentConfirmationDraft {
                  Pre-Auth Key   : {}\r\n\r\n\
                  Proceeding requests Administrator elevation (UAC) to re-authenticate this node.",
                 self.normalized_endpoint, self.masked_preauth_preview
+            ),
+        }
+    }
+
+    /// Formats a localized confirmation modal summary via Discovery v1.1 §4.1 lookup `tr`
+    /// without exposing raw secrets (`SEC-01`, `US-127`).
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub(crate) fn format_confirmation_summary_localized(
+        &self,
+        tr: impl Fn(&str) -> &'static str,
+    ) -> String {
+        let pick = |key: &str, fallback: &'static str| -> &'static str {
+            let val = tr(key);
+            if val.is_empty() { fallback } else { val }
+        };
+        let tls_summary = match self.server_pin {
+            Some(pin) => format!(
+                "{} ({pin})",
+                pick("onboarding.tls_spki_pin", "SPKI Pin (Default)")
+            ),
+            None => pick("onboarding.tls_system_ca", "System CA (Domain)").to_owned(),
+        };
+        let node_summary = self
+            .node_name
+            .as_ref()
+            .map_or("<OS Hostname>", NodeName::as_str);
+        match self.action_kind {
+            ConfirmActionKind::EnrollNewNode => format!(
+                "{}\r\n\r\n\
+                 {} : {}\r\n\
+                 TLS : {}\r\n\
+                 {} : {}\r\n\
+                 {} : {}\r\n\r\n\
+                 {}",
+                pick("confirm.enrollment", "Confirm Mesh Node Enrollment"),
+                pick("onboarding.control_server", "Control server (host:port)"),
+                self.normalized_endpoint,
+                tls_summary,
+                pick("onboarding.preauth_key", "Pre-auth Key (mpk_...)"),
+                self.masked_preauth_preview,
+                pick("onboarding.node_name", "Device Name (optional RFC 1123)"),
+                node_summary,
+                pick(
+                    "confirm.verify_before_enroll",
+                    "Verify Server Trust Before Enrolling"
+                ),
+            ),
+            ConfirmActionKind::RotateKey => format!(
+                "{}\r\n\r\n\
+                 {} : {}\r\n\
+                 {} : {}\r\n\r\n\
+                 {}",
+                pick("confirm.rotation", "Confirm Pre-Auth Key Rotation"),
+                pick("onboarding.control_server", "Control server (host:port)"),
+                self.normalized_endpoint,
+                pick("onboarding.preauth_key", "Pre-auth Key (mpk_...)"),
+                self.masked_preauth_preview,
+                pick("confirm.confirm_rotation", "Confirm Key Rotation"),
             ),
         }
     }
@@ -321,7 +381,10 @@ pub(crate) fn validate_update_server_payload(
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::{DesktopOnboardingTab, Zone3ModalKind};
+    use super::{
+        DesktopOnboardingTab, OnboardingFormInput, OnboardingTlsMode, Zone3ModalKind,
+        validate_manual_onboarding_to_draft,
+    };
 
     #[test]
     fn test_onboarding_tabs_and_zone3_modal_kinds() {
@@ -335,5 +398,26 @@ mod tests {
             Zone3ModalKind::RotateNodeKey,
             Zone3ModalKind::UpdateControlServer
         );
+        let form = OnboardingFormInput {
+            endpoint_raw: "mesh.example.com:8443".to_owned(),
+            tls_mode: OnboardingTlsMode::SystemCa,
+            spki_pin_raw: String::new(),
+            preauth_key_raw: "mpk_QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE".to_owned(),
+            node_name_raw: "win-node".to_owned(),
+        };
+        if let Ok(draft) = validate_manual_onboarding_to_draft(&form) {
+            assert!(
+                draft
+                    .format_confirmation_summary()
+                    .contains("mesh.example.com")
+            );
+            let localized_vi = draft.format_confirmation_summary_localized(|key| match key {
+                "confirm.enrollment" => "Xác nhận đăng ký nút Mesh",
+                _ => "",
+            });
+            assert!(localized_vi.contains("Xác nhận đăng ký nút Mesh"));
+            assert!(localized_vi.contains("mesh.example.com"));
+            assert!(!localized_vi.contains(form.preauth_key_raw.as_str()));
+        }
     }
 }

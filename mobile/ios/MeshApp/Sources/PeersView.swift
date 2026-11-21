@@ -11,6 +11,15 @@ public enum PeerFilterMode: String, CaseIterable, Sendable {
     case direct
     case relay
 
+    public var localizationKey: String {
+        switch self {
+        case .all: return "peers.filter.all"
+        case .online: return "peers.filter.online"
+        case .direct: return "peers.filter.direct"
+        case .relay: return "peers.filter.relay"
+        }
+    }
+
     public var displayTitle: String {
         switch self {
         case .all: return "All"
@@ -18,6 +27,10 @@ public enum PeerFilterMode: String, CaseIterable, Sendable {
         case .direct: return "Direct"
         case .relay: return "Relay"
         }
+    }
+
+    public func localizedTitle(locale: Locale) -> String {
+        L10n.tr(localizationKey, locale: locale)
     }
 }
 
@@ -98,6 +111,7 @@ public enum PeerFilter: Sendable {
 @MainActor
 struct PeersView: View {
     @ObservedObject var viewModel: AppViewModel
+    @EnvironmentObject var localeManager: LocaleManager
     @Environment(\.colorScheme) private var colorScheme
     @State private var searchText = ""
     @State private var selectedFilter: PeerFilterMode = .all
@@ -105,19 +119,20 @@ struct PeersView: View {
     @State private var toastDismissTask: Task<Void, Never>?
 
     var body: some View {
+        let locale = localeManager.resolvedLocale
         NavigationView {
             ZStack(alignment: .bottom) {
-                peersList
+                peersList(locale: locale)
                 if let toastMessage {
                     ToastBannerView(message: toastMessage)
                         .padding(.bottom, 16)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
-            .navigationTitle("Peers")
+            .navigationTitle(L10n.tr("tab.peers", locale: locale))
             .searchable(
                 text: $searchText,
-                prompt: "Search name, FQDN, IP, or ID"
+                prompt: L10n.tr("peers.search_placeholder", locale: locale)
             )
             .refreshable {
                 await viewModel.refreshAllState()
@@ -126,7 +141,7 @@ struct PeersView: View {
         .navigationViewStyle(.stack)
     }
 
-    private var peersList: some View {
+    private func peersList(locale: Locale) -> some View {
         let allPeers = viewModel.statusSnapshot?.peers ?? []
         let counts = PeerFilter.counts(peers: allPeers)
         let filtered = PeerFilter.filter(peers: allPeers, mode: selectedFilter, query: searchText)
@@ -136,7 +151,8 @@ struct PeersView: View {
                 PeerFilterBar(
                     selectedFilter: $selectedFilter,
                     counts: counts,
-                    colorScheme: colorScheme
+                    colorScheme: colorScheme,
+                    locale: locale
                 )
                 .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
             }
@@ -149,7 +165,7 @@ struct PeersView: View {
 
             Section {
                 if filtered.isEmpty {
-                    Text(allPeers.isEmpty ? "No peers visible yet." : "No matching peers.")
+                    Text(L10n.tr("diag.no_peers", locale: locale))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 } else {
@@ -158,8 +174,9 @@ struct PeersView: View {
                             peer: peer,
                             canPing: viewModel.tunnelStatus == .connected && !viewModel.isBusy,
                             colorScheme: colorScheme,
-                            onCopyIp: { copyValue(peer.overlayIp, label: "Overlay IP") },
-                            onCopyFqdn: { copyValue(peer.fqdn, label: "FQDN") },
+                            locale: locale,
+                            onCopyIp: { copyValue(peer.overlayIp, locale: locale) },
+                            onCopyFqdn: { copyValue(peer.fqdn, locale: locale) },
                             onPing: { Task { await viewModel.pingPeer(peer) } }
                         )
                     }
@@ -170,14 +187,14 @@ struct PeersView: View {
                         .foregroundStyle(.secondary)
                 }
             } header: {
-                Text("Peers (\(filtered.count))")
+                Text("\(L10n.tr("tab.peers", locale: locale)) (\(filtered.count))")
             }
         }
     }
 
-    private func copyValue(_ value: String, label: String) {
+    private func copyValue(_ value: String, locale: Locale) {
         viewModel.copyNonSecretAddress(value)
-        showToast("Copied \(label): \(value)")
+        showToast("\(L10n.tr("peers.copied_toast", locale: locale)): \(value)")
     }
 
     private func showToast(_ message: String) {
@@ -199,6 +216,7 @@ private struct PeerFilterBar: View {
     @Binding var selectedFilter: PeerFilterMode
     let counts: PeerFilterCounts
     let colorScheme: ColorScheme
+    let locale: Locale
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -211,7 +229,7 @@ private struct PeerFilterBar: View {
                         selectedFilter = mode
                     } label: {
                         HStack(spacing: 4) {
-                            Text(mode.displayTitle)
+                            Text(mode.localizedTitle(locale: locale))
                             Text("\(chipCount)")
                                 .font(.caption2.monospacedDigit().weight(.semibold))
                                 .padding(.horizontal, 5)
@@ -242,6 +260,7 @@ private struct PeerRowView: View {
     let peer: MobilePeerStatus
     let canPing: Bool
     let colorScheme: ColorScheme
+    let locale: Locale
     let onCopyIp: @MainActor () -> Void
     let onCopyFqdn: @MainActor () -> Void
     let onPing: @MainActor () -> Void
@@ -263,7 +282,7 @@ private struct PeerRowView: View {
                         .foregroundStyle(statusColor)
                 }
                 Spacer()
-                Button("Ping", action: onPing)
+                Button(L10n.tr("action.ping", locale: locale), action: onPing)
                     .buttonStyle(.bordered)
                     .disabled(!canPing)
             }
@@ -272,8 +291,11 @@ private struct PeerRowView: View {
                 Button {
                     onCopyIp()
                 } label: {
-                    Label("Copy IP", systemImage: "doc.on.doc")
-                        .font(.caption)
+                    Label(
+                        L10n.tr("peers.copy_overlay_ip", locale: locale),
+                        systemImage: "doc.on.doc"
+                    )
+                    .font(.caption)
                 }
                 .buttonStyle(.bordered)
 
@@ -281,8 +303,11 @@ private struct PeerRowView: View {
                     Button {
                         onCopyFqdn()
                     } label: {
-                        Label("Copy FQDN", systemImage: "doc.on.doc")
-                            .font(.caption)
+                        Label(
+                            L10n.tr("peers.copy_fqdn", locale: locale),
+                            systemImage: "doc.on.doc"
+                        )
+                        .font(.caption)
                     }
                     .buttonStyle(.bordered)
                 }
@@ -297,11 +322,21 @@ private struct PeerRowView: View {
     }
 
     private var pathSubtitle: String {
-        let pathText = String(describing: peer.activePath)
-        if let rtt = peer.rttMs {
-            return "\(peer.online ? "Online" : "Offline") | \(pathText) | \(rtt) ms"
+        let stateKey = peer.online ? "peers.filter.online" : "peers.badge.offline"
+        let stateText = L10n.tr(stateKey, locale: locale)
+        let pathText: String
+        switch peer.activePath {
+        case .direct:
+            pathText = L10n.tr("peers.filter.direct", locale: locale)
+        case .relay:
+            pathText = L10n.tr("peers.filter.relay", locale: locale)
+        case .none:
+            pathText = String(describing: peer.activePath)
         }
-        return "\(peer.online ? "Online" : "Offline") | \(pathText)"
+        if let rtt = peer.rttMs {
+            return "\(stateText) | \(pathText) | \(rtt) ms"
+        }
+        return "\(stateText) | \(pathText)"
     }
 }
 

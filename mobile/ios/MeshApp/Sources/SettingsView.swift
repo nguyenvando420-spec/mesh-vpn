@@ -17,14 +17,15 @@ struct SettingsView: View {
     @State private var editServerPin = ""
 
     var body: some View {
+        let locale = localeManager.resolvedLocale
         NavigationView {
             Form {
-                appearanceSection
-                languageSection
-                diagnosticsSection
-                maintenanceSection
+                appearanceSection(locale: locale)
+                languageSection(locale: locale)
+                diagnosticsSection(locale: locale)
+                maintenanceSection(locale: locale)
             }
-            .navigationTitle("Settings")
+            .navigationTitle(L10n.tr("tab.settings", locale: locale))
             .sheet(isPresented: $isShowingRotateSheet) {
                 RotateKeyPromptSheet(
                     tokenInput: $rotationTokenInput,
@@ -40,6 +41,7 @@ struct SettingsView: View {
                         viewModel.prepareManualEnrollment(isRotation: true)
                     }
                 )
+                .environment(\.locale, locale)
             }
             .sheet(isPresented: $isShowingServerEditSheet) {
                 UpdateServerSheet(
@@ -59,51 +61,58 @@ struct SettingsView: View {
                         }
                     }
                 )
+                .environment(\.locale, locale)
             }
             .confirmationDialog(
-                "Reset Device Identity?",
+                L10n.tr("confirm.reset", locale: locale),
                 isPresented: $isShowingResetConfirm,
                 titleVisibility: .visible
             ) {
-                Button("Reset & Delete Local Keys", role: .destructive) {
+                Button(L10n.tr("action.reset_identity", locale: locale), role: .destructive) {
                     Task { await viewModel.resetIdentity() }
                 }
-                Button("Cancel", role: .cancel) {}
+                Button(L10n.tr("generic.cancel", locale: locale), role: .cancel) {}
             } message: {
-                Text("This removes the VPN profile, sealed node keys, and Keychain DEK.")
+                Text(L10n.tr("confirm.reset_detail", locale: locale))
             }
         }
         .navigationViewStyle(.stack)
     }
 
-    private var appearanceSection: some View {
-        Section("Appearance") {
-            Picker("Theme", selection: $themeManager.themeMode) {
+    private func appearanceSection(locale: Locale) -> some View {
+        Section(L10n.tr("theme.appearance", locale: locale)) {
+            Picker(
+                L10n.tr("theme.appearance", locale: locale),
+                selection: $themeManager.themeMode
+            ) {
                 ForEach(ThemeMode.allCases, id: \.self) { mode in
-                    Text(mode.displayTitle).tag(mode)
+                    Text(themeLabel(for: mode, locale: locale)).tag(mode)
                 }
             }
             .pickerStyle(.segmented)
         }
     }
 
-    private var languageSection: some View {
-        Section("Language") {
-            Picker("Language", selection: $localeManager.localeMode) {
-                ForEach(LocaleMode.allCases, id: \.self) { mode in
-                    Text(mode.displayTitle).tag(mode)
+    private func languageSection(locale: Locale) -> some View {
+        Section(L10n.tr("locale.language", locale: locale)) {
+            Picker(
+                L10n.tr("locale.language", locale: locale),
+                selection: $localeManager.localeMode
+            ) {
+                ForEach([LocaleMode.system, .vi, .en], id: \.self) { mode in
+                    Text(mode.localizedTitle(locale: locale)).tag(mode)
                 }
             }
             .pickerStyle(.segmented)
         }
     }
 
-    private var diagnosticsSection: some View {
-        Section("Diagnostics") {
+    private func diagnosticsSection(locale: Locale) -> some View {
+        Section(L10n.tr("settings.diag_title", locale: locale)) {
             Button {
                 Task { await viewModel.runNetcheck() }
             } label: {
-                Label("Run UDP & NAT Netcheck", systemImage: "network")
+                Label(L10n.tr("action.run_netcheck", locale: locale), systemImage: "network")
             }
             .disabled(viewModel.tunnelStatus != .connected || viewModel.isBusy)
 
@@ -111,7 +120,10 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("NAT: \(String(describing: netcheck.natType))")
                         .font(.subheadline)
-                    let relayText = netcheck.relayConnected ? "Connected" : "Offline"
+                    let relayKey = netcheck.relayConnected
+                        ? "state.connected"
+                        : "peers.badge.offline"
+                    let relayText = L10n.tr(relayKey, locale: locale)
                     let udpText = netcheck.udpReachable ? "Reachable" : "Blocked"
                     Text("UDP: \(udpText) | Relay: \(relayText)")
                         .font(.caption)
@@ -127,19 +139,28 @@ struct SettingsView: View {
             Button {
                 Task { await viewModel.exportBugreport() }
             } label: {
-                Label("Export Redacted Bugreport", systemImage: "square.and.arrow.up")
+                Label(
+                    L10n.tr("action.export_bugreport", locale: locale),
+                    systemImage: "square.and.arrow.up"
+                )
             }
             .disabled(viewModel.isBusy)
         }
     }
 
-    private var maintenanceSection: some View {
-        Section("Security & Maintenance") {
+    private func maintenanceSection(locale: Locale) -> some View {
+        Section(L10n.tr("settings.section_header", locale: locale)) {
             if let summary = viewModel.bootstrapSummary {
-                LabeledValueRow(title: "Control", value: summary.serverEndpoint)
                 LabeledValueRow(
-                    title: "TLS Mode",
-                    value: summary.tlsAuthMode == .spkiPin ? "SPKI Pin" : "System CA"
+                    title: L10n.tr("label.control", locale: locale),
+                    value: summary.serverEndpoint
+                )
+                let tlsKey = summary.tlsAuthMode == .spkiPin
+                    ? "onboarding.tls_spki_pin"
+                    : "onboarding.tls_system_ca"
+                LabeledValueRow(
+                    title: L10n.tr("settings.server_tls", locale: locale),
+                    value: L10n.tr(tlsKey, locale: locale)
                 )
             }
             LabeledValueRow(title: "Version", value: MeshConstants.agentVersion)
@@ -148,7 +169,7 @@ struct SettingsView: View {
                 rotationTokenInput = ""
                 isShowingRotateSheet = true
             } label: {
-                Label("Rotate Node Key", systemImage: "key.fill")
+                Label(L10n.tr("action.rotate_key", locale: locale), systemImage: "key.fill")
             }
             .disabled(viewModel.isBusy)
 
@@ -160,16 +181,24 @@ struct SettingsView: View {
                 }
                 isShowingServerEditSheet = true
             } label: {
-                Label("Update Control Server", systemImage: "server.rack")
+                Label(L10n.tr("action.update_server", locale: locale), systemImage: "server.rack")
             }
             .disabled(viewModel.isBusy)
 
             Button(role: .destructive) {
                 isShowingResetConfirm = true
             } label: {
-                Label("Reset Device Identity", systemImage: "trash")
+                Label(L10n.tr("action.reset_identity", locale: locale), systemImage: "trash")
             }
             .disabled(viewModel.isBusy)
+        }
+    }
+
+    private func themeLabel(for mode: ThemeMode, locale: Locale) -> String {
+        switch mode {
+        case .system: return L10n.tr("theme.system", locale: locale)
+        case .light: return L10n.tr("theme.light", locale: locale)
+        case .dark: return L10n.tr("theme.dark", locale: locale)
         }
     }
 }
@@ -179,26 +208,27 @@ private struct RotateKeyPromptSheet: View {
     @Binding var tokenInput: String
     let onCancel: @MainActor () -> Void
     let onContinue: @MainActor () -> Void
+    @Environment(\.locale) private var locale
 
     var body: some View {
         NavigationView {
             Form {
-                Section("Pre-Auth Token") {
+                Section(L10n.tr("onboarding.preauth_key", locale: locale)) {
                     SecureField("mpk_...", text: $tokenInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
                 Section {
                     let trimmedToken = tokenInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                    Button("Review Rotation", action: onContinue)
+                    Button(L10n.tr("action.review_rotation", locale: locale), action: onContinue)
                         .disabled(trimmedToken.isEmpty)
                 }
             }
-            .navigationTitle("Rotate Node Key")
+            .navigationTitle(L10n.tr("action.rotate_key", locale: locale))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: onCancel)
+                    Button(L10n.tr("generic.cancel", locale: locale), action: onCancel)
                 }
             }
         }
@@ -212,18 +242,21 @@ private struct UpdateServerSheet: View {
     @Binding var serverPin: String
     let onCancel: @MainActor () -> Void
     let onSave: @MainActor () -> Void
+    @Environment(\.locale) private var locale
 
     var body: some View {
         NavigationView {
             Form {
-                Section("Control Server") {
+                Section(L10n.tr("onboarding.control_server", locale: locale)) {
                     TextField("host:port", text: $endpoint)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                    Picker("TLS Mode", selection: $tlsMode) {
-                        Text("SPKI Pin").tag(MobileTlsAuthMode.spkiPin)
-                        Text("System CA").tag(MobileTlsAuthMode.systemCa)
+                    Picker(L10n.tr("settings.server_tls", locale: locale), selection: $tlsMode) {
+                        Text(L10n.tr("onboarding.tls_spki_pin", locale: locale))
+                            .tag(MobileTlsAuthMode.spkiPin)
+                        Text(L10n.tr("onboarding.tls_system_ca", locale: locale))
+                            .tag(MobileTlsAuthMode.systemCa)
                     }
                     if tlsMode == .spkiPin {
                         TextField("sha256:...", text: $serverPin)
@@ -232,14 +265,14 @@ private struct UpdateServerSheet: View {
                     }
                 }
                 Section {
-                    Button("Verify & Save", action: onSave)
+                    Button(L10n.tr("action.verify_save", locale: locale), action: onSave)
                 }
             }
-            .navigationTitle("Update Server")
+            .navigationTitle(L10n.tr("settings.update_server", locale: locale))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: onCancel)
+                    Button(L10n.tr("generic.cancel", locale: locale), action: onCancel)
                 }
             }
         }

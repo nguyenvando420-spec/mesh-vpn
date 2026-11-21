@@ -33,8 +33,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import dev.meshvpn.android.LocaleHelper
+import dev.meshvpn.android.R
 import dev.meshvpn.android.ui.MainUiScreenState
 import dev.meshvpn.android.ui.theme.MeshTokens
 import java.util.Locale
@@ -117,7 +120,10 @@ fun PeersScreen(
                 .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("Peers (${allPeers.size})", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            text = "${stringResource(R.string.tab_peers)} (${allPeers.size})",
+            style = MaterialTheme.typography.headlineSmall,
+        )
 
         PeerSearchField(
             query = screenState.peerSearchQuery,
@@ -136,34 +142,42 @@ fun PeersScreen(
 
         if (allPeers.isEmpty()) {
             Text(
-                text = "No peers visible yet. Connect to receive mesh Netmap.",
+                text = stringResource(R.string.diag_no_peers),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else if (filteredPeers.isEmpty()) {
             Text(
-                text = "No peers match the current search or filter.",
+                text =
+                    LocaleHelper.tr(
+                        context,
+                        "No peers match the current search or filter.",
+                        "Không có thiết bị nào khớp với tìm kiếm hoặc bộ lọc.",
+                    ),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
+            val copiedLabel = stringResource(R.string.peers_copied_toast)
+            val ipTitle = stringResource(R.string.peers_copy_overlay_ip)
+            val fqdnTitle = stringResource(R.string.peers_copy_fqdn)
             for (peer in filteredPeers) {
                 PeerDetailCard(
                     peer = peer,
                     onCopyIp = {
                         copyNonSecretText(
                             context = context,
-                            label = "Mesh Overlay IP",
+                            label = ipTitle,
                             value = peer.overlayIp,
-                            toastMessage = "Copied IP: ${peer.overlayIp}",
+                            toastMessage = "$copiedLabel: ${peer.overlayIp}",
                         )
                     },
                     onCopyFqdn = {
                         copyNonSecretText(
                             context = context,
-                            label = "Mesh FQDN",
+                            label = fqdnTitle,
                             value = peer.fqdn,
-                            toastMessage = "Copied FQDN: ${peer.fqdn}",
+                            toastMessage = "$copiedLabel: ${peer.fqdn}",
                         )
                     },
                     onPingPeer = { onPingPeer(peer.overlayIp) },
@@ -178,20 +192,30 @@ private fun PeerSearchField(
     query: String,
     onQueryChanged: (String) -> Unit,
 ) {
+    val context = LocalContext.current
     OutlinedTextField(
         value = query,
         onValueChange = onQueryChanged,
-        label = { Text("Search peers") },
-        placeholder = { Text("Name, FQDN, IP, or node ID") },
+        label = { Text(stringResource(R.string.peers_search_placeholder)) },
+        placeholder = {
+            Text(
+                LocaleHelper.tr(
+                    context,
+                    "Name, FQDN, IP, or node ID",
+                    "Tên, FQDN, IP hoặc ID nút",
+                ),
+            )
+        },
         leadingIcon = {
             Icon(imageVector = Icons.Outlined.Search, contentDescription = null)
         },
         trailingIcon = {
             if (query.isNotEmpty()) {
                 IconButton(onClick = { onQueryChanged("") }) {
+                    val clearDesc = LocaleHelper.tr(context, "Clear search", "Xóa tìm kiếm")
                     Icon(
                         imageVector = Icons.Outlined.Clear,
-                        contentDescription = "Clear search",
+                        contentDescription = clearDesc,
                     )
                 }
             }
@@ -212,10 +236,26 @@ private fun PeerFilterChipsRow(
 ) {
     val chips =
         listOf(
-            Triple(PeerFilterMode.ALL, "All (${counts.all})", "peers_filter_all"),
-            Triple(PeerFilterMode.ONLINE, "Online (${counts.online})", "peers_filter_online"),
-            Triple(PeerFilterMode.DIRECT, "Direct (${counts.direct})", "peers_filter_direct"),
-            Triple(PeerFilterMode.RELAY, "Relay (${counts.relay})", "peers_filter_relay"),
+            Triple(
+                PeerFilterMode.ALL,
+                "${stringResource(R.string.peers_filter_all)} (${counts.all})",
+                "peers_filter_all",
+            ),
+            Triple(
+                PeerFilterMode.ONLINE,
+                "${stringResource(R.string.peers_filter_online)} (${counts.online})",
+                "peers_filter_online",
+            ),
+            Triple(
+                PeerFilterMode.DIRECT,
+                "${stringResource(R.string.peers_filter_direct)} (${counts.direct})",
+                "peers_filter_direct",
+            ),
+            Triple(
+                PeerFilterMode.RELAY,
+                "${stringResource(R.string.peers_filter_relay)} (${counts.relay})",
+                "peers_filter_relay",
+            ),
         )
     Row(
         modifier =
@@ -306,7 +346,7 @@ private fun PeerDetailCard(
                     modifier = Modifier.testTag("peers_copy_ip_button"),
                 ) {
                     Icon(imageVector = Icons.Outlined.ContentCopy, contentDescription = null)
-                    Text(" Copy IP")
+                    Text(" ${stringResource(R.string.peers_copy_overlay_ip)}")
                 }
                 OutlinedButton(
                     onClick = onCopyFqdn,
@@ -314,13 +354,13 @@ private fun PeerDetailCard(
                     modifier = Modifier.testTag("peers_copy_fqdn_button"),
                 ) {
                     Icon(imageVector = Icons.Outlined.ContentCopy, contentDescription = null)
-                    Text(" Copy FQDN")
+                    Text(" ${stringResource(R.string.peers_copy_fqdn)}")
                 }
                 OutlinedButton(
                     onClick = onPingPeer,
                     enabled = peer.online,
                 ) {
-                    Text("Ping")
+                    Text(stringResource(R.string.action_ping))
                 }
             }
         }
@@ -362,12 +402,15 @@ private fun peerStatusColor(peer: MobilePeerStatus): Color =
         else -> MeshTokens.SemanticNeutral
     }
 
+@Composable
 private fun peerPathLabel(peer: MobilePeerStatus): String =
     when {
-        !peer.online -> "Offline"
-        peer.activePath == MobileActivePathKind.DIRECT -> "Direct"
-        peer.activePath == MobileActivePathKind.RELAY -> "Relay"
-        else -> "Online"
+        !peer.online -> stringResource(R.string.peers_badge_offline)
+        peer.activePath == MobileActivePathKind.DIRECT ->
+            stringResource(R.string.peers_filter_direct)
+        peer.activePath == MobileActivePathKind.RELAY ->
+            stringResource(R.string.peers_filter_relay)
+        else -> stringResource(R.string.peers_filter_online)
     }
 
 private fun copyNonSecretText(

@@ -16,6 +16,20 @@ pub(crate) enum PeerFilterMode {
     Relay,
 }
 
+#[cfg(target_os = "windows")]
+impl PeerFilterMode {
+    /// Canonical Discovery v1.1 §4.1 i18n key for this filter chip (`US-127`).
+    #[must_use]
+    pub(crate) const fn label_key(self) -> &'static str {
+        match self {
+            Self::All => "peers.filter.all",
+            Self::Online => "peers.filter.online",
+            Self::Direct => "peers.filter.direct",
+            Self::Relay => "peers.filter.relay",
+        }
+    }
+}
+
 /// Per-category peer counts powering the 4-state filter chip badges (`US-120`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct PeerFilterCounts {
@@ -168,6 +182,7 @@ pub(crate) fn filter_peers<'a>(
 }
 
 /// Formats a single concise ListBox line for a peer entry (`Name | IP | Path | RTT | Traffic`).
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 pub(crate) fn format_peer_list_entry(peer: &AgentPeerStatus) -> String {
     let status_tag = if !peer.online {
@@ -193,6 +208,7 @@ pub(crate) fn format_peer_list_entry(peer: &AgentPeerStatus) -> String {
 }
 
 /// Formats detailed peer diagnostics for the selected peer inspector pane.
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 pub(crate) fn format_peer_detail_summary(peer: &AgentPeerStatus) -> String {
     let path_str = match peer.active_path {
@@ -231,6 +247,7 @@ pub(crate) fn format_peer_detail_summary(peer: &AgentPeerStatus) -> String {
 }
 
 /// Formats `POST /v1/agent/ping` output into readable multiline diagnostics (`PingVia` + summary).
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 pub(crate) fn format_ping_response(resp: &PingResponse) -> String {
     let mut lines = Vec::with_capacity(resp.samples.len() + 3);
@@ -256,6 +273,140 @@ pub(crate) fn format_ping_response(resp: &PingResponse) -> String {
             "  #{} via={} endpoint={} rtt={}",
             sample.seq, via, ep, rtt
         ));
+    }
+    if let (Some(min_ms), Some(avg_ms), Some(max_ms)) =
+        (resp.rtt_min_ms, resp.rtt_avg_ms, resp.rtt_max_ms)
+    {
+        lines.push(format!(
+            "RTT min/avg/max = {min_ms:.2} / {avg_ms:.2} / {max_ms:.2} ms"
+        ));
+    }
+    lines.join("\r\n")
+}
+
+/// Localized ListBox entry for a peer using Discovery v1.1 §4.1 lookup `tr` (`US-127`).
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) fn format_peer_list_entry_localized(
+    peer: &AgentPeerStatus,
+    tr: impl Fn(&str) -> &'static str,
+) -> String {
+    let pick = |key: &str, fallback: &'static str| -> &'static str {
+        let val = tr(key);
+        if val.is_empty() { fallback } else { val }
+    };
+    let status_tag = if !peer.online {
+        pick("peers.badge.offline", "Offline").to_owned()
+    } else {
+        let rtt = peer
+            .rtt_ms
+            .map_or_else(|| "-".to_owned(), |ms| format!("{ms}ms"));
+        match peer.active_path {
+            ActivePathKind::Direct => format!("{} {rtt}", pick("peers.filter.direct", "Direct")),
+            ActivePathKind::Relay => format!("{} {rtt}", pick("peers.filter.relay", "Relay")),
+            ActivePathKind::None => format!(
+                "{} ({})",
+                pick("peers.filter.online", "Online"),
+                pick("peers.badge.idle", "Idle")
+            ),
+        }
+    };
+    format!(
+        "{:<18} {:<15} [{:<13}] TX {} / RX {}",
+        peer.name.as_str(),
+        peer.overlay_ip,
+        status_tag,
+        format_human_bytes(peer.tx_bytes),
+        format_human_bytes(peer.rx_bytes),
+    )
+}
+
+/// Localized peer inspector diagnostics summary using Discovery v1.1 §4.1 lookup `tr` (`US-127`).
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) fn format_peer_detail_summary_localized(
+    peer: &AgentPeerStatus,
+    tr: impl Fn(&str) -> &'static str,
+) -> String {
+    let pick = |key: &str, fallback: &'static str| -> &'static str {
+        let val = tr(key);
+        if val.is_empty() { fallback } else { val }
+    };
+    let path_str = match peer.active_path {
+        ActivePathKind::Direct => pick("peers.filter.direct", "Direct"),
+        ActivePathKind::Relay => pick("label.blind_relay", "Blind Relay"),
+        ActivePathKind::None => pick("peers.badge.idle", "Idle"),
+    };
+    let online_str = if peer.online {
+        pick("peers.filter.online", "Online")
+    } else {
+        pick("peers.badge.offline", "Offline")
+    };
+    let endpoint = peer.direct_endpoint.as_deref().unwrap_or("-");
+    let rtt = peer
+        .rtt_ms
+        .map_or_else(|| "-".to_owned(), |ms| format!("{ms} ms"));
+    let hs = peer
+        .last_handshake_at_ms
+        .map_or_else(|| "-".to_owned(), |ts| format!("{ts} ms UTC"));
+    format!(
+        "{}: {} ({})\r\n\
+         {} IP : {}\r\n\
+         Node ID    : {}\r\n\
+         {}     : {}\r\n\
+         Path       : {} ({})\r\n\
+         RTT        : {}\r\n\
+         Handshake  : {}\r\n\
+         Traffic    : TX {} / RX {}",
+        pick("tab.peers", "Peers"),
+        peer.name.as_str(),
+        peer.fqdn,
+        pick("label.overlay", "Overlay"),
+        peer.overlay_ip,
+        peer.node_id,
+        pick("tab.status", "Status"),
+        online_str,
+        path_str,
+        endpoint,
+        rtt,
+        hs,
+        format_human_bytes(peer.tx_bytes),
+        format_human_bytes(peer.rx_bytes),
+    )
+}
+
+/// Localized `POST /v1/agent/ping` diagnostics output using Discovery v1.1 §4.1 lookup `tr`.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub(crate) fn format_ping_response_localized(
+    resp: &PingResponse,
+    tr: impl Fn(&str) -> &'static str,
+) -> String {
+    let pick = |key: &str, fallback: &'static str| -> &'static str {
+        let val = tr(key);
+        if val.is_empty() { fallback } else { val }
+    };
+    let mut lines = Vec::with_capacity(resp.samples.len() + 3);
+    lines.push(format!(
+        "{} {} ({}) — {} / {} ({:.1}%)",
+        pick("action.ping", "Ping"),
+        resp.target_name.as_str(),
+        resp.target_overlay_ip,
+        resp.packets_received,
+        resp.packets_sent,
+        resp.loss_percent
+    ));
+    for sample in &resp.samples {
+        let via = match sample.via {
+            PingVia::Direct => pick("peers.filter.direct", "Direct"),
+            PingVia::Relay => pick("peers.filter.relay", "Relay"),
+            PingVia::Timeout => "timeout",
+        };
+        let ep = sample.endpoint.as_deref().unwrap_or("-");
+        let rtt = sample
+            .rtt_ms
+            .map_or_else(|| "*".to_owned(), |ms| format!("{ms:.2} ms"));
+        lines.push(format!("  #{} [{via}] {ep} rtt={rtt}", sample.seq));
     }
     if let (Some(min_ms), Some(avg_ms), Some(max_ms)) =
         (resp.rtt_min_ms, resp.rtt_avg_ms, resp.rtt_max_ms)
@@ -324,6 +475,10 @@ mod tests {
             };
             assert!(format_peer_list_entry(&peer).contains("peer-test"));
             assert!(format_peer_detail_summary(&peer).contains("Direct P2P UDP"));
+            assert_eq!(
+                super::filter_peers(std::slice::from_ref(&peer), "peer").len(),
+                1
+            );
             let ping = PingResponse {
                 target_name: name,
                 target_overlay_ip: ip,
@@ -341,6 +496,18 @@ mod tests {
                 rtt_max_ms: Some(9.5),
             };
             assert!(format_ping_response(&ping).contains("9.50"));
+            #[cfg(target_os = "windows")]
+            {
+                assert_eq!(PeerFilterMode::Direct.label_key(), "peers.filter.direct");
+                assert!(
+                    super::format_peer_list_entry_localized(&peer, |_| "").contains("peer-test")
+                );
+                assert!(
+                    super::format_peer_detail_summary_localized(&peer, |_| "")
+                        .contains("peer-test")
+                );
+                assert!(super::format_ping_response_localized(&ping, |_| "").contains("9.50"));
+            }
         }
     }
 }

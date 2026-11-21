@@ -96,26 +96,32 @@ final class UnifiedUiFoundationTests: XCTestCase {
         XCTAssertEqual(connected.lightHex, "#16A34A")
         XCTAssertEqual(connected.darkHex, "#4ADE80")
         XCTAssertEqual(connected.label, "Connected")
+        XCTAssertEqual(connected.localizationKey, "state.connected")
 
         XCTAssertEqual(connecting.tone, .warning)
         XCTAssertEqual(connecting.lightHex, "#D97706")
         XCTAssertEqual(connecting.darkHex, "#FBBF24")
+        XCTAssertEqual(connecting.localizationKey, "state.connecting")
 
         XCTAssertEqual(degraded.tone, .warning)
         XCTAssertEqual(degraded.label, "Degraded")
+        XCTAssertEqual(degraded.localizationKey, "state.degraded")
 
         XCTAssertEqual(reauth.tone, .warning)
         XCTAssertEqual(reauth.label, "Re-auth Required")
+        XCTAssertEqual(reauth.localizationKey, "state.reauth_required")
 
         XCTAssertEqual(revoked.tone, .error)
         XCTAssertEqual(revoked.lightHex, "#DC2626")
         XCTAssertEqual(revoked.darkHex, "#F87171")
         XCTAssertEqual(revoked.label, "Device Revoked")
+        XCTAssertEqual(revoked.localizationKey, "state.revoked")
 
         XCTAssertEqual(disconnected.tone, .neutral)
         XCTAssertEqual(disconnected.lightHex, "#6B7280")
         XCTAssertEqual(disconnected.darkHex, "#9CA3AF")
         XCTAssertEqual(disconnected.label, "Disconnected")
+        XCTAssertEqual(disconnected.localizationKey, "state.disconnected")
 
         XCTAssertEqual(MeshDesignTokens.brandCobaltHex, "#0B57D0")
         XCTAssertEqual(MeshDesignTokens.brandSkyHex, "#60A5FA")

@@ -6,12 +6,15 @@ import SwiftUI
 struct DashboardWindowView: View {
     @ObservedObject var store: DesktopStore
     @ObservedObject var themeManager: ThemeManager
+    @ObservedObject var localeManager: LocaleManager
 
     @State private var activeTab: DesktopTabKind = .status
     @State private var onboardingSheetMode: OnboardingSheetModeWrapper?
     @State private var showDiagnosticsSheet: Bool = false
     @State private var firewallOptInOnInstall: Bool = true
     @State private var confirmRevokedReset: Bool = false
+
+    private var loc: Locale { localeManager.effectiveLocale }
 
     private struct OnboardingSheetModeWrapper: Identifiable {
         let mode: OnboardingMode
@@ -46,6 +49,8 @@ struct DashboardWindowView: View {
         .sheet(item: $onboardingSheetMode) { wrapper in
             OnboardingSheetView(store: store, mode: wrapper.mode)
                 .preferredColorScheme(themeManager.preferredColorScheme)
+                .environmentObject(localeManager)
+                .environment(\.locale, loc)
         }
         .sheet(isPresented: $showDiagnosticsSheet) {
             DiagnosticsSheetView(
@@ -55,19 +60,18 @@ struct DashboardWindowView: View {
             )
             .frame(minWidth: 620, minHeight: 520)
             .preferredColorScheme(themeManager.preferredColorScheme)
+            .environmentObject(localeManager)
+            .environment(\.locale, loc)
         }
-        .alert("Reset Device Identity?", isPresented: $confirmRevokedReset) {
-            Button("Cancel", role: .cancel) {}
-            Button("Reset Identity", role: .destructive) {
+        .alert(MeshL10n.tr("confirm.reset", locale: loc), isPresented: $confirmRevokedReset) {
+            Button(MeshL10n.tr("generic.cancel", locale: loc), role: .cancel) {}
+            Button(MeshL10n.tr("action.reset_identity", locale: loc), role: .destructive) {
                 Task { @MainActor in
                     _ = await store.resetIdentity()
                 }
             }
         } message: {
-            Text(
-                "Removes local WireGuard/control credentials so you can enroll again with a "
-                    + "fresh pre-auth key."
-            )
+            Text(MeshL10n.tr("confirm.reset_detail", locale: loc))
         }
     }
 
@@ -104,7 +108,7 @@ struct DashboardWindowView: View {
             }
 
             Toggle(
-                "Launch at Login",
+                MeshL10n.tr("action.launch_at_login", locale: loc),
                 isOn: Binding(
                     get: { store.launchAtLoginEnabled },
                     set: { store.setLaunchAtLogin($0) }
@@ -115,12 +119,14 @@ struct DashboardWindowView: View {
             Button {
                 Task { @MainActor in await store.refreshNow() }
             } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
+                Label(MeshL10n.tr("generic.refresh", locale: loc), systemImage: "arrow.clockwise")
             }
             .disabled(store.isBusy)
 
             if !store.uiState.isEnrolledState {
-                Button("Diagnostics...") { showDiagnosticsSheet = true }
+                Button(MeshL10n.tr("tab.diagnostics_settings", locale: loc)) {
+                    showDiagnosticsSheet = true
+                }
             }
         }
     }
@@ -145,12 +151,15 @@ struct DashboardWindowView: View {
                     confirmRevokedReset = true
                 }
             )
-            Picker("Section", selection: $activeTab) {
-                Text(DesktopTabKind.status.rawValue)
+            Picker(MeshL10n.tr("tab.status", locale: loc), selection: $activeTab) {
+                Text(DesktopTabKind.status.localizedTitle(locale: loc))
                     .tag(DesktopTabKind.status)
-                Text("Peers (\(store.onlinePeerCount)/\(store.sortedPeers.count))")
-                    .tag(DesktopTabKind.peers)
-                Text(DesktopTabKind.diagnostics.rawValue)
+                Text(
+                    "\(DesktopTabKind.peers.localizedTitle(locale: loc))"
+                        + " (\(store.onlinePeerCount)/\(store.sortedPeers.count))"
+                )
+                .tag(DesktopTabKind.peers)
+                Text(DesktopTabKind.diagnostics.localizedTitle(locale: loc))
                     .tag(DesktopTabKind.diagnostics)
             }
             .pickerStyle(.segmented)
@@ -191,7 +200,7 @@ struct DashboardWindowView: View {
             DashboardCenteredCard(
                 icon: "shield.slash",
                 tintColor: statusTintColor,
-                title: "Background Service Not Installed",
+                title: MeshL10n.tr("state.agent_unavailable", locale: loc),
                 subtitle: "Mesh VPN requires the privileged meshd LaunchDaemon "
                     + "(\(AgentDefaults.launchdLabel)) to manage utun tunnels and routes."
             ) {
@@ -199,7 +208,7 @@ struct DashboardWindowView: View {
                     "Add macOS Application Firewall exception for meshd (recommended for P2P)",
                     isOn: $firewallOptInOnInstall
                 )
-                Button("Install Background Service") {
+                Button(MeshL10n.tr("service.start_repair", locale: loc)) {
                     Task { @MainActor in
                         _ = await store.installOrUpdateService(
                             firewallOptIn: firewallOptInOnInstall
@@ -216,16 +225,16 @@ struct DashboardWindowView: View {
             DashboardCenteredCard(
                 icon: "pause.circle",
                 tintColor: statusTintColor,
-                title: "Background Service Is Stopped",
+                title: MeshL10n.tr("state.service_stopped", locale: loc),
                 subtitle: "meshd is installed at \(AgentDefaults.daemonBinaryPath), "
                     + "but is not listening on \(AgentDefaults.roSocketPath)."
             ) {
                 HStack(spacing: 12) {
-                    Button("Start Background Service") {
+                    Button(MeshL10n.tr("service.start_repair", locale: loc)) {
                         Task { @MainActor in _ = await store.startOrRepairService() }
                     }
                     .buttonStyle(.borderedProminent)
-                    Button("Reinstall / Update Service") {
+                    Button(MeshL10n.tr("service.update", locale: loc)) {
                         Task { @MainActor in
                             _ = await store.installOrUpdateService(firewallOptIn: true)
                         }
@@ -237,10 +246,10 @@ struct DashboardWindowView: View {
             DashboardCenteredCard(
                 icon: "link.badge.plus",
                 tintColor: statusTintColor,
-                title: "Ready to Join a Mesh Network",
-                subtitle: "Paste a mesh://join URI or enter your Control server endpoint and pin."
+                title: MeshL10n.tr("headline.setup", locale: loc),
+                subtitle: MeshL10n.tr("onboarding.desktop.subtitle", locale: loc)
             ) {
-                Button("Enroll Device...") {
+                Button(MeshL10n.tr("action.enroll", locale: loc)) {
                     onboardingSheetMode = OnboardingSheetModeWrapper(mode: .initialEnrollment)
                 }
                 .buttonStyle(.borderedProminent)
@@ -254,7 +263,8 @@ struct DashboardWindowView: View {
     private var headerStatusSubtitle: String {
         store.uiState.resolvedTitle(
             isDegradedTunnel: store.isDegradedTunnel,
-            isManuallyDisconnected: store.isManuallyDisconnected
+            isManuallyDisconnected: store.isManuallyDisconnected,
+            locale: loc
         )
     }
 
